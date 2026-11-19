@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 
+import api from "../src/api/client";
+
 import { __setEmbedModeForTests } from "../src/embed";
 import {
   __setBootUnreadFallbackMsForTests,
@@ -15,6 +17,7 @@ import { useMachineStore } from "../src/store/machineStore";
 import { useMessageStore } from "../src/store/messageStore";
 import { useSavedStore } from "../src/store/savedStore";
 import { useServerStore } from "../src/store/serverStore";
+import type { Server } from "../src/store/serverStore";
 import { useThreadStore } from "../src/store/threadStore";
 
 /**
@@ -178,6 +181,33 @@ test("an embed with a web-drawn header is not treated as chat-less", SERIAL, asy
     assert.equal(probe.calls.inbox, 1);
   } finally {
     probe.restore();
+    restoreTimers();
+    restoreEmbed();
+  }
+});
+
+test("the layout's first-screen announcements read reuses the server switch's read of the same server", SERIAL, async () => {
+  const restoreEmbed = __setEmbedModeForTests({ embedded: false, shell: "web" });
+  const restoreTimers = __setBootUnreadFallbackMsForTests(60_000);
+  const realLoad = useAnnouncementStore.getState().load;
+  const probe = countLoaders();
+  // The real announcements store, its request counted at the API client.
+  useAnnouncementStore.setState({ load: realLoad } as never);
+  useServerStore.setState({ current: { id: "10000000-0000-4000-8000-0000000000aa" } as Server });
+  const get = vi.spyOn(api, "get").mockResolvedValue({ data: { announcements: [] } });
+  const announcementReads = () => get.mock.calls.filter(([url]) => url === "/announcements/active").length;
+  try {
+    // What the server switch runs (announcementStore's server reset).
+    await useAnnouncementStore.getState().load();
+    assert.equal(announcementReads(), 1);
+    await boot();
+    await Promise.resolve();
+    assert.equal(announcementReads(), 1, "the bootstrap's read joins the one already made: ONE /announcements/active");
+  } finally {
+    get.mockRestore();
+    probe.restore();
+    useAnnouncementStore.getState().reset();
+    useServerStore.setState({ current: null });
     restoreTimers();
     restoreEmbed();
   }

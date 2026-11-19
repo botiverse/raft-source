@@ -1,9 +1,10 @@
-import { useCallback, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import type { ChangeEvent, FormEvent } from "react";
 import { useIntl } from "react-intl";
 import {
   REFERRAL_SOURCES,
   SIGNUP_ROLES,
+  isReferralSourceId,
 } from "@botiverse/raft-shared";
 import type {
   ReferralSourceId,
@@ -14,6 +15,7 @@ import Banner from "../ui/Banner";
 import { Button, Input } from "@botiverse/raft-ui";
 import SetupSessionFooter from "./SetupSessionFooter";
 import SetupStepFrame from "./SetupStepFrame";
+import { REFERRAL_SOURCE_LABEL_ID } from "./referralSourceLabels";
 
 /**
  * Asked once, immediately after Cindy is created and immediately before the handoff.
@@ -25,8 +27,11 @@ import SetupStepFrame from "./SetupStepFrame";
  *
  * "How did you hear about Raft" is not a new question. It writes `referralSource`,
  * which has always existed and is written by the same PATCH /api/auth/me. The
- * owner-onboarding modal asks it later only when it is still unanswered, so filling
- * it here simply means it is not asked twice.
+ * owner-onboarding modal that used to ask it is gone; ReferralSourcePrompt (flag
+ * referral_source_prompt_v0) asks a new account once while it is still unanswered,
+ * so an answer given here means that card never asks. The other way round does not
+ * hold: this step is owed on the role (signupSurveyCompletedAt), so an owner who
+ * answered the card is still asked here, with their answer already chosen.
  */
 function OptionGrid<T extends string>({
   name,
@@ -81,8 +86,16 @@ export default function ServerSetupSurveyStep({
   const { formatMessage } = useIntl();
   const updateProfile = useAuthStore((state) => state.updateProfile);
   const [role, setRole] = useState<SignupRoleId | null>(null);
-  const [source, setSource] = useState<ReferralSourceId | null>(null);
-  const [sourceOther, setSourceOther] = useState("");
+  // An answer already on the account (ReferralSourcePrompt) starts chosen.
+  const answered = useAuthStore((state) => state.user);
+  const [source, setSource] = useState<ReferralSourceId | null>(() => (
+    isReferralSourceId(answered?.referralSource) ? answered.referralSource : null
+  ));
+  const referralOptions = useMemo(
+    () => REFERRAL_SOURCES.map((option) => ({ id: option.id, label: formatMessage({ id: REFERRAL_SOURCE_LABEL_ID[option.id] }) })),
+    [formatMessage],
+  );
+  const [sourceOther, setSourceOther] = useState(() => answered?.referralSourceOther ?? "");
   const handleSourceOtherChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
     setSourceOther(event.target.value);
   }, []);
@@ -147,7 +160,7 @@ export default function ServerSetupSurveyStep({
         <p className="mb-2 text-footnote font-bold text-foreground">
           {formatMessage({ id: "layout.onboarding.howHearAboutRaft" })}
         </p>
-        <OptionGrid name="source" options={REFERRAL_SOURCES} value={source} onChange={setSource} />
+        <OptionGrid name="source" options={referralOptions} value={source} onChange={setSource} />
         {source === "other" && (
           <Input
             type="text"

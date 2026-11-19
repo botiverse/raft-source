@@ -117,6 +117,7 @@ exports[`each type, prepared and executed > agent:create executed 1`] = `
         "children": [
           "description",
           "computer",
+          "runtime",
         ],
         "props": {
           "direction": "column",
@@ -165,6 +166,15 @@ exports[`each type, prepared and executed > agent:create executed 1`] = `
           "wrap": false,
         },
         "type": "Stack",
+      },
+      "runtime": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.suggestedRuntime",
+          },
+          "value": "Codex CLI",
+        },
+        "type": "Field",
       },
     },
     "root": "root",
@@ -235,6 +245,7 @@ exports[`each type, prepared and executed > agent:create prepared 1`] = `
         "children": [
           "description",
           "computer",
+          "runtime",
         ],
         "props": {
           "direction": "column",
@@ -283,6 +294,15 @@ exports[`each type, prepared and executed > agent:create prepared 1`] = `
           "wrap": false,
         },
         "type": "Stack",
+      },
+      "runtime": {
+        "props": {
+          "label": {
+            "$msg": "actionCard.field.suggestedRuntime",
+          },
+          "value": "Codex CLI",
+        },
+        "type": "Field",
       },
     },
     "root": "root",
@@ -3226,6 +3246,10 @@ exports[`the legacy presentation fields are what they were: buildActionCardPrese
       "key": "suggestedComputer",
       "value": "4f5c1a8c-5b6e-4d0f-9a7b-9c1d2e3f4a5b",
     },
+    {
+      "key": "suggestedRuntime",
+      "value": "codex",
+    },
   ],
   "genericApprovalAllowed": false,
   "riskLevel": "normal",
@@ -3248,6 +3272,10 @@ exports[`the legacy presentation fields are what they were: buildActionCardPrese
     {
       "key": "suggestedComputer",
       "value": "4f5c1a8c-5b6e-4d0f-9a7b-9c1d2e3f4a5b",
+    },
+    {
+      "key": "suggestedRuntime",
+      "value": "codex",
     },
   ],
   "genericApprovalAllowed": false,

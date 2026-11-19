@@ -3,6 +3,7 @@ import type { ServerRole } from "@botiverse/raft-shared";
 import { and, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
 import { getDb, type DatabaseExecutor } from "../db/index";
 import { agents, integrationAuditEvents, oauthClients, servers, users } from "../db/schema";
+import { ownerDispatchRequestId } from "./ownerDispatchContext";
 
 export const INTEGRATION_AUDIT_EVENT_TYPES = [
   "app.registered",
@@ -19,8 +20,22 @@ export const INTEGRATION_AUDIT_EVENT_TYPES = [
   "app.offline_rejected",
   "app.action_endpoint_requested",
   "app.action_endpoint_reviewed",
+  // RFC 076 §17 before card buttons moved to the installation: a server_local
+  // App's own Server confirmed its endpoint. No longer written; kept for the rows.
   "app.link_card_actions_confirmed",
+  // Card buttons of an App that is not official, on the event's Server (RFC
+  // 076 §17): allowed for the endpoint in force, or that allow withdrawn; on
+  // a server_local App's own Server, switched on or off.
+  "app.link_card_actions_allowed",
   "app.link_card_actions_withdrawn",
+  "app.link_card_actions_on",
+  "app.link_card_actions_off",
+  // RFC 086 §5.2: the public key card SecretInputs are sealed to, set or
+  // removed with the App's own credential (appCardEncryptionKeyService.ts);
+  // removed by the system only with a registration another App took over.
+  // Metadata: the `kid`, never the key.
+  "app.card_encryption_key_set",
+  "app.card_encryption_key_removed",
   "official_app.registry_created",
   "official_app.registry_updated",
   "official_app.registry_removed",
@@ -61,10 +76,18 @@ export const INTEGRATION_AUDIT_EVENT_TYPES = [
   "installation.legacy_import_grants_created",
   "assistant.send_as_owner",
   "assistant.send_as_owner.deleted",
+  // A personal assistant published an Artifact as its owner (#proj-assistant:#33).
+  "assistant.publish_artifact_as_owner",
   // A personal assistant changed one of its owner's settings (assistantOwnerSettingsService).
   "assistant.owner_setting_changed",
   // A personal assistant acted as its owner on one of the owner's own routes (middleware/assistantAsOwner.ts).
   "assistant.owner_action",
+  // RFC 085 request:prepare cards (preparedRequestCommit.ts, preparedRequestCards.ts): one event per commit
+  // attempt that reached the route (its outcome: success, refused with the route's code, unknown) and one per
+  // decline. Actor the person, requester the preparing agent, target the card; request_id the dispatched
+  // request's own id, which the route's own audit rows carry too.
+  "action_card.request_run",
+  "action_card.request_declined",
   // A personal assistant read its owner's own state (a `read` owner action); the tool only, never what it read.
   "assistant.owner_read",
   // The WeChat bridge (wechatBridgeService): a person's WeChat bound to their
@@ -110,6 +133,10 @@ export const INTEGRATION_AUDIT_EVENT_TYPES = [
   // outcome, best-effort). Never anything from the context.
   "agent.context_view_requested",
   "agent.context_viewed",
+  // Raft voice (#wg-runtime-form:#22): a person's side question to an agent
+  // (agentVoiceService), required and written before the Computer is asked.
+  // Who, which agent, when and through which App; never the question or answer.
+  "agent.voice_question_asked",
   // A hold ended `expired` (agentRuntimeApprovalService): whether any card of it ever reached a decider.
   "agent_runtime.approval_ended",
   // Server-wide audit (#wg-rbac): high-impact server actions share this table.
@@ -192,6 +219,10 @@ export const INTEGRATION_AUDIT_EVENT_TYPES = [
   "account.second_factor_recovery_started",
   "account.second_factor_recovery_cancelled",
   "account.second_factor_recovery_completed",
+  // A person signed out or revoked their own other sign-in(s) from their
+  // sign-in list (services/mySessions.ts): `reason` sign_out (logout-like) or
+  // lost_device (a security revoke: what they issued or approved goes too).
+  "account.session_revoked",
   "sso.connection_saved",
   "sso.connection_deleted",
   "sso.rules_updated",
@@ -282,7 +313,13 @@ const EVENT_METADATA_ALLOWLIST: Record<IntegrationAuditEventType, readonly strin
   "app.action_endpoint_requested": ["clientKey"],
   "app.action_endpoint_reviewed": ["clientKey", "decision"],
   "app.link_card_actions_confirmed": ["clientKey", "actionEndpoint"],
+  "app.link_card_actions_allowed": ["clientKey", "actionEndpoint"],
   "app.link_card_actions_withdrawn": ["clientKey", "actionEndpoint"],
+  "app.link_card_actions_on": ["clientKey"],
+  "app.link_card_actions_off": ["clientKey"],
+  "app.card_encryption_key_set": ["clientKey", "kid", "previousKid"],
+  // reason: removed (by the App), registration_deleted (by the App), taken_over (system).
+  "app.card_encryption_key_removed": ["clientKey", "kid", "reason"],
   "official_app.registry_created": ["clientKey", "publisherServerId", "revision", "autoInstall", "status", "purpose"],
   "official_app.registry_updated": ["clientKey", "publisherServerId", "revision", "autoInstall", "status", "purpose", "changedFields"],
   "official_app.registry_removed": ["clientKey", "publisherServerId", "revision", "autoInstall", "status", "purpose"],
@@ -307,7 +344,8 @@ const EVENT_METADATA_ALLOWLIST: Record<IntegrationAuditEventType, readonly strin
   "app.agent_jwt_updated": ["clientKey", "enabled"],
   "installation.agent_jwt_updated": ["clientKey", "enabled"],
   // loginMode: "account" on an account-mode login's events (RFC 079 phase 3a); absent in server mode.
-  "oauth.lifecycle": ["clientKey", "stage", "result", "grantType", "principalType", "errorClass", "loginMode"],
+  // source: where the person approved, when the approving client said so (`desktop_browser`: Raft Desktop's built-in browser sheet).
+  "oauth.lifecycle": ["clientKey", "stage", "result", "grantType", "principalType", "errorClass", "loginMode", "source"],
   // The reviewed switch (design §2.4): from and to modes, the review reference, the reason and who ran it,
   // and what it found (§2.3): the App's live server-mode human tokens and open server-mode human codes.
   "oauth.login_mode_switched": ["clientKey", "from", "to", "review", "reason", "operator", "liveServerHumanTokens", "openServerHumanCodes"],
@@ -333,6 +371,8 @@ const EVENT_METADATA_ALLOWLIST: Record<IntegrationAuditEventType, readonly strin
   // RFC 077: never the message text.
   "assistant.send_as_owner": ["messageId", "channelId", "channelType", "errorCode"],
   "assistant.send_as_owner.deleted": ["messageId", "channelId"],
+  // Never the files or the title. The Artifact's id (pt_…) is here: target_id is a uuid column.
+  "assistant.publish_artifact_as_owner": ["artifactId", "version", "homeChannelId", "newArtifact"],
   // One row per changed setting: which (theme, themeDecor, displayLanguage,
   // preferredTimezone) and its value before and after. Actor: the assistant;
   // subject: its owner. The owner reads these back (GET /api/servers/:id/assistant/setting-changes).
@@ -342,6 +382,8 @@ const EVENT_METADATA_ALLOWLIST: Record<IntegrationAuditEventType, readonly strin
   // A confirmed (confirm-tier) action also says who asked (`via`, the assistant), that the owner
   // confirmed it, on which card, and the route's status (assistantOwnerActionCards.ts).
   "assistant.owner_action": ["action", "tool", "targetId", "previousValue", "nextValue", "via", "confirmed", "cardMessageId", "status"],
+  "action_card.request_run": ["cardMessageId", "operation", "route", "attempt", "preparerAgentId", "outcome", "routeStatus", "routeCode", "dispatchRequestId"],
+  "action_card.request_declined": ["cardMessageId", "operation", "route", "attempt", "preparerAgentId", "outcome"],
   "assistant.owner_read": ["action", "tool"],
   // WeChat bridge: Raft ids, a reason and counts only. Never an iLink id, a
   // token or message text. Subject: the owner; target: the binding.
@@ -409,6 +451,7 @@ const EVENT_METADATA_ALLOWLIST: Record<IntegrationAuditEventType, readonly strin
   "agent.context_view_requested": ["agentId", "messageId", "machineId", "viewerType", ...AGENT_CONTEXT_QUERY_AUDIT_KEYS],
   // Ids, the outcome (`ok` or a failure reason), decompressed bytes (ok only), runtime and duration.
   "agent.context_viewed": ["agentId", "messageId", "machineId", "viewerType", "outcome", "bytes", "runtime", "durationMs", ...AGENT_CONTEXT_QUERY_AUDIT_KEYS],
+  "agent.voice_question_asked": ["agentId", "machineId"],
   // The grant's id and its grantee; a revoke also says whether the revoker was the granter.
   "agent.context_view_granted": ["grantId", "agentId", ...SERVER_AUDIT_CONTEXT_KEYS],
   "agent.context_view_grant_revoked": ["grantId", "agentId", "granterUserId", "byGranter", ...SERVER_AUDIT_CONTEXT_KEYS],
@@ -443,6 +486,8 @@ const EVENT_METADATA_ALLOWLIST: Record<IntegrationAuditEventType, readonly strin
   "account.second_factor_passkey_removed": ["sessionFamilyId", "passkeyId", "method", "signedOutSessionCount"],
   "account.second_factor_passkey_counter_regressed": ["sessionFamilyId", "passkeyId", "storedCounter", "receivedCounter", "context"],
   "account.second_factor_backup_code_used": ["sessionFamilyId", "method", "context", "signInFlow", "remaining"],
+  // Ids, the reason and a count only: never the client's platform or version.
+  "account.session_revoked": ["sessionFamilyId", "revokedSessionFamilyIds", "reason", "scope", "signedOutSessionCount"],
   "account.second_factor_recovery_started": ["requestId", "eligibleAt"],
   "account.second_factor_recovery_cancelled": ["requestId", "cancelledBy"],
   "account.second_factor_recovery_completed": ["requestId", "signInFlow"],
@@ -481,7 +526,12 @@ const EVENT_CATEGORY: Record<IntegrationAuditEventType, IntegrationAuditEventCat
   "app.action_endpoint_requested": "registration",
   "app.action_endpoint_reviewed": "registration",
   "app.link_card_actions_confirmed": "registration",
+  "app.link_card_actions_allowed": "registration",
   "app.link_card_actions_withdrawn": "revocation",
+  "app.link_card_actions_on": "registration",
+  "app.link_card_actions_off": "revocation",
+  "app.card_encryption_key_set": "registration",
+  "app.card_encryption_key_removed": "revocation",
   "official_app.registry_created": "registration",
   "official_app.registry_updated": "registration",
   "official_app.registry_removed": "revocation",
@@ -517,8 +567,11 @@ const EVENT_CATEGORY: Record<IntegrationAuditEventType, IntegrationAuditEventCat
   "installation.legacy_import_grants_created": "scope",
   "assistant.send_as_owner": "runtime",
   "assistant.send_as_owner.deleted": "runtime",
+  "assistant.publish_artifact_as_owner": "runtime",
   "assistant.owner_setting_changed": "runtime",
   "assistant.owner_action": "runtime",
+  "action_card.request_run": "runtime",
+  "action_card.request_declined": "runtime",
   "assistant.owner_read": "runtime",
   "assistant.wechat_bound": "install",
   "assistant.wechat_disconnected": "revocation",
@@ -550,6 +603,7 @@ const EVENT_CATEGORY: Record<IntegrationAuditEventType, IntegrationAuditEventCat
   // who viewed is GET /api/agents/:id/context-views (the agent's own viewers).
   "agent.context_view_requested": "runtime",
   "agent.context_viewed": "runtime",
+  "agent.voice_question_asked": "runtime",
   "agent_runtime.approval_decided": "runtime",
   "agent_runtime.approval_ended": "runtime",
   "server.profile_updated": "server_profile",
@@ -586,6 +640,7 @@ const EVENT_CATEGORY: Record<IntegrationAuditEventType, IntegrationAuditEventCat
   "account.second_factor_passkey_removed": "account_security",
   "account.second_factor_passkey_counter_regressed": "account_security",
   "account.second_factor_backup_code_used": "account_security",
+  "account.session_revoked": "account_security",
   "account.second_factor_recovery_started": "account_security",
   "account.second_factor_recovery_cancelled": "account_security",
   "account.second_factor_recovery_completed": "account_security",
@@ -708,7 +763,8 @@ function integrationAuditEventRow(input: IntegrationAuditEventInput): typeof int
     targetType: input.target.type,
     targetId: input.target.id ?? null,
     correlationId: input.correlationId ?? null,
-    requestId: input.requestId ?? null,
+    // Inside a confirmed card's dispatched request (ownerDispatchContext.ts), its id, so this row joins the card's own event.
+    requestId: input.requestId ?? ownerDispatchRequestId() ?? null,
     metadata: sanitizeIntegrationAuditMetadata(input.eventType, input.metadata),
     diff: sanitizeIntegrationAuditDiff(input.diff),
   };

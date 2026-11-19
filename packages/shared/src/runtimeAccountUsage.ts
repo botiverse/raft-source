@@ -367,6 +367,105 @@ export function isRuntimeUsageModelGroupWindow(window: Pick<RuntimeAccountUsageW
   return window.scope?.kind === "models" && window.scope.name.toLowerCase() === group.toLowerCase();
 }
 
+/** Claude's label for a window tied to one model: "Current week (Fable)", "Current session (Opus)". */
+const CLAUDE_MODEL_WINDOW_LABEL = /^Current (?:week|session) \((.+)\)$/u;
+
+/** The model a scope-less Claude window's label names; null for "all models", the OAuth apps' window and any other label. */
+function claudeModelOfLabel(window: Pick<RuntimeAccountUsageWindow, "label">): string | null {
+  if (isClaudeOAuthAppsWindow(window)) return null;
+  const name = CLAUDE_MODEL_WINDOW_LABEL.exec(window.label)?.[1]?.trim();
+  return name && name.toLowerCase() !== "all models" ? name : null;
+}
+
+/**
+ * Compatibility shim for Computers before window scope (Computer 1.22.0 and
+ * earlier; `scope` arrives with Computer 1.25.0 / OAR 0.102): their Claude
+ * windows carry no `scope`, so a model's own window ("Current week (Fable)")
+ * would count as an all-models one, and an account with only Fable used up
+ * would read as used up. A Claude window without `scope` whose label names a
+ * model is read as that model's (`{ kind: "model", name }`); a window with a
+ * scope, and every other provider, stay as given. Applied where a snapshot
+ * is summarized (the web's usage read, the server's usage-limit notice), never
+ * to what the cache stores or serves. Remove once the oldest supported
+ * Computer reports scope (docs/contracts/runtime-account-usage.md).
+ */
+export function inferClaudeUsageWindowScopes(snapshot: RuntimeAccountUsageSnapshot): RuntimeAccountUsageSnapshot {
+  if (snapshot.provider !== "claude") return snapshot;
+  if (!snapshot.accounts.some((account) => account.windows.some((window) => !window.scope && claudeModelOfLabel(window)))) return snapshot;
+  return {
+    ...snapshot,
+    accounts: snapshot.accounts.map((account) => ({
+      ...account,
+      windows: account.windows.map((window) => {
+        const name = window.scope ? null : claudeModelOfLabel(window);
+        return name ? { ...window, scope: { kind: "model" as const, name } } : window;
+      }),
+    })),
+  };
+}
+
+/** A window the runtime ties to one model or a group of models (OAR's `scope`), not the whole account. */
+export function isModelScopedUsageWindow(window: Pick<RuntimeAccountUsageWindow, "scope">): boolean {
+  return window.scope?.kind === "model" || window.scope?.kind === "models";
+}
+
+/** How used a window is, to compare windows: a reached limit above any share; null when unreadable. */
+function windowTightness(window: RuntimeAccountUsageWindow): number | null {
+  if (window.status === "limit_reached") return 2;
+  return window.status === "ok" && typeof window.usedRatio === "number" ? window.usedRatio : null;
+}
+
+/**
+ * An account whose every window is a group of models' (Antigravity: "Gemini
+ * Models", "Claude and GPT models", OAR 0.103), with two groups or more: it
+ * runs while any group has quota left (OAR reports it rate limited only once
+ * every group is used up), so it counts as its group with the most left. Null
+ * for any other account.
+ */
+function roomiestModelGroup(windows: readonly RuntimeAccountUsageWindow[]): RuntimeAccountUsageWindow[] | null {
+  const groups = new Map<string, RuntimeAccountUsageWindow[]>();
+  for (const window of windows) {
+    if (window.scope?.kind !== "models") return null;
+    const key = window.scope.name.toLowerCase();
+    groups.set(key, [...(groups.get(key) ?? []), window]);
+  }
+  if (groups.size < 2) return null;
+  let roomiest: { windows: RuntimeAccountUsageWindow[]; tightness: number } | null = null;
+  for (const group of groups.values()) {
+    const readings = group.map(windowTightness).filter((value): value is number => value !== null);
+    if (readings.length === 0) continue;
+    const tightness = Math.max(...readings);
+    if (roomiest === null || tightness < roomiest.tightness) roomiest = { windows: group, tightness };
+  }
+  return roomiest?.windows ?? null;
+}
+
+/**
+ * The account as every usage summary counts it (the web's rack cell and its
+ * first line, the rack's sort, the bulk dialog, the usage card's badge; the
+ * server's usage-limit notice): never Claude's OAuth apps' window
+ * (third-party apps' use), and a model's or a group of models' own window
+ * (OAR's `scope`) only when the account reports nothing else; then
+ * `modelLine` is false, so the same model is never shown twice. An account
+ * of model groups only (Antigravity) counts as its group with the most left,
+ * and its model line shows the others. A limit reached only on a window left
+ * out leaves the account its percentage (health `ok`): OAR marks the whole
+ * account rate limited when any window is at its limit, a model's too. Display
+ * and notices only; agent blocking follows the account's own health.
+ */
+export function allModelsUsageAccount(account: RuntimeAccountUsageAccount): { account: RuntimeAccountUsageAccount; modelLine: boolean } {
+  const counted = account.windows.filter((window) => !isClaudeOAuthAppsWindow(window));
+  const allModels = counted.filter((window) => !isModelScopedUsageWindow(window));
+  const roomiestGroup = allModels.length === 0 ? roomiestModelGroup(counted) : null;
+  const modelLine = roomiestGroup !== null || (allModels.length > 0 && counted.some(isModelScopedUsageWindow));
+  const kept = roomiestGroup ?? (allModels.length > 0 ? allModels : counted);
+  if (kept.length === account.windows.length) return { account, modelLine };
+  const limitOnlyLeftOut = account.health === "rate_limited"
+    && !kept.some((window) => window.status === "limit_reached")
+    && account.windows.some((window) => !kept.includes(window) && window.status === "limit_reached");
+  return { account: { ...account, ...(limitOnlyLeftOut ? { health: "ok" as const } : {}), windows: kept }, modelLine };
+}
+
 /**
  * Spending one of an account's limit resets from the web (Codex; OAR's
  * `Runtime.redeemLimitReset`). The idempotency key names one attempt: the web

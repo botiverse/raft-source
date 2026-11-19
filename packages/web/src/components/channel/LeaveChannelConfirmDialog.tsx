@@ -42,7 +42,7 @@ export default function LeaveChannelConfirmDialog({
   return (
     <ConfirmDialog
       chromeLocale="active"
-      title={formatMessage({ id: deletes ? "channel.edit.leaveDeleteTitle" : "channel.edit.leaveChannel" })}
+      title={formatMessage({ id: deletes ? "channel.edit.leaveDeleteTitle" : "channel.edit.leaveChannelTitle" })}
       message={deletes
         ? formatMessage({ id: "channel.edit.leaveDeleteMessage" })
         : formatMessage({ id: messageId }, { name: channelName })}

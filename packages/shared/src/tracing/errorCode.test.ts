@@ -62,25 +62,29 @@ test("#421 the cause chain is walked, but only to a bounded depth", () => {
 // @Tracey measured this: a failed `fetch` is a TypeError with NO top-level
 // code; the real code sits on `err.cause`. Reading only `err.code` folded the
 // single largest class of upload failures into "other" (20,658 TypeErrors in
-// one day). This uses a real fetch against a closed port rather than a
-// hand-built shape, so it stays true if undici changes where it puts the code.
+// one day). This uses a real fetch rather than a hand-built shape, so it stays
+// true if undici changes where it puts the code. The server accepts and drops
+// every connection: the fetch is sure to fail while the server holds the port.
+// (Fetching a port freed just before was flaky: on a busy runner another
+// process could take the port in between and answer, staging 43606079161.)
 test("#421 a real fetch failure reports its code from the cause chain", async () => {
+  const server = net.createServer((socket) => socket.destroy());
   const port = await new Promise<number>((resolve, reject) => {
-    const probe = net.createServer();
-    probe.once("error", reject);
-    probe.listen(0, "127.0.0.1", () => {
-      const address = probe.address();
-      const chosen = typeof address === "object" && address !== null ? address.port : 0;
-      probe.close(() => resolve(chosen));
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      resolve(typeof address === "object" && address !== null ? address.port : 0);
     });
   });
 
   let caught: unknown;
   try {
     await fetch(`http://127.0.0.1:${port}/`);
-    assert.fail("fetch to a closed port must reject");
+    assert.fail("fetch to a server that drops the connection must reject");
   } catch (err) {
     caught = err;
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 
   assert.equal(errorClassOf(caught), "TypeError", "the class is the same for every fetch failure");
@@ -89,5 +93,12 @@ test("#421 a real fetch failure reports its code from the cause chain", async ()
     undefined,
     "precondition: fetch puts no code on the top-level error",
   );
-  assert.equal(errorCodeOf(caught), "ECONNREFUSED", "the code must be recovered from err.cause");
+  // A dropped connection reads as a clean close or a reset depending on timing,
+  // OS and Node version; which one is not what this test is about.
+  const causeCode = (caught as { cause?: { code?: unknown } }).cause?.code;
+  assert.ok(
+    causeCode === "UND_ERR_SOCKET" || causeCode === "ECONNRESET",
+    `precondition: the cause carries a socket code, got ${String(causeCode)}`,
+  );
+  assert.equal(errorCodeOf(caught), causeCode, "the code must be recovered from err.cause");
 });

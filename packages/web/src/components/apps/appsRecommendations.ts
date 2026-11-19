@@ -19,7 +19,10 @@ export interface AppRecommendation {
 
 /**
  * The recommendations to show: each one the Marketplace lists for this
- * Server (as its tab does) and this Server hasn't installed.
+ * Server (as its tab does), this Server hasn't installed, and no person on
+ * this Server has uninstalled (`uninstalledHereAt`): a Server that removed
+ * Stamp said no, and is not asked again. The Marketplace still lists it. An
+ * older server sends no `uninstalledHereAt`, which reads as never uninstalled.
  */
 export function appRecommendations(
   records: readonly MarketplaceOAuthClientRecord[],
@@ -27,6 +30,6 @@ export function appRecommendations(
 ): AppRecommendation[] {
   return RECOMMENDED_APPS.flatMap(({ clientId, summaryId }) => {
     const record = records.find((client) => client.clientId === clientId && client.official === true);
-    return record && isMarketplaceTabClient(record, serverId) && !record.installedAt ? [{ record, summaryId }] : [];
+    return record && isMarketplaceTabClient(record, serverId) && !record.installedAt && !record.uninstalledHereAt ? [{ record, summaryId }] : [];
   });
 }

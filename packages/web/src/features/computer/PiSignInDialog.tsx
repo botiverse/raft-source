@@ -309,11 +309,12 @@ export function PiSignInDialog({
                 {formatMessage({ id: "machine.runtimeAuth.pi.key.chosen" }, { provider: chosen.provider.label })}
               </p>
               <Field invalid={keyInvalid}>
-                <FieldLabel required>{formatMessage({ id: "machine.runtimeAuth.provider.apiKeyLabel" })}</FieldLabel>
+                <FieldLabel>{formatMessage({ id: "machine.runtimeAuth.provider.apiKeyLabel" })}</FieldLabel>
                 {/* A password field that no password manager offers to keep: the key is
                     the provider's, not a sign-in to this site. */}
                 <Input
                   type="password"
+                  aria-required="true"
                   value={apiKey}
                   onChange={handleApiKey}
                   autoComplete="off"

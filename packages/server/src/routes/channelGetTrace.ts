@@ -66,7 +66,10 @@ export const ACTIVITY_LIST_FETCH_REASONS = [
   "sync_scope_change",
   "inplace_reconcile",
 ] as const;
-export const ACTIVITY_ROW_FETCH_REASONS = ["follow_change", "read_partial", "rw_lag_retry"] as const;
+// `position_reread`: the web's per-row position rule asked for these rows
+// (#244 step 2, inbox_row_position_v1); the trigger header says why.
+// `position_audit`: a sampled check of rows it patched in place (1 in 20).
+export const ACTIVITY_ROW_FETCH_REASONS = ["follow_change", "read_partial", "rw_lag_retry", "position_reread", "position_audit"] as const;
 export type ActivityList = "inbox" | "done" | "unfollowed" | "followed_threads";
 
 function enumReasonAttr(raw: string | string[] | undefined, allowed: readonly string[]): string {

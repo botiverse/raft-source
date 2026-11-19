@@ -25,5 +25,8 @@ test("drain files: only the version-1 shape is read; unknown keys are ignored", 
   assert.deepEqual(parseComputerUpgradeDrainStateFile(state), state);
   assert.deepEqual(parseComputerUpgradeDrainStateFile({ ...state, finished: "quiet" }), { ...state, finished: "quiet" });
   assert.equal(parseComputerUpgradeDrainStateFile({ ...state, finished: "done" }), null);
+  // Optional count: kept when valid, dropped (not rejected) when not.
+  assert.deepEqual(parseComputerUpgradeDrainStateFile({ ...state, finished: "quiet", waitedFor: 2 }), { ...state, finished: "quiet", waitedFor: 2 });
+  assert.deepEqual(parseComputerUpgradeDrainStateFile({ ...state, waitedFor: -1 }), state);
   assert.equal(parseComputerUpgradeDrainStateFile({ ...state, notQuietAgentIds: [1] }), null);
 });

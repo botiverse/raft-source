@@ -18,11 +18,25 @@ function leadingMessageId(value: string): string | null {
   return value.match(LEADING_MESSAGE_ID)?.[1] ?? null;
 }
 
+/**
+ * A host name as it is compared here: lower case, without the trailing dots of
+ * a fully-qualified name. `app.raft.build.` (and `app.raft.build..`) reach the
+ * same server as `app.raft.build`, but WHATWG `URL.hostname` keeps the dots,
+ * so comparing it as written lets a Raft address pass for an outside one.
+ * Everything else that names the same host (upper case, a percent-encoded or
+ * full-width dot, a port, a user name) is already gone from `URL.hostname`.
+ */
+function comparableHostname(hostname: string): string {
+  return hostname.toLowerCase().replace(/\.+$/, "");
+}
+
 function toAllowedHostnames(hostnames?: string | readonly string[]): Set<string> {
   const values = Array.isArray(hostnames) ? hostnames : [hostnames];
   return new Set(
     [...values, ...DEFAULT_RAFT_PERMALINK_HOSTNAMES]
       .filter((value): value is string => Boolean(value))
+      .map(comparableHostname)
+      .filter(Boolean)
   );
 }
 
@@ -30,10 +44,12 @@ function toAllowedHostnames(hostnames?: string | readonly string[]): Set<string>
  * Whether `hostname` is one of Raft's own app hosts: `currentHostname` (the
  * page's and the deployment's) or the fixed defaults parseRaftPermalink also
  * reads. A link there is Raft's, and routes in the app rather than in a web
- * preview.
+ * preview. Both sides are compared as comparableHostname spells them, so
+ * every caller (the link router, the built-in browser's address rule, the
+ * web preview) may pass `URL.hostname` as it is.
  */
 export function isRaftAppHostname(hostname: string, currentHostname?: string | readonly string[]): boolean {
-  return toAllowedHostnames(currentHostname).has(hostname);
+  return toAllowedHostnames(currentHostname).has(comparableHostname(hostname));
 }
 
 export function parseRaftPermalink(
@@ -42,8 +58,7 @@ export function parseRaftPermalink(
 ): ParsedRaftPermalink | null {
   try {
     const url = new URL(href);
-    const allowedHostnames = toAllowedHostnames(currentHostname);
-    if (!allowedHostnames.has(url.hostname)) return null;
+    if (!isRaftAppHostname(url.hostname, currentHostname)) return null;
 
     const match = url.pathname.match(/^\/s\/([^/]+)\/(channel|dm)\/([0-9a-f-]+)$/i);
     if (!match) return null;

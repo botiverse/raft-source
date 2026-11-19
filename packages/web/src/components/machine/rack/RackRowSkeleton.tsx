@@ -1,8 +1,10 @@
 import { Card, CardContent, CardDescription, CardHeader, CardLeading, CardTitle, CardTrailing, Separator, Skeleton } from "@botiverse/raft-ui";
+import type { ReactNode } from "react";
 import { SkeletonTextBar } from "../../ui/Skeleton";
 import { CardHeading } from "../../../features/computer/CardHeading";
 import { RACK_ACTION_WIDTH, RACK_CELL_WIDTH, RACK_IDENTITY_WIDTH } from "../../../features/computer/computersRackLayout";
 import type { ComputersRackView } from "../../../store/computersRackViewPreference";
+import { DEFAULT_CARD_SHAPE } from "../../../features/computer/computersRackRemembered";
 import type { RackCardShape } from "../../../features/computer/computersRackRemembered";
 
 // The loaded row's own type on each line (ComputerRackRow), so each line is
@@ -35,14 +37,6 @@ function CardLineSkeleton({ name }: { name: string }) {
   );
 }
 
-/**
- * A computer while the Computers list loads, in the loaded row's own layout
- * (ComputerRackRow), so the computers land where these were (Raft DS ›
- * Feedback: the skeleton is the size of what it stands for): a computer's
- * card in the shape it had last time (`shape`: its usage lines, the Other
- * runtimes line, or an offline card's none; else one usage line) or a desktop list row (the phone draws its own, MobileComputersPanel). aria-hidden: the list
- * around it says it is busy.
- */
 /** A usage line, with its model line under it when it had one ("Fable · 40%", RackUsageCardLine). */
 function UsageLineSkeleton({ model }: { model: boolean }) {
   return (
@@ -53,8 +47,37 @@ function UsageLineSkeleton({ model }: { model: boolean }) {
   );
 }
 
-const DEFAULT_CARD_SHAPE: RackCardShape = { usageLines: 1, modelLines: 0, leadUsage: false, otherRuntimes: false, offline: false };
+/** The card's content below its head, in `shape` (the phone's card skeleton draws its own agents' line, `slots`). */
+export function RackCardBodySkeleton({ shape, slots = <SlotsSkeleton /> }: { shape: RackCardShape; slots?: ReactNode }) {
+  return (
+    <CardContent className="flex flex-1 flex-col gap-3">
+      {slots}
+      {shape.offline ? null : (
+        <div className="grid grid-cols-[76px_minmax(0,1fr)_auto] items-center gap-x-2 gap-y-2">
+          {/* As the loaded card: a usage line the list is sorted by leads, over its own divider. */}
+          {shape.leadUsage ? <><UsageLineSkeleton model={shape.modelLines > 0} /><Separator className="col-span-3" /></> : null}
+          <CardLineSkeleton name="w-8" />
+          <CardLineSkeleton name="w-12" />
+          {shape.usageLines > (shape.leadUsage ? 1 : 0) ? <Separator className="col-span-3" /> : null}
+          {Array.from({ length: shape.usageLines - (shape.leadUsage ? 1 : 0) }, (_, line) => (
+            <UsageLineSkeleton key={line} model={line + (shape.leadUsage ? 1 : 0) < shape.modelLines} />
+          ))}
+        </div>
+      )}
+      {/* The Other runtimes line (RackOtherCardLine): one footnote line. */}
+      {shape.otherRuntimes ? <span className="text-footnote"><SkeletonTextBar className="w-40" /></span> : null}
+    </CardContent>
+  );
+}
 
+/**
+ * A computer while the Computers list loads, in the loaded row's own layout
+ * (ComputerRackRow), so the computers land where these were (Raft DS ›
+ * Feedback: the skeleton is the size of what it stands for): a computer's
+ * card in the shape it had last time (`shape`: its usage lines, the Other
+ * runtimes line, or an offline card's none; else DEFAULT_CARD_SHAPE) or a desktop list row (the phone draws its own, MobileComputersPanel). aria-hidden: the list
+ * around it says it is busy.
+ */
 export function RackRowSkeleton({ view, shape = DEFAULT_CARD_SHAPE }: { view: ComputersRackView; shape?: RackCardShape }) {
   if (view === "cards") {
     return (
@@ -70,23 +93,7 @@ export function RackRowSkeleton({ view, shape = DEFAULT_CARD_SHAPE }: { view: Co
           </CardDescription>
           <span className={`col-span-2 ${OWNER_CLASS}`}><SkeletonTextBar className="w-20" /></span>
         </CardHeader>
-        <CardContent className="flex flex-1 flex-col gap-3">
-          <SlotsSkeleton />
-          {shape.offline ? null : (
-            <div className="grid grid-cols-[76px_minmax(0,1fr)_auto] items-center gap-x-2 gap-y-2">
-              {/* As the loaded card: a usage line the list is sorted by leads, over its own divider. */}
-              {shape.leadUsage ? <><UsageLineSkeleton model={shape.modelLines > 0} /><Separator className="col-span-3" /></> : null}
-              <CardLineSkeleton name="w-8" />
-              <CardLineSkeleton name="w-12" />
-              {shape.usageLines > (shape.leadUsage ? 1 : 0) ? <Separator className="col-span-3" /> : null}
-              {Array.from({ length: shape.usageLines - (shape.leadUsage ? 1 : 0) }, (_, line) => (
-                <UsageLineSkeleton key={line} model={line + (shape.leadUsage ? 1 : 0) < shape.modelLines} />
-              ))}
-            </div>
-          )}
-          {/* The Other runtimes line (RackOtherCardLine): one footnote line. */}
-          {shape.otherRuntimes ? <span className="text-footnote"><SkeletonTextBar className="w-40" /></span> : null}
-        </CardContent>
+        <RackCardBodySkeleton shape={shape} />
       </Card>
     );
   }

@@ -85,7 +85,9 @@ The URL carries `installation_id`, `server_id`, and `setup_revision`, never cred
 Treat the URL/instructions as untrusted App metadata, not authority. The App must
 authenticate the visitor and verify their Server configuration rights. Its backend
 uses client-authenticated `POST /api/oauth/installations/lookup` to verify context
-and read `setup`, then `PUT /api/oauth/installations/{installation_id}/setup` with
+and read `setup`, the Server's current `server.name` and `server.slug` (show them from
+this answer, not from the URL, and don't store them), and `app_page_url`, the App's
+page in Raft to link back to as-is; then `PUT /api/oauth/installations/{installation_id}/setup` with
 `revision` and `status: "complete"` (or `"pending"`), plus its client credentials,
 to report saved configuration. Do not ask people to paste secrets into chat.
 Only that App can report its active installation; a stale revision returns 409.

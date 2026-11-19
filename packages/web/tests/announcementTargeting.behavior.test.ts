@@ -50,3 +50,26 @@ test("failed writes cannot advance the next workspace's queue", async () => {
   assert.equal(last.server_id, b);
   assert.equal(last.after, undefined);
 });
+test("ensureLoaded (the layout's first screen) reuses the server switch's read; load() and a new server read again", async () => {
+  context(a);
+  const get = vi.spyOn(api, "get").mockResolvedValue({ data: { announcements: [] } });
+  const first = useAnnouncementStore.getState().load();
+  await useAnnouncementStore.getState().ensureLoaded();
+  await first;
+  await useAnnouncementStore.getState().ensureLoaded();
+  assert.equal(get.mock.calls.length, 1, "joined in flight, then skipped once loaded");
+  await useAnnouncementStore.getState().load();
+  assert.equal(get.mock.calls.length, 2, "load() (focus, reconnect) always reads");
+  context(b);
+  await useAnnouncementStore.getState().ensureLoaded();
+  assert.equal(get.mock.calls.length, 3, "another server's list is read");
+  assert.equal(get.mock.calls[2][1]?.params.server_id, b);
+});
+test("ensureLoaded reads again after a failed read", async () => {
+  context(a);
+  const get = vi.spyOn(api, "get").mockRejectedValueOnce(new Error("offline")).mockResolvedValue({ data: { announcements: [] } });
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  await useAnnouncementStore.getState().load();
+  await useAnnouncementStore.getState().ensureLoaded();
+  assert.equal(get.mock.calls.length, 2);
+});

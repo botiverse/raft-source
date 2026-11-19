@@ -9,7 +9,7 @@
 import { useCallback, useEffect, useId, useState } from "react";
 import type { ReactNode } from "react";
 import type { AxiosInstance } from "axios";
-import { Button } from "@botiverse/raft-ui";
+import { Button, ScrollArea } from "@botiverse/raft-ui";
 import type { FeedbackSubmitType } from "@botiverse/raft-shared";
 import { sendFeedbackCard } from "../agentFeedbackCard";
 import { FeedbackCardFields, FeedbackCardSubmitButton, useFeedbackCardForm } from "../FeedbackCardForm";
@@ -144,7 +144,16 @@ function FeedbackActionCardForm({
     onSubmitted: onSent,
   });
   return (
-    <form className="feedback-card-entry" aria-labelledby={titleId} onSubmit={form.handleSubmit}>
+    // The page's one scroller, a raft-ui ScrollArea that is the form itself. Its fields and buttons
+    // take focus themselves, so the area is no tab stop of its own, and `overscroll="auto"` leaves
+    // the end of the scroll as the platform has it (a phone's bounce or stretch), as it was natively.
+    <ScrollArea
+      render={<form aria-labelledby={titleId} onSubmit={form.handleSubmit} />}
+      tabIndex={-1}
+      overscroll="auto"
+      className="feedback-card-entry"
+      contentClassName="feedback-card-entry-content"
+    >
       {/* The dialog's title and description, as a page. */}
       <h1 id={titleId} className="m-0 font-sans text-headline font-bold text-foreground">
         {copy("actionCard.feedback.dialogTitle")}
@@ -157,6 +166,6 @@ function FeedbackActionCardForm({
         </Button>
         <FeedbackCardSubmitButton form={form} copy={copy} />
       </div>
-    </form>
+    </ScrollArea>
   );
 }

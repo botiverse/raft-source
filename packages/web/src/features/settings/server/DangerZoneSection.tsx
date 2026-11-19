@@ -112,7 +112,7 @@ function LeaveServerConfirmDialog({
   return (
     <ConfirmDialog
       chromeLocale="active"
-      title={formatMessage({ id: "settings.dangerZone.leaveServerTitle" })}
+      title={formatMessage({ id: "settings.dangerZone.leaveServerConfirmTitle" })}
       message={(
         <>
           {formatMessage({ id: "settings.dangerZone.leaveConfirmMessage" }, { serverName })}

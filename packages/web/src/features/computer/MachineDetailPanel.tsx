@@ -17,7 +17,7 @@ import { getServerUrl } from "../../utils/server";
 import { formatRelativeTime } from "../../utils/relativeTime";
 import { getComputerCommands } from "../../utils/computerSetupCommand";
 import { useComputerRestart, useComputerUpgradeCard } from "../../components/machine/useComputerUpgradeCard";
-import { canManageMachine } from "../../utils/canManageMachine";
+import { canControlComputer, canManageMachine, isMachineController } from "../../utils/canManageMachine";
 import { canViewMachineRuntimeAccountUsage } from "../../utils/machineRuntimeUsageVisibility";
 import { ComputerActionConfirms } from "../../components/machine/ComputerActionConfirms";
 import Tooltip from "../../components/ui/Tooltip";
@@ -103,6 +103,8 @@ export function MachineDetailPanel({
     [serverId, serverSlug, serverName],
   );
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [selectionDock, setSelectionDock] = useState<HTMLDivElement | null>(null);
+  const [selectingAgents, setSelectingAgents] = useState(false);
   const [showDisconnectConfirm, setShowDisconnectConfirm] = useState(false);
   const [disconnectError, setDisconnectError] = useState<unknown>(null);
   // Collapsed-by-default install/setup fallback on the offline Computer
@@ -184,16 +186,16 @@ export function MachineDetailPanel({
   // Computers stay collapsed, while an offline Computer exposes recovery.
   const showRecoveryGuide = recoveryGuideDisclosure ?? machine.status !== "online";
   const canManageMachines = canManageMachine(machine, currentUserId, capabilities);
+  // Restart and Upgrade: the narrower gate the `/computer/:action` route enforces.
+  const canControl = canControlComputer(machine, currentUserId, capabilities);
   const canViewRuntimeAccountUsage = canViewMachineRuntimeAccountUsage(machine, currentUserId, capabilities);
   // task #1268: explicit detection state from the server (never inferred from an empty list).
   const rescanRuntimes = useMachineStore((s) => s.rescanRuntimes);
   const { state: rescanState, rescan: onRescanRuntimes } = useRuntimeRescan(machine.id, rescanRuntimes);
   const runtimeDetection = machine.runtimeDetection ?? null;
-  // Endpoint-equivalent eligibility (servers.ts rescan route: machine creator
-  // or the editMachines capability) — never the broader canManageMachines.
-  const canRescanRuntimes = capabilities.editMachines
-    || machine.computerAttachedByCurrentUser === true
-    || (currentUserId !== null && machine.creator?.id === currentUserId);
+  // Endpoint-equivalent eligibility (servers.ts rescan route: the machine's
+  // controller or the editMachines capability) — never the broader canManageMachines.
+  const canRescanRuntimes = capabilities.editMachines || isMachineController(machine, currentUserId);
   const openDeleteConfirm = useCallback(() => setShowDeleteConfirm(true), []);
   // This device (product decision 3): "Delete Computer" becomes "Disconnect
   // This Device from <server>" (B4 detach: its key there revoked, its local
@@ -243,15 +245,15 @@ export function MachineDetailPanel({
     startUpgrade: handleRemoteUpgradeV2Click,
   } = upgradeCard;
   // Offered as the card offers it: online and not mid-upgrade.
-  const computerRestart = useComputerRestart(machine.id, machine.status === "online" && upgradeCard.cardState.kind !== "upgrading");
+  const computerRestart = useComputerRestart(machine.id, canControl && machine.status === "online" && upgradeCard.cardState.kind !== "upgrading");
   const { progress: computerOperationProgress, restart: handleComputerRestartClick } = computerRestart;
   // A runtime this Computer predates offers the page's own one-click Upgrade.
   const runtimeChipsUpgradeAction = useMemo(
     // Same gate as the Actions card's Upgrade button.
-    () => canManageMachines && !isThisDevice && machine.isComputer && machine.status === "online" && cardState.kind === "oneClick"
+    () => canControl && !isThisDevice && machine.isComputer && machine.status === "online" && cardState.kind === "oneClick"
       ? { label: formatMessage({ id: "machine.detail.upgradeToVersion" }, { version: cardState.version }), onClick: handleRemoteUpgradeV2Click }
       : null,
-    [canManageMachines, isThisDevice, cardState, formatMessage, handleRemoteUpgradeV2Click, machine.isComputer, machine.status],
+    [canControl, isThisDevice, cardState, formatMessage, handleRemoteUpgradeV2Click, machine.isComputer, machine.status],
   );
   const statusCommandText = machineComputerCommands?.status ?? "raft-computer status";
   const statusCommand = <InlineCode>{statusCommandText}</InlineCode>;
@@ -279,7 +281,7 @@ export function MachineDetailPanel({
     : "";
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col font-sans">
+    <div className="relative flex min-h-0 flex-1 flex-col font-sans">
       {!hideHeader && (
         <MachinePanelHeader machine={machine} />
       )}
@@ -325,7 +327,7 @@ export function MachineDetailPanel({
               canManage={canManageMachines}
               platform={windowsMachine ? "windows" : "mac-linux"}
               commands={computerFreshInstallCommands}
-              upgradeTargetVersion={machine.status === "online" && cardState.kind === "oneClick" ? cardState.version : null}
+              upgradeTargetVersion={canControl && machine.status === "online" && cardState.kind === "oneClick" ? cardState.version : null}
               manualUpgrade={cardState.kind === "manualUpgrade"}
               onUpgrade={handleRemoteUpgradeV2Click}
             />
@@ -624,7 +626,7 @@ export function MachineDetailPanel({
           )}
 
           {/* Agents on this machine — isolated to prevent activity re-renders */}
-          <MachineAgentList machine={machine} canManageMachines={canManageMachines} canViewRuntimeAccountUsage={canViewRuntimeAccountUsage} />
+          <MachineAgentList machine={machine} canManageMachines={canManageMachines} canViewRuntimeAccountUsage={canViewRuntimeAccountUsage} selectionDock={selectionDock} onSelectingChange={setSelectingAgents} />
 
           {/* Agent Workspaces — only when machine is online */}
           {machine.status === "online" && (
@@ -649,6 +651,7 @@ export function MachineDetailPanel({
                   machine={machine}
                   computerOperationProgress={computerOperationProgress}
                   handleComputerRestartClick={handleComputerRestartClick}
+                  canControl={canControl}
                   cardState={cardState}
                   versionTier={versionTier}
                   webUpgradeOn={webUpgradeOn}
@@ -727,7 +730,11 @@ export function MachineDetailPanel({
             </div>
           )}
         </div>
+        {/* While agents are selected, the page's last content scrolls clear of the floating toolbar (as the Tasks list's does). */}
+        {selectingAgents ? <div className="h-16" aria-hidden data-testid="machine-agents-selection-clearance" /> : null}
       </ScrollArea>
+      {/* The agents list floats its toolbar for selected agents here: over the bottom of the column, outside the scroller. */}
+      <div ref={setSelectionDock} className="contents" data-testid="machine-agents-selection-dock" />
 
       <ComputerActionConfirms name={machine.name} agentCount={machineAgents.length} upgrade={upgradeCard} restart={computerRestart} />
 

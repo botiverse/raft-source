@@ -12,6 +12,7 @@ export type RelayedMachineResponse = Extract<MachineToServerMessage, {
     | "machine:runtime_account_usage:limit_resets:read:result"
     | "agent:interrupt-turn:result"
     | "agent:interrupt-subagent:result"
+    | "agent:side-ask:result"
     | "machine:runtime_auth:logout:result"
     | "machine:runtime_auth:providers:result"
     | "machine:runtime_auth:connect_provider:result";

@@ -9,12 +9,13 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { and, desc, eq } from "drizzle-orm";
 import type { Server as SocketServer } from "socket.io";
-import { DESKTOP_NOTIFICATION_EVENT, type DesktopNotificationV1 } from "@botiverse/raft-shared";
+import { DESKTOP_NOTIFICATION_EVENT, NOTIFICATION_FOLLOWED_THREAD_REPLIES_SWITCH_FEATURE_FLAG_KEY, type DesktopNotificationV1 } from "@botiverse/raft-shared";
 import { createApiTest } from "../../test/integration/apiTest";
 import { enableTaskV2ConversationsForServer } from "../../test/integration/taskV2Flag";
 import { getDb } from "../../db/index";
 import {
   agentMigrations,
+  featureFlags,
   messages,
   notificationOutbox,
   pushSubscriptions,
@@ -703,9 +704,15 @@ withTransports("a DM reads as the sender's words, not as a mention", async (ctx,
   assert.equal(aps.alert.body, "hi there");
 });
 
-// "Replies in threads I follow" off (account followedThreadReplies, #triage:#357).
-const followedThreadRepliesOff = (w: World) =>
-  call(w.http, w.receiver, w.serverId, "PATCH", "/api/me/notification-settings", { followedThreadReplies: false }).then(() => undefined);
+// "Replies in threads I follow" off (account followedThreadReplies, #triage:#357),
+// with its flag (notification_followed_thread_replies_switch, default off) on:
+// while the flag is off the PATCH writes nothing and the switch reads as on.
+const followedThreadRepliesOff = async (w: World) => {
+  await getDb().insert(featureFlags)
+    .values({ key: NOTIFICATION_FOLLOWED_THREAD_REPLIES_SWITCH_FEATURE_FLAG_KEY, randomizationUnit: "user", salt: "test", defaultEnabled: true })
+    .onConflictDoUpdate({ target: featureFlags.key, set: { defaultEnabled: true } });
+  await call(w.http, w.receiver, w.serverId, "PATCH", "/api/me/notification-settings", { followedThreadReplies: false });
+};
 
 withTransports("followed-thread replies off: a followed thread or task conversation alerts nowhere unless it @mentions me; tasks are unchanged", async (ctx, transports) => {
   const mismatches: string[] = [];

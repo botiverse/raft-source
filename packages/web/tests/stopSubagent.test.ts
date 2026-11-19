@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createIntl } from "react-intl";
+import { RUNTIMES, RUNTIMES_WITH_SUBAGENTS } from "@botiverse/raft-shared";
 import api from "../src/api/client";
 import { canStopSubagentsOf, stopSubagentWithFeedback } from "../src/components/agent/stopSubagent";
 import { setToastManager } from "../src/components/toastBridge";
@@ -19,6 +20,14 @@ test("only a live Codex, Claude Code or Kimi agent, for a viewer with Stop turn'
   assert.equal(canStopSubagentsOf({ runtime: "opencode", deletedAt: null }, true), false, "a runtime that cannot stop one subagent");
   assert.equal(canStopSubagentsOf({ runtime: "codex", deletedAt: "2026-11-03T00:00:00.000Z" }, true), false, "a deleted agent");
   assert.equal(canStopSubagentsOf({ runtime: "codex" }, false), false, "no runtime authority");
+});
+
+test("every runtime that can stop a sub-agent is one whose Activity always offers Sub-agents", () => {
+  // A runtime with Stop has sub-agents to stop, so the Sub-agents view must be there for it at 0 too
+  // (runtimeHasSubagents, stdrc 2026-11-14). Adding a runtime to one list and not the other fails here.
+  for (const { id } of RUNTIMES) {
+    if (canStopSubagentsOf({ runtime: id, deletedAt: null }, true)) assert.ok(RUNTIMES_WITH_SUBAGENTS.includes(id), id);
+  }
 });
 
 test("the stop says what happened; an older Computer is told apart; a plain failure offers Retry, which stops again", async () => {

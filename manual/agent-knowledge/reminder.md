@@ -24,6 +24,8 @@ Earlier verification:
 - packages/server/src/routes/reminders.ts:1-5 (v0 scope comment: human-facing read-only)
 - packages/web/src/components/agent/AgentRemindersSection.tsx:25-27 (v0 human surface is read-only)
 - packages/web/src/features/agent/AgentDetailPanel.tsx (GET /reminders?ownerAgentId=...)
+- packages/shared/src/agentInboxApp.ts (AGENT_INBOX_PREVIEW_MAX_CHARS = 120)
+- packages/daemon/src/apps/reminder/inboxDefinition.ts (projectReminderInboxTitle: cut to 120 with a trailing … marker, no split surrogate pair)
 @ verified against current staging head (re-verified during cohort review pass)
 */}
 
@@ -64,6 +66,9 @@ The **human-side UI is read-only**. Humans can see pending reminders on an agent
 - `raft reminder list` — shows this agent's scheduled reminders (recurring ones stay `scheduled` between fires). A one-time reminder that has fired is `fired` for good, so the default view counts those on its last line instead of listing them; `--status fired` lists them, `--all` lists every state.
   - ⚠️ `[fired]` is the reminder's state, not an open item: it does not say whether you acked the fire. A fire still waiting for your ack is an item in `raft inbox check`.
 
+**Reminder ids**
+- `--id` takes the full id, a short prefix, or the item as `raft inbox check` prints it: `reminder:<id>`, or `reminder:<id>:<rev>`, whose revision ack, dismiss, seal and unseal then use.
+
 **Snooze a reminder**
 - `raft reminder snooze --id <reminder-id> --by <duration>` — push it later without creating a new one
 - ⚠️ Snooze takes **`--by`** (e.g. `30m`, `2h`, `1d`). It does **not** accept `--delay-seconds` (that flag exists only on `schedule`) and does not accept `--in`. The relative-time flag differs per subcommand — see the table below before copying a command.
@@ -75,6 +80,12 @@ The **human-side UI is read-only**. Humans can see pending reminders on an agent
 - 🔴 **`update` fails on a one-time reminder that has already fired**: `Code: reminder_not_active` ("This reminder has already fired, so it can't be updated: snooze it back to scheduled first, or schedule a new one."). The working sequence is **`snooze --by <duration>` first, then `update`**. A recurring reminder stays `scheduled` (each fire only moves its next time), so it can be updated directly.
 - `--title` is capped at **500 characters** on **both `schedule` and `update`** — rejected with `SCHEDULE_FAILED` / `UPDATE_FAILED` respectively. Worth knowing because a useful reminder title carries its own scope (so the fire receipt tells you what to do), and that runs long fast.
 - Doesn't change the `--message-id` anchor
+
+**⚠️ The title in a due-reminder notice is cut at 120 characters.** The inbox item for a fired reminder
+shortens a longer title to 120 UTF-16 code units, ending in `…` (Computers before 1.0.47 cut it with no
+marker). A cut can leave a value that still looks valid: `CLI < 0.0.28` arrives as `CLI < 0.0.2`. So
+never take a criterion from the notice; read the full title with `raft reminder list --status fired`
+(or `--all`). A plain `raft reminder list` shows only scheduled reminders, so a fired one-time reminder is not in it.
 
 **⚠️ The relative-time flag is NOT the same across this command family — check before copying**
 

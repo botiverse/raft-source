@@ -1,5 +1,5 @@
 import { spawnRuntimeChild } from "./runtimeChild";
-import type { AgentConfig, AxSurfaceText, RuntimeModelSourceOutcome } from "@botiverse/raft-shared";
+import { hydrateRuntimeConfig, runtimeConfigToLaunchFields, type AgentConfig, type AxSurfaceText, type RuntimeModelSourceOutcome } from "@botiverse/raft-shared";
 import type { RuntimeDriver, SpawnContext, SpawnResult, ParsedEvent, RuntimeProbeResult } from "./types";
 import { buildCliTransportSystemPrompt, prepareCliTransport } from "./cliTransport";
 import { ClaudeEventNormalizer } from "./claudeEventNormalizer";
@@ -256,4 +256,23 @@ export class ClaudeDriver implements RuntimeDriver {
     });
   }
 
+}
+
+/**
+ * #wg-runtime-form:#22: how to start a side-question fork of a Claude agent's
+ * session (agentSideAsk.ts): the provider env its own model call uses (a
+ * custom provider's, with the host's provider env cleared), and the command
+ * for `args` with Windows shims resolved.
+ */
+export function claudeSideQuestionProviderEnv(config: AgentConfig): Record<string, string | undefined> {
+  return {
+    ...buildClaudeProviderIsolationEnv({ config } as SpawnContext),
+    ...(runtimeConfigToLaunchFields(hydrateRuntimeConfig(config)).envVars ?? {}),
+  };
+}
+
+/** Start the fork as a runtime child (guarded like the agent's own) in the agent's workspace. */
+export function startClaudeSideQuestion(config: AgentConfig, args: string[], env: NodeJS.ProcessEnv, cwd: string): import("node:child_process").ChildProcess {
+  const spec = buildClaudeSpawnSpec(resolveClaudeLaunchCommand(config, { env }), args, { env });
+  return spawnRuntimeChild(spec.command, spec.args, { cwd, env: (spec.env ?? env) as NodeJS.ProcessEnv, stdio: ["pipe", "pipe", "pipe"], shell: false });
 }

@@ -90,3 +90,40 @@ test("feature flags: on, off, and a key not evaluated counts as off", () => {
 test("no rules narrow nothing", () => {
   assert.equal(matchesAnnouncementRules(undefined, ctx({ server: null, platform: null, locale: null })), true);
 });
+
+test("computer_version: semantic order, pre-release below its release, unknown counts as older", async () => {
+  const { computerVersionBelow, announcementRulesNeedComputers } = await import("../announcement-audience");
+  assert.equal(computerVersionBelow("1.0.52", "1.0.53"), true);
+  assert.equal(computerVersionBelow("1.0.53", "1.0.53"), false);
+  assert.equal(computerVersionBelow("1.0.53-rc.1", "1.0.53"), false, "a pre-release counts as its release, like the floor");
+  assert.equal(computerVersionBelow("1.0.52-rc.1", "1.0.53"), true);
+  assert.equal(computerVersionBelow("1.0.53+build.7", "1.0.53"), false);
+  assert.equal(computerVersionBelow("1.0.100", "1.0.53"), false); // numeric, not string, order
+  assert.equal(computerVersionBelow("1.1.0", "1.0.53"), false);
+  assert.equal(computerVersionBelow("0.9.99", "1.0.53"), true);
+  assert.equal(computerVersionBelow("v1.0.54", "1.0.53"), false);
+  assert.equal(computerVersionBelow(null, "1.0.53"), true);
+  assert.equal(computerVersionBelow("garbage", "1.0.53"), true);
+  assert.throws(() => computerVersionBelow("1.0.0", "1.0"));
+
+  const one = (condition: unknown, context: AnnouncementRuleContext) =>
+    matchesAnnouncementRules(rules({ match: "all", groups: [{ match: "all", conditions: [condition] }] }), context);
+  const server = (computerVersions?: Array<string | null>) => ctx({ server: { createdAt: daysAgo(40), plan: "free", role: "owner", computerVersions } });
+  const old = { field: "computer_version", below: "1.0.53" };
+  assert.equal(one(old, server(["1.0.53", "1.0.50"])), true);
+  assert.equal(one(old, server(["1.0.53", null])), true);
+  assert.equal(one(old, server(["1.0.53", "1.0.60"])), false);
+  assert.equal(one(old, server([])), false); // no Computer in use
+  // Not loaded or no Server open: unknown, which never matches, negated or not.
+  assert.equal(one(old, server(undefined)), false);
+  assert.equal(one({ ...old, negate: true }, server(undefined)), false);
+  assert.equal(one(old, ctx({ server: null })), false);
+  assert.equal(one({ ...old, negate: true }, server(["1.0.60"])), true);
+
+  for (const below of ["1.0", "v1.0.53", "1.0.53-rc.1", "01.0.53", "", 53]) {
+    assert.throws(() => rules({ match: "all", groups: [{ match: "all", conditions: [{ field: "computer_version", below }] }] }), Error, String(below));
+  }
+  assert.throws(() => rules({ match: "all", groups: [{ match: "all", conditions: [{ field: "computer_version", below: "1.0.53", days: 7 }] }] }));
+  assert.equal(announcementRulesNeedComputers(rules({ match: "all", groups: [{ match: "all", conditions: [old] }] })), true);
+  assert.equal(announcementRulesNeedComputers(rules({ match: "all", groups: [{ match: "all", conditions: [{ field: "locale", values: ["en"] }] }] })), false);
+});

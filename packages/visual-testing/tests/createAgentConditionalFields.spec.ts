@@ -63,8 +63,8 @@ test(`conditional runtime-config fields render and obey the field axis`, async (
     runtime: [...document.querySelectorAll('[data-slot="select-value"]')].map((v) => (v.textContent || "").trim())[1] ?? null,
   }));
   expect(afterCatalog.runtime, `runtime catalog primed and a runtime is selected`).toBe("Claude Code");
-  // Provider is required in the v2 Claude form, hence the asterisk.
-  expect(afterCatalog.labels, `the Provider field is revealed by that selection`).toContain("Provider*");
+  // Provider is required in the v2 Claude form; a required label carries no mark.
+  expect(afterCatalog.labels, `the Provider field is revealed by that selection`).toContain("Provider");
 
   // Before Provider -> Custom, the pair is hidden by the form's visibility rule.
   const before = (await page.locator('[data-slot="field-label"]').allTextContents()).map((l) => l.trim());
@@ -78,7 +78,6 @@ test(`conditional runtime-config fields render and obey the field axis`, async (
 
   const labels = (await page.locator('[data-slot="field-label"]').allTextContents()).map((l) => l.trim());
   // The whole point: fields exist now that did not before the provider was chosen.
-  // The v2 Claude form marks neither as required (no asterisk).
   expect(labels, `API URL revealed`).toContain("API URL");
   expect(labels, `API Key revealed`).toContain("API Key");
 

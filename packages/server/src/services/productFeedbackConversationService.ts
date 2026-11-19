@@ -68,6 +68,14 @@ export type ProductFeedbackTicket = {
   } | null;
   unread: boolean;
   unread_count: number;
+  /**
+   * Echoed by Hands from the create metadata (`client_kind`, `client_version`;
+   * Volta, #raft-botiverse:a61e7583): the client that filed it. Absent until
+   * Hands sends them; null when the ticket's metadata has none. Raft Desktop
+   * files as web with `client_version` "Raft Desktop <ver>".
+   */
+  client_kind?: string | null;
+  client_version?: string | null;
 };
 
 export type ProductFeedbackComment = {
@@ -203,6 +211,11 @@ function readConfig(env: NodeJS.ProcessEnv): Config {
   };
 }
 
+/** The key this app's env signs list cursors with (the merged list signs its composite cursor with the web app's). */
+export function productFeedbackCursorKey(env: NodeJS.ProcessEnv = process.env): string {
+  return readConfig(env).cursorKey;
+}
+
 export function isProductFeedbackConversationConfigured(
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
@@ -293,7 +306,18 @@ function parseTicket(value: unknown): ProductFeedbackTicket | null {
     ...(latestComment === undefined ? {} : { latest_comment: latestComment }),
     unread: value.unread,
     unread_count: value.unread_count,
+    ...(value.client_kind === undefined ? {} : { client_kind: echoedClientField(value.client_kind) }),
+    ...(value.client_version === undefined ? {} : { client_version: echoedClientField(value.client_version) }),
   };
+}
+
+/**
+ * A field Hands echoes from the create metadata: a label's input, never a
+ * reason to fail the list (like `parseLatestComment`). Anything but a string
+ * is read as "none"; a string is cut to the bound Hands itself applies.
+ */
+function echoedClientField(value: unknown): string | null {
+  return typeof value === "string" ? value.slice(0, 256) : null;
 }
 
 function parseComment(value: unknown): ProductFeedbackComment | null {
@@ -329,7 +353,7 @@ function parseAttachment(value: unknown): ProductFeedbackAttachmentMetadata | nu
   };
 }
 
-type CursorRoute = "ticket_list" | "ticket_comments";
+type CursorRoute = "ticket_list" | "ticket_comments" | "ticket_list_all";
 type CursorPayload = {
   v: 1;
   route: CursorRoute;
@@ -1051,25 +1075,42 @@ function queryPath(config: Config, suffix: string): string {
   return `/api/apps/${encodeURIComponent(config.appId)}/reporter-feedback${suffix}`;
 }
 
-export async function listProductFeedbackTickets(input: {
-  userId: string;
+type TicketListPageInput = {
   reporterId: string;
   limit: number;
-  cursor?: string;
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
   now?: () => number;
   onUpstreamServerTiming?: (value: string | null) => void;
-}): Promise<ProductFeedbackList> {
+};
+
+/** The most tickets Hands answers per list page. */
+export const PRODUCT_FEEDBACK_LIST_PAGE_MAX = 50;
+
+/** One page of one app's list, with Hands' own cursors (opaque strings). */
+export type ProductFeedbackTicketListPage = {
+  tickets: ProductFeedbackTicket[];
+  next_hands_cursor: string | null;
+  unread_total: number;
+};
+
+/**
+ * One page of the reporter's tickets in the app `env` names, addressed by
+ * Hands' own cursor. The merged list (productFeedbackMergedList.ts) keeps one
+ * such cursor per app inside its own; the single-app list wraps it below.
+ */
+export async function listProductFeedbackTicketsPage(
+  input: TicketListPageInput & { handsCursor: string | null },
+): Promise<ProductFeedbackTicketListPage> {
   const config = readConfig(input.env ?? process.env);
-  if (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > 50) {
+  if (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > PRODUCT_FEEDBACK_LIST_PAGE_MAX) {
     throw new ProductFeedbackConversationError(400, "feedback_invalid");
   }
-  const handsCursor = input.cursor
-    ? decodeProductFeedbackCursor(input.cursor, { route: "ticket_list", userId: input.userId, ticketId: null, nowMs: input.now?.() }, config.cursorKey)
-    : null;
+  if (input.handsCursor !== null && (!input.handsCursor || Buffer.byteLength(input.handsCursor, "utf8") > HANDS_CURSOR_MAX_BYTES)) {
+    throw new ProductFeedbackConversationError(400, "feedback_invalid");
+  }
   const params = new URLSearchParams({ limit: String(input.limit) });
-  if (handsCursor) params.set("cursor", handsCursor);
+  if (input.handsCursor) params.set("cursor", input.handsCursor);
   const response = await handsRequest(queryPath(config, `?${params}`), {
     config,
     env: input.env ?? process.env,
@@ -1093,14 +1134,32 @@ export async function listProductFeedbackTickets(input: {
     breakerFailure(config, "read", input.now?.() ?? currentTimeMs());
     throw new ProductFeedbackConversationError(503, "feedback_service_unavailable");
   }
-  const nextCursor = value.next_cursor
-    ? encodeProductFeedbackCursor({ route: "ticket_list", userId: input.userId, ticketId: null, handsCursor: value.next_cursor, issuedAtMs: input.now?.() }, config.cursorKey)
-    : null;
   breakerSuccess(config, "read", input.now?.() ?? currentTimeMs());
   return {
     tickets: tickets as ProductFeedbackTicket[],
-    next_cursor: nextCursor,
+    next_hands_cursor: value.next_cursor,
     unread_total: value.unread_total,
+  };
+}
+
+export async function listProductFeedbackTickets(input: TicketListPageInput & {
+  userId: string;
+  cursor?: string;
+}): Promise<ProductFeedbackList> {
+  const config = readConfig(input.env ?? process.env);
+  const handsCursor = input.cursor
+    ? decodeProductFeedbackCursor(input.cursor, { route: "ticket_list", userId: input.userId, ticketId: null, nowMs: input.now?.() }, config.cursorKey)
+    : null;
+  const page = await listProductFeedbackTicketsPage({ ...input, handsCursor });
+  const nextCursor = page.next_hands_cursor
+    ? encodeProductFeedbackCursor({ route: "ticket_list", userId: input.userId, ticketId: null, handsCursor: page.next_hands_cursor, issuedAtMs: input.now?.() }, config.cursorKey)
+    : null;
+  return {
+    // Hands' client_kind / client_version are not part of this answer (the
+    // merged list derives `client` from them; this list stays as it was).
+    tickets: page.tickets.map(({ client_kind: _kind, client_version: _version, ...ticket }) => ticket),
+    next_cursor: nextCursor,
+    unread_total: page.unread_total,
   };
 }
 

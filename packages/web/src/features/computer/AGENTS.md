@@ -24,6 +24,10 @@ model-provider dialogs. One component per file, named exports.
     `claudeLimitResetCopy.ts`): Claude limit resets by kind behind
     `claude_limit_reset`: View available resets (consent first at the 5-hour
     limit), Use per kind, Use 5-hour reset at the wall (same contract).
+    What a viewer is offered is `claudeLimitResetOffer.ts`: a person who
+    cannot use them (did not connect the Computer) gets the list read-only
+    below the 5-hour limit, and no entry at all at it (the read needs consent);
+    never a control beside a note saying why it cannot be used.
   - `DeleteComputerDialog.tsx`: Delete Computer, from `MachineDetailPanel` and
     the rack row's `RackRowMenu`. Which path is the server's revoke gate:
     the viewer's own computer is a Computer whose machine row is theirs

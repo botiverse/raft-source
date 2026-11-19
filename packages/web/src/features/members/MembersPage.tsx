@@ -39,7 +39,7 @@ import { useProfileStore } from "../../store/profileStore";
 import { useServerStore } from "../../store/serverStore";
 import { SidebarCellList } from "../sidebar/rows/SidebarCellList";
 import { SidebarRowsSkeleton } from "../sidebar/rows/SidebarRowsSkeleton";
-import { useAgentsGrouping, writeAgentsGrouping } from "./agentsGroupingPreference";
+import { useAgentsGrouping, useMembersTab, writeAgentsGrouping, writeMembersTab } from "./membersViewPreference";
 import { MembersAddAgentDialogs } from "./MembersAddAgentDialogs";
 import { MembersCreateAgentButton } from "./MembersCreateAgentButton";
 import { useAddAgentActions } from "./useAddAgentActions";
@@ -133,7 +133,10 @@ export function MembersPage() {
   const userId = useAuthStore((s) => s.user?.id);
   const openProfile = useProfileStore((s) => s.openProfile);
   const { role, capabilities } = useServerPermissions();
-  const storedGrouping = useAgentsGrouping();
+  // The tab and the Agents grouping are remembered per server on this device (membersViewPreference).
+  const serverId = useServerStore((s) => s.current?.id);
+  const storedGrouping = useAgentsGrouping(serverId);
+  const chooseGrouping = useCallback((next: AgentsGrouping) => writeAgentsGrouping(serverId, next), [serverId]);
 
   // Who the viewer may see, as the sidebar's Members list decided it: a member
   // of a server that hides its people sees no Humans (nor who made an agent:
@@ -163,7 +166,8 @@ export function MembersPage() {
   }, [allAgents, members]);
   const tabs = visibleTabs({ showHumans });
 
-  const [tabChoice, setTab] = useState<MembersTab>("all");
+  const tabChoice = useMembersTab(serverId);
+  const setTab = useCallback((next: MembersTab) => writeMembersTab(serverId, next), [serverId]);
   const tab = tabs.includes(tabChoice) ? tabChoice : "all";
   const [query, setQuery] = useState("");
   // The usage view (#proj-o11y:#36): on a desktop's Agents tab, for whoever
@@ -231,7 +235,6 @@ export function MembersPage() {
   const loading = (members.length === 0 && !membersLoadError) || (agentsLoading && allAgents.length === 0);
   // How many humans and agents were listed last time here, for the tiles'
   // skeleton (membersGroupCounts); remembered once both lists are read.
-  const serverId = useServerStore((s) => s.current?.id);
   const rememberedGroups = useRememberedMembersGroupCounts({
     userId,
     serverId,
@@ -298,6 +301,9 @@ export function MembersPage() {
     </h3>
   ) : null, [formatMessage]);
 
+  // The phone's loading rows (renderBody), marked busy on the body around them (raft-design feedback.md).
+  const phoneLoading = !isDesktop && loading && groups.length === 0 && !query.trim();
+
   const renderBody = () => {
     if (groups.length === 0) {
       if (query.trim()) {
@@ -317,10 +323,13 @@ export function MembersPage() {
           <span className="flex h-lh items-center text-footnote"><AfterSkeletonDelay><Skeleton variant="line" className="w-16" /></AfterSkeletonDelay></span>
         );
         if (!isDesktop) {
+          // A phone's rows under one heading where the loaded list has one (All; Agents only where a grouping
+          // names its groups, as the desktop's; Humans never), two lines tall on the Agents tab (what it runs on: MemberPhoneRow). aria-busy
+          // is on the body, which stays when the members arrive.
           return (
-            <section className="pt-3" aria-busy="true" data-testid="members-loading" data-skeleton="rows">
-              <div className="px-5">{headingLine}</div>
-              <div className="py-2"><AfterSkeletonDelay><SidebarRowsSkeleton rows={8} /></AfterSkeletonDelay></div>
+            <section data-testid="members-loading" data-skeleton="rows">
+              {tab === "all" || (tab === "agents" && agentsGrouping !== "none") ? <div className="px-5 pt-3">{headingLine}</div> : null}
+              <div className="py-2"><AfterSkeletonDelay><SidebarRowsSkeleton rows={8} twoLine={tab === "agents"} /></AfterSkeletonDelay></div>
             </section>
           );
         }
@@ -352,7 +361,10 @@ export function MembersPage() {
         }
         return (
           <section aria-busy="true" data-testid="members-loading" data-skeleton="rows">
-            <div className="mx-5 border-x border-transparent pt-4">{headingLine}</div>
+            {/* The first group's heading line, which holds the column headings; a bar only where a grouping names its groups. */}
+            <div className="mx-5 border-x border-transparent pt-4">
+              {agentsGrouping === "none" ? <span className="block h-lh text-footnote" /> : headingLine}
+            </div>
             <AfterSkeletonDelay>
               <ListRowGroup className="mx-5 mt-2">
                 {Array.from({ length: 6 }, (_, index) => <AgentRowSkeleton key={index} />)}
@@ -498,7 +510,7 @@ export function MembersPage() {
                         heading={formatMessage({ id: "ui.listToolbar.group" })}
                         value={agentsGrouping}
                         options={groupingOptions}
-                        onValueChange={writeAgentsGrouping}
+                        onValueChange={chooseGrouping}
                         testId="members-more-group"
                       />
                     ) : null}
@@ -528,6 +540,7 @@ export function MembersPage() {
                     value={agentsGrouping}
                     options={agentsGroupingOptions(creatorsHidden)}
                     applied={agentsGrouping !== DEFAULT_AGENTS_GROUPING}
+                    onChange={chooseGrouping}
                   />
                 ) : null}
                 {canInvite ? (
@@ -556,7 +569,7 @@ export function MembersPage() {
         ) : null}
         {/* Its own stacking context, so nothing in it (an avatar's badge is z-raised, and later in
             the DOM) is drawn over the sticky toolbar (raft-design lists.md: no row shows through). */}
-        <div className="isolate" data-testid="members-body">{renderBody()}</div>
+        <div className="isolate" data-testid="members-body" aria-busy={phoneLoading || undefined}>{renderBody()}</div>
       </ScrollArea>
       {showInvite ? <InviteHumanDialog onClose={closeInvite} surface="members_page" /> : null}
       <MembersAddAgentDialogs step={addAgent} onStep={setAddAgent} />
@@ -571,12 +584,17 @@ export function MembersPage() {
  * Select › Filters look (as the Apps toolbar), filled info-soft while it is
  * off its default. Its name says what it groups and how.
  */
-function GroupSelect({ value, options, applied }: { value: AgentsGrouping; options: readonly AgentsGrouping[]; applied: boolean }) {
+function GroupSelect({ value, options, applied, onChange }: {
+  value: AgentsGrouping;
+  options: readonly AgentsGrouping[];
+  applied: boolean;
+  onChange: (grouping: AgentsGrouping) => void;
+}) {
   const { formatMessage } = useIntl();
   const label = formatMessage({ id: GROUPING_LABEL[value] });
   const handleChange = useCallback((next: AgentsGrouping | null) => {
-    if (next != null) writeAgentsGrouping(next);
-  }, []);
+    if (next != null) onChange(next);
+  }, [onChange]);
   return (
     <Select<AgentsGrouping> value={value} onValueChange={handleChange}>
       <FitToolbarPicker

@@ -24,6 +24,7 @@ import { errorClassOf, recordTraceEvent, runWithTraceSpan } from "../tracing/sem
 import { argon2VerifyTraceAttrs, newArgon2VerifyStats, type Argon2VerifyStats } from "../services/argon2VerifyStats";
 import { admitMachineConnect, admitMachineConnectFromAddress, cachedMachineConnectRejection, isMachineConnectVerified, recordMachineConnectAuthFailure, recordMachineConnectVerified, rememberMachineConnectRejection } from "../services/machineConnectRateLimit";
 import { clientIpForRateLimit } from "../lib/clientIpForRateLimit";
+import { isDraining, recordDrainRefusal } from "../services/drainState";
 import type { MachineToServerMessage } from "@botiverse/raft-shared";
 import {
   buildMachineConnectTraceContext,
@@ -219,6 +220,19 @@ export function setupMachineWebSocket(
         ...(apiKey ? { api_key_fingerprint: extractApiKeyFingerprint(apiKey) } : {}),
       },
     });
+
+    // A draining task refuses new daemon connections before any credential
+    // work: the going-away spread only closes the connections open at drain
+    // start, so one accepted in the seconds the ALB still routes here would
+    // be hard-cut at deregistration expiry (deployment thread 3f292dc3). On
+    // a non-101 the daemon reconnects with its jittered backoff.
+    if (isDraining()) {
+      recordDrainRefusal("daemon");
+      socket.write("HTTP/1.1 503 Service Unavailable\r\nSlock-Reason: server_draining\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      span.end("ok", { attrs: { outcome: "refused", reason: "server_draining", ...traceAttrs } });
+      return;
+    }
 
     // Wall time in argon2 (incl. the wait for a libuv pool thread), on every outcome.
     const argon2Stats = newArgon2VerifyStats();

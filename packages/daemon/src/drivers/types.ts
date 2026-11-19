@@ -857,6 +857,14 @@ export interface RuntimeDriver {
   parseLine(line: string): ParsedEvent[];
 
   /**
+   * Events for the end of stdout, emitted before the session's `close`. For a
+   * per_turn runtime whose output alone cannot say a turn is over (OpenCode
+   * 2.x: a reply may be followed by background sub-agents), so the turn still
+   * ends through the ordinary `turn_end` path rather than by process exit.
+   */
+  parseStdoutEnd?(): ParsedEvent[];
+
+  /**
    * Current runtime-native session identity, if the driver can observe one.
    * Telemetry recorders use this live state rather than launch-time config so
    * session rollovers/forks are preserved as telemetry sequence boundaries.

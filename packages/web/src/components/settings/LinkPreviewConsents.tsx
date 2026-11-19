@@ -3,15 +3,6 @@ import type { ChangeEvent, RefObject } from "react";
 import { useIntl } from "react-intl";
 import { Link, Search, TriangleAlert, X } from "lucide-react";
 import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogBody,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
   Banner,
   BannerDescription,
   Button,
@@ -23,7 +14,9 @@ import {
   Dialog,
   DialogBody,
   DialogClose,
+  DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogSheetContent,
   DialogTitle,
@@ -239,23 +232,25 @@ function LinkPreviewRevokeDialog({ target, open, busy, error, onOpenChange, onCo
   const { formatMessage } = useIntl();
   const name = target?.name ?? "";
   return (
-    // DS AlertDialog (400px): revoking interrupts, but can be undone right
-    // here, so the confirm is orange, and Cancel says what stays.
-    <AlertDialog open={open} onOpenChange={onOpenChange}>
-      <AlertDialogContent finalFocus={finalFocus} aria-busy={busy} data-testid="link-preview-revoke-dialog">
-        <AlertDialogHeader>
-          <AlertDialogTitle>{formatMessage({ id: "settings.linkPreviews.revokeTitle" }, { app: name })}</AlertDialogTitle>
-        </AlertDialogHeader>
-        <AlertDialogBody>
-          <AlertDialogDescription>{formatMessage({ id: "settings.linkPreviews.revokeBody" }, { app: name })}</AlertDialogDescription>
+    // DS Dialog at size sm (400px; AlertDialog is only for the confirmations
+    // Raft Chat lists): revoking interrupts, but can be undone right here, so
+    // the confirm is orange, and Cancel says what stays.
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent size="sm" finalFocus={finalFocus} aria-busy={busy} data-testid="link-preview-revoke-dialog">
+        <DialogHeader>
+          <DialogTitle>{formatMessage({ id: "settings.linkPreviews.revokeTitle" }, { app: name })}</DialogTitle>
+          <DialogClose disabled={busy} aria-label={formatMessage({ id: "common.confirm.closeDialog" })} />
+        </DialogHeader>
+        <DialogBody>
+          <DialogDescription>{formatMessage({ id: "settings.linkPreviews.revokeBody" }, { app: name })}</DialogDescription>
           {/* A problem is orange: red is for what can't be undone. */}
           {error && <Banner status="warning" size="sm" role="alert" className="mt-3"><TriangleAlert aria-hidden /><BannerDescription>{error}</BannerDescription></Banner>}
-        </AlertDialogBody>
-        <AlertDialogFooter>
-          <AlertDialogCancel size="lg" disabled={busy}>{formatMessage({ id: "settings.linkPreviews.keepAllowed" })}</AlertDialogCancel>
+        </DialogBody>
+        <DialogFooter>
+          <DialogClose render={<Button variant="ghost" size="lg" />} disabled={busy}>{formatMessage({ id: "settings.linkPreviews.keepAllowed" })}</DialogClose>
           {/* focusableWhenDisabled: Revoke keeps focus while it runs, so a
               failure (the dialog stays open) leaves focus on it. */}
-          <AlertDialogAction
+          <Button
             focusableWhenDisabled
             variant="warning"
             size="lg"
@@ -265,10 +260,10 @@ function LinkPreviewRevokeDialog({ target, open, busy, error, onOpenChange, onCo
             data-testid="link-preview-revoke-confirm"
           >
             {formatMessage({ id: "settings.linkPreviews.revoke" })}
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 

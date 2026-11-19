@@ -14,7 +14,7 @@ import * as messageService from "./messageService";
 import type { AgentContextQueryResult } from "./agentContextViewRelay";
 import { AgentContextQueryRateLimiter, agentContextNotViewableSentence, handleAgentContextQuery } from "./agentContextQueryApi";
 
-vi.mock("./featureFlagService", () => ({ evaluateFeatureFlag: vi.fn() }));
+vi.mock("./featureFlagService", async (importOriginal) => ({ ...(await importOriginal<typeof import("./featureFlagService")>()), evaluateFeatureFlag: vi.fn() }));
 vi.mock("./agentService", () => ({ getAgent: vi.fn() }));
 vi.mock("./messageService", () => ({ resolveMessageIdVisibleToAgent: vi.fn() }));
 vi.mock("./agentContextViewGrantService", () => ({ findUsableAgentContextViewGrant: vi.fn() }));

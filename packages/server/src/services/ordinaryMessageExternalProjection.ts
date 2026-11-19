@@ -68,6 +68,8 @@ export const ORDINARY_MESSAGE_PRODUCER_CLASSIFICATION = {
   "assistant.send_as_owner": "eligible",
   // RFC 077 step 2: Raft's DM from the assistant to its owner (an agent DM, never bridged).
   "assistant.notify": "eligible",
+  // Raft voice calls: the agent's messages to its caller (tell_user, a late answer, the call's record) in their DM (an agent DM).
+  "agent_voice_call.dm": "eligible",
   // A first-party app's message as the signed-in person (Artifacts' share: a note and a link), as if they sent it.
   "first_party_app.post_as_reader": "eligible",
   // The owner's WeChat text, posted as the owner into their DM with their assistant (wechatBridgeWorker); a DM, never bridged.
@@ -76,6 +78,7 @@ export const ORDINARY_MESSAGE_PRODUCER_CLASSIFICATION = {
   "seat_request.person_card": "excluded_action_metadata",
   // The owner's card to create the agent a seat request was for (seatRequestService.sendCreateAgentCard).
   "seat_request.create_agent_card": "excluded_action_metadata",
-  // The ordinary message a person's New task posts as the task's source (routes/tasks.ts, task v2); it carries no task fields.
+  // The ordinary message a sourceless task create posts as the task's source (task v2: a person's New task, an agent's create
+  // from a CLI too old to send a source; services/taskCreatorSourceMessage.ts); it carries no task fields.
   "tasks.create_source": "eligible",
 } as const satisfies Record<string, OrdinaryMessageProducerClassification>;

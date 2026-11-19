@@ -179,6 +179,7 @@ const runtimeModelSetSchema = z.object({
     runtime: z.literal("builtin"),
     runtimeVersion: z.string().min(1),
     customModelProviderIds: z.array(z.string()).optional(),
+    customModelConnectionProviderIds: z.array(z.string()).optional(),
   }).optional(),
   // Disabled models stay in their own list, never in `models` (older clients offer every model).
   unavailable: z.array(z.object({ id: z.string().min(1), label: z.string(), reason: z.string() })).optional(),

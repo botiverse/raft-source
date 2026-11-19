@@ -125,6 +125,7 @@ import {
   namer,
   notVisible,
   positionCursor,
+  quotedPath,
   readableVersion,
   readPositionOf,
   requireEnabled,
@@ -357,7 +358,7 @@ function checkRequest(body: AgentApiArtifactPublishBody): PublishRequest {
   for (const path of [...body.files.map((file) => file.path), ...deletes]) {
     if (!isWellFormedArtifactFilePath(path)) throw new ArtifactApiFailure(invalidPath(path));
     if (seenPaths.has(path)) {
-      refuse(400, { code: "DUPLICATE_PATH", error: "A path is listed twice, or both sent and deleted, in this push: list each path once.", details: { path } });
+      refuse(400, { code: "DUPLICATE_PATH", error: `${quotedPath(path)} is listed twice, or both sent and deleted, in this push: list each path once.`, details: { path } });
     }
     seenPaths.add(path);
   }
@@ -370,7 +371,7 @@ function checkRequest(body: AgentApiArtifactPublishBody): PublishRequest {
     else if ("content_base64" in file) {
       inline = decodeBase64(file.content_base64);
       if (!inline) {
-        refuse(400, { code: "INVALID_CONTENT", error: "A file's content_base64 isn't valid padded base64: send it base64-encoded, or as content if it is text.", details: { path: file.path } });
+        refuse(400, { code: "INVALID_CONTENT", error: `The content_base64 of ${quotedPath(file.path)} isn't valid padded base64: send it base64-encoded, or as content if it is text.`, details: { path: file.path } });
       }
     }
     const size = inline ? inline.length : (file as { size: number }).size;
@@ -601,7 +602,7 @@ function checkResult(evaluation: Extract<Evaluation, { kind: "ok" }>): void {
   if (!evaluation.files.has(evaluation.entry)) {
     refuse(400, {
       code: "ENTRY_NOT_FOUND",
-      error: "The entry file isn't in the version this push would make: push that file too, or name an entry file that is in it.",
+      error: `The entry file ${quotedPath(evaluation.entry)} isn't in the version this push would make: push that file too, or name an entry file that is in it.`,
       details: { entry: evaluation.entry },
     });
   }
@@ -800,12 +801,17 @@ export type PublishLocation = { existing: ArtifactItemRow } | { home: NewHome };
  * `summaryOf`, the answer's Artifact as the caller may see it named;
  * `assistantAgentId`, the personal assistant publishing (publishAs.ts): a
  * new Artifact's mark, and a repeated create replays only an Artifact with
- * that mark.
+ * that mark; `holdMovesReadPosition`, whether a 409 UNSEEN_CHANGES counts the
+ * comments it lists as seen (default yes: the agent API shows them, so the
+ * same request again goes through). The person door says no: its caller
+ * doesn't show them (an assistant publishing as its owner, Tenny #33), so
+ * only a request carrying `seen` gets past the hold.
  */
 export interface PublishDoor {
   locate(): Promise<PublishLocation | ArtifactApiError>;
   summaryOf(items: readonly ArtifactItemRow[]): Promise<AgentApiArtifactSummary[]>;
   assistantAgentId: string | undefined;
+  holdMovesReadPosition?: boolean;
 }
 
 export function createPublishOperations() {
@@ -859,7 +865,8 @@ export function createPublishOperations() {
     // Shown: the newest held comments, those in full counting as seen
     // (evaluation.through), so the same request again goes through unless
     // some are left `unread`. Also with `seen`, so the CLI and the SDK stay in step.
-    await advanceReadPosition(publisher.reader, itemId, evaluation.through);
+    // Not for a door whose caller doesn't show them (holdMovesReadPosition: false).
+    if (door.holdMovesReadPosition !== false) await advanceReadPosition(publisher.reader, itemId, evaluation.through);
     return fail(409, {
       code: "UNSEEN_CHANGES",
       error: unseenChangesError("push", { comments: evaluation.count, versions: 0, unread: evaluation.unread }),

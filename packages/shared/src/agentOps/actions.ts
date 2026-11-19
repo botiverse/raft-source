@@ -14,7 +14,7 @@ import { z } from "zod";
 
 import { actionCardActionSchema, looksLikeUuid, QUESTION_ASK_ANYONE, QUESTION_CARD_ERROR_CODES } from "../actionCards";
 import type { AgentApiClient, AgentApiClientResult } from "../agentApiClient";
-import { agentApiActionPrepareBodySchema, type AgentApiActionPrepareBody, type AgentApiActionWithdrawResponse } from "../agentApiContract";
+import { agentApiActionPrepareBodySchema, type AgentApiActionOperationsResponse, type AgentApiActionPrepareBody, type AgentApiActionWithdrawResponse } from "../agentApiContract";
 import { foldAgentOneLineText, indentAgentBodyContinuationLines, quoteAgentOneLineText } from "../agentMessageText";
 import { agentTaskThreadTarget } from "../agentText/tasks";
 import { lazySchema } from "../lazySchema";
@@ -98,8 +98,14 @@ export interface AgentActionCardPostedOptions {
   existing?: boolean;
   /** A `question:ask` card: who it asks and when it expires, as the Server stored them (null when it did not say). */
   question?: { asked: RaftQuestionAsked | null; expiresAt: string | null };
-  /** How the withdraw command of a question card is shown: the CLI's (default) or the tool call. */
+  /** How the withdraw command of a question or request card is shown: the CLI's (default) or the tool call. */
   hints?: RaftHintStyle;
+  /**
+   * A `request:prepare` card: the Server's echo (RFC 085 §4.2 step 5), the
+   * card's title with the names this agent may see (an older Server's whole
+   * summary), and whom it is for.
+   */
+  request?: { summary: string; for: string };
 }
 
 /**
@@ -119,6 +125,12 @@ export function formatAgentActionCardPosted(
     return `Upgrade card posted to ${where}. Its button only opens the upgrade dialog; no reply will follow, and you are not told whether they upgrade.\n`;
   }
   if (card.type === "question:ask" && shortId) return formatQuestionCardPosted(target, where, shortId, card);
+  if (card.type === "request:prepare" && shortId && card.request) {
+    const thread = getParentTargetForThread(target) !== null ? "this thread" : "the card's thread";
+    const withdraw = formatHint(RAFT_HINTS.actionWithdraw(shortId), card.hints ?? "cli");
+    return `Request card posted to ${where} for ${foldAgentOneLineText(card.request.for)}. It shows them: ${foldAgentOneLineText(card.request.summary)}. `
+      + `When they confirm or decline it, the result arrives as a reply in ${thread} that @mentions you; you do not need to poll. If you no longer need it, withdraw it with: ${withdraw}\n`;
+  }
   return shortId
     ? `Action card posted to ${where}. The human can click the action verb to commit.\n`
     : `Action card posted to ${target}.\n`;
@@ -252,6 +264,9 @@ export async function prepareActionCard(
   const question = type === "question:ask"
     ? { asked: questionAskedFrom(stored, request.action), expiresAt: typeof expiresAt === "string" ? expiresAt : null }
     : undefined;
+  // A request card: the summary the person sees, as the Server echoed it (an older Server sends none: the generic line).
+  const echo = result.data.preparedRequest;
+  const preparedRequest = type === "request:prepare" && echo ? { summary: echo.title ?? echo.summary, for: echo.for } : undefined;
   return {
     ok: true,
     state: "prepared",
@@ -259,8 +274,60 @@ export async function prepareActionCard(
     next: type === "plan:upgrade"
       ? planUpgradeNext(request.target, card.messageId, existing, style)
       : awaitOutcomeNext(request.target, card.messageId, style, type === "question:ask"),
-    text: formatAgentActionCardPosted(request.target, card.messageId, { type, existing, ...(question ? { question, hints: style } : {}) }),
+    text: formatAgentActionCardPosted(request.target, card.messageId, {
+      type,
+      existing,
+      ...(question ? { question, hints: style } : {}),
+      ...(preparedRequest ? { request: preparedRequest, hints: style } : {}),
+    }),
   };
+}
+
+// ── What can be prepared as a request card (RFC 085 §4.2 discovery) ────────
+
+/**
+ * The text of `raft action prepare --list`: the operations this agent may
+ * prepare as a request card (`request:prepare`) on its server, as the Server
+ * lists them (its own docs and its card copy; nothing here is anyone's free
+ * text, but each field is still printed as one line). Ends with the command
+ * that prepares the first one, or, with none, with what to do instead.
+ */
+export function formatPreparableOperations(data: AgentApiActionOperationsResponse, style: RaftHintStyle = "cli"): string {
+  const line = (text: string) => foldAgentOneLineText(text);
+  const person = "dm:@<person>";
+  if (data.operations.length === 0) {
+    const why = data.enabled ? "none is listed on this server yet" : "request cards are off on this server";
+    return `You can't prepare any operation as a request card here: ${why}. Ask the person in a message to do it themselves in Raft: ${formatHint(RAFT_HINTS.messageReply({ target: person }), style)}\n`;
+  }
+  const lines = ["Operations you can prepare as a request card here (the person you name confirms; it runs as them):", ""];
+  for (const op of data.operations) {
+    lines.push(`${line(op.operation)}: ${line(op.summary)}`);
+    for (const arg of op.args) lines.push(`  arg ${line(arg.name)}${arg.required ? "" : " (optional)"}: ${line(arg.description)}`);
+    lines.push(`  ask: ${line(op.confirmer)}`);
+    lines.push(`  they see: "${line(op.personSees.title)}" and a "${line(op.personSees.button)}" button`);
+  }
+  const first = data.operations[0]!;
+  const action = { type: "request:prepare", to: "@<person>", operation: first.operation, args: first.example, note: "<why, in one sentence>" };
+  // The CLI form is a heredoc of three lines (as the Manual and `--help` write it), each indented; the tool form
+  // leaves `action` to fill, so the card it takes follows on its own line.
+  const command = formatHint(RAFT_HINTS.actionPrepareCard({ target: person, action }), style);
+  lines.push("", "Prepare one where the person can act (a DM with them, or a channel they are in):", ...command.split("\n").map((part) => `  ${line(part)}`));
+  if (style !== "cli") lines.push(`  action: ${line(JSON.stringify(action))}`);
+  return `${lines.join("\n")}\n`;
+}
+
+/**
+ * The operations this agent may prepare as a request card on its server
+ * (`raft action prepare --list`). The Server decides: only while request
+ * cards are on there (`prepared_request_card_v0`), only what prepare takes.
+ */
+export async function listPreparableOperations(
+  client: Pick<AgentApiClient, "actions">,
+  options: RaftHintOptions = {},
+): Promise<RaftOutcome<AgentApiActionOperationsResponse, "operations">> {
+  const result = await client.actions.operations();
+  if (!result.ok) return failureFromClientResult(result);
+  return { ok: true, state: "operations", data: result.data, next: null, text: formatPreparableOperations(result.data, options.hints ?? "cli") };
 }
 
 // ── Withdrawing a question card (question-card spec §4.4) ───────────────────
@@ -319,6 +386,18 @@ function nobodyAnswers(asked: RaftQuestionAsked | null, already: boolean): strin
  */
 export function formatAgentQuestionWithdrawn(withdrawal: Pick<RaftQuestionWithdrawal, "messageId" | "alreadyWithdrawn" | "metadata">): string {
   const action = (withdrawal.metadata as { action?: unknown }).action;
+  // A request card (RFC 085): its person can no longer confirm it.
+  if (action && typeof action === "object" && (action as { type?: unknown }).type === "request:prepare") {
+    const card = questionCardRef(withdrawal.messageId, null);
+    const asked = questionAsked(action);
+    const person = asked?.kind === "user" ? `@${asked.handle}` : null;
+    const nobody = person
+      ? `${person} ${withdrawal.alreadyWithdrawn ? "cannot" : "can no longer"} confirm it.`
+      : "No one can confirm it now.";
+    return withdrawal.alreadyWithdrawn
+      ? `Request card already withdrawn: ${card}; nothing changed. ${nobody}\n`
+      : `Request card withdrawn: ${card}. ${nobody} No reply is posted for a withdrawal; this is your receipt.\n`;
+  }
   const card = questionCardRef(withdrawal.messageId, questionRef(action));
   const asked = questionAsked(action);
   return withdrawal.alreadyWithdrawn

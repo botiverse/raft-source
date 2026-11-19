@@ -11,7 +11,7 @@ import {
 import express, { type Express, type Request, type RequestHandler } from "express";
 import helmet from "helmet";
 import cors from "cors";
-import { AGENT_CONTEXT_VIEW_RESULT_ROUTE, aiTrainingCrawlerRobotsLines } from "@botiverse/raft-shared";
+import { AGENT_CONTEXT_VIEW_RESULT_ROUTE, INBOX_BACKEND_HEADER, aiTrainingCrawlerRobotsLines } from "@botiverse/raft-shared";
 import { sharedRateLimit } from "./services/sharedRateLimitStore";
 import rateLimit, { ipKeyGenerator, type Store } from "express-rate-limit";
 import { channelRouter } from "./routes/channels";
@@ -74,6 +74,9 @@ import { agentApiErrorTrace } from "./routes/agentApiErrorTrace";
 import { serverRouter } from "./routes/servers";
 import { billingRouter, isBillingPreviewPath, stripeWebhookHandler } from "./routes/billing";
 import { resendNewsletterWebhookHandler } from "./routes/newsletterWebhooks";
+import { handleAgentVoiceCallCallback } from "./services/agentVoiceCallService";
+import type { AgentOrchestrator } from "./services/agentOrchestrator";
+import type { Server as SocketServer } from "socket.io";
 import { raftbenchRouter } from "./routes/raftbench";
 import { taskRouter } from "./routes/tasks";
 import { reminderRouter } from "./routes/reminders";
@@ -89,6 +92,8 @@ import { pushRouter } from "./routes/push";
 import { notificationRouter } from "./routes/notifications";
 import { notificationLevelsRouter } from "./routes/notificationLevels";
 import { meRouter } from "./routes/me";
+import { mySessionsRouter } from "./routes/mySessions";
+import { runWithSessionClient } from "./services/sessionClient";
 import { announcementRouter } from "./routes/announcements";
 import { integrationInviteRouter, integrationLogoPublicRouter, integrationRouter } from "./routes/integrations";
 import { appInstallationRouter } from "./routes/appInstallations";
@@ -163,6 +168,43 @@ export function shouldSkipProductFeedbackRateLimit(input: {
   return input.method === "GET"
     || input.method === "HEAD"
     || input.method === "OPTIONS";
+}
+
+/** Hands feedback tickets one person may file an hour (the dialog and a feedback card's form together). */
+export const PRODUCT_FEEDBACK_RATE_LIMIT_PER_HOUR = 10;
+export const PRODUCT_FEEDBACK_RATE_LIMITED_BODY = {
+  error: "Too many feedback submissions. Please try again later.",
+  code: "feedback_rate_limited",
+  errorCode: "feedback_rate_limited",
+} as const;
+
+/**
+ * The per-person limit on filing Hands feedback tickets: 10 an hour per
+ * person (rateLimitUserOrIpKey; the routes behind it require auth). Counted
+ * across replicas (SharedRateLimitStore, key `rl:product-feedback:<key>`;
+ * each replica's memory when Redis is down or errors): with an in-process
+ * count each server task kept its own budget, so a person got one per task.
+ * Past it 429 with the body below, RateLimit-* headers and Retry-After.
+ */
+export function createProductFeedbackLimiter(input: {
+  validate: false | undefined;
+  skip: (req: Request) => boolean;
+}): RequestHandler {
+  return rateLimit({
+    // Counted across replicas (SharedRateLimitStore; memory if Redis is down); a 429 names the limiter on the span.
+    ...sharedRateLimit("product-feedback"),
+    windowMs: 60 * 60 * 1000,
+    max: PRODUCT_FEEDBACK_RATE_LIMIT_PER_HOUR,
+    validate: input.validate,
+    standardHeaders: true,
+    legacyHeaders: false,
+    // `code` for the dialog's readers; `errorCode` too, as every other refusal of
+    // /api/actions/:messageId/execute (a feedback card's form submit runs this
+    // limiter, routes/actions.ts), so one field serves both paths (Tenny, L3).
+    message: PRODUCT_FEEDBACK_RATE_LIMITED_BODY,
+    keyGenerator: rateLimitUserOrIpKey,
+    skip: input.skip,
+  });
 }
 
 export function shouldSkipAuthRateLimit(input: {
@@ -372,12 +414,13 @@ export function createApp(options: CreateAppOptions = {}): Express {
   // they are exposed: the web client reads the sync horizon of /messages/sync,
   // and X-Raft-Stale / Retry-After of the unread and Activity reads to say
   // they may be out of date and to pace its retries (routes/rwStaleRead.ts),
-  // and X-Trace-Id to show a reportable id on errors (#proj-o11y:#18).
+  // X-Trace-Id to show a reportable id on errors (#proj-o11y:#18), and
+  // X-Raft-Inbox-Backend of the Activity read for its drift check (#244).
   app.use(cors({
     origin: corsOrigin,
     credentials: true,
     maxAge: CORS_PREFLIGHT_MAX_AGE_SECONDS,
-    exposedHeaders: [SYNC_HORIZON_HEADER, SYNC_HORIZON_RESET_HEADER, STALE_RESPONSE_HEADER, "Retry-After", TRACE_ID_RESPONSE_HEADER],
+    exposedHeaders: [SYNC_HORIZON_HEADER, SYNC_HORIZON_RESET_HEADER, STALE_RESPONSE_HEADER, "Retry-After", TRACE_ID_RESPONSE_HEADER, INBOX_BACKEND_HEADER],
   }));
   // Resource Timing gives a cross-origin page only the total duration of a
   // request unless the response allows its origin: echo the request's Origin
@@ -426,6 +469,33 @@ export function createApp(options: CreateAppOptions = {}): Express {
     antiprotonApprovalHintLimiter,
     express.raw({ type: "application/json", limit: "16kb" }),
     receiveAntiprotonApprovalHint,
+  );
+  // Raft voice calls: holt-live's signed callbacks for one call (each call has
+  // its own secret; agentVoiceCallService verifies the raw body).
+  // Per call, not per IP: holt-live calls back from a few addresses for every call.
+  const holtLiveCallbackLimiter = rateLimit({
+    keyGenerator: (req) => `holt-live-call:${String(req.params.callId).slice(0, 64)}`,
+    windowMs: 60 * 1000,
+    max: 600,
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: () => isTestEnv,
+  });
+  app.post(
+    "/api/webhooks/holt-live/calls/:callId",
+    holtLiveCallbackLimiter,
+    express.raw({ type: "application/json", limit: "64kb" }),
+    (req, res, next) => {
+      handleAgentVoiceCallCallback({
+        orchestrator: req.app.get("agentOrchestrator") as AgentOrchestrator,
+        io: req.app.get("io") as SocketServer,
+        callId: String(req.params.callId),
+        payload: Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0),
+        headers: { id: req.headers["webhook-id"], timestamp: req.headers["webhook-timestamp"], signature: req.headers["webhook-signature"] },
+      }).then((answer) => {
+        res.status(answer.status).json(answer.body);
+      }, next);
+    },
   );
   app.post(
     "/api/slack-bridge/events",
@@ -663,6 +733,11 @@ export function createApp(options: CreateAppOptions = {}): Express {
     message: { error: "Too many requests. Please try again later.", code: "rate_limited" },
   });
 
+  // Every sign-in and refresh is under /api/auth: the request's client claims
+  // (platform, version) ride along to createSession and the rotation, for the
+  // person's sign-in list. Display only (services/sessionClient.ts).
+  app.use("/api/auth", runWithSessionClient);
+
   // Auth routes (rate limited, no auth required)
   // Apply stricter limiter specifically to forgot-password before the general auth limiter
   app.use("/api/auth/forgot-password", forgotPasswordLimiter);
@@ -872,23 +947,18 @@ export function createApp(options: CreateAppOptions = {}): Express {
   // person whose deletion is scheduled reaches only GET / DELETE here
   // (requireAuth). Rate-limited like the other re-authentication routes.
   app.use("/api/me/account/deletion", authLimiter, requireAuth, accountDeletionRouter);
+  // The person's own sign-ins (routes/mySessions.ts): without requireVerified,
+  // like account deletion, so anyone signed in can sign a lost device out.
+  // Rate-limited like the other re-authenticated account routes.
+  app.use("/api/me/sessions", authLimiter, requireAuth, mySessionsRouter);
   // Unified notification settings (docs/contracts/notifications.md §2) and
   // the person's account-mode app logins (docs/raft-app/README.md).
   app.use("/api/me", requireAuth, requireVerified, meRouter);
   app.use("/api/notification-levels", requireAuth, requireVerified, notificationLevelsRouter);
   app.use("/api/feature-flags", requireAuth, requireVerified, featureFlagsRouter);
 
-  const productFeedbackLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000,
-    max: 10,
+  const productFeedbackLimiter = createProductFeedbackLimiter({
     validate: rateLimitValidate,
-    standardHeaders: true,
-    legacyHeaders: false,
-    // `code` for the dialog's readers; `errorCode` too, as every other refusal of
-    // /api/actions/:messageId/execute (a feedback card's form submit runs this
-    // limiter, routes/actions.ts), so one field serves both paths (Tenny, L3).
-    message: { error: "Too many feedback submissions. Please try again later.", code: "feedback_rate_limited", errorCode: "feedback_rate_limited" },
-    keyGenerator: rateLimitUserOrIpKey,
     skip: (req) => shouldSkipProductFeedbackRateLimit({
       isSlockdev,
       isTestEnv: isTestEnv && !options.testHarness?.enforceProductFeedbackRateLimit,

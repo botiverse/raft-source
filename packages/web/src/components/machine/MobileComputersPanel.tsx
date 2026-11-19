@@ -1,4 +1,4 @@
-import { Button, Card, CardContent, CardDescription, CardHeader, CardLeading, CardTitle, CardTrailing, IconTile, PanelAction, PanelScrollViewport, ListRow, ListRowBody, ListRowDescription, ListRowGroup, ListRowTitle, Skeleton } from "@botiverse/raft-ui";
+import { Button, Card, CardDescription, CardHeader, CardLeading, CardTitle, CardTrailing, IconTile, PanelAction, PanelScrollViewport, ListRow, ListRowBody, ListRowDescription, ListRowGroup, ListRowTitle, Skeleton } from "@botiverse/raft-ui";
 import { EllipsisVertical, Monitor, Plus, RefreshCw } from "lucide-react";
 import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import type { ComponentProps, MouseEvent } from "react";
@@ -29,6 +29,8 @@ import type { ComputersRackList as RackList } from "../../features/computer/Comp
 import type { ComputersRackToolbar as RackToolbar } from "../../features/computer/ComputersRackToolbar";
 import { useComputersRackView } from "../../store/computersRackViewPreference";
 import { useLocalComputerMachineId } from "./localComputer/localComputerStore";
+import { RackCardBodySkeleton } from "./rack/RackRowSkeleton";
+import { DEFAULT_CARD_SHAPE } from "../../features/computer/computersRackRemembered";
 
 /**
  * Mobile-only Computers panel — renders as a regular detail panel (the
@@ -86,33 +88,20 @@ const ComputersRackList = deferredPanel<ComponentProps<typeof RackList>>(() => l
 // The rack's search and its Filter / Group / Sort menus, from the same load.
 const ComputersRackToolbar = deferredPanel<ComponentProps<typeof RackToolbar>>(() => loadComputersRack().then((module) => ({ default: module.ComputersRackToolbar })));
 
-// The rack's phone parts, for its skeleton (RackSkeleton): the card's meters
-// grid (ComputerRackRow's cards) and the list's runtime header line
-// (RackListHeader's phone row).
-const RACK_CARD_METERS_CLASS = "grid grid-cols-[76px_minmax(0,1fr)_auto] items-center gap-x-2 gap-y-2";
-const RACK_CARD_LINE_LABEL_CLASS = "flex min-w-0 items-center gap-1.5 text-footnote";
+// The rack's phone parts, for its skeleton (RackSkeleton): the list's
+// runtime header line (RackListHeader's phone row).
 const RACK_MONO_META_CLASS = "font-mono text-mono-meta whitespace-nowrap";
 // The agents' line: their 27px slots (RackSlotStrip, whose 4px inset its
 // negative margin takes back).
 const RACK_SLOTS_LINE_CLASS = "h-[27px]";
 
-/** A card's Disk or Memory line: label, bar, "x% used" (RackResource's card line). */
-function RackCardLineSkeleton() {
-  return (
-    <>
-      <span className={RACK_CARD_LINE_LABEL_CLASS}><span><SkeletonTextBar className="w-12" /></span></span>
-      <span className="flex items-center"><Skeleton variant="line" className="h-2 w-full" /></span>
-      <span className={RACK_MONO_META_CLASS}><SkeletonTextBar className="w-14" /></span>
-    </>
-  );
-}
-
 /**
  * A computer's card while the rack loads, from the loaded card's parts
  * (ComputerRackRow, cards): the head (the device's 20px glyph, the name, the
- * … menu's box, the facts line, the owner line), the agents' line, and
- * Disk and Memory. The usage and Other runtimes lines below them depend on
- * the computer's runtimes, not known yet.
+ * … menu's box, the facts line, the owner line), the agents' line, and the
+ * meters, usage and Other runtimes lines in the common online card's shape
+ * (DEFAULT_CARD_SHAPE, as a desktop card never loaded there): the rack's
+ * remembered card shapes are the desktop's, This device first.
  */
 function RackCardSkeleton() {
   return (
@@ -131,13 +120,7 @@ function RackCardSkeleton() {
         </CardDescription>
         <span className="col-span-2 min-w-0 text-caption"><SkeletonTextBar className="w-24" /></span>
       </CardHeader>
-      <CardContent className="flex flex-1 flex-col gap-3">
-        <div className={RACK_SLOTS_LINE_CLASS} />
-        <div className={RACK_CARD_METERS_CLASS}>
-          <RackCardLineSkeleton />
-          <RackCardLineSkeleton />
-        </div>
-      </CardContent>
+      <RackCardBodySkeleton shape={DEFAULT_CARD_SHAPE} slots={<div className={RACK_SLOTS_LINE_CLASS} />} />
     </Card>
   );
 }

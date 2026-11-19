@@ -97,6 +97,7 @@
  * READ_PROGRESS_DETAIL_CHANGED_EVENT goes to the watchers of every face
  * (noteAgentChannelMuteChanged): only those who show the line hear it.
  */
+import { markAgentProgress } from "./agentProgressMarks";
 import { and, eq, sql } from "drizzle-orm";
 import type { Server as SocketServer, Socket } from "socket.io";
 import {
@@ -216,6 +217,8 @@ const coalescer = new AgentReadProgressCoalescer({
  * evaluates the flag in the background first.
  */
 export function noteAgentReadAdvance(advance: AgentReadAdvance): void {
+  // #proj-runtime:#62: a moved read position is progress, whatever this flag says.
+  if (advance.to > advance.from) markAgentProgress(advance.agentId);
   if (!socketServer || !(advance.to > advance.from)) return;
   const cached = cachedFlag(advance.serverId, Date.now());
   if (cached === false) return;

@@ -7,6 +7,8 @@ import { getTaskForConversationChannel } from "../services/taskConversationServi
 import rateLimit from "express-rate-limit";
 import { resolveAppLinkPreviews } from "../services/appLinkPreviewService";
 import { LINK_CARD_READ_MAX_BODY_BYTES, LINK_CARD_READ_URLS_PER_MINUTE, parseLinkCardReadBody, readLinkCards } from "../services/linkCardReadService";
+import { readMessageCardActions } from "../services/messageCardActionRead";
+import type { MessageCardOnRead } from "../services/messageCardLiveState";
 import { serializeErrorForLog } from "../tracing/safeErrorLog";
 import express, { Router, type ErrorRequestHandler, type Request, type RequestHandler, type Response, type Router as RouterType } from "express";
 import { isMessageShortId, UUID_RE } from "../lib/messageId";
@@ -91,6 +93,7 @@ import {
 import { parseOptionalIanaTimezone } from "../lib/ianaTimezone";
 import { parseSyncHorizon, readSyncHorizon, SYNC_HORIZON_HEADER, SYNC_HORIZON_RESET_HEADER } from "../services/syncHorizon";
 import { parseOffsetQueryParam } from "../lib/offsetQueryParam";
+import { parseThreadPreviewChars, THREAD_PREVIEW_CHARS_PARAM } from "../services/threadReplyPreview";
 
 export const messageRouter: RouterType = Router();
 export const messageV2Router: RouterType = Router();
@@ -706,7 +709,7 @@ type PreviewRefusal = "not_found" | "not_previewable" | "not_visible" | "out_of_
 async function messageVisibility(
   req: Request,
   message: { channelId: string; createdAt: Date },
-): Promise<{ refusal: "not_visible" | "out_of_history" } | { historyWindow: Awaited<ReturnType<typeof getServerHistoryWindowForRead>>; joint: boolean }> {
+): Promise<{ refusal: "not_visible" | "out_of_history" } | { historyWindow: Awaited<ReturnType<typeof getServerHistoryWindowForRead>>; joint: boolean; conversationId: string }> {
   const serverId = req.serverId!;
   const channel = await channelService.getChannel(message.channelId);
   if (!channel) return { refusal: "not_visible" };
@@ -714,7 +717,7 @@ async function messageVisibility(
   if (!localChannelId || !(await canView({ type: "user", id: req.userId!, serverId }, [{ kind: "conversation", channelId: localChannelId }]))[0]) return { refusal: "not_visible" };
   const historyWindow = await getServerHistoryWindowForRead(serverId);
   if (isBehindHistoryWindow(message.createdAt, historyWindow)) return { refusal: "out_of_history" };
-  return { historyWindow, joint: channel.serverId !== serverId || channel.type === "joint" };
+  return { historyWindow, joint: channel.serverId !== serverId || channel.type === "joint", conversationId: localChannelId };
 }
 
 /**
@@ -744,6 +747,49 @@ async function readPreviewableMessageOrRefusal(req: Request, messageId: string):
   });
   const visible = context?.messages.find((item) => item.id === message.id);
   return visible ? { message: visible } : { refusal: "not_visible" };
+}
+
+/**
+ * RFC 086: a card message as the viewer may read it from this Server, through
+ * the same visibility as a preview read (messageVisibleToViewer, then the
+ * message as the viewer's history shows it), or why not. Its acting buttons
+ * are read and pressed through the link card read and actions.
+ */
+async function readMessageCardOrRefusal(req: Request, messageId: string): Promise<{ message: { content: string; card: MessageCardOnRead } } | { refusal: PreviewRefusal }> {
+  const message = await messageService.getMessage(messageId);
+  if (!message || message.deletedAt) return { refusal: "not_found" };
+  if (message.messageType !== "chat" || !isMessageCardMetadata(message.actionMetadata)) return { refusal: "not_previewable" };
+  const visibility = await messageVisibility(req, message);
+  if ("refusal" in visibility) return { refusal: visibility.refusal };
+  const context = await messageService.getMessageContext(message.id, 0, 0, visibility.historyWindow.cutoff, {
+    attachmentCommentViewerUserId: req.userId, forwardedBundleViewerUserId: req.userId, viewerServerId: req.serverId,
+  });
+  const visible = context?.messages.find((item) => item.id === message.id);
+  if (!visible || !isMessageCardMetadata(visible.actionMetadata)) return { refusal: "not_visible" };
+  return {
+    message: {
+      content: visible.content,
+      // RFC 086: read through a Joint Channel or a thread in one, whichever Server stores it: its root, walked as the send's check walks it.
+      card: {
+        metadata: visible.actionMetadata, senderType: message.senderType, senderId: message.senderId,
+        joint: visibility.joint || (await channelService.getConversationArchiveRoot(visibility.conversationId)).rootType === "joint",
+      },
+    },
+  };
+}
+
+/**
+ * The message a link card action (prepare, execute, status, operation
+ * lookups: routes/linkCards.ts) reads, as the viewer may read it now: an
+ * ordinary chat message whose links a card reads (readPreviewableMessage),
+ * or a card message, whose acting buttons act (RFC 086); null otherwise.
+ */
+export async function readCardActionMessage(req: Request, messageId: string): Promise<{ content: string; messageCard?: MessageCardOnRead } | null> {
+  const previewable = await readPreviewableMessageOrRefusal(req, messageId);
+  if (!("refusal" in previewable)) return { content: previewable.message.content };
+  if (previewable.refusal !== "not_previewable") return null;
+  const card = await readMessageCardOrRefusal(req, messageId);
+  return "refusal" in card ? null : { content: card.message.content, messageCard: card.message.card };
 }
 
 /**
@@ -819,7 +865,20 @@ messageRouter.post("/:messageId/link-cards/read", linkCardReadLimiter, async (re
   const readVisible = () => readPreviewableMessage(req, messageId);
   try {
     const first = await readPreviewableMessageOrRefusal(req, messageId);
-    if ("refusal" in first) { tracePreviewRefusal("link_cards_read", messageId, first.refusal); res.status(404).json({ error: "Message not found" }); return; }
+    // RFC 086: a card message's acting buttons, for this viewer (messageCardActionRead.ts); it has no link previews.
+    const card = "refusal" in first && first.refusal === "not_previewable" ? await readMessageCardOrRefusal(req, messageId) : null;
+    if (card && !("refusal" in card)) {
+      const read = await readMessageCardActions({
+        serverId: req.serverId!, viewerId: req.userId!, messageId, content: card.message.content, card: card.message.card, request,
+      });
+      res.json({ items: [], prompts: read.prompts, message_card: read.message_card });
+      return;
+    }
+    if ("refusal" in first) {
+      tracePreviewRefusal("link_cards_read", messageId, card && "refusal" in card ? card.refusal : first.refusal);
+      res.status(404).json({ error: "Message not found" });
+      return;
+    }
     const message = first.message;
     res.json(await readLinkCards({ serverId: req.serverId!, userId: req.userId!, messageId, content: message.content, request,
       stillVisible: async () => (await readVisible())?.content === message.content }));
@@ -1027,6 +1086,7 @@ messageRouter.get("/context/:messageId", async (req, res) => {
           userId: req.userId!,
           parentMessageIds: contextParentMessageIds,
           parentMessageScopeSource: "messages_context",
+          previewChars: parseThreadPreviewChars(req.query[THREAD_PREVIEW_CHARS_PARAM]),
         });
 
     res.json({
@@ -1213,6 +1273,7 @@ messageRouter.get("/channel/:channelId", async (req, res) => {
             userId: req.userId!,
             parentMessageIds: threadParentScopeIds,
             parentMessageScopeSource: "messages_page",
+            previewChars: parseThreadPreviewChars(req.query[THREAD_PREVIEW_CHARS_PARAM]),
             traceQuery: createTraceDbQueryTracer("messages.thread_summaries"),
           }),
           (_durationMs, result) => ({
@@ -1345,6 +1406,7 @@ messageRouter.get("/channel/:channelId/by-activity", async (req, res) => {
           userId: req.userId!,
           parentMessageIds: pageMessages.map((message) => message.id),
           parentMessageScopeSource: "messages_page",
+          previewChars: parseThreadPreviewChars(req.query[THREAD_PREVIEW_CHARS_PARAM]),
           traceQuery: createTraceDbQueryTracer("messages.activity_thread_summaries"),
         });
     res.json({

@@ -25,11 +25,14 @@ export const loadArtifactActivityViewer = () => import("./ArtifactActivityViewer
 export type { ArtifactActivityViewerProps } from "./ArtifactActivityViewer";
 export { ARTIFACT_CARD_MIN_WIDTH, ArtifactCoverViewer, useArtifactClosed, useArtifactHeaderBack, useArtifactHost, useArtifactShell, useArtifactSideCard, useShellArtifactCard } from "./ArtifactSideCard";
 export type { ArtifactCardPlace, ArtifactSideCard } from "./ArtifactSideCard";
+/** Around a conversation's side card: the viewer's title lists the Artifacts recently opened there (#proj-workspace:#291). */
+export { ArtifactConversationProvider } from "./ArtifactConversationProvider";
 /** The title of the Artifact open beside a conversation, for the side window's switch chip (features/webPreview). */
 export { useOpenArtifactTitle } from "./artifactShownTitle";
 export { ArtifactSavedAttachments, canSaveAsArtifact, setArtifactSessionScope, useArtifactAttachmentMenu } from "./ArtifactAttachment";
 export { artifactRealtimeStandIn } from "./artifactRealtimeStandIn";
 export { usePhoneHistoryEntry } from "./artifactPhoneHistory";
+export { backPastArtifactFrame } from "./artifactFrameBack";
 export type { ArtifactAttachmentContext, ArtifactAttachmentInput } from "./ArtifactAttachment";
 export { artifactLinkSendNoteKey, setArtifactShareHost } from "./artifactShareHost";
 /** "Send to conversation": an Artifact as what core's Forward dialog forwards. */

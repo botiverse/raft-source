@@ -6,13 +6,17 @@ import { readFileSync } from "node:fs";
 
 import { and, eq } from "drizzle-orm";
 import {
+  AGENT_MIGRATION_CAPABILITY,
+  BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS,
+  PI_BUILTIN_PROVIDER_MODELS,
   PROVIDER_CONNECTION_PROVIDER_IDS,
   PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY,
 } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
-import { agentProviderConnections, agents, featureFlagRules, integrationAuditEvents, machines, providerConnections, serverMembers, users } from "../db/schema";
+import { agentMigrations, agentProviderConnections, agents, featureFlagRules, integrationAuditEvents, machines, providerConnections, serverMembers, servers, users } from "../db/schema";
 import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { createServer } from "../services/serverService";
+import { assertBuiltInPresetSupportedByCatalog } from "../services/builtinModelCatalogCompatibility";
 import { openTestApp } from "../test/integration/app";
 
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
@@ -219,7 +223,8 @@ test("provider connection API gates management, rejects aliases, and never retur
           version: 1,
           runtime: "builtin",
           provider: { kind: "connection", connectionId: created.id },
-          model: { kind: "custom", name: "wrong-model-shape" },
+          // Another provider's model: never compatible with a DeepSeek connection.
+          model: { kind: "preset", id: "openai/gpt-5.5-pro" },
           mode: { kind: "default" },
           hostUserState: "forbidden",
         },
@@ -228,6 +233,27 @@ test("provider connection API gates management, rejects aliases, and never retur
     const incompatibleText = await incompatibleAgent.text();
     assert.equal(incompatibleAgent.status, 400, incompatibleText);
     assert.equal(incompatibleText.includes("api-private-value"), false);
+
+    // A typed DeepSeek id through the connection is compatible, as on DeepSeek
+    // directly, and so goes to the target Computer's catalog check (none here).
+    const typedAgent = await fetch(`${app.baseUrl}/api/agents`, {
+      method: "POST",
+      headers: headers(ownerToken, server.id),
+      body: JSON.stringify({
+        name: "typed-provider-agent",
+        formDefinitionRef: { protocolVersion: 1, runtimeId: "builtin", schemaVersion: "builtin-pi.create.v3" },
+        runtimeConfig: {
+          version: 1,
+          runtime: "builtin",
+          provider: { kind: "connection", connectionId: created.id },
+          model: { kind: "custom", name: "deepseek-v5-preview" },
+          mode: { kind: "default" },
+          hostUserState: "forbidden",
+        },
+      }),
+    });
+    assert.equal(typedAgent.status, 409);
+    assert.equal((await typedAgent.json() as { code?: string }).code, "builtin_catalog_target_required");
 
     const compatibleAgent = await fetch(`${app.baseUrl}/api/agents`, {
       method: "POST",
@@ -638,6 +664,499 @@ test("deleted Agents stop blocking provider connection deletion", async () => {
       headers: headers(ownerToken, server.id),
     });
     assert.equal(secondDelete.status, 204);
+  } finally {
+    await app.close();
+    if (originalKey === undefined) delete process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
+    else process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = originalKey;
+  }
+});
+
+// A saved preset connection behaves like its provider chosen directly: a typed
+// model id and the limits are accepted on the same terms (the v2 form submit
+// builds them as the direct path does), and the target Computer must run a
+// typed id through a connection (customModelConnectionProviderIds). One that
+// runs a typed id only on a direct preset (customModelProviderIds: every
+// released Computer that reports OpenRouter) is refused, as an older Computer
+// is for a direct typed id. The stub runs the real catalog check.
+test("a saved preset connection takes a typed id and limits when the target Computer runs one through a connection", async () => {
+  const originalKey = process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
+  process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = Buffer.alloc(32, 8).toString("base64");
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
+  try {
+    const owner = await seedUser("provider-typed-owner@raft.test", "provider-typed-owner");
+    const server = await createServer("Provider Typed", "provider-typed", owner.id);
+    const token = await login(app.baseUrl, owner.email);
+    await enableProviderConnections(server.id);
+    const createdResponse = await fetch(`${app.baseUrl}/api/provider-connections`, {
+      method: "POST",
+      headers: headers(token, server.id),
+      body: JSON.stringify({ name: "Team DeepSeek", providerId: "deepseek", apiKey: "typed-private-value" }),
+    });
+    assert.equal(createdResponse.status, 201);
+    const connection = (await createdResponse.json()) as { id: string };
+    const [machine] = await getDb().insert(machines).values({
+      serverId: server.id,
+      userId: owner.id,
+      name: "provider-typed-machine",
+      apiKeyHash: "unused-provider-typed-machine-hash",
+      runtimes: ["builtin"],
+    }).returning();
+
+    let catalog: Record<string, unknown> = {};
+    Object.assign(app.app.get("agentOrchestrator"), {
+      hasMachineLocally: () => true,
+      validateBuiltInPresetForMachine: async (machineId: string, config: Parameters<typeof assertBuiltInPresetSupportedByCatalog>[0], connectionProviderId: string | null) => {
+        const validation = assertBuiltInPresetSupportedByCatalog(
+          config,
+          {
+            kind: "live",
+            value: {
+              models: [{ id: "deepseek/deepseek-v4-pro", label: "DeepSeek V4 Pro" }],
+              catalog: { protocolVersion: 1, runtime: "builtin", runtimeVersion: "1.5.0", ...catalog },
+            },
+          },
+          { machineId, daemonVersion: "1.25.0", computerVersion: "1.25.0" },
+          connectionProviderId,
+        );
+        return validation ? { ...validation, authority: { connectionEpochId: "e", replicaGeneration: "g" } } : null;
+      },
+      acquireBuiltInCatalogAuthority: () => () => undefined,
+    });
+    const create = (name: string, formValues: Record<string, unknown>) => fetch(`${app.baseUrl}/api/agents`, {
+      method: "POST",
+      headers: headers(token, server.id),
+      body: JSON.stringify({
+        name,
+        machineId: machine.id,
+        formDefinitionRef: { protocolVersion: 2, runtimeId: "builtin" },
+        formValues: { providerId: `connection:${connection.id}`, ...formValues },
+      }),
+    });
+    const typed = { model: "deepseek-v5-preview", contextWindow: "128000", maxOutputTokens: "8000" };
+
+    catalog = { customModelProviderIds: ["deepseek"] };
+    const older = await create("typed-older", typed);
+    const olderText = await older.text();
+    assert.equal(older.status, 409, olderText);
+    assert.equal((JSON.parse(olderText) as { code: string }).code, "builtin_custom_model_upgrade_required");
+    assert.equal(olderText.includes("typed-private-value"), false);
+
+    catalog = { customModelProviderIds: ["deepseek"], customModelConnectionProviderIds: ["deepseek"] };
+    const accepted = await create("typed-current", typed);
+    const acceptedText = await accepted.text();
+    assert.equal(accepted.status, 200, acceptedText);
+    const agent = JSON.parse(acceptedText) as { runtimeConfig: { provider: unknown; model: unknown } };
+    assert.deepEqual(agent.runtimeConfig.provider, { kind: "connection", connectionId: connection.id });
+    assert.deepEqual(agent.runtimeConfig.model, { kind: "custom", name: "deepseek-v5-preview", contextWindow: 128_000, maxOutputTokens: 8_000 });
+
+    // A listed model with a limit is that model's DeepSeek id, as on DeepSeek directly; without one it stays the preset.
+    const listedOverride = await create("listed-override", { model: "deepseek/deepseek-v4-pro", contextWindow: "64000" });
+    const listedOverrideText = await listedOverride.text();
+    assert.equal(listedOverride.status, 200, listedOverrideText);
+    assert.deepEqual((JSON.parse(listedOverrideText) as { runtimeConfig: { model: unknown } }).runtimeConfig.model, { kind: "custom", name: "deepseek-v4-pro", contextWindow: 64_000 });
+    const listed = await create("listed", { model: "deepseek/deepseek-v4-pro", contextWindow: "" });
+    const listedText = await listed.text();
+    assert.equal(listed.status, 200, listedText);
+    assert.deepEqual((JSON.parse(listedText) as { runtimeConfig: { model: unknown } }).runtimeConfig.model, { kind: "preset", id: "deepseek/deepseek-v4-pro" });
+  } finally {
+    await app.close();
+    if (originalKey === undefined) delete process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
+    else process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = originalKey;
+  }
+});
+
+/**
+ * A live Built-in catalog from the target Computer, for both the form routes
+ * (model probe) and the write routes (catalog check), from one setting.
+ */
+function stubBuiltInCatalog(app: { app: { get(name: string): unknown } }, catalogOf: (machineId: string) => Record<string, unknown>) {
+  const live = (machineId: string) => ({
+    kind: "live" as const,
+    value: {
+      models: Object.values(PI_BUILTIN_PROVIDER_MODELS).flat(),
+      catalog: { protocolVersion: 1, runtime: "builtin", runtimeVersion: "1.5.0", ...catalogOf(machineId) },
+    },
+  });
+  Object.assign(app.app.get("agentOrchestrator") as object, {
+    hasMachineLocally: () => true,
+    detectMachineRuntimeModelsWithAuthority: async (machineId: string) => ({
+      outcome: live(machineId),
+      authority: { connectionEpochId: "e", replicaGeneration: "g" },
+      daemonVersion: "1.25.0",
+      computerVersion: "1.25.0",
+    }),
+    validateBuiltInPresetForMachine: async (machineId: string, config: Parameters<typeof assertBuiltInPresetSupportedByCatalog>[0], connectionProviderId: string | null) => {
+      const validation = assertBuiltInPresetSupportedByCatalog(config, live(machineId) as Parameters<typeof assertBuiltInPresetSupportedByCatalog>[1], { machineId, daemonVersion: "1.25.0", computerVersion: "1.25.0" }, connectionProviderId);
+      return validation ? { ...validation, authority: { connectionEpochId: "e", replicaGeneration: "g" } } : null;
+    },
+    acquireBuiltInCatalogAuthority: () => () => undefined,
+  });
+}
+
+async function openConnectionsApp(slug: string) {
+  const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
+  const owner = await seedUser(`${slug}-owner@raft.test`, `${slug}-owner`);
+  const server = await createServer(slug, slug, owner.id);
+  const token = await login(app.baseUrl, owner.email);
+  await enableProviderConnections(server.id);
+  const [machine] = await getDb().insert(machines).values({
+    serverId: server.id,
+    userId: owner.id,
+    name: `${slug}-machine`,
+    apiKeyHash: `unused-${slug}-machine-hash`,
+    runtimes: ["builtin"],
+  }).returning();
+  const connect = async (providerId: string) => {
+    const response = await fetch(`${app.baseUrl}/api/provider-connections`, {
+      method: "POST",
+      headers: headers(token, server.id),
+      body: JSON.stringify({ name: `Team ${providerId}`, providerId, apiKey: `${providerId}-private-value` }),
+    });
+    assert.equal(response.status, 201);
+    return ((await response.json()) as { id: string }).id;
+  };
+  return { app, server, token, machine, connect };
+}
+
+type V3Rule = { scope: string; condition: { schema: { enum?: string[] } } };
+const limitRuleValues = (form: { uiSchema?: { rules?: V3Rule[] } }) =>
+  (form.uiSchema?.rules ?? []).find((rule) => rule.scope === "#/properties/contextWindow")?.condition.schema.enum ?? [];
+
+// The shipped state: every released Computer runs a typed id on a preset
+// provider directly (customModelProviderIds) but not through a saved
+// connection. v3 then shows the limit fields for the provider and never for
+// its connection, whose save would refuse them; a current Computer shows
+// them for both.
+test("v3 shows the limit fields on a saved preset connection only on a Computer that runs a typed id through one", async () => {
+  const originalKey = process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
+  process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = Buffer.alloc(32, 8).toString("base64");
+  const { app, server, token, machine, connect } = await openConnectionsApp("provider-v3-limits");
+  try {
+    const connectionId = await connect("deepseek");
+    let catalog: Record<string, unknown> = { customModelProviderIds: ["deepseek"] };
+    stubBuiltInCatalog(app, () => catalog);
+    const definition = async () => {
+      const response = await fetch(`${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/runtime-forms/v2/builtin?clientCapabilities=runtime_form.v3`, {
+        headers: headers(token, server.id),
+      });
+      assert.equal(response.status, 200);
+      return limitRuleValues(await response.json() as { uiSchema?: { rules?: V3Rule[] } });
+    };
+
+    const shipped = await definition();
+    assert.ok(shipped.includes("deepseek"), "DeepSeek chosen directly shows them");
+    assert.equal(shipped.includes(`connection:${connectionId}`), false, "its saved connection does not");
+
+    catalog = { customModelProviderIds: ["deepseek"], customModelConnectionProviderIds: ["deepseek"] };
+    const current = await definition();
+    assert.ok(current.includes("deepseek"));
+    assert.ok(current.includes(`connection:${connectionId}`));
+  } finally {
+    await app.close();
+    if (originalKey === undefined) delete process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
+    else process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = originalKey;
+  }
+});
+
+// A listed model saved with a limit through a connection reads back as that
+// listed model (not its stored API id), so saving the edit form unchanged
+// stores the same config; with a reasoning effort on OpenAI, whose typed ids
+// take none, it is not mistaken for a typed id.
+test("a listed model saved with a limit through a saved connection round-trips through the edit form unchanged", async () => {
+  const originalKey = process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
+  process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = Buffer.alloc(32, 8).toString("base64");
+  const { app, server, token, machine, connect } = await openConnectionsApp("provider-edit-roundtrip");
+  try {
+    const connectionId = await connect("openai");
+    stubBuiltInCatalog(app, () => ({ customModelProviderIds: ["openai"], customModelConnectionProviderIds: ["openai"] }));
+    const created = await fetch(`${app.baseUrl}/api/agents`, {
+      method: "POST",
+      headers: headers(token, server.id),
+      body: JSON.stringify({
+        name: "listed-override",
+        machineId: machine.id,
+        formDefinitionRef: { protocolVersion: 3, runtimeId: "builtin" },
+        formValues: { providerId: `connection:${connectionId}`, model: "openai/gpt-5.5-pro", contextWindow: "64000", reasoningEffort: "high" },
+      }),
+    });
+    const createdText = await created.text();
+    assert.equal(created.status, 200, createdText);
+    const agent = JSON.parse(createdText) as { id: string; runtimeConfig: { model: unknown; reasoningEffort: unknown } };
+    assert.deepEqual(agent.runtimeConfig.model, { kind: "custom", name: "gpt-5.5-pro", contextWindow: 64_000 });
+
+    const editForm = await fetch(`${app.baseUrl}/api/agents/${agent.id}/runtime-form?clientCapabilities=runtime_form.v3`, {
+      headers: headers(token, server.id),
+    });
+    assert.equal(editForm.status, 200);
+    const edit = await editForm.json() as { values: Record<string, unknown>; uiSchema?: { rules?: V3Rule[] } };
+    assert.equal(edit.values.model, "openai/gpt-5.5-pro", "shown as the listed model");
+    assert.equal(edit.values.contextWindow, "64000");
+    assert.ok(limitRuleValues(edit).includes(`connection:${connectionId}`), "its limit field is shown");
+
+    const saved = await fetch(`${app.baseUrl}/api/agents/${agent.id}`, {
+      method: "PATCH",
+      headers: headers(token, server.id),
+      body: JSON.stringify({ formDefinitionRef: { protocolVersion: 3, runtimeId: "builtin" }, formValues: edit.values }),
+    });
+    const savedText = await saved.text();
+    assert.equal(saved.status, 200, savedText);
+    const after = (await getDb().select().from(agents).where(eq(agents.id, agent.id)))[0]!;
+    const stored = after.runtimeConfig as { model: unknown; reasoningEffort: unknown };
+    assert.deepEqual(stored.model, agent.runtimeConfig.model);
+    assert.equal(stored.reasoningEffort, "high");
+  } finally {
+    await app.close();
+    if (originalKey === undefined) delete process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
+    else process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = originalKey;
+  }
+});
+
+// Every Built-in preset provider takes a typed id today (Google included), so
+// the route-level refusals for a connection's typed id are: a name not stored
+// as its provider stores it (Raft's `<provider>/` namespace), and a Computer
+// that does not run that provider's typed id through a connection.
+test("a typed id through a Google connection is refused in Raft's namespace and on a Computer that does not run it through a connection", async () => {
+  const originalKey = process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
+  process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = Buffer.alloc(32, 8).toString("base64");
+  const { app, server, token, machine, connect } = await openConnectionsApp("provider-google-typed");
+  try {
+    const connectionId = await connect("google");
+    stubBuiltInCatalog(app, () => ({ customModelProviderIds: ["google"], customModelConnectionProviderIds: ["deepseek"] }));
+    const create = (name: string, model: unknown) => fetch(`${app.baseUrl}/api/agents`, {
+      method: "POST",
+      headers: headers(token, server.id),
+      body: JSON.stringify({
+        name,
+        machineId: machine.id,
+        formDefinitionRef: { protocolVersion: 1, runtimeId: "builtin", schemaVersion: "builtin-pi.create.v3" },
+        runtimeConfig: {
+          version: 1,
+          runtime: "builtin",
+          provider: { kind: "connection", connectionId },
+          model,
+          mode: { kind: "default" },
+          hostUserState: "forbidden",
+        },
+      }),
+    });
+    const namespaced = await create("google-namespaced", { kind: "custom", name: "google/gemini-raft-test" });
+    assert.equal(namespaced.status, 400, await namespaced.clone().text());
+    assert.equal((await namespaced.json() as { code?: string }).code, "provider_connection_invalid");
+
+    const notThroughConnection = await create("google-typed", { kind: "custom", name: "gemini-raft-test" });
+    assert.equal(notThroughConnection.status, 409, await notThroughConnection.clone().text());
+    assert.equal((await notThroughConnection.json() as { code?: string }).code, "builtin_custom_model_upgrade_required");
+    assert.equal((await getDb().select().from(agents).where(eq(agents.serverId, server.id))).length, 0, "nothing created");
+  } finally {
+    await app.close();
+    if (originalKey === undefined) delete process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
+    else process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = originalKey;
+  }
+});
+
+/** A released Computer: typed ids on every preset provider directly, none through a saved connection. */
+const RELEASED_COMPUTER = { customModelProviderIds: [...BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS] };
+const CURRENT_COMPUTER = { ...RELEASED_COMPUTER, customModelConnectionProviderIds: [...BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS] };
+const LIMITS_MESSAGE = "This Computer is too old to run this model with a context window or max output tokens set. Upgrade the Computer, or clear Context window and Max output tokens.";
+
+// An old app on a released Computer shows the limit fields on a saved preset
+// connection (by its underlyingProviderId). Filling one on a listed model is
+// refused with the way out that fits: the limits, not another model.
+test("adding a limit to a listed model on a saved preset connection is refused on a released Computer, naming the limits", async () => {
+  const originalKey = process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
+  process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = Buffer.alloc(32, 8).toString("base64");
+  const { app, server, token, machine, connect } = await openConnectionsApp("provider-patch-limit");
+  try {
+    const connectionId = await connect("deepseek");
+    stubBuiltInCatalog(app, () => RELEASED_COMPUTER);
+    const formValues = { providerId: `connection:${connectionId}`, model: "deepseek/deepseek-v4-pro" };
+    const created = await fetch(`${app.baseUrl}/api/agents`, {
+      method: "POST",
+      headers: headers(token, server.id),
+      body: JSON.stringify({ name: "listed", machineId: machine.id, formDefinitionRef: { protocolVersion: 2, runtimeId: "builtin" }, formValues }),
+    });
+    const createdText = await created.text();
+    assert.equal(created.status, 200, createdText);
+    const agent = JSON.parse(createdText) as { id: string; runtimeConfig: { model: unknown } };
+    assert.deepEqual(agent.runtimeConfig.model, { kind: "preset", id: "deepseek/deepseek-v4-pro" });
+
+    const patch = await fetch(`${app.baseUrl}/api/agents/${agent.id}`, {
+      method: "PATCH",
+      headers: headers(token, server.id),
+      body: JSON.stringify({ formDefinitionRef: { protocolVersion: 2, runtimeId: "builtin" }, formValues: { ...formValues, contextWindow: "64000" } }),
+    });
+    const patchBody = await patch.json() as { code?: string; error?: string };
+    assert.equal(patch.status, 409, JSON.stringify(patchBody));
+    assert.equal(patchBody.code, "builtin_custom_model_upgrade_required");
+    assert.equal(patchBody.error, LIMITS_MESSAGE);
+    const after = (await getDb().select().from(agents).where(eq(agents.id, agent.id)))[0]!;
+    assert.deepEqual((after.runtimeConfig as { model: unknown }).model, agent.runtimeConfig.model, "the stored model is untouched");
+  } finally {
+    await app.close();
+    if (originalKey === undefined) delete process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
+    else process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = originalKey;
+  }
+});
+
+// An agent saved with a typed id, or a listed model with a limit, through a
+// saved preset connection on a current Computer cannot move to a released one.
+test("migrating an agent with a typed id or a limit through a saved preset connection to a released Computer is refused", async () => {
+  const originalKey = process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
+  process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = Buffer.alloc(32, 8).toString("base64");
+  const { app, server, token, machine, connect } = await openConnectionsApp("provider-migrate");
+  try {
+    const db = getDb();
+    const connectionId = await connect("deepseek");
+    const now = new Date();
+    await db.update(machines).set({ daemonVersion: "1.26.0", lastHeartbeat: now }).where(eq(machines.id, machine.id));
+    const [target] = await db.insert(machines).values({
+      serverId: server.id,
+      userId: (await db.select().from(machines).where(eq(machines.id, machine.id)))[0]!.userId,
+      name: "provider-migrate-target",
+      apiKeyHash: "unused-provider-migrate-target-hash",
+      runtimes: ["builtin"],
+      daemonVersion: "1.25.0",
+      lastHeartbeat: now,
+    }).returning();
+    // The source runs typed ids through a connection; the target is a released Computer.
+    stubBuiltInCatalog(app, (machineId) => (machineId === target!.id ? RELEASED_COMPUTER : CURRENT_COMPUTER));
+    await db.update(servers).set({ plan: "founder" }).where(eq(servers.id, server.id));
+    Object.assign(app.app.get("agentOrchestrator") as object, {
+      getMachineStatus: async () => "online",
+      getMachineDaemonVersion: () => "1.25.0",
+      getMachineMigrationTransport: async () => ({ capabilities: [AGENT_MIGRATION_CAPABILITY] }),
+      sendAgentMigrationTransportLease: async () => undefined,
+    });
+    app.app.set("agentMigrationObjectStoreTransferProvisioner", async () => ({
+      provider: "object_store" as const,
+      sessionId: "provider-migrate-session",
+      leaseMs: 60 * 60 * 1000,
+      maxBytes: 123_456,
+    }));
+    for (const [name, formValues, message] of [
+      ["typed", { model: "deepseek-v5-preview" }, "This Computer is too old to run a model ID that is not in its list. Upgrade the Computer, or choose a model from the list."],
+      ["listed-limit", { model: "deepseek/deepseek-v4-pro", contextWindow: "64000" }, LIMITS_MESSAGE],
+    ] as const) {
+      const created = await fetch(`${app.baseUrl}/api/agents`, {
+        method: "POST",
+        headers: headers(token, server.id),
+        body: JSON.stringify({
+          name,
+          machineId: machine.id,
+          formDefinitionRef: { protocolVersion: 2, runtimeId: "builtin" },
+          formValues: { providerId: `connection:${connectionId}`, ...formValues },
+        }),
+      });
+      const createdText = await created.text();
+      assert.equal(created.status, 200, createdText);
+      const agent = JSON.parse(createdText) as { id: string; runtimeConfig: { model: { kind: string } } };
+      assert.equal(agent.runtimeConfig.model.kind, "custom", name);
+      const migrate = await fetch(`${app.baseUrl}/api/agents/${agent.id}/migrate`, {
+        method: "POST",
+        headers: headers(token, server.id),
+        body: JSON.stringify({ targetComputer: target!.id }),
+      });
+      const body = await migrate.json() as { code?: string; error?: string };
+      assert.equal(migrate.status, 409, `${name}: ${JSON.stringify(body)}`);
+      assert.equal(body.code, "builtin_custom_model_upgrade_required", name);
+      assert.equal(body.error, message, name);
+      assert.equal((await db.select().from(agentMigrations).where(eq(agentMigrations.agentId, agent.id))).length, 0, `${name}: no migration granted`);
+    }
+  } finally {
+    await app.close();
+    if (originalKey === undefined) delete process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
+    else process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = originalKey;
+  }
+});
+
+// Credential boundary: a connection id from another server is never resolved
+// here, whatever model it is asked for, and its key never leaves its server.
+test("creating an agent with another server's saved connection is refused", async () => {
+  const originalKey = process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
+  process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = Buffer.alloc(32, 8).toString("base64");
+  const { app, server, token, machine } = await openConnectionsApp("provider-cross-server");
+  try {
+    const owner = await seedUser("provider-cross-other-owner@raft.test", "provider-cross-other-owner");
+    const other = await createServer("Provider Cross Other", "provider-cross-other", owner.id);
+    await enableProviderConnections(other.id);
+    const otherToken = await login(app.baseUrl, owner.email);
+    const otherConnection = await fetch(`${app.baseUrl}/api/provider-connections`, {
+      method: "POST",
+      headers: headers(otherToken, other.id),
+      body: JSON.stringify({ name: "Other DeepSeek", providerId: "deepseek", apiKey: "other-server-private-value" }),
+    });
+    assert.equal(otherConnection.status, 201);
+    const otherConnectionId = ((await otherConnection.json()) as { id: string }).id;
+    stubBuiltInCatalog(app, () => CURRENT_COMPUTER);
+    for (const model of ["deepseek/deepseek-v4-pro", "deepseek-v5-preview"]) {
+      const created = await fetch(`${app.baseUrl}/api/agents`, {
+        method: "POST",
+        headers: headers(token, server.id),
+        body: JSON.stringify({
+          name: "cross-server",
+          machineId: machine.id,
+          formDefinitionRef: { protocolVersion: 2, runtimeId: "builtin" },
+          formValues: { providerId: `connection:${otherConnectionId}`, model },
+        }),
+      });
+      const text = await created.text();
+      assert.equal(created.status, 409, text);
+      assert.equal((JSON.parse(text) as { code?: string }).code, "provider_connection_unavailable", model);
+      assert.equal(text.includes("other-server-private-value"), false);
+    }
+    assert.equal((await getDb().select().from(agents).where(eq(agents.serverId, server.id))).length, 0, "nothing created");
+  } finally {
+    await app.close();
+    if (originalKey === undefined) delete process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
+    else process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = originalKey;
+  }
+});
+
+// Binding a saved connection hands the agent the team's key: the form lists
+// connections only to `manageExternalAuth`, and a connection id is visible in
+// other agents' runtimeConfig. A member who may edit an agent (its creator)
+// keeps the connection it has, but cannot bind another by id.
+test("binding another saved connection on edit needs manageExternalAuth; keeping the stored one does not", async () => {
+  const originalKey = process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;
+  process.env.SLOCK_PROVIDER_CREDENTIAL_KEY = Buffer.alloc(32, 8).toString("base64");
+  const { app, server, token, machine, connect } = await openConnectionsApp("provider-bind-auth");
+  try {
+    const stored = await connect("deepseek");
+    const other = await connect("openrouter");
+    stubBuiltInCatalog(app, () => CURRENT_COMPUTER);
+    const formRef = { protocolVersion: 2, runtimeId: "builtin" };
+    const created = await fetch(`${app.baseUrl}/api/agents`, {
+      method: "POST",
+      headers: headers(token, server.id),
+      body: JSON.stringify({ name: "bound", machineId: machine.id, formDefinitionRef: formRef, formValues: { providerId: `connection:${stored}`, model: "deepseek/deepseek-v4-pro" } }),
+    });
+    const createdText = await created.text();
+    assert.equal(created.status, 200, createdText);
+    const agent = JSON.parse(createdText) as { id: string };
+
+    const member = await seedUser("provider-bind-auth-member@raft.test", "provider-bind-auth-member");
+    await getDb().insert(serverMembers).values({ serverId: server.id, userId: member.id, role: "member" });
+    await getDb().update(agents).set({ creatorType: "user", creatorId: member.id }).where(eq(agents.id, agent.id));
+    const memberToken = await login(app.baseUrl, member.email);
+    const edit = (as: string, formValues: Record<string, string>) => fetch(`${app.baseUrl}/api/agents/${agent.id}`, {
+      method: "PATCH",
+      headers: headers(as, server.id),
+      body: JSON.stringify({ formDefinitionRef: formRef, formValues }),
+    });
+    const boundTo = async () => ((await getDb().select().from(agents).where(eq(agents.id, agent.id)))[0]!.runtimeConfig as { provider: { connectionId?: string } }).provider.connectionId;
+
+    const kept = await edit(memberToken, { providerId: `connection:${stored}`, model: "deepseek/deepseek-flash" });
+    assert.equal(kept.status, 200, await kept.text());
+
+    const rebound = await edit(memberToken, { providerId: `connection:${other}`, model: "openrouter/moonshotai/kimi-k2.7-code" });
+    const reboundText = await rebound.text();
+    assert.equal(rebound.status, 403, reboundText);
+    assert.equal((JSON.parse(reboundText) as { code?: string }).code, "provider_connection_manage_auth_required");
+    assert.equal(await boundTo(), stored, "the stored connection is untouched");
+
+    const byOwner = await edit(token, { providerId: `connection:${other}`, model: "openrouter/moonshotai/kimi-k2.7-code" });
+    assert.equal(byOwner.status, 200, await byOwner.text());
+    assert.equal(await boundTo(), other);
   } finally {
     await app.close();
     if (originalKey === undefined) delete process.env.SLOCK_PROVIDER_CREDENTIAL_KEY;

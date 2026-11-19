@@ -22,7 +22,7 @@ import { usePhoneHistoryEntry } from "../../apps/artifacts";
 import { useMediaQuery } from "../../hooks/effectPrimitives";
 import type { Channel } from "../../store/channelStore";
 import ChannelSideCard from "../task/ChannelSideCard";
-import { SideSectionPortal } from "../task/ChannelSideArea";
+import { SideSectionPortal, useSideSections } from "../task/ChannelSideArea";
 import { channelDetailsExternal } from "./channelDetails";
 import { PHONE_MEDIA_QUERY } from "../ui/NarrowDialog";
 import { useHostTitleBar } from "../topbar/overlayTitleBar";
@@ -78,8 +78,10 @@ export function ChannelDetailsSurface({
 }) {
   const { formatMessage } = useIntl();
   const phone = useMediaQuery(PHONE_MEDIA_QUERY);
-  // MainLayout's row mounts its side area (its hidden `data-side-area` marker; a test id is for tests, not for this) with the app shell, before any channel.
-  const [inRow] = useState(() => typeof document !== "undefined" && document.querySelector("[data-side-area]") !== null);
+  // MainLayout's row mounts its side area with the app shell. Read from its store, not the DOM once at first render:
+  // a window opened straight onto a channel renders this before the area in the same commit, and the details then
+  // stood alone over the conversation for the whole session (under the desktop's title bar, a band above their head).
+  const inRow = useSideSections((s) => s.mounted);
   const belowTitleBar = useHostTitleBar();
   const title = formatMessage({ id: "channel.details.title" });
   if (!open) return null;

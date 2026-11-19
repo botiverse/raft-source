@@ -100,9 +100,13 @@ test("the short form says how long ago in one word and a number, in the same ste
     // Never the long words ("yesterday", "this minute"), which are what didn't fit.
     assert.equal(formatShortRelativeTime(ago(86_400_000), "en"), "1d ago");
     assert.equal(formatShortRelativeTime(ago(86_400_000), "zh-cn"), "1 天前");
-    assert.equal(formatShortRelativeTime(ago(0), "en"), "0m ago");
+    // Under half a minute: the locale's word for now, never a zero count ("0m ago").
+    assert.equal(formatShortRelativeTime(ago(0), "en"), "now");
+    assert.equal(formatShortRelativeTime(ago(20_000), "en"), "now");
+    assert.equal(formatShortRelativeTime(ago(0), "zh-cn"), "现在");
+    assert.equal(formatShortRelativeTime(ago(40_000), "en"), "1m ago");
     // A clock behind the server's: just now, never "in 5m".
-    assert.equal(formatShortRelativeTime(ago(-5 * 60_000), "en"), "0m ago");
+    assert.equal(formatShortRelativeTime(ago(-5 * 60_000), "en"), "now");
     assert.equal(formatShortRelativeTime(null, "en"), null);
     assert.equal(formatShortRelativeTime("not a time", "en"), null);
   } finally {
@@ -121,7 +125,7 @@ test("a narrow form that only marks the past with a minus says the short one ins
     assert.equal(formatShortRelativeTime(ago(9 * 86_400_000), "ru"), "9 дн. назад");
     assert.equal(formatShortRelativeTime(ago(3 * 3_600_000), "ru"), "3 ч назад");
     assert.equal(formatShortRelativeTime(ago(5 * 60_000), "ru"), "5 мин. назад");
-    assert.equal(formatShortRelativeTime(ago(0), "ru"), "0 мин. назад", "the negated zero has a minus too");
+    assert.equal(formatShortRelativeTime(ago(0), "ru"), "сейчас", "zero is the word for now, not a count");
     assert.equal(formatShortRelativeTime(ago(9 * 86_400_000), "en"), "9d ago");
     assert.equal(formatShortRelativeTime(ago(3 * 3_600_000), "en"), "3h ago", "not en's short \"3 hr. ago\"");
   } finally {

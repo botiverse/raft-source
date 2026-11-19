@@ -56,19 +56,6 @@ test("a runtime this server's switch keeps off is not listed", () => {
   assert.equal(catalog.runtimes.some((runtime) => runtime.id === "qoder"), true);
 });
 
-test("CodeBuddy Code is listed (experimental, OAR-only, live models, v2 form), with no server switch", () => {
-  const byId = new Map(projectServerRuntimeCatalog(ALL_ON).runtimes.map((runtime) => [runtime.id, runtime]));
-  const codebuddy = byId.get("codebuddy");
-  assert.equal(codebuddy?.displayName, "CodeBuddy Code");
-  assert.equal(codebuddy?.binary, "codebuddy");
-  assert.equal(codebuddy?.experimental, true);
-  assert.equal(codebuddy?.oarOnly, true);
-  assert.equal(codebuddy?.modelsSource, "fallback");
-  assert.deepEqual(codebuddy?.forms, [{ kind: "generic" }, { kind: "v2" }]);
-  // No switch: the fail-closed default (a flag store error) still lists it.
-  assert.equal(projectServerRuntimeCatalog(DEFAULT_RUNTIME_ADMISSION_POLICY).runtimes.some((runtime) => runtime.id === "codebuddy"), true);
-});
-
 test("single source: the ids and their order are shared RUNTIMES after the switches", () => {
   // docs/contracts/server-runtime-catalog.md "Single source": no server-side copy.
   const disabled = new Set(["qwen", "codex"]);

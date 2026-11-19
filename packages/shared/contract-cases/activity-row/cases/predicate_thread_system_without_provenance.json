@@ -1,0 +1,41 @@
+{
+  "formatVersion": 1,
+  "id": "predicate_thread_system_without_provenance",
+  "rule": "predicate",
+  "title": "On a thread row, a system message without its provenance cannot be judged",
+  "why": "The event did not carry systemSubtype/causal actor; the row is re-read (web today: not counted, and its re-read brings the server's count).",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/web/src/store/inboxInPlaceUnread.ts (liveActivityUnread, liveUnreadFields)",
+      "packages/web/src/store/inboxRowPosition.ts (rowPositionVerdict, with inbox_row_position_v1 on)"
+    ],
+    "server": [
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (unread_count FILTER)",
+      "packages/server/src/services/inboxUnreadEligibility.ts (isMessageUnreadEligibleForReceiver)"
+    ]
+  },
+  "given": {
+    "viewer": {
+      "type": "user",
+      "id": "viewer-1"
+    },
+    "scope": {
+      "rowKind": "thread",
+      "threadFollowed": true
+    },
+    "message": {
+      "senderType": "system",
+      "senderId": "system",
+      "messageType": "system",
+      "mentions": []
+    }
+  },
+  "steps": [],
+  "expect": {
+    "verdict": {
+      "counts": null,
+      "mention": false
+    }
+  }
+}

@@ -15,6 +15,7 @@ import {
   bootShellPlugin,
   readBootInlineScript,
   renderBootShellPage,
+  signInPreloadFiles,
 } from "../scripts/bootShellPlugin";
 import { assertMetaCsp, injectMetaCsp, inlineScriptCspSources, pageMetaCsp, pageMetaCspPlugin } from "../scripts/pageMetaCsp";
 import {
@@ -29,6 +30,9 @@ import {
   BOOT_ROOT_REDIRECT_MEDIA_QUERY,
   BOOT_SCROLL_MEMORY_PREFIX,
   BOOT_SERVER_THEME_STORAGE_PREFIX,
+  BOOT_SIGN_IN_FILES_ID,
+  BOOT_SIGN_IN_PATHS,
+  BOOT_SIGN_IN_SKIP_PARAMS,
   bootInlineScriptCspSource,
 } from "../src/boot/bootInlineScript";
 import { displayLocaleMatchRules } from "@botiverse/raft-shared";
@@ -387,7 +391,7 @@ const CATALOG_MAP: Record<string, string> = Object.fromEntries(["en", "es", "pt-
 ]));
 
 /** The boot script on a page with the build's catalog map: the modulepreload links it adds. */
-function runCatalogPreload(path: string, languages: readonly string[], map: unknown = CATALOG_MAP) {
+function runCatalogPreload(path: string, languages: readonly string[], map: unknown = CATALOG_MAP, signIn: readonly string[] | null = null, stored: Record<string, string> = {}) {
   const links: { rel: string; href: string; crossOrigin: string | null }[] = [];
   const document = {
     documentElement: {
@@ -396,11 +400,12 @@ function runCatalogPreload(path: string, languages: readonly string[], map: unkn
       style: { setProperty: () => {} },
       setAttribute: () => {},
     },
-    getElementById: (id: string) => (id === BOOT_LOCALE_CATALOGS_ID && map !== null ? { textContent: typeof map === "string" ? map : JSON.stringify(map) } : null),
+    getElementById: (id: string) => (id === BOOT_LOCALE_CATALOGS_ID && map !== null ? { textContent: typeof map === "string" ? map : JSON.stringify(map) }
+      : id === BOOT_SIGN_IN_FILES_ID && signIn !== null ? { textContent: JSON.stringify(signIn) } : null),
     createElement: () => ({ rel: "", href: "", crossOrigin: null as string | null }),
     head: { appendChild: (link: { rel: string; href: string; crossOrigin: string | null }) => { links.push(link); } },
   };
-  const storage = { length: 0, key: () => null, getItem: () => null };
+  const storage = { length: 0, key: () => null, getItem: (key: string) => stored[key] ?? null };
   new Function("document", "localStorage", "location", "navigator", BOOT_HINTS_SCRIPT)(document, storage, new URL(path, "https://app.raft.build"), { languages });
   return links.map((link) => `${link.rel} ${link.href} ${link.crossOrigin}`);
 }
@@ -411,6 +416,36 @@ test("boot hints: every page modulepreloads the boot locale's catalog (its first
   assert.deepEqual(runCatalogPreload("/s/demo", ["ja-JP"]), ["modulepreload /assets/ja-AAAAAAAA.js ", "modulepreload /assets/en-AAAAAAAA.js "]);
   assert.deepEqual(runCatalogPreload("/login?lang=zh-TW", []), ["modulepreload /assets/zh-tw-AAAAAAAA.js ", "modulepreload /assets/en-AAAAAAAA.js "]);
   assert.deepEqual(runCatalogPreload("/artifacts/pt_x", ["ko"]), ["modulepreload /assets/ko-AAAAAAAA.js ", "modulepreload /assets/en-AAAAAAAA.js "], "an Artifact link too");
+});
+
+test("boot hints: with no stored session, an address whose page is sign-in modulepreloads its files; no other address does", () => {
+  const files = ["/assets/SignInPage-AAAAAAAA.js", "/assets/LoginPage-AAAAAAAA.js"];
+  const signIn = ["modulepreload /assets/SignInPage-AAAAAAAA.js ", "modulepreload /assets/LoginPage-AAAAAAAA.js "];
+  assert.deepEqual(runCatalogPreload("/", ["en-US"], CATALOG_MAP, files), ["modulepreload /assets/en-AAAAAAAA.js ", ...signIn]);
+  assert.deepEqual(runCatalogPreload("/?lang=ja", [], CATALOG_MAP, files).slice(2), signIn, "after the catalog's first parts; no other part");
+  assert.deepEqual(runCatalogPreload("/login/", ["en-US"], CATALOG_MAP, files).slice(1), signIn, "/login");
+  assert.deepEqual(runCatalogPreload("/", ["en-US"], CATALOG_MAP, files, { slock_access_token: "t" }), ["modulepreload /assets/en-AAAAAAAA.js "], "a stored session: never");
+  for (const path of ["/s/demo/channel/general", "/join/abc", "/?reset=r1", "/?invite=i&x=1", "/?verify=v", "/?auth_callback=social", "/artifacts/pt_1", "/signup", "/download", "/login/device", "/login/app"]) {
+    assert.deepEqual(runCatalogPreload(path, ["en-US"], CATALOG_MAP, files), ["modulepreload /assets/en-AAAAAAAA.js "], `${path} draws something else first`);
+  }
+  assert.deepEqual(runCatalogPreload("/", ["en-US"], CATALOG_MAP, ["https://evil.example/x.js", "/assets/x.css"]), ["modulepreload /assets/en-AAAAAAAA.js "], "only built JS files");
+});
+
+test("the boot script's sign-in addresses and landing query parameters are landingPages.ts's", async () => {
+  const { LANDING_QUERY_PARAMS, SIGN_IN_PATHS } = await import("../src/pages/landingPages");
+  assert.deepEqual([...BOOT_SIGN_IN_SKIP_PARAMS].sort(), [...LANDING_QUERY_PARAMS].sort());
+  assert.deepEqual([...BOOT_SIGN_IN_PATHS], [...SIGN_IN_PATHS]);
+});
+
+test("signInPreloadFiles: the sign-in page's chunks outside the first download, from the manifest", () => {
+  const manifest = {
+    "index.html": { file: "assets/index-A.js", isEntry: true, imports: ["_app-shell.js"] },
+    "_app-shell.js": { file: "assets/app-shell-A.js" },
+    "src/components/auth/SignInPage.tsx": { file: "assets/SignInPage-A.js", imports: ["_app-shell.js", "_LoginPage.js"] },
+    "_LoginPage.js": { file: "assets/LoginPage-A.js", imports: ["_app-shell.js"] },
+  };
+  assert.deepEqual(signInPreloadFiles(manifest), ["/assets/SignInPage-A.js", "/assets/LoginPage-A.js"]);
+  assert.throws(() => signInPreloadFiles({ "index.html": { file: "assets/index-A.js", isEntry: true } }), /SignInPage/);
 });
 
 test("boot hints: no map, a broken one, or a URL that isn't a built JS file preloads nothing and breaks nothing", () => {

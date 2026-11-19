@@ -1399,6 +1399,37 @@ test("current model keeps Mentions filter independent from unread mention badge"
   assert.equal(mentionsRow.hasAnyMention, true, "mentions tab still includes read mention history");
 });
 
+// #244, the agreed Activity unread rule (shared activityUnreadPredicate.ts,
+// contract cases predicate_channel_own_caused_system / _dm_own_caused_system /
+// _channel_uncounted_subtype / _channel_self_unfollow_subtype): on a channel or
+// DM row, a system message the receiver caused and the noise subtypes never
+// count; another's system message does.
+test("system messages the receiver caused and the noise subtypes do not count, on channel rows as on threads", () => {
+  const system = (seq: number, extra: Partial<InboxPolicyModel["messages"][number]>) => ({
+    ...message("c-general", seq, "sender-c"), senderType: "system" as const, messageType: "system" as const, systemSubtype: null, ...extra,
+  });
+  const model = baseModel({
+    messages: [
+      message("c-general", 1),
+      system(2, { causalActorType: "user", causalActorId: USER }),
+      system(3, { systemSubtype: "channel.self_unfollow_thread" }),
+      system(4, { systemSubtype: "task.deleted_summary" }),
+      system(5, { causalActorType: "user", causalActorId: OTHER_USER }),
+    ],
+    lastReadSeqByChannel: { "c-general": 0 },
+  });
+  const row = projectCurrentInboxPolicy(model, "all").rows[0]!;
+  if (row.kind !== "channel") assert.fail(`expected channel row, got ${row.kind}`);
+  assert.equal(row.unreadCount, 2, "message 1 and another's system message 5");
+  assert.equal(row.firstUnreadMessageId, "c-general-m1");
+
+  const caused = projectCurrentInboxPolicy(baseModel({
+    messages: [system(1, { causalActorType: "user", causalActorId: USER })],
+    lastReadSeqByChannel: { "c-general": 0 },
+  }), "unread");
+  assert.equal(caused.rows.length, 0, "only a message the receiver caused: nothing unread");
+});
+
 test("mute policy treats Activity as receiver notification fact history", () => {
   const mutedModel = baseModel({
     mutedChannelIds: ["c-general"],
@@ -1416,15 +1447,18 @@ test("mute policy treats Activity as receiver notification fact history", () => 
     mentionFacts: [visibleMention(USER, "c-general", 2)],
   });
 
+  // The agreed rule (#244, contract case predicate_muted_channel_mention): a
+  // mention in a muted conversation lists the row and lights its @, and does
+  // not count.
   assert.deepEqual(projectionSummary(projectCurrentInboxPolicy(mutedModel, "all")), {
     totalCount: 1,
-    totalUnreadCount: 1,
+    totalUnreadCount: 0,
     rows: [
       {
         key: "channel:c-general",
-        unreadCount: 1,
+        unreadCount: 0,
         hasMention: true,
-        firstUnreadMessageId: "c-general-m2",
+        firstUnreadMessageId: null,
       },
     ],
   });
@@ -1478,7 +1512,7 @@ test("mute boundary preserves pre-mute activity history and hides post-mute ordi
   if (piercedRow.kind !== "channel") assert.fail(`expected channel row, got ${piercedRow.kind}`);
   assert.equal(piercedRow.latestMessageId, "c-general-m3");
   assert.equal(piercedRow.firstUnreadMessageId, "c-general-m2");
-  assert.equal(piercedRow.unreadCount, 2);
+  assert.equal(piercedRow.unreadCount, 1, "the mention past the mute lights the @ and does not count");
   assert.equal(piercedRow.hasMention, true);
   assert.equal(projectCurrentInboxPolicy(piercedMentionModel, "mentions").rows.length, 1);
 });
@@ -1542,8 +1576,8 @@ test("mute-from-first corner keeps broadcast-only traffic out while personal men
   const pierced = projectCurrentInboxPolicy(personalAfterMute, "all").rows[0]!;
   if (pierced.kind !== "channel") assert.fail(`expected channel row, got ${pierced.kind}`);
   assert.equal(pierced.latestMessageId, "c-general-m3");
-  assert.equal(pierced.firstUnreadMessageId, "c-general-m3");
-  assert.equal(pierced.unreadCount, 1);
+  assert.equal(pierced.firstUnreadMessageId, null);
+  assert.equal(pierced.unreadCount, 0, "the mention past the mute lights the @ and does not count");
   assert.equal(pierced.hasMention, true);
   assert.equal(projectCurrentInboxPolicy(personalAfterMute, "mentions").rows.length, 1);
 
@@ -1683,8 +1717,9 @@ test("contract: member mute freezes channel while followed threads stay independ
     {
       key: "channel:c-main",
       latestMessageId: "c-main-m4",
-      firstUnreadMessageId: "c-main-m4",
-      unreadCount: 1,
+      // Past the mute: the @ lights, nothing counts.
+      firstUnreadMessageId: null,
+      unreadCount: 0,
       hasMention: true,
     },
     {
@@ -1924,7 +1959,7 @@ test("property: serving rows use notification facts with latest_notified_seq as 
                 latestMessageId: row.kind === "thread" ? row.latestActivityMessageId : row.latestMessageId,
                 firstUnreadMessageId: row.firstUnreadMessageId,
                 latestNotifiedSeq: Math.max(0, ...facts.map((fact) => fact.seq)),
-                firstUnreadSeq: facts.find((fact) => fact.seq > readSeq)?.seq ?? null,
+                firstUnreadSeq: facts.find((fact) => fact.seq > readSeq && fact.unreadEligible !== false)?.seq ?? null,
                 unreadCount: row.unreadCount,
                 latestPersonalMentionSeq: personalMentions[personalMentions.length - 1]?.seq ?? null,
                 unreadMentionCount: unreadMentions.length,
@@ -1998,6 +2033,8 @@ test("property: serving rows use notification facts with latest_notified_seq as 
                 messageId,
                 activityAt: eventIndex + 1,
                 personalMention,
+                // A mention that pierces the mute lights the @ and does not count (#244).
+                ...(mutedTargets[receiver].has(channelId) ? { unreadEligible: false } : {}),
               });
             }
           }
@@ -2132,13 +2169,14 @@ test("receiver effects distinguish human and agent notification plus Inbox API f
     },
   ]);
   assert.deepEqual(receiverEffectSummary(mutedHuman), []);
+  // A mention in a muted conversation lights the @ and does not count (#244).
   assert.deepEqual(receiverEffectSummary(mutedMentionedHuman), [
     {
       key: "channel:c-general",
       inAll: true,
-      inUnread: true,
+      inUnread: false,
       inMentions: true,
-      unreadCount: 1,
+      unreadCount: 0,
       hasMention: true,
       mentionOnly: false,
       notification: "personal_mention",
@@ -2216,10 +2254,12 @@ test("property: receiver effects pin visible notification and Inbox filter outpu
 
         assert.ok(effect);
         assert.equal(effect.inAll, true);
-        assert.equal(effect.inUnread, unread && !effect.mentionOnly);
+        // A muted conversation counts nothing past its mute; a mention there lights the @ only (#244).
+        const counted = unread && !effect.mentionOnly && !muted;
+        assert.equal(effect.inUnread, counted);
         assert.equal(effect.inMentions, mentioned);
         assert.equal(effect.mentionOnly, !member && mentioned);
-        assert.equal(effect.unreadCount, unread && !effect.mentionOnly ? 1 : 0);
+        assert.equal(effect.unreadCount, counted ? 1 : 0);
         assert.equal(effect.hasMention, mentioned && (!member || !read));
         assert.equal(effect.notification, expectedNotification);
       },
@@ -2287,7 +2327,8 @@ test("property: inbox order and pagination respect mid-conversation mute boundar
           );
           const latestSeq = includedSeqs[includedSeqs.length - 1];
           if (latestSeq == null) return [];
-          const unreadSeqs = includedSeqs.filter((seq) => seq > spec.lastReadSeq);
+          // Past the mute only a mention is listed, and it does not count (#244).
+          const unreadSeqs = includedSeqs.filter((seq) => seq > spec.lastReadSeq && (spec.muteFromSeq === 0 || seq < spec.muteFromSeq));
           const mentionTargetsReceiver = spec.mentionSeq > 0;
           return [{
             key: `channel:${channelId}`,
@@ -2497,13 +2538,14 @@ test("trace: Inbox event path pins receiver-specific state transitions", () => {
     {
       event: "user checks mentions after personal mention pierces mute",
       view: {
+        // The mention past the mute lights the @ and does not count (#244).
         totalCount: 1,
-        totalUnreadCount: 2,
+        totalUnreadCount: 1,
         rows: [{
           key: "channel:c-trace",
           latestMessageId: "c-trace-m3",
           firstUnreadMessageId: "c-trace-m1",
-          unreadCount: 2,
+          unreadCount: 1,
           hasMention: true,
           hasAnyMention: true,
         }],
@@ -2625,7 +2667,8 @@ test("property: Inbox view checks observe the event-state-machine projection", (
             if (!latest) return [];
 
             const readSeq = readByReceiver[receiver][channelId] ?? 0;
-            const unread = included.filter((msg) => msg.seq > readSeq);
+            // A mention past the mute is listed and lights the @, and does not count (#244).
+            const unread = included.filter((msg) => msg.seq > readSeq && (muteFromSeq == null || msg.seq < muteFromSeq));
             return [{
               key: `channel:${channelId}`,
               activityAt: latest.createdAt,

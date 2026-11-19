@@ -20,6 +20,43 @@ export const AGENT_STOP_KILL_GRACE_MS = 10_000;
  */
 export const AGENT_STOP_KILL_CONFIRM_MS = 5_000;
 
+/**
+ * Why an agent was stopped, on its `daemon.agent.stop` event: `shutdown` (the
+ * daemon's stopAll), `explicit` (a person's or the Server's stop), `internal`
+ * (any other silent stop: a host move, a restart, a sweep).
+ */
+export type AgentStopReason = "shutdown" | "explicit" | "internal";
+
+/**
+ * `daemon.agent.stop`, once per stop of an agent a host held: which host and
+ * runtime, why, how long the stop waited for the exit, and whether it had to
+ * be forced (SIGKILL after the grace) or the exit was never confirmed.
+ * Bounded attributes only, no message text.
+ */
+export function agentStopTraceAttrs(stop: {
+  agentId: string;
+  launchId?: string | null;
+  runtime?: string | null;
+  host: "legacy" | "oar";
+  reason: AgentStopReason;
+  hadProcess: boolean;
+  waitMs: number;
+  escalated: boolean;
+  exitConfirmed: boolean;
+}): Record<string, unknown> {
+  return {
+    agentId: stop.agentId,
+    launchId: stop.launchId || undefined,
+    runtime: stop.runtime || undefined,
+    host: stop.host,
+    reason: stop.reason,
+    had_process: stop.hadProcess,
+    wait_ms: Math.max(0, Math.round(stop.waitMs)),
+    escalated: stop.escalated,
+    exit_confirmed: stop.exitConfirmed,
+  };
+}
+
 /** The process being stopped, as the stop sees it. */
 export interface StoppableProcess {
   readonly pid: number | undefined;

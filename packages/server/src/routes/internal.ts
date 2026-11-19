@@ -27,7 +27,7 @@ import { Router, type Request, type RequestHandler, type Response, type Router a
 import multer from "multer";
 import { randomUUID } from "node:crypto";
 import * as messageService from "../services/messageService";
-import { agentMessageCardField } from "../services/messageCardService";
+import { agentMessageCardFieldNamed } from "../services/messageCardService";
 import * as channelService from "../services/channelService";
 import * as agentService from "../services/agentService";
 import * as machineService from "../services/machineService";
@@ -182,7 +182,9 @@ import { agentServerProfileAudit, assertAgentCanManageServerProfile, updateServe
 import { agentProfileWriteRefusal, ASSISTANT_PROFILE_FIXED_CODE, ASSISTANT_PROFILE_FIXED_ERROR } from "../services/assistantService";
 import { parseOffsetQueryParam } from "../lib/offsetQueryParam";
 import { resolveAgentLoginClient } from "../services/oauthClientKeys";
-import { refuse } from "../lib/refusal";
+import { recordIntegrationServiceRequested, recordServiceNotOfferedUnlessMcpApp } from "../services/integrationServiceRequested";
+import { getProductEventSink } from "../services/productEventIngest";
+import { refuse, type RefusalInput } from "../lib/refusal";
 import { getHostedRuntimeSummary } from "../services/agentRuntimeProvisionService";
 import {
   AGENT_CHANNEL_NOT_FOUND_REFUSAL,
@@ -260,6 +262,8 @@ import {
   ACTION_TYPE_NOT_PREPARABLE_REFUSAL,
   agentLoginNotFoundRefusal,
   appRegistrationScopeRefusal,
+  AGENT_NOT_ON_THIS_COMPUTER_REFUSAL,
+  MACHINE_AGENT_NOT_FOUND_REFUSAL,
   MACHINE_AUTH_REQUIRED_REFUSAL,
   MACHINE_NOT_FOUND_REFUSAL,
   MACHINE_SERVER_GONE_REFUSAL,
@@ -590,9 +594,9 @@ export async function buildAgentResolvedMessagePayload(
     sender_description: sender?.description ?? null,
     sender_timezone: external ? null : message.senderTimezone ?? null,
     // RFC 077: resolve reads "sent by an assistant for its owner" like every other read.
-    ...(await messageService.agentDelegatedByField(message as { delegatedByAgentId?: string | null })),
+    ...(await messageService.agentAuthorshipFields(message as messageService.AgentAuthorshipRow)),
     // RFC 082: a card message reads `card=r<revision>` in the header; its content is the fallback.
-    ...agentMessageCardField(external ? null : "actionMetadata" in message ? message.actionMetadata : null),
+    ...(await agentMessageCardFieldNamed(external ? null : "actionMetadata" in message ? message.actionMetadata : null)),
     ...messageService.toAgentVisibleExternalMessage(message),
     ...(external && {
       mentioned: messageService.isSlackBridgedExternalMessage(message)
@@ -761,48 +765,35 @@ const validateLegacyAgentSendBody: RequestHandler<{ id: string }> = (req, res, n
   next();
 };
 
-/**
- * Validate that the requesting machine owns the agent (agent.machineId === req.machineId).
- * Prevents a machine from impersonating agents assigned to a different machine.
- */
-function verifyMachineOwnsAgent(
-  agent: { machineId: string | null; serverId: string },
-  machineId: string | undefined,
-  serverId: string | undefined,
-): string | null {
-  if (agent.serverId !== serverId) return "Agent not found";
-  if (!machineId || agent.machineId !== machineId) return "This agent is not assigned to your machine";
-  return null; // OK
-}
-
 type OwnedMachineAgentResult =
   | {
       agent: NonNullable<Awaited<ReturnType<typeof agentService.getAgent>>>;
     }
   | {
       status: 401 | 403 | 404;
+      /** The refusal's sentence; `refusal` is what the route answers. */
       error: string;
+      refusal: RefusalInput;
     };
 
+function ownedMachineAgentRefusal(status: 401 | 403 | 404, refusal: RefusalInput): OwnedMachineAgentResult {
+  return { status, error: refusal.error, refusal };
+}
+
+/**
+ * The agent a machine-authenticated call acts for, when it is on the calling
+ * machine. Answers what middleware/agentScope.ts answers for the same checks:
+ * an agent that doesn't exist and one on another server read the same.
+ */
 async function loadOwnedMachineAgent(
   agentId: string,
   machineId: string | undefined,
   serverId: string | undefined,
 ): Promise<OwnedMachineAgentResult> {
-  if (!machineId || !serverId) {
-    return { status: 401, error: "Machine authentication required" };
-  }
-
+  if (!machineId || !serverId) return ownedMachineAgentRefusal(401, MACHINE_AUTH_REQUIRED_REFUSAL);
   const agent = await agentService.getAgent(agentId);
-  if (!agent) {
-    return { status: 404, error: "Agent not found" };
-  }
-
-  const ownerErr = verifyMachineOwnsAgent(agent, machineId, serverId);
-  if (ownerErr) {
-    return { status: ownerErr === "Agent not found" ? 404 : 403, error: ownerErr };
-  }
-
+  if (!agent || agent.serverId !== serverId) return ownedMachineAgentRefusal(404, MACHINE_AGENT_NOT_FOUND_REFUSAL);
+  if (agent.machineId !== machineId) return ownedMachineAgentRefusal(403, AGENT_NOT_ON_THIS_COMPUTER_REFUSAL);
   return { agent };
 }
 
@@ -1541,7 +1532,7 @@ internalRouter.post("/machine/agents/:id/start", async (req, res) => {
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("error" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
 
@@ -1559,7 +1550,7 @@ internalRouter.post("/machine/agents/:id/stop", async (req, res) => {
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("error" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
 
@@ -1580,7 +1571,7 @@ internalRouter.get("/agent/:id/integrations", async (req, res) => {
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("error" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
 
@@ -1628,7 +1619,7 @@ internalRouter.post("/agent/:id/integrations/login", async (req, res) => {
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("error" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
 
@@ -1660,6 +1651,14 @@ internalRouter.post("/agent/:id/integrations/login", async (req, res) => {
       const marketplaceResolved = await resolveAgentLoginClient(publicClients, req.body?.service);
       if (!marketplaceResolved.ok) {
         res.status(marketplaceResolved.status).json({ error: marketplaceResolved.error });
+        // This older route knows no MCP Apps, so the name may still be one of this agent's: only a
+        // name that is none of them counts as not offered (integration_service_requested).
+        if (marketplaceResolved.status === 404 && typeof req.body?.service === "string" && !result.agent.assistantOwnerUserId) {
+          void recordServiceNotOfferedUnlessMcpApp(getProductEventSink(req.app), {
+            serverId: result.agent.serverId, agentId: result.agent.id, rawService: req.body.service,
+            clientKeyMatched: resolved.clientKeyMatched === true, command: "login",
+          });
+        }
         return;
       }
 
@@ -1727,6 +1726,11 @@ internalRouter.post("/agent/:id/integrations/login", async (req, res) => {
       }
 
       res.json(response);
+      if (!result.agent.assistantOwnerUserId) {
+        void recordIntegrationServiceRequested(getProductEventSink(req.app), {
+          serverId: result.agent.serverId, agentId: result.agent.id, rawService: req.body?.service, outcome: "not_installed", command: "login",
+        });
+      }
       return;
     }
 
@@ -1836,7 +1840,7 @@ internalRouter.post("/agent/:id/integrations/app/prepare", async (req, res) => {
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("error" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
 
@@ -2190,7 +2194,7 @@ internalRouter.post("/agent/:id/upload", requireAgentScope("attachment:upload"),
   const channelId = typeof req.body?.channelId === "string" ? req.body.channelId : undefined;
   try {
     const result = await loadOwnedMachineAgent(agentId, req.machineId, req.serverId);
-    if ("error" in result) { res.status(result.status).json({ error: result.error }); return; }
+    if ("error" in result) { refuse(res, result.status, result.refusal); return; }
     const { agent } = result;
 
     const file = req.file;
@@ -2303,7 +2307,7 @@ internalRouter.post("/agent/:id/resolve-channel", async (req, res) => {
     }
 
     const result = await loadOwnedMachineAgent(agentId, req.machineId, req.serverId);
-    if ("error" in result) { res.status(result.status).json({ error: result.error }); return; }
+    if ("error" in result) { refuse(res, result.status, result.refusal); return; }
     const { agent } = result;
 
     const resolved = await resolveWritableAgentTarget(agent.serverId, agentId, target);
@@ -2388,7 +2392,7 @@ internalRouter.post("/agent/:id/send", validateLegacyAgentSendBody, requireAgent
         },
       }),
     );
-    if ("error" in result) { res.status(result.status).json({ error: result.error }); return; }
+    if ("error" in result) { refuse(res, result.status, result.refusal); return; }
     const { agent } = result;
     const sendFreshnessMode = (process.env.SLOCK_ATTESTED_SEND_MODE ?? "on").trim().toLowerCase();
     const sendFreshnessEnabled = isSendFreshnessEnabled(agent.serverId, agentId);
@@ -2862,7 +2866,7 @@ internalRouter.post("/agent/:id/messages/:messageId/reactions", requireAgentScop
     }
 
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
-    if ("error" in result) { res.status(result.status).json({ error: result.error }); return; }
+    if ("error" in result) { refuse(res, result.status, result.refusal); return; }
     const { agent } = result;
 
     const message = await loadVisibleMessageForAgent(req.params.messageId, agent.id, agent.serverId, res);
@@ -2944,7 +2948,7 @@ internalRouter.delete("/agent/:id/messages/:messageId/reactions", requireAgentSc
     }
 
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
-    if ("error" in result) { res.status(result.status).json({ error: result.error }); return; }
+    if ("error" in result) { refuse(res, result.status, result.refusal); return; }
     const { agent } = result;
 
     const message = await loadVisibleMessageForAgent(req.params.messageId, agent.id, agent.serverId, res);
@@ -3069,7 +3073,7 @@ internalRouter.get("/agent/:id/receive", requireAgentScope("message:read"), asyn
         },
       }),
     );
-    if ("error" in result) { res.status(result.status).json({ error: result.error }); return; }
+    if ("error" in result) { refuse(res, result.status, result.refusal); return; }
     const { agent } = result;
 
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
@@ -3213,7 +3217,7 @@ internalRouter.post("/agent/:id/receive-ack", async (req, res) => {
     }
 
     const result = await loadOwnedMachineAgent(agentId, req.machineId, req.serverId);
-    if ("error" in result) { res.status(result.status).json({ error: result.error }); return; }
+    if ("error" in result) { refuse(res, result.status, result.refusal); return; }
 
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
     agentOrchestrator.acknowledgeDeliveredMessages(agentId, seqs, messageIds);
@@ -3249,7 +3253,7 @@ internalRouter.post("/agent/:id/runtime-profile/migration-done", async (req, res
       : "";
 
     const result = await loadOwnedMachineAgent(agentId, req.machineId, req.serverId);
-    if ("error" in result) { res.status(result.status).json({ error: result.error }); return; }
+    if ("error" in result) { refuse(res, result.status, result.refusal); return; }
 
     const launchId = typeof req.headers["x-agent-launch-id"] === "string"
       ? req.headers["x-agent-launch-id"]
@@ -3292,7 +3296,7 @@ internalRouter.get("/agent/:id/messages/:messageId/resolve", requireAgentScope("
     const rawMessageId = req.params.messageId;
 
     const result = await loadOwnedMachineAgent(agentId, req.machineId, req.serverId);
-    if ("error" in result) { res.status(result.status).json({ error: result.error }); return; }
+    if ("error" in result) { refuse(res, result.status, result.refusal); return; }
     const { agent } = result;
 
     const resolved = await messageService.resolveMessageIdVisibleToAgent(agent.serverId, agentId, rawMessageId);
@@ -3338,7 +3342,7 @@ internalRouter.get("/agent/:id/history", requireAgentScope("message:read"), asyn
     }
 
     const result = await loadOwnedMachineAgent(agentId, req.machineId, req.serverId);
-    if ("error" in result) { res.status(result.status).json({ error: result.error }); return; }
+    if ("error" in result) { refuse(res, result.status, result.refusal); return; }
     const { agent } = result;
 
     // Task v2: a task ref (`#parent:#7`, as deliveries name a task's
@@ -3593,7 +3597,7 @@ internalRouter.get("/agent/:id/search", requireAgentScope("message:read"), async
     const query = rawQuery.trim();
 
     const result = await loadOwnedMachineAgent(agentId, req.machineId, req.serverId);
-    if ("error" in result) { res.status(result.status).json({ error: result.error }); return; }
+    if ("error" in result) { refuse(res, result.status, result.refusal); return; }
     const { agent } = result;
 
     const channelRef = typeof req.query.channel === "string" ? req.query.channel : undefined;
@@ -3678,7 +3682,7 @@ internalRouter.get("/agent/:id/search", requireAgentScope("message:read"), async
       ...searchResponse,
       results: searchResponse.results.map((result, index) => {
         // RFC 077: an agent reads "sent by an assistant for its owner" as `delegated_by=@name`, as on every other message it reads.
-        const { externalMessage, delegatedBy, retracted: _retracted, ...visibleResult } = result;
+        const { externalMessage, delegatedBy, retracted: _retracted, postedByVoiceCall, ...visibleResult } = result;
         const external = result.senderType === "external_projection";
         // Slack-bridged rows read like ordinary messages; other external content stays inert.
         const inert = external && (!isSlackBridgedExternalProvider(externalMessage?.provider)
@@ -3690,6 +3694,7 @@ internalRouter.get("/agent/:id/search", requireAgentScope("message:read"), async
           senderType: toAgentFacingActorType(result.senderType),
           ...(externalMessage ? { external_message: externalMessage } : {}),
           ...(delegatedBy ? { delegated_by: { name: delegatedBy.name } } : {}),
+          ...(postedByVoiceCall ? { posted_by: "voice_call" as const } : {}),
           content: inert
             ? renderThirdPartyInertText({ field: "tool_result", value: result.content })
             : renderedContents[index],
@@ -3729,7 +3734,7 @@ internalRouter.post("/agent/:id/channels/:channelId/join", requireAgentScope("ch
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("error" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
 
@@ -3814,7 +3819,7 @@ internalRouter.post("/agent/:id/channels/:channelId/leave", requireAgentScope("c
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("error" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
 
@@ -3874,7 +3879,7 @@ internalRouter.post("/agent/:id/channels", requireAgentScope("channel:create"), 
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("error" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
 
@@ -3906,7 +3911,7 @@ internalRouter.patch("/agent/:id/channels/:channelId", requireAgentScope("channe
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("error" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
 
@@ -3939,7 +3944,7 @@ internalRouter.post("/agent/:id/channels/:channelId/members", requireAgentScope(
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("error" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
 
@@ -3973,7 +3978,7 @@ internalRouter.delete("/agent/:id/channels/:channelId/members", requireAgentScop
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("error" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
 
@@ -4007,7 +4012,7 @@ internalRouter.post("/agent/:id/threads/unfollow", requireAgentScope("thread:unf
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("error" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
 
@@ -4123,7 +4128,7 @@ internalRouter.get("/agent/:id/channel-members", requireAgentScope("channel:read
       humans: visibleHumans.map((u) => {
         const servers = channelService.agentVisibleMemberServers(u, ctx.agent.serverId);
         // Another server's person: their role stays with their organization.
-        return { name: u.name, description: u.description, ...(u.serverId === ctx.agent.serverId ? { role: u.role } : {}), ...(servers ? { servers } : {}) };
+        return { name: u.name, description: u.description, ...(channelService.isViewerServerMember(u, ctx.agent.serverId) ? { role: u.role } : {}), ...(servers ? { servers } : {}) };
       }),
     });
   } catch (err) {
@@ -4141,7 +4146,7 @@ internalRouter.get("/agent/:id/server", requireAgentScope("server:read"), async 
     const agentId = req.params.id;
 
     const result = await loadOwnedMachineAgent(agentId, req.machineId, req.serverId);
-    if ("error" in result) { res.status(result.status).json({ error: result.error }); return; }
+    if ("error" in result) { refuse(res, result.status, result.refusal); return; }
     const { agent } = result;
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
 
@@ -4198,7 +4203,7 @@ internalRouter.patch("/agent/:id/server", requireAgentScope("server:update"), as
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("error" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
 
@@ -4228,7 +4233,7 @@ internalRouter.post("/agent/:id/server/avatar", requireAgentScope("server:update
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("error" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
 
@@ -4308,7 +4313,7 @@ internalRouter.get("/agent/:id/profile", async (req, res) => {
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("error" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
 
@@ -4338,7 +4343,7 @@ internalRouter.post("/agent/:id/profile/avatar", async (req, res) => {
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("error" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
 
@@ -4399,7 +4404,7 @@ internalRouter.post("/agent/:id/profile", async (req, res) => {
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("error" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
 
@@ -5109,7 +5114,7 @@ internalRouter.get("/agent/:id/reminders", async (req, res) => {
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("status" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
 
@@ -5151,7 +5156,7 @@ internalRouter.post("/agent/:id/reminders", async (req, res) => {
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("status" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
     if (await refuseIfRemindersMovedToApp(res, result.agent.serverId)) return;
@@ -5307,7 +5312,7 @@ internalRouter.delete("/agent/:id/reminders/:reminderId", async (req, res) => {
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("status" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
 
@@ -5362,7 +5367,7 @@ internalRouter.post("/agent/:id/reminders/:reminderId/snooze", async (req, res) 
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("status" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
     if (await refuseIfRemindersMovedToApp(res, result.agent.serverId)) return;
@@ -5421,7 +5426,7 @@ internalRouter.patch("/agent/:id/reminders/:reminderId", async (req, res) => {
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("status" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
     if (await refuseIfRemindersMovedToApp(res, result.agent.serverId)) return;
@@ -5546,7 +5551,7 @@ internalRouter.get("/agent/:id/reminders/:reminderId/log", async (req, res) => {
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("status" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
 
@@ -5579,7 +5584,7 @@ internalRouter.post("/agent/:id/prepare-action", requireAgentScope("action:prepa
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("status" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
 
@@ -5660,7 +5665,7 @@ internalRouter.get("/agent/:id/scopes", async (req, res) => {
   try {
     const result = await loadOwnedMachineAgent(req.params.id, req.machineId, req.serverId);
     if ("status" in result) {
-      res.status(result.status).json({ error: result.error });
+      refuse(res, result.status, result.refusal);
       return;
     }
     const set = await agentScopesService.loadAgentScopes(req.params.id);

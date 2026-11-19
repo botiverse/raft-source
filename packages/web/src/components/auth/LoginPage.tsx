@@ -17,7 +17,8 @@ import { AUTH_MESSAGE_IDS, authServerErrorMessage, isValidEmailFormat } from "./
 import OpenInBrowserSignInGuide from "./OpenInBrowserSignInGuide";
 import { DesktopSignInWaiting, SocialProviderSection } from "./SocialProviderButton";
 import { SsoSignInEntry } from "./SsoSignInEntry";
-import { PendingSecondFactorSignInStep, useSecondFactorSignInPending } from "./SecondFactorSignInStep";
+import { PendingSecondFactorSignInStep } from "./SecondFactorSignInStep";
+import { useSecondFactorSignInPending } from "./secondFactorSignIn";
 import { EMAIL_AUTOCOMPLETE_WITH_PASSKEYS, usePasskeySignIn } from "./usePasskeySignIn";
 import { signInFailureTraceId } from "./signInFailure";
 import { desktopPasskeySignInShown, runDesktopPasskeySignIn } from "../../utils/desktopPasskeySignIn";

@@ -158,7 +158,7 @@ export type AccountDeletionCleanupDeps = {
   /** Overridable for tests; production calls Resend. */
   deleteResendContact?: (contact: { id: string } | { email: string }) => Promise<void>;
   /** Overridable for tests; production calls Resend. */
-  cancelScheduledEmail?: (emailId: string) => Promise<void>;
+  cancelScheduledEmail?: (emailId: string, options?: { scheduledAt?: Date | null }) => Promise<void>;
   /** Overridable for tests; production deletes the stored image unless someone else still shows it (avatarService.ts). */
   deleteStoredUserAvatar?: (avatarUrl: string | null) => Promise<unknown>;
   /** Overridable for tests; production posts the "offline, move it" notice to each agent owner (computerDetachedNotices.ts). */
@@ -971,13 +971,13 @@ async function deletePaidLifecycleJourney(ctx: CleanupContext): Promise<StepOutc
 /** A day-1 onboarding email still scheduled at Resend is cancelled before the journey goes. */
 async function deleteOnboardingEmailJourneys(ctx: CleanupContext): Promise<StepOutcome> {
   const cancel = ctx.deps.cancelScheduledEmail ?? cancelScheduledEmail;
-  const rows = await getDb().select({ id: onboardingEmailJourneys.id, day1EmailId: onboardingEmailJourneys.day1EmailId, day1Status: onboardingEmailJourneys.day1Status, canceledAt: onboardingEmailJourneys.canceledAt })
+  const rows = await getDb().select({ id: onboardingEmailJourneys.id, day1EmailId: onboardingEmailJourneys.day1EmailId, day1Status: onboardingEmailJourneys.day1Status, day1ScheduledAt: onboardingEmailJourneys.day1ScheduledAt, canceledAt: onboardingEmailJourneys.canceledAt })
     .from(onboardingEmailJourneys).where(eq(onboardingEmailJourneys.userId, ctx.userId));
   let outcome: StepOutcome = "done";
   for (const row of rows) {
     const emailId = row.day1EmailId;
     if (emailId && row.day1Status === "scheduled" && !row.canceledAt
-      && !await bestEffort("cancel_onboarding_email", "cancelling the scheduled onboarding email", ctx.userId, () => cancel(emailId))) {
+      && !await bestEffort("cancel_onboarding_email", "cancelling the scheduled onboarding email", ctx.userId, () => cancel(emailId, { scheduledAt: row.day1ScheduledAt }))) {
       outcome = "failed";
       continue;
     }

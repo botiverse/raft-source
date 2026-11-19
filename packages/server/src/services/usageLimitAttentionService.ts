@@ -1,4 +1,8 @@
 import {
+  allModelsUsageAccount,
+  inferClaudeUsageWindowScopes,
+  isClaudeOAuthAppsWindow,
+  isModelScopedUsageWindow,
   SERVER_SYSTEM_ATTENTION_CONTRACT_VERSION,
   type RuntimeAccountUsageProvider,
   type RuntimeAccountUsageSnapshot,
@@ -134,16 +138,24 @@ export class UsageLimitAttentionService {
       .sort();
 
     const observedAt = new Date(snapshot.collectedAt);
-    for (const account of snapshot.accounts) {
+    // An older Computer's Claude windows carry no scope: read a model's own
+    // window ("Current week (Fable)") as that model's, as the web does.
+    for (const account of inferClaudeUsageWindowScopes(snapshot).accounts) {
+      // Used up on the basis the web shows (allModelsUsageAccount): OAR says
+      // rate limited when any window is at its limit, a model's too.
+      const usedUp = allModelsUsageAccount(account).account.health === "rate_limited";
       for (const window of account.windows) {
         if (window.status === "parse_unavailable") continue;
-        // A group of models' quota (Antigravity's "Gemini Models"): while the
-        // account is not rate limited it still runs the other groups' models,
-        // so one group used up is not "<provider> used up" for every agent on
-        // it. Once OAR says it is (every group used up, no credits left), the
-        // groups' windows say so and when they reset.
-        if (window.scope?.kind === "models" && account.health !== "rate_limited") continue;
-        if (window.status === "limit_reached" && affectedAgentIds.length === 0) continue;
+        // A model's window (Claude's Fable week), a group of models' quota
+        // (Antigravity's "Gemini Models") or the OAuth apps' window: while the
+        // account is not used up on all models it still runs the other
+        // models, so one at its limit is not "<provider> used up" for every
+        // agent on it (read as clear: a notice it raised while the account
+        // was used up resolves). Once it is, these windows say so and when
+        // they reset.
+        const leftOut = isModelScopedUsageWindow(window) || isClaudeOAuthAppsWindow(window);
+        const status = leftOut && !usedUp && window.status === "limit_reached" ? "ok" : window.status;
+        if (status === "limit_reached" && affectedAgentIds.length === 0) continue;
         await executor.transaction(async (tx) => {
           const identity = {
             serverId: machine.serverId,
@@ -170,7 +182,7 @@ export class UsageLimitAttentionService {
           const transition = planUsageLimitTransition({
             latest: latest ?? null,
             observedAt,
-            windowStatus: window.status,
+            windowStatus: status,
             now: this.now(),
           });
           if (transition.action === "ignore") return;

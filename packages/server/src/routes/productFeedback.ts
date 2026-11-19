@@ -48,9 +48,10 @@ import {
 } from "../services/productFeedbackConversationService";
 import {
   ensureProductFeedbackRouteBinding,
-  isTransientHandsFailure,
   ProductFeedbackRouteBindingError,
 } from "../services/productFeedbackRouteBindingService";
+import { listProductFeedbackTicketsAcrossSources, productFeedbackTicketWithSource } from "../services/productFeedbackMergedList";
+import { feedbackListFailureTraceAttrs, transientFeedbackReadFailure } from "../services/productFeedbackReadFailure";
 import { productFeedbackServerTiming } from "../services/productFeedbackTiming";
 import { pushProductFeedbackAppUnread, pushProductFeedbackUnread } from "../services/productFeedbackUnreadRealtime";
 import { addTraceEvent } from "../tracing/semanticTrace";
@@ -278,27 +279,6 @@ async function completeFeedbackCard(
   }
 }
 
-/**
- * Hands slow or refusing for a moment, as on a fresh task right after a deploy
- * (v1.21.49 switch: 95 list 503s from binding and read timeouts and the open
- * breaker). Configuration and authorization failures are not: those stay
- * errors so they are seen.
- */
-function transientFeedbackReadFailure(error: unknown): { step: "binding" | "read"; reason: string } | null {
-  if (error instanceof ProductFeedbackRouteBindingError) {
-    return error.reason === "circuit_open" || isTransientHandsFailure(error.reason)
-      ? { step: "binding", reason: error.reason }
-      : null;
-  }
-  if (!(error instanceof ProductFeedbackConversationError) || error.code !== "feedback_service_unavailable") return null;
-  const { stage, upstreamStatus } = error.diagnostic;
-  const transient = stage === "breaker_open"
-    || stage === "upstream_transport"
-    || stage === "reporter_session_transport"
-    || ((stage === "upstream_response" || stage === "reporter_session_response") && upstreamStatus !== null && upstreamStatus >= 500);
-  return transient ? { step: "read", reason: stage } : null;
-}
-
 /** Seconds a client that asked for degraded answers waits before listing again. */
 const DEGRADED_LIST_RETRY_AFTER_SECONDS = 5;
 
@@ -308,15 +288,30 @@ productFeedbackRouter.get("/tickets", async (req, res) => {
   const degradedOk = req.query.degraded_ok === "1" && req.query.cursor === undefined;
   const limit = positiveInt(req.query.limit, 20, 50);
   const cursor = typeof req.query.cursor === "string" ? req.query.cursor : undefined;
-  if (limit === null || (req.query.cursor !== undefined && cursor === undefined)) {
+  // `sources=all`: one list across every app the person files into
+  // (productFeedbackMergedList.ts). Without it, the caller's own app only.
+  const allSources = req.query.sources === "all";
+  if (
+    limit === null || (req.query.cursor !== undefined && cursor === undefined)
+    || (req.query.sources !== undefined && !allSources)
+  ) {
     res.status(400).json({ error: "Invalid feedback request", code: "feedback_invalid" });
     return;
   }
   try {
-    const env = await resolveProductFeedbackEnv({ source: conversationFeedbackSource(req) });
-    const { reporterId } = await ensureProductFeedbackRouteBinding({ userId: req.userId!, env });
     const upstreamStartedAt = performance.now();
     let handsServerTiming: string | null = null;
+    if (allSources) {
+      const list = await listProductFeedbackTicketsAcrossSources({
+        userId: req.userId!, limit, cursor,
+        onUpstreamServerTiming: (value) => { handsServerTiming = value; },
+      });
+      setUpstreamTiming(res, upstreamStartedAt, handsServerTiming);
+      res.json(list);
+      return;
+    }
+    const env = await resolveProductFeedbackEnv({ source: conversationFeedbackSource(req) });
+    const { reporterId } = await ensureProductFeedbackRouteBinding({ userId: req.userId!, env });
     const list = await listProductFeedbackTickets({
       userId: req.userId!, reporterId, limit, cursor, env,
       onUpstreamServerTiming: (value) => { handsServerTiming = value; },
@@ -340,6 +335,9 @@ productFeedbackRouter.get("/tickets", async (req, res) => {
       console.error("[ProductFeedback] Failed to list feedback", error);
       res.status(503).json({ error: "Feedback service is temporarily unavailable", code: "feedback_service_unavailable" });
     }
+    // The 503 an older client (no degraded_ok) gets: say on the span which
+    // code it was and what failed, as list_degraded does for the 200.
+    if (res.statusCode === 503) addTraceEvent("server.product_feedback.list_failed", feedbackListFailureTraceAttrs(error));
   }
 });
 
@@ -366,7 +364,10 @@ productFeedbackRouter.get("/tickets/:ticketId", async (req, res) => {
       onUpstreamServerTiming: (value) => { handsServerTiming = value; },
     });
     setUpstreamTiming(res, upstreamStartedAt, handsServerTiming);
-    res.json(detail);
+    // The app the ticket lives in and the client that filed it, as on the
+    // merged list (productFeedbackMergedList.ts): a design labels a ticket
+    // filed from another client. Additive; the ticket's own fields are unchanged.
+    res.json({ ...detail, ticket: productFeedbackTicketWithSource(detail.ticket, source) });
     // This read moved the reporter's read receipt in the app the ticket lives
     // in: the user's other tabs and devices get that app's new total (the one
     // Hands just answered, no extra call), so their unread dot clears. Each

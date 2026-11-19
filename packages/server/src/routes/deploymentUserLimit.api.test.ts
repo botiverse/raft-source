@@ -9,6 +9,7 @@ import { createChannel } from "../services/channelService";
 import { countHumanUserAccounts } from "../services/deploymentUserLimit";
 import { createJoinLink } from "../services/inviteService";
 import { createServer, deleteServer } from "../services/serverService";
+import { setEditionForTest, useEdition } from "../test/edition";
 import { createApiTest } from "../test/integration/apiTest";
 import { enableExternalChannelsFlag, seedUser, sha256 } from "../test/externalInviteFixture";
 import { seedBoundGuest } from "../test/guestFixture";
@@ -19,16 +20,8 @@ import { seedBoundGuest } from "../test/guestFixture";
 // deployment_user_limit_reached (403). The cloud edition is unchanged.
 const test = createApiTest();
 
-// The edition line export-snapshot rewrites (edition.ts), switched per test.
-const edition = vi.hoisted(() => ({ value: "source-available" as "cloud" | "source-available" }));
-vi.mock("../edition", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../edition")>();
-  return { ...actual, humanUserLimit: () => actual.humanUserLimit(edition.value) };
-});
-
-afterEach(() => {
-  edition.value = "source-available";
-});
+// Runs as the source-available edition in either tree (src/test/edition.ts).
+useEdition("source-available");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 type User = Awaited<ReturnType<typeof seedUser>>;
@@ -292,7 +285,7 @@ test("over the limit already: the people there keep working, nobody new is added
 
 test("the cloud edition has no user limit", async ({ app, http }) => {
   const { owner, home } = await seedCounted(HUMAN_USER_LIMIT);
-  edition.value = "cloud";
+  setEditionForTest("cloud");
   const sixth = await person("sixth");
   const joined = await acceptJoinLink(http, home, owner, sixth);
   assert.equal(joined.status, 200, await joined.clone().text());

@@ -1,8 +1,22 @@
 {
-  "runner": "headless Chromium (no GPU) on an arm64 host, against staging; baseline 2026-11-12 (3 collections of 3 runs): slow-frame time 58-62%, frame p95 100-117 ms, channel switch 196-212 ms. From tool 0.7.0 a switch starts at the click event's own timestamp instead of when the page's listener ran (a few ms earlier); the lines were not moved. Take the baseline again on a quiet runner: with this host under heavy load, the old and the new tool both read 540-1250 ms for the switch",
+  "runner": "headless Chromium (no GPU) on a 12-core arm64 host, against staging. Lines set 2026-11-14 on the page below from 5 collections of 3 runs (web 5ff9c256..1d8dfdf6, after #14870 and #14873), host load average about 6.5 and no run flagged busy: channel switch 359-389 ms, slow-frame time 25.2-27.6%, frame p95 66.6-66.7 ms. The lines of 2026-11-12 (350 ms, 80%, 160 ms) were set on another channel (#qa-biginbox) and were not comparable with this page: 375 ms here read as over a line it was never measured against",
+  "page": {
+    "server": "qa-wa-1ilac",
+    "channel": "wa-main",
+    "other": "all"
+  },
   "marks": {
-    "scroll_slow_frame_pct": { "max": 80, "note": "share of scroll time spent in frames over 33.4 ms" },
-    "scroll_frame_p95_ms": { "max": 160, "note": "95th percentile frame interval while scrolling" },
-    "channel_switch_ms": { "max": 350, "note": "sidebar click to the channel's own messages painted (the slower direction), timed in the page" }
+    "scroll_slow_frame_pct": {
+      "max": 40,
+      "note": "share of scroll time spent in frames over 33.4 ms"
+    },
+    "scroll_frame_p95_ms": {
+      "max": 100,
+      "note": "95th percentile frame interval while scrolling"
+    },
+    "channel_switch_ms": {
+      "max": 480,
+      "note": "sidebar click to the channel's own messages painted (the slower direction), timed in the page"
+    }
   }
 }

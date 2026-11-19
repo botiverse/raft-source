@@ -3,14 +3,6 @@ import type { ChangeEvent, FormEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
 import { Info, TriangleAlert } from "lucide-react";
 import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogBody,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
   Banner,
   BannerDescription,
   BannerTitle,
@@ -21,6 +13,7 @@ import {
   Dialog,
   DialogBody,
   DialogClose,
+  DialogContent,
   DialogDescription,
   DialogFooter,
   DialogHeader,
@@ -175,22 +168,23 @@ export function WeChatConnectDialog({ name, status, onClose }: {
           </>
         )}
 
-        <AlertDialog open={confirmDiscard} onOpenChange={handleDiscardOpenChange}>
-          <AlertDialogContent data-testid="wechat-discard-confirm">
-            <AlertDialogHeader>
-              <AlertDialogTitle>{formatMessage({ id: "message.chatPanel.overflow.unsavedTitle" })}</AlertDialogTitle>
-            </AlertDialogHeader>
-            <AlertDialogBody>{formatMessage({ id: "agent.detail.editProfile.discardBody" })}</AlertDialogBody>
-            <AlertDialogFooter>
-              <AlertDialogCancel size="lg">
+        <Dialog open={confirmDiscard} onOpenChange={handleDiscardOpenChange}>
+          <DialogContent size="sm" data-testid="wechat-discard-confirm">
+            <DialogHeader>
+              <DialogTitle>{formatMessage({ id: "agent.detail.editProfile.discardTitle" })}</DialogTitle>
+              <DialogClose aria-label={formatMessage({ id: "common.confirm.closeDialog" })} />
+            </DialogHeader>
+            <DialogBody>{formatMessage({ id: "agent.detail.editProfile.discardBody" })}</DialogBody>
+            <DialogFooter>
+              <DialogClose render={<Button variant="ghost" size="lg" />}>
                 {formatMessage({ id: "message.chatPanel.overflow.keepEditing" })}
-              </AlertDialogCancel>
-              <AlertDialogAction variant="danger" size="lg" onClick={close} data-testid="wechat-discard-confirm-action">
-                {formatMessage({ id: "message.chatPanel.overflow.discardChanges" })}
-              </AlertDialogAction>
-            </AlertDialogFooter>
-          </AlertDialogContent>
-        </AlertDialog>
+              </DialogClose>
+              <Button variant="danger" size="lg" onClick={close} data-testid="wechat-discard-confirm-action">
+                {formatMessage({ id: "agent.detail.editProfile.discard" })}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </NarrowDialogContent>
     </Dialog>
   );

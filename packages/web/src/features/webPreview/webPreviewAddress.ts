@@ -25,3 +25,38 @@ export function typedWebAddress(text: string): URL | null {
   // A bare word is not a host: a name needs a dot unless it is this computer's.
   return url && (local || url.hostname.includes(".") || url.hostname.startsWith("[")) ? url : null;
 }
+
+/** The most characters of a refused address shown after its host (or its scheme); the rest is cut with "…". */
+export const BLOCKED_ADDRESS_REST_MAX = 48;
+/** The most characters of a refused address in the hover text. */
+const BLOCKED_ADDRESS_FULL_MAX = 2048;
+
+function cut(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+/**
+ * The address a page chose and the built-in browser refused, as the notice
+ * shows it before its button opens it: `lead` is what says where it goes and
+ * is never cut (a web address's host, without any user:password@; another
+ * application's scheme), `rest` is what follows (path, query and fragment; the
+ * scheme's target), cut to BLOCKED_ADDRESS_REST_MAX; `full` is the whole
+ * address for the hover text. Every part is the address as WHATWG serializes
+ * it (ASCII: a host in punycode, anything else percent-encoded), so no
+ * character of the page's choosing (a right-to-left override, a look-alike
+ * letter) reaches Raft's own words. Null where it doesn't parse.
+ */
+export function blockedAddressParts(address: string): { lead: string; rest: string; full: string } | null {
+  let url: URL;
+  try {
+    url = new URL(address);
+  } catch {
+    return null;
+  }
+  const full = cut(url.href, BLOCKED_ADDRESS_FULL_MAX);
+  if (url.protocol === "http:" || url.protocol === "https:") {
+    const rest = `${url.pathname}${url.search}${url.hash}`;
+    return { lead: url.host, rest: rest === "/" ? "" : cut(rest, BLOCKED_ADDRESS_REST_MAX), full };
+  }
+  return { lead: url.protocol, rest: cut(url.href.slice(url.protocol.length), BLOCKED_ADDRESS_REST_MAX), full };
+}

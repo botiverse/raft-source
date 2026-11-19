@@ -12,7 +12,7 @@ import { dbTest as test } from "../test/integration/dbTest";
 import { closeTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
 
-import { DAEMON_CAPABILITY_RUNTIME_HOST_OAR, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CODEX, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_GROK, type ServerToMachineMessage } from "@botiverse/raft-shared";
+import { DAEMON_CAPABILITY_RUNTIME_HOST_OAR, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CODEX, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_GROK, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_OPENCODE, type ServerToMachineMessage } from "@botiverse/raft-shared";
 
 import { getDb } from "../db/index";
 import { agents, machines, serverMembers, servers, users } from "../db/schema";
@@ -184,8 +184,6 @@ test("OAR host: an OAR-only runtime (Qwen Code) always asks for the OAR host fro
   assert.equal((await startConfig("oar-qwen-no-cap", { runtime: "qwen", capabilities: [] })).runtimeHost, undefined);
   assert.equal(agentRuntimeOarFeatureFlagKey("qwen"), null);
   assert.equal(agentRuntimeOarFeatureFlagKey("qoder"), null);
-  assert.equal((await startConfig("oar-codebuddy-no-flag", { runtime: "codebuddy" })).runtimeHost, "oar");
-  assert.equal(agentRuntimeOarFeatureFlagKey("codebuddy"), null);
 });
 
 test("OAR host: a Computer with runtime-host:oar but not runtime-host:oar:grok keeps the Grok driver with the flag on (#oar-raft:#4)", async ({ db: _db }) => {
@@ -206,6 +204,19 @@ test("OAR host: Cursor needs agent_runtime_oar_cursor on and a Computer with run
   assert.equal((await startConfig("oar-cursor-lone-cap", { runtime: "cursor", capabilities: [DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR] })).runtimeHost, undefined, "the Cursor capability alone is not the OAR host");
   // The Cursor flag moves no other runtime.
   assert.equal((await startConfig("oar-cursor-flag-grok", { capabilities: [...cursorReady, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_GROK] })).runtimeHost, undefined);
+});
+
+test("OAR host: OpenCode needs agent_runtime_oar_opencode on and a Computer with runtime-host:oar:opencode", async ({ db: _db }) => {
+  const opencodeReady = [DAEMON_CAPABILITY_RUNTIME_HOST_OAR, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_OPENCODE];
+  assert.equal(agentRuntimeOarFeatureFlagKey("opencode"), "agent_runtime_oar_opencode");
+  // Flag x capability: only both together ask for the OAR host.
+  assert.equal((await startConfig("oar-opencode-no-flag", { runtime: "opencode", capabilities: opencodeReady })).runtimeHost, undefined, "default off: no flag row");
+  await createFeatureFlag({ key: AGENT_RUNTIME_OAR_FEATURE_FLAG_KEYS.opencode, randomizationUnit: "server", defaultEnabled: true });
+  assert.equal((await startConfig("oar-opencode-on", { runtime: "opencode", capabilities: opencodeReady })).runtimeHost, "oar");
+  assert.equal((await startConfig("oar-opencode-no-cap", { runtime: "opencode", capabilities: [DAEMON_CAPABILITY_RUNTIME_HOST_OAR] })).runtimeHost, undefined, "an older Computer (or Windows) keeps the driver");
+  assert.equal((await startConfig("oar-opencode-lone-cap", { runtime: "opencode", capabilities: [DAEMON_CAPABILITY_RUNTIME_HOST_OAR_OPENCODE] })).runtimeHost, undefined, "the OpenCode capability alone is not the OAR host");
+  // The OpenCode flag moves no other runtime.
+  assert.equal((await startConfig("oar-opencode-flag-grok", { capabilities: [...opencodeReady, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_GROK] })).runtimeHost, undefined);
 });
 
 test("OAR host: the server kill switch keeps Cursor on its driver with the flag on", async ({ db: _db }) => {

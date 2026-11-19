@@ -690,7 +690,7 @@ export function PlanSectionContent({
       )}
       {showCancelSubscriptionConfirm && (
         <ConfirmDialog
-          title={formatMessage({ id: "billing.cancelSubscription" })}
+          title={formatMessage({ id: "planBilling.cancel.confirmTitle" })}
           message={cancelConfirmMessage(formatMessage, server.name, billing?.externalChannelsTotal)}
           confirmLabel={formatMessage({ id: "billing.cancelSubscription" })}
           loadingLabel={formatMessage({ id: "billing.canceling" })}

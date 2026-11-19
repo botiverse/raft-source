@@ -527,9 +527,10 @@
       "fields": [
         "updatedAt",
         "delegatedBy",
-        "delegatedByAgentId"
+        "delegatedByAgentId",
+        "voiceCallId"
       ],
-      "migrationStatus": "web canonical zero-consumption; mobile legacy consumption to retire in round-2 (label/event-key/SQL cache -> (epoch,seq,id/revision) adjudication); RFC 077 delegation fields: web/mobile label pending (Kirby / Lagoon)"
+      "migrationStatus": "web canonical zero-consumption; mobile legacy consumption to retire in round-2 (label/event-key/SQL cache -> (epoch,seq,id/revision) adjudication); RFC 077 delegation fields: web/mobile label pending (Kirby / Lagoon); voiceCallId: agent-facing only, no client label planned"
     },
     "viewerScopedFields": {
       "fields": [

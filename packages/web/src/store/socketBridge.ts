@@ -16,7 +16,7 @@ import { applyReadStateUpdate } from "./applyReadStateUpdate";
 import { useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import type { NavigateFunction } from "react-router-dom";
-import { ACTIVITY_CHANGED_EVENT, LIST_CHANGED_EVENTS, PRODUCT_FEEDBACK_UNREAD_EVENT, SERVER_FEATURES_CHANGED_SOCKET_EVENT, failpoints, isNotificationLevel, isRaftThemeId, SOCKET_NOT_SERVER_MEMBER_ERROR, SOCKET_SSO_REQUIRED_ERROR } from "@botiverse/raft-shared";
+import { ACTIVITY_CHANGED_EVENT, LIST_CHANGED_EVENTS, PRODUCT_FEEDBACK_APP_UNREAD_EVENT, PRODUCT_FEEDBACK_UNREAD_EVENT, SERVER_FEATURES_CHANGED_SOCKET_EVENT, failpoints, isNotificationLevel, isRaftThemeId, SOCKET_NOT_SERVER_MEMBER_ERROR, SOCKET_SSO_REQUIRED_ERROR } from "@botiverse/raft-shared";
 import api from "../api/client";
 import type { ActivityChangedEvent, AgentActivityStatePayload, AgentSeenEvent, ComputerVersionGate, CredentialHoldActivityDiagnostic, DeliveryConsumptionActivityDiagnostic, RuntimeErrorCode, SpawnFailureActivityDiagnostic, ToolStuckActivityDiagnostic, WakeCrashLoopActivityDiagnostic } from "@botiverse/raft-shared";
 import {
@@ -44,7 +44,7 @@ import { useChannelStore } from "./channelStore";
 import { dispatchServerNotificationPrefsUpdated } from "./events/notificationPrefsEvents";
 import { cancelInboxBackgroundRefresh, compareActivitySeq, requestInboxBackgroundRefresh, useInboxStore } from "./inboxStore";
 import { liveActivityUnread } from "./inboxInPlaceUnread";
-import { isThreadReplyGap, requestResumeGapReread, storedMessageLive } from "./inboxLiveCatchUp";
+import { echoTakenByPosition, isThreadReplyGap, rereadThreadRowOnGap, requestResumeGapReread, storedMessageLive } from "./inboxLiveCatchUp";
 import type { InboxLiveUnread } from "./inboxInPlaceUnread";
 import { useLiveAgentActivityStore } from "./liveAgentActivityStore";
 import { isAgentActivitySubscribed, resubscribeAgentActivity, setAgentActivitySubscriptionSocket } from "./agentActivitySubscriptions";
@@ -104,7 +104,7 @@ import { createCoalescedRefresh } from "../utils/coalescedRefresh";
 import { dropOwedReads, heldWhileHidden, noteLiveSessionRecovery, setOwedGapReadsPaidListener, traceLiveSession } from "./hiddenOwedReads";
 import { channelOwesGapFill } from "./liveGapFill";
 import { listChangedSocketBindings, requestListsAfterReconnect } from "./listChangedSocket";
-import { acceptFeedbackUnreadPush, refreshFeedbackUnreadAfterReconnect } from "../feedback/feedbackUnreadState";
+import { acceptFeedbackAppUnreadPush, acceptFeedbackUnreadPush, refreshFeedbackUnreadAfterReconnect } from "../feedback/feedbackUnreadState";
 import { isTaskConversationMessage, taskIdOfConversationMessage } from "../utils/taskConversation";
 
 export interface SocketLike {
@@ -222,6 +222,7 @@ export const MAIN_LAYOUT_SOCKET_EVENT_NAMES = [
   ...LIST_CHANGED_EVENTS, // listChangedSocket.ts
   SERVER_FEATURES_CHANGED_SOCKET_EVENT, // listChangedSocket.ts: a list's gating flag (flags themselves: featureFlagRealtimeSync.ts)
   PRODUCT_FEEDBACK_UNREAD_EVENT, // feedback/feedbackUnreadState.ts: the "new reply" dot's count
+  PRODUCT_FEEDBACK_APP_UNREAD_EVENT, // feedback/feedbackUnreadState.ts: a mobile App's share of it
 ] as const;
 
 type SocketHandler = {
@@ -382,7 +383,7 @@ export function applyTaskConversationReply(msg: Message): void {
 // hidden page defers it until it is visible again.
 const FOLLOWED_THREADS_REFRESH_DELAY_MS = 1500;
 const followedThreadsRefresh = createCoalescedRefresh({
-  run: () => loadFollowedThreads("realtime_fallback"),
+  run: (coalesced) => { void useThreadStore.getState().loadFollowedThreads("realtime_fallback", { trigger: "followed_not_listed", coalesced }); }, // #triage:#389
   delayMs: FOLLOWED_THREADS_REFRESH_DELAY_MS,
   isVisible: () => typeof document === "undefined" || document.visibilityState === "visible",
 });
@@ -801,7 +802,7 @@ function bootstrapMainLayoutRealtimeBridge(
   // Not needed for the first screen (boot/deferredUi).
   afterFirstScreen(() => {
     void useSavedStore.getState().loadSaved();
-    void useAnnouncementStore.getState().load();
+    void useAnnouncementStore.getState().ensureLoaded(); // the server switch's read, if it had one
   }, "bootstrap:saved+announcements");
 }
 
@@ -852,9 +853,9 @@ export function buildMainLayoutSocketBindings(
       // My own send can land from its HTTP answer first, another from a catch-up: the row still
       // needs it, and (#244) its first live patch counts unless its row already counted it.
       const live = storedMessageLive(msg);
-      if (live) useInboxStore.getState().receiveThreadReply(msg, live);
-      patchActivityChannelRow(msg, live);
-      applyMessageChannelActivity(msg, scheduleInboxRefresh, "message_echo");
+      const threadTaken = !!live && useInboxStore.getState().receiveThreadReply(msg, live);
+      const taken = echoTakenByPosition(patchActivityChannelRow(msg, live) || threadTaken); // #244 step 2: flag on, its rows took it
+      applyMessageChannelActivity(msg, taken ? () => {} : scheduleInboxRefresh, "message_echo");
     }
   };
 
@@ -1356,13 +1357,14 @@ export function buildMainLayoutSocketBindings(
       : false;
     if (!suppressActivity) {
       const replyGap = isThreadReplyGap(data.threadChannelId, effectiveReplyCount);
-      if (data.latestReply) useInboxStore.getState().receiveThreadReply(data.latestReply, liveActivityUnread(data.latestReply, "thread_reply"));
+      // #244 step 3b (inbox_message_inplace_v1): a listed row patched in full on a settled list needs no re-read; a reply gap still does.
+      const skipsReread = !!data.latestReply && useInboxStore.getState().receiveThreadReply(data.latestReply, liveActivityUnread(data.latestReply, "thread_reply", "thread:updated"));
       useInboxStore.getState().updateThreadActivityMeta(
         data.threadChannelId,
         effectiveReplyCount,
         data.lastReplyAt,
       );
-      scheduleInboxRefresh(replyGap ? "reply_gap" : "thread_reply");
+      if (replyGap ? !rereadThreadRowOnGap(data.threadChannelId) : !skipsReread) scheduleInboxRefresh(replyGap ? "reply_gap" : "thread_reply");
     }
   };
 
@@ -1600,6 +1602,7 @@ export function buildMainLayoutSocketBindings(
     ...agentReadProgressSocketBindings(),
     { event: "read_state:updated", handler: readStateUpdated },
     { event: PRODUCT_FEEDBACK_UNREAD_EVENT, handler: acceptFeedbackUnreadPush },
+    { event: PRODUCT_FEEDBACK_APP_UNREAD_EVENT, handler: acceptFeedbackAppUnreadPush },
     { event: "sync:changed", handler: handleSyncChanged },
     ...listChangedSocketBindings(),
     { event: "read_state:updated_bulk", handler: readStateUpdatedBulk },
@@ -1717,17 +1720,16 @@ function applyLiveMessageActivity(
 ) {
   releaseActivityReadHoldForLiveMessage(msg);
   if (isMessageActivitySuppressedByMute(msg)) return;
-  // #244: its existing row's unread too, in place (the re-read stays for now).
-  const live = liveActivityUnread(msg, "message_new");
-  useInboxStore.getState().receiveThreadReply(msg, live);
-  patchActivityChannelRow(msg, live);
-  applyMessageChannelActivity(msg, scheduleInboxRefresh, "message_new");
+  // #244: its existing row's unread too, in place; step 3b (inbox_message_inplace_v1): a listed row patched in full on a settled list needs no re-read.
+  const live = liveActivityUnread(msg, "message_new", "message:new");
+  const skipsReread = useInboxStore.getState().receiveThreadReply(msg, live);
+  applyMessageChannelActivity(msg, patchActivityChannelRow(msg, live) || skipsReread ? () => {} : scheduleInboxRefresh, "message_new");
 }
 
-/** Seq-guarded, so a repeat delivery is a no-op. Not past a mute: the served row stops there. */
-function patchActivityChannelRow(msg: Message, live?: InboxLiveUnread): void {
-  if (isMessageInMutedActivityRange(msg)) return;
-  useInboxStore.getState().receiveChannelMessage(msg, live);
+/** Seq-guarded, so a repeat delivery is a no-op. Not past a mute: the served row stops there. True: its re-read can be skipped. */
+function patchActivityChannelRow(msg: Message, live?: InboxLiveUnread): boolean {
+  if (isMessageInMutedActivityRange(msg)) return false;
+  return useInboxStore.getState().receiveChannelMessage(msg, live);
 }
 
 function releaseActivityReadHoldForLiveMessage(msg: Message): void {

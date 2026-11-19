@@ -565,6 +565,28 @@ export function wakeRecycleKindTraceAttrs(
 export const COLD_IDLE_SWEEP_MS = 10 * 60_000;
 
 /**
+ * #proj-runtime:#63: how long an idle process of these runtimes is kept for a
+ * fast next wake. Codex's `app-server` re-downloads the model catalog every
+ * 270 s while it lives, idle or not (codex 0.159 `models_refresh_worker`,
+ * no setting): ~0.66 MB each time, ~6.4 GB a month per idle agent. Past an
+ * hour the model's prompt cache is cold anyway, so the process buys almost
+ * nothing; it is stopped and the next wake resumes the same thread. Unlike
+ * the cold-idle recycle, whatever the context size and whatever the
+ * Server's wake-recycle flags. `RAFT_IDLE_PROCESS_STOP_MS` (agent env var,
+ * then the daemon's) sets the wait; 0 turns it off.
+ */
+export const IDLE_PROCESS_STOP_MS = 60 * 60_000;
+export const IDLE_PROCESS_STOP_RUNTIMES: ReadonlySet<string> = new Set<string>(["codex"]);
+
+/** The idle process stop's wait for this agent (IDLE_PROCESS_STOP_MS unless set); 0 is off. */
+export function idleProcessStopMs(agentEnvVars: Record<string, string> | null | undefined, processEnv: NodeJS.ProcessEnv = process.env): number {
+  const raw = agentEnvVars?.RAFT_IDLE_PROCESS_STOP_MS ?? processEnv.RAFT_IDLE_PROCESS_STOP_MS;
+  if (raw === undefined || raw.trim() === "") return IDLE_PROCESS_STOP_MS;
+  const ms = Number(raw);
+  return Number.isFinite(ms) && ms >= 0 ? ms : IDLE_PROCESS_STOP_MS;
+}
+
+/**
  * Cold idle (RFC 070, reconciler step 8b) is a session policy, not idle: a
  * process that is idle (agentIdle.ts, decided by the caller) is cold when no
  * event has come from it for longer than the cold gap AND its session's

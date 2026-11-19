@@ -19,7 +19,8 @@ const formatTokens = (value: number): string => `${value.toLocaleString("en-US")
  * default (`raft_default`): only humans see the web warning, so the agent is
  * told which values are defaults and how it can declare the real ones. Pi
  * applies a `modelOverrides` entry of `<agentDir>/models.json` over the model
- * Raft registers; the file is read when the session's services are built, at
+ * Raft registers (only those entries' limits and metadata: piBuiltInModelsJson.ts
+ * filters the file); the file is read when the session's services are built, at
  * the agent's next start (a rotation reuses them), and configureBuiltIn*CustomModel
  * report such a value as `catalog`. Null when no value is a default. The ids
  * are the registry's, never a base URL, key or env value.
@@ -60,6 +61,7 @@ export const formatBuiltInDefaultModelLimitsNote = axSurface(
       "```",
       "",
       "- Keep the file valid JSON: Pi ignores an invalid models.json entirely, all of its settings, not only these.",
+      "- Only `modelOverrides` limits and model metadata in this file apply. Raft ignores endpoint, header, key and other transport or auth settings in it (`baseUrl`, `headers`, `apiKey`, `compat`, `models`, ...).",
       "- A value there also overrides the Context window or Max output tokens your owner sets in your agent settings.",
       "- It applies the next time you are started (a restart from your page in Raft, or a restart of your Computer), not in this session.",
       "",

@@ -8,6 +8,7 @@ import {
   BOOT_CHUNK_PAGES,
   CATALOG_GATE,
   CATALOG_PARTS,
+  FIRST_PART_PAGES,
   idsNamedBy,
   partKey,
   splitCatalog,
@@ -61,6 +62,20 @@ export function firstDownload(chunks: Iterable<ChunkLike>): Set<string> {
   const byName = new Map<string, ChunkLike>();
   for (const chunk of chunks) byName.set(chunk.fileName, chunk);
   return staticClosure([...byName.values()].filter((chunk) => chunk.isEntry).map((chunk) => chunk.fileName), byName);
+}
+
+/**
+ * The chunks whose words are in the first part: the first download, and the
+ * FIRST_PART_PAGES with the chunks they import statically. Loading one waits
+ * for no part (gateFor).
+ */
+export function firstPartDownload(chunks: Iterable<ChunkLike>, firstPartFacades: ReadonlySet<string>): Set<string> {
+  const byName = new Map<string, ChunkLike>();
+  for (const chunk of chunks) byName.set(chunk.fileName, chunk);
+  const roots = [...byName.values()]
+    .filter((chunk) => chunk.isEntry || (chunk.facadeModuleId !== null && firstPartFacades.has(chunk.facadeModuleId)))
+    .map((chunk) => chunk.fileName);
+  return staticClosure(roots, byName);
 }
 
 /** The chunks a boot-started page downloads beside the first download: its own and those it imports statically. */
@@ -129,6 +144,7 @@ export function catalogPartsPlugin(): Plugin {
   let base = "/";
   let root = process.cwd();
   let bootFacades = new Set<string>();
+  let firstPartFacades = new Set<string>();
   let first: Set<string> | null = null;
   let firstOf: object | null = null;
   return {
@@ -148,6 +164,12 @@ export function catalogPartsPlugin(): Plugin {
         if (!info?.dynamicallyImportedIds.length) this.error(`catalog parts: ${loader} (BOOT_CHUNK_LOADERS) is not in the build or loads nothing`);
         for (const id of info!.dynamicallyImportedIds) bootFacades.add(id);
       }
+      firstPartFacades = new Set();
+      for (const page of FIRST_PART_PAGES) {
+        const id = resolve(root, page);
+        if (!this.getModuleInfo(id)) this.error(`catalog parts: ${page} (FIRST_PART_PAGES) is not in the build`);
+        firstPartFacades.add(id);
+      }
       for (const page of BOOT_CHUNK_PAGES) {
         const id = resolve(root, page);
         if (!this.getModuleInfo(id)) this.error(`catalog parts: ${page} (BOOT_CHUNK_PAGES) is not in the build`);
@@ -157,7 +179,7 @@ export function catalogPartsPlugin(): Plugin {
     renderChunk(code, chunk, _options, meta) {
       const chunks = meta.chunks as Record<string, ChunkLike>;
       if (firstOf !== chunks) {
-        first = firstDownload(Object.values(chunks));
+        first = firstPartDownload(Object.values(chunks), firstPartFacades);
         firstOf = chunks;
       }
       const wrapped = wrapLazyImports(code, chunk.fileName, chunks, first!, bootFacades);
@@ -168,7 +190,7 @@ export function catalogPartsPlugin(): Plugin {
     },
     async generateBundle(_options, bundle) {
       const chunks = Object.values(bundle).flatMap((output) => (output.type === "chunk" ? [output] : []));
-      const initial = firstDownload(chunks);
+      const initial = firstPartDownload(chunks, firstPartFacades);
       const boot = bootDownload(chunks, bootFacades, initial);
       if (boot.size === 0) this.error("catalog parts: no boot-started page chunk in this build");
       const catalogs = await readCatalogs(root);

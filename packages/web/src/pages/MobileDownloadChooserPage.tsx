@@ -18,6 +18,7 @@ import { useDesktopDownloadView } from "../components/settings/DesktopDownloadOp
 import type { DesktopDownloadView } from "../components/settings/DesktopDownloadOptions";
 import MobileDownloadQr from "../components/settings/MobileDownloadQr";
 import LeavingRaftMark, { opensInNewTabAriaLabel } from "../components/ui/LeavingRaftMark";
+import { trackDesktopDownloadClicked, trackMobileDownloadClicked } from "../analytics/appDownload";
 
 /**
  * Public download page, `/download` (raft-design
@@ -74,6 +75,12 @@ type DownloadLink = {
   iconSrc?: string;
   /** The row's leading line icon: a smartphone for a phone platform, a monitor for a computer. */
   icon: ReactNode;
+  /**
+   * Counts the click (app_download_clicked, analytics/appDownload.ts). This
+   * page is public and has no server loaded, so today nothing is sent from
+   * it: the sender only sends for the server a signed-in tab is in.
+   */
+  onClick: () => void;
 };
 
 function useMobileLinks(): Record<"ios" | "googlePlay" | "apk", DownloadLink> {
@@ -88,6 +95,7 @@ function useMobileLinks(): Record<"ios" | "googlePlay" | "apk", DownloadLink> {
       testId: "mobile-download-chooser-ios",
       iconSrc: APP_STORE_ICON_URL,
       icon: <Smartphone />,
+      onClick: () => trackMobileDownloadClicked("download_page", "ios", "new_tab"),
     },
     googlePlay: {
       href: GOOGLE_PLAY_URL,
@@ -98,6 +106,7 @@ function useMobileLinks(): Record<"ios" | "googlePlay" | "apk", DownloadLink> {
       testId: "mobile-download-chooser-google-play",
       iconSrc: GOOGLE_PLAY_ICON_URL,
       icon: <Smartphone />,
+      onClick: () => trackMobileDownloadClicked("download_page", "google_play", "new_tab"),
     },
     apk: {
       href: mobileDownloadUrl("android"),
@@ -107,6 +116,7 @@ function useMobileLinks(): Record<"ios" | "googlePlay" | "apk", DownloadLink> {
       store: false,
       testId: "mobile-download-chooser-android",
       icon: <Smartphone />,
+      onClick: () => trackMobileDownloadClicked("download_page", "apk", "same_tab"),
     },
   };
 }
@@ -125,6 +135,7 @@ function desktopLink(
     store: false,
     testId: `desktop-download-chooser-${target}`,
     icon: <Monitor />,
+    onClick: () => trackDesktopDownloadClicked("download_page", target, "same_tab"),
   };
 }
 
@@ -139,9 +150,10 @@ function DownloadRow({ link }: { link: DownloadLink }) {
       aria-label={opensInNewTabAriaLabel(formatMessage, link.rowAria)}
       data-testid={link.testId}
       data-kind="store"
+      onClick={link.onClick}
     />
   ) : (
-    <a href={link.href} aria-label={link.rowAria} data-testid={link.testId} data-kind="installer" />
+    <a href={link.href} aria-label={link.rowAria} data-testid={link.testId} data-kind="installer" onClick={link.onClick} />
   );
   return (
     <ListRow variant="plain" render={anchor}>
@@ -214,9 +226,10 @@ function ThisDeviceBlock({ thisDevice }: { thisDevice: ThisDevice }) {
             aria-label={opensInNewTabAriaLabel(formatMessage, primary.label)}
             data-testid="download-this-device-primary"
             data-kind="store"
+            onClick={primary.onClick}
           />
         ) : (
-          <a href={primary.href} aria-label={primary.label} data-testid="download-this-device-primary" data-kind="installer" />
+          <a href={primary.href} aria-label={primary.label} data-testid="download-this-device-primary" data-kind="installer" onClick={primary.onClick} />
         )}
         nativeButton={false}
         variant="primary"
@@ -229,7 +242,7 @@ function ThisDeviceBlock({ thisDevice }: { thisDevice: ThisDevice }) {
       </Button>
       {footnote ? (
         <p className="text-center text-footnote">
-          <TextLink render={<a href={footnote.href} aria-label={footnote.label} data-testid="download-this-device-footnote" />}>
+          <TextLink render={<a href={footnote.href} aria-label={footnote.label} data-testid="download-this-device-footnote" onClick={footnote.onClick} />}>
             {footnote.label}
             <TextLinkDownloadIcon />
           </TextLink>

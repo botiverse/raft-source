@@ -101,17 +101,31 @@ export type SystemctlRunner = (scope: SupervisorScope, args: string[]) => Promis
 
 const SYSTEMCTL_TIMEOUT_MS = 15_000;
 
+/** Run `program args` with a bound; never a shell. A kill on the bound says so in stderr. */
+function runBounded(program: string, args: string[]): Promise<SystemctlResult> {
+  return new Promise((resolve) => {
+    const child = spawn(program, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+    }, SYSTEMCTL_TIMEOUT_MS);
+    child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+    child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+    child.on("error", (error) => { clearTimeout(timer); resolve({ code: null, stdout, stderr: `${stderr}${error.message}` }); });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      // The note first: a receipt quotes stderr's first line, and a kill on
+      // the bound is the fact that matters.
+      resolve({ code, stdout, stderr: timedOut ? `${program} did not finish within ${SYSTEMCTL_TIMEOUT_MS / 1000} s\n${stderr}` : stderr });
+    });
+  });
+}
+
 /** Run `systemctl [--user] <args>` with a bound; never a shell. */
-export const runSystemctl: SystemctlRunner = (scope, args) => new Promise((resolve) => {
-  const child = spawn("systemctl", scope === "user" ? ["--user", ...args] : args, { stdio: ["ignore", "pipe", "pipe"] });
-  let stdout = "";
-  let stderr = "";
-  const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* already gone */ } }, SYSTEMCTL_TIMEOUT_MS);
-  child.stdout.on("data", (chunk) => { stdout += String(chunk); });
-  child.stderr.on("data", (chunk) => { stderr += String(chunk); });
-  child.on("error", (error) => { clearTimeout(timer); resolve({ code: null, stdout, stderr: `${stderr}${error.message}` }); });
-  child.on("close", (code) => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
-});
+export const runSystemctl: SystemctlRunner = (scope, args) => runBounded("systemctl", scope === "user" ? ["--user", ...args] : args);
 
 /** `systemctl show -P <property>`; null when systemctl is unreachable or the unit is unknown. */
 export async function showUnitProperty(
@@ -249,6 +263,40 @@ export async function inspectSupervisor(slockHome: string, deps: InspectDeps = {
 
 /** KillMode values under which a detached installer survives `systemctl stop`. */
 export const UPGRADE_SAFE_KILL_MODES: readonly string[] = ["process", "mixed"];
+
+/**
+ * Whether this process may open a transient scope with the unit's manager:
+ * what installer 0.3.21+ does to leave the unit before stopping it, whatever
+ * the unit's KillMode (raft-computer-installer rust/systemd.rs `escape`:
+ * `systemd-run [--user] --scope --quiet --collect -- <installer>`; refused,
+ * it writes a `held` receipt). A system unit run as a non-root user is
+ * refused by polkit ("Access denied as the requested operation requires
+ * interactive authentication"), a user unit without a reachable manager
+ * cannot connect: either way the upgrade would be downloaded and held.
+ * Probing with `true` costs one short process and tells before.
+ */
+export type SystemdScopeProbe = (scope: SupervisorScope) => Promise<SystemctlResult>;
+
+/** The installer's own `systemd-run` shape, with `true` for the work. */
+export function systemdScopeProbeArgs(scope: SupervisorScope): string[] {
+  return [...(scope === "user" ? ["--user"] : []), "--scope", "--quiet", "--collect", "--", "true"];
+}
+
+export const runSystemdScopeProbe: SystemdScopeProbe = (scope) => runBounded("systemd-run", systemdScopeProbeArgs(scope));
+
+/**
+ * The refusal when the installer could leave the unit only through a scope
+ * this process cannot open: the installer's own `held` words (rust/systemd.rs
+ * `confinement_reason`, which the server reads as `installation_held` and the
+ * web turns into the stop/install/start steps), plus systemd-run's first line.
+ */
+export function describeScopeUnavailable(unit: string, scope: SupervisorScope, detail: string): string {
+  const firstLine = detail.trim().split("\n")[0] ?? "";
+  const manager = scope === "user" ? "systemctl --user" : "systemctl";
+  return `The Computer service runs in systemd unit ${unit}, which would stop the upgrade together with the service, `
+    + `and the upgrade could not move out of it${firstLine ? ` (systemd-run: ${firstLine})` : ""}. `
+    + `Upgrade from the host: \`${manager} stop ${unit}\`, run the install command, then \`${manager} start ${unit}\`.`;
+}
 
 export function describeKillModeRequirement(unit: string, killMode: string | null): string {
   return `The Computer service runs under systemd unit ${unit} with KillMode=${killMode ?? "unknown"}. `

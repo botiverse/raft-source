@@ -54,11 +54,20 @@ export type ProductEventPropertySpec = (
    * A bare host name such as a referring site (`x.com`): lowercase labels
    * joined by dots, no scheme, path, query, port or IP address.
    */
-  | { readonly type: "hostname" }) & { readonly required?: true };
+  | { readonly type: "hostname" }
+  /**
+   * A campaign name that may be a repository path (`acme/widgets.js`): one or
+   * two segments joined by one `/`, each 1-128 of `[a-z0-9_.-]` and not only
+   * dots (PRODUCT_EVENT_CAMPAIGN_PATH). Still no `@`, space, `%`, `:` or `?`,
+   * so an email, URL or sentence cannot get through. Only for a campaign
+   * value a partner's link names; everything else stays a `string` token.
+   */
+  | { readonly type: "campaign_path" }) & { readonly required?: true };
 
 export const PRODUCT_EVENT_STRING_TOKEN = /^[a-z0-9_-]*$/;
 export const PRODUCT_EVENT_VERSION = /^\d{1,6}\.\d{1,6}\.\d{1,6}(?:-[0-9a-z]{1,16}(?:\.[0-9a-z]{1,16}){0,3})?$/;
 export const PRODUCT_EVENT_HOSTNAME = /^(?=.{1,253}$)[a-z0-9-]+(?:\.[a-z0-9-]+)+$/;
+export const PRODUCT_EVENT_CAMPAIGN_PATH = /^(?!\.+(?:\/|$))[a-z0-9_.-]{1,128}(?:\/(?!\.+$)[a-z0-9_.-]{1,128})?$/;
 const IPV4_ADDRESS = /^\d+(?:\.\d+){3}$/;
 
 export interface ProductEventSpec {
@@ -135,7 +144,41 @@ export const NATIVE_SETTINGS_PAGE_TABS = ["mobile", "storage"] as const;
 // its Create agent ▾ menu, which takes over from the web's `sidebar_external`.
 // `computer_rack`: Create agent in a Computers page card's … menu (2026-11-10;
 // web and the apps).
-export const AGENT_CREATE_ENTRIES = ["sidebar", "sidebar_external", "channel_members", "computer_detail", "members_page", "members_page_external", "computer_rack"] as const;
+// `channel_members_external`: Create external agent in a channel's member
+// list (it sent `channel_members` until 2026-11-15, so the two were one).
+// `link_external`: a `?dialog=connect-external-agent` link (an announcement's
+// button) opened Connect an external agent.
+export const AGENT_CREATE_ENTRIES = ["sidebar", "sidebar_external", "channel_members", "computer_detail", "members_page", "members_page_external", "computer_rack", "channel_members_external", "link_external"] as const;
+
+// External agent setup (Grace, 2026-11-15, #wg-external-agent-ux): what people
+// do in the Create external agent dialog and on the agent page's connection
+// card, up to the agent's first sign-in. No agent id: these are counts of
+// people per step, a sample; which agents connected, and when, is the
+// database's (agents.first_connected_at, Grace's server change).
+/** How the agent will run, as agents.external_setup_method. */
+export const EXTERNAL_AGENT_SETUP_METHODS = ["existing_agent", "sdk"] as const;
+export const EXTERNAL_AGENT_SETUP_SURFACES = ["dialog", "profile_card"] as const;
+/**
+ * `created`: Next made the agent and its credential. `create_failed`: it did
+ * not (nothing is left behind; closing "Verify it's you" is not a failure).
+ * `connected_seen`: the status turned to connected while the dialog or the
+ * card was open, once per opening.
+ */
+export const EXTERNAL_AGENT_SETUP_STEPS = ["created", "create_failed", "connected_seen"] as const;
+/** A copy records that it happened, never what was copied. `credential_*`: on the card only. */
+export const EXTERNAL_AGENT_SETUP_ACTIONS = [
+  "method_switched", "prompt_copied", "credential_copied", "install_copied", "code_copied", "sdk_guide_opened",
+  "credential_created", "credential_replaced", "credential_revoked",
+] as const;
+/**
+ * How the dialog closed. `cancelled`: before anything was made. `discarded`:
+ * the agent was deleted from the confirm. `finish_later`: Done while still
+ * waiting (the agent stays). `done_connected`: closed after it connected.
+ */
+export const EXTERNAL_AGENT_SETUP_CLOSE_RESULTS = ["cancelled", "discarded", "finish_later", "done_connected"] as const;
+const EXTERNAL_AGENT_SETUP_QUESTION =
+  "Where do people stop when setting up an external agent: in the dialog, at copying the prompt or the credential, or waiting for the first sign-in, and does it differ by method?";
+const EXTERNAL_AGENT_SETUP_REQUESTED_BY = "Grace (2026-11-15, dm:@Grace:739ded2c)";
 
 // Bulk "Change model" on the Computer page (flag bulk_change_model_web_v0).
 // Contract agreed with John in #raft-botiverse-user-analytics (2026-10-14).
@@ -544,7 +587,34 @@ export const ARTIFACT_FRAME_DURATION_BUCKETS = ["<500ms", "500ms-2s", "2-5s", ">
 // table (action_card.*) to here: both are written while readers switch
 // (cindyz, 2026-10-26, #proj-analytics:69ac4304). The card itself and its
 // state stay in Postgres (`action_cards`).
-/** Every card type, as `ACTION_CARD_ACTION_TYPES` (the registry test keeps them equal; this file imports nothing). */
+// Services agents ask for that Raft does not offer (AppFather, 2026-11-15,
+// dm task #2). The keys are the whole vocabulary: what an agent typed is
+// matched to one of them (aliases in integrationServiceCatalog.ts, the one
+// list the Apps page can share) or counted as `other`, and the text itself is
+// never stored. Google's services stay separate (the common-services row
+// needs that split). This file imports nothing, so the keys live here.
+export const REQUESTED_SERVICE_KEYS = [
+  "gmail", "google_docs", "google_drive", "google_calendar", "google_sheets", "google_slides",
+  "notion", "linear", "slack", "github", "gitlab", "jira", "confluence", "atlassian",
+  "figma", "asana", "trello", "monday", "clickup", "airtable", "todoist",
+  "hubspot", "salesforce", "zendesk", "intercom", "stripe", "shopify",
+  "sentry", "datadog", "pagerduty", "supabase", "vercel", "cloudflare", "aws", "postgres",
+  "discord", "telegram", "whatsapp", "x", "linkedin", "youtube",
+  "zoom", "microsoft_teams", "outlook", "onedrive", "dropbox",
+  "zapier", "calendly", "perplexity", "workiq",
+] as const;
+export type RequestedServiceKey = (typeof REQUESTED_SERVICE_KEYS)[number];
+/** `not_offered`: the name matched no app at all. `not_installed`: a public Marketplace app this server does not have. */
+export const REQUESTED_SERVICE_OUTCOMES = ["not_offered", "not_installed"] as const;
+/** `login`: `raft integration login`. `lookup`: a `--service` lookup (`integration invoke`, `integration env`, the SDK). */
+export const REQUESTED_SERVICE_COMMANDS = ["login", "lookup"] as const;
+
+/**
+ * Every card type an agent prepares for a person: `ACTION_CARD_ACTION_TYPES`
+ * plus the request card (`request:prepare`, RFC 085), which is stored-only
+ * but is prepared by an agent and decided by a person like the rest. The
+ * registry test keeps the list equal to that; this file imports nothing.
+ */
 export const PRODUCT_EVENT_ACTION_CARD_TYPES = [
   "channel:create",
   "agent:create",
@@ -559,6 +629,7 @@ export const PRODUCT_EVENT_ACTION_CARD_TYPES = [
   "plan:upgrade",
   "agent:migrate",
   "question:ask",
+  "request:prepare",
 ] as const;
 export function isProductEventActionCardType(type: string): type is (typeof PRODUCT_EVENT_ACTION_CARD_TYPES)[number] {
   return (PRODUCT_EVENT_ACTION_CARD_TYPES as readonly string[]).includes(type);
@@ -614,7 +685,7 @@ const ONBOARDING_REQUESTED_BY = "Ferry (2026-10-31, #proj-onboarding:#2)";
 const ONBOARDING_ACCOUNT_QUESTION =
   "Where do new accounts stop between signing up and having a server (verification email, identity, first server), how long does each step take, and on which client?";
 const ONBOARDING_SETUP_QUESTION =
-  "Which server setup step do new owners stop at (connecting a computer, Cindy, the survey, the handoff), what did they do there, and what blocked them?";
+  "Which server setup step do new owners stop at (connecting a computer, Cindy, the first agent, the survey, the handoff), what did they do there, and what blocked them?";
 const ACCOUNT_EVENT_PLATFORM = { type: "enum", values: [...CLIENT_PLATFORMS, "unknown"], required: true } as const;
 // External channel invites (cindyz via Warden/Nova, 2026-11-11, #wg-rbac:#60 / #proj-analytics:51bc46e0):
 // the invite emails a host sends, the invite link opened signed out, and the invitee opening the invite page.
@@ -701,8 +772,31 @@ export type ExternalConnectFinishedResult = (typeof EXTERNAL_CONNECT_RESULTS)[nu
 export type ExternalConnectRefusalCode = (typeof EXTERNAL_CONNECT_REFUSAL_CODES)[number];
 /** The host server's plan, coarse: `free`, or any paid plan (`paid`). */
 export const EXTERNAL_CONNECT_HOST_PLANS = ["free", "paid"] as const;
-/** The setup steps, in the order an owner meets them; not every owner sees every one (the Pro step is Free + flag). */
-export const SERVER_SETUP_STEPS = ["computer_runtime", "create_agent", "survey", "upgrade", "display_style", "handoff"] as const;
+// The redesigned onboarding (stdrc via Ferry, 2026-11-14, onboarding redesign, dm thread with Nova):
+// a first screen before the account exists, three setup steps, then a tour. Registered ahead
+// of the flow: nothing sends these values until it ships.
+const ONBOARDING_V2_REQUESTED_BY = "stdrc via Ferry (2026-11-14, onboarding redesign, dm thread with Nova)";
+const ONBOARDING_TOUR_QUESTION =
+  "How far do new owners get through the tour after setup, and how does it end (finished, skipped, left, or the agent's first result arriving)?";
+/**
+ * `account_created.first_task`: how the person filled in the one thing they
+ * want done on the new flow's first screen. `typed`: wrote it themselves;
+ * `example`: picked an example unchanged; `example_edited`: picked an example
+ * and edited it; `not_sure`: chose "Not sure". A category only: never the text.
+ */
+export const ONBOARDING_FIRST_TASKS = ["typed", "example", "example_edited", "not_sure"] as const;
+/**
+ * The setup steps, in the order an owner meets them; not every owner sees every
+ * one (the Pro step is Free + flag). Two flows share the list. The new flow
+ * (`flow: v2`): `computer_runtime` (shared with the old flow), `cindy_starting`,
+ * `first_agent`. The old flow: `computer_runtime`, `create_agent`, `survey`,
+ * `upgrade`, `display_style`, `handoff`; these stay for older clients and for
+ * servers still on the old flow.
+ */
+export const SERVER_SETUP_STEPS = [
+  "computer_runtime", "cindy_starting", "first_agent",
+  "create_agent", "survey", "upgrade", "display_style", "handoff",
+] as const;
 /** What a person did on a setup step (`server_setup_step_action.action`); each step uses its own few. */
 export const SERVER_SETUP_ACTIONS = [
   // computer_runtime: the commands it shows (mac/Linux: one install-and-connect command, or under "already
@@ -711,20 +805,62 @@ export const SERVER_SETUP_ACTIONS = [
   "copy_install_and_setup_command", "copy_install_command", "copy_setup_command", "copy_runtime_install_command",
   "use_this_computer", "next",
   "start_over", "switch_server", "server_settings", "use_cloud_agent",
+  // computer_runtime, new flow. `start_this_computer`: the desktop app only, one Start that adds this Mac and
+  // starts Cindy (not `use_this_computer`, which only adds the computer). `change_model`: picked another model
+  // for Cindy. In a browser: `download_app`, `open_app` (the desktop app), `install_myself` (the commands instead).
+  // The old flow sends `download_app` and `install_myself` too (no `flow`): its browser computer step offers Raft
+  // Desktop first, the commands behind "Install with a command".
+  "start_this_computer", "change_model", "download_app", "open_app", "install_myself",
   // create_agent
   "create_cindy",
+  // first_agent (new flow). `create_agent_opened`: the person opened Cindy's proposal card.
+  // `create_agent_submitted`: they clicked create. A click, not a success: read success from the agents table.
+  "create_agent_opened", "create_agent_submitted",
   // survey, display_style
   "continue",
   // handoff
   "lets_go",
 ] as const;
-/** Why a setup step cannot go on (`ServerSetupGateReason` values that hold the step). */
-export const SERVER_SETUP_BLOCK_REASONS = [
+/** The old flow's reasons: the `ServerSetupGateReason` values that hold a step (the server and the web check against these). */
+export const SERVER_SETUP_GATE_BLOCK_REASONS = [
   "computer_offline", "computer_status_unknown", "runtime_not_ready", "runtime_checking", "runtime_error",
   "runtime_status_unknown", "official_onboarding_agent_missing", "official_onboarding_agent_unusable",
   "official_onboarding_agent_status_unknown", "resolver_error",
 ] as const;
+/**
+ * Why a setup step cannot go on (`server_setup_blocked.reason`): the gate
+ * reasons, and the new flow's two, which are not gate reasons.
+ * `cindy_start_failed`: Cindy could not start (with `runtime` and `failure`).
+ * `cindy_no_reply`: 2 minutes after Start, Cindy has not sent its first
+ * message. A model that fails and is replaced automatically is
+ * `cindy_start_failed`, not `cindy_no_reply`.
+ */
+export const SERVER_SETUP_BLOCK_REASONS = [...SERVER_SETUP_GATE_BLOCK_REASONS, "cindy_start_failed", "cindy_no_reply"] as const;
+/** `server_setup_blocked.failure`, with `cindy_start_failed`: the runtime's account is out of quota, is not signed in, or anything else. */
+export const SERVER_SETUP_START_FAILURES = ["quota", "not_signed_in", "other"] as const;
+/**
+ * `server_setup_blocked.runtime`, with `cindy_start_failed`: the runtime Cindy was being started on.
+ * Cindy starts from a fixed list, in order: Claude Code, Codex, Kimi Code, then Raft's built-in Pi;
+ * `other` is a reserve for a runtime put on that list before it is added here. The runtime family,
+ * not the exact id (`kimi-sdk` counts as `kimi`); `failure` is about the account that runtime signs in with.
+ */
+export const SERVER_SETUP_START_RUNTIMES = ["claude", "codex", "kimi", "pi", "other"] as const;
+/** The tour after setup has six steps; `tour_step` / `at_step` count from 1. */
+export const ONBOARDING_TOUR_STEP_COUNT = 6;
+/**
+ * `onboarding_tour_ended.how`. `done`: the last step's button; `skip`: Skip;
+ * `left`: the page went away mid-tour (sent as it goes, so it undercounts);
+ * `result_arrived`: the agent's first result came in and the tour gave way.
+ */
+export const ONBOARDING_TOUR_ENDS = ["done", "skip", "left", "result_arrived"] as const;
 const SERVER_SETUP_STEP = { type: "enum", values: SERVER_SETUP_STEPS, required: true } as const;
+/**
+ * `v2` on the new flow's events; absent on the old flow's. `computer_runtime`
+ * is a step of both flows and the new flow rolls out behind a flag, so a date
+ * cannot tell them apart.
+ */
+const SERVER_SETUP_FLOW = { type: "enum", values: ["v2"] } as const;
+const ONBOARDING_TOUR_STEP = { type: "integer", min: 1, max: ONBOARDING_TOUR_STEP_COUNT, required: true } as const;
 /**
  * `true` when the setup page runs inside the mobile app (mobile_server_setup_v1:
  * the app opens this web onboarding in a WebView, with its `raft-onboarding-v1`
@@ -793,6 +929,57 @@ export const DRAFT_PLACES = ["channel", "dm", "thread", "task"] as const;
 export const AGENT_READ_PROGRESS_PARTS = ["faces", "not_reaching_line"] as const;
 export const AGENT_READ_PROGRESS_CONVERSATIONS = ["channel", "thread"] as const;
 
+// The native apps' device settings (Settings › Mobile on a phone; the same
+// cards under Settings › Appearance with a mouse or trackpad). artin via Lagoon,
+// approved by Nova (2026-11-14, #proj-mobile). Enums and booleans only.
+const APP_SETTINGS_REQUESTED_BY = "artin via Lagoon, approved by Nova (2026-11-14, #proj-mobile)";
+/** `app_setting_changed.setting`: one key per setting, the same names as `app_settings_snapshot`'s properties. */
+export const APP_SETTINGS = [
+  "message_alignment", "link_open_mode", "compact_messages", "long_message_collapse", "new_message_menu",
+  "conversation_forward_gesture", "ios_native_nav", "activity_task_status_badges", "composer_enter_sends",
+  "multi_shell_host", "desktop_mode_large_screen", "server_drawer", "home_server_avatar",
+] as const;
+export const APP_SETTING_MESSAGE_ALIGNMENTS = ["left", "right"] as const;
+export const APP_SETTING_LINK_OPEN_MODES = ["system_browser", "in_app_browser"] as const;
+/**
+ * `app_setting_changed.value` / `previous_value`: one list for every setting (a
+ * registry property has one type). An on/off setting is `on` / `off`; the
+ * registry does not check that a value belongs to its setting, the app does.
+ */
+export const APP_SETTING_VALUES = ["on", "off", ...APP_SETTING_MESSAGE_ALIGNMENTS, ...APP_SETTING_LINK_OPEN_MODES] as const;
+/** Where the setting was changed: Settings › Mobile, or the same cards under Settings › Appearance (mouse or trackpad). */
+export const APP_SETTING_SURFACES = ["settings_mobile", "settings_appearance"] as const;
+
+// Getting the Raft app from inside Raft (cindyz, 2026-11-13, user source work,
+// #proj-analytics:72b5e0e2): a click on a link that downloads Raft Desktop or
+// a mobile app, or opens its store listing.
+/** What the link gives: an installer for that OS, the App Store or Google Play listing, the Android APK, or the /download page (where the choice is its own click). */
+export const APP_DOWNLOAD_TARGETS = ["mac", "windows", "linux", "ios", "google_play", "apk", "download_page"] as const;
+/** Where the link is: Settings › About, the "open in Raft Desktop" banner, a phone's "app not installed" sheet, the /download page. */
+export const APP_DOWNLOAD_SURFACES = ["settings_about", "desktop_banner", "phone_sheet", "download_page", "server_setup"] as const;
+/** The desktop installer asked for, as /api/desktop-download's `target` names it (`-` as `_`). */
+export const APP_DOWNLOAD_DESKTOP_BUILDS = ["mac", "mac_arm64", "mac_x64", "windows", "linux_appimage", "linux_deb"] as const;
+
+/**
+ * The `target` values GET /api/desktop-download accepts, as the link spells
+ * them. The route (packages/server/src/routes/desktopDownload.ts) keys its
+ * installer table by this list and `desktop_download_requested` records it,
+ * so the server's route and the registry cannot drift. (The web keeps its own
+ * list of the targets it links to, packages/web/src/utils/desktopDownload.ts.)
+ */
+export const DESKTOP_DOWNLOAD_TARGETS = ["mac", "mac-arm64", "mac-x64", "linux-appimage", "linux-deb", "windows"] as const;
+export type DesktopDownloadTarget = (typeof DESKTOP_DOWNLOAD_TARGETS)[number];
+/**
+ * `from=app` on a /api/desktop-download link: the Raft web app (the desktop
+ * app embeds it) made the link. The route records no
+ * `desktop_download_requested` for it (Tenny, 2026-11-15, slock #15014): a
+ * click inside the product must not add an analytics row for someone who
+ * turned "share usage data" off, even a row without a person, and people who
+ * share are already counted by `app_download_clicked`.
+ */
+export const DESKTOP_DOWNLOAD_FROM_PARAM = "from";
+export const DESKTOP_DOWNLOAD_FROM_APP = "app";
+
 // The Computers page (/computers; cindyz, 2026-11-12, #proj-analytics:a559ea75):
 // which filters, groupings and default sort the page needs. A snapshot of what
 // the page showed when it opened, each control the person changed, and each
@@ -844,14 +1031,35 @@ export const PRODUCT_EVENT_REGISTRY = {
   // up, how, and whether an invite brought them. The cohort start for "new
   // users"; the client is what the signup request said (X-Raft-Client-Platform),
   // `unknown` when it did not. Nothing that identifies the person.
+  // utm_* (artin / Edgar, 2026-11-13, #triage:#363): the campaign link that
+  // brought a web sign-up, as the web app's landing URL carried it; absent
+  // when there was none, on company SSO and on native sign-ups. `utm_campaign`
+  // may be a partner's repository path (`owner/repo`).
+  // referrer_domain (cindyz, 2026-11-13, #proj-analytics:72b5e0e2): the
+  // external site the visitor was on before Raft's landing site, which passes
+  // it on the sign-up link as `ref_domain`. Stored as on public_page_viewed
+  // (the registrable domain); absent when unknown, for Raft's own hosts, on
+  // company SSO and on native sign-ups.
+  // first_task (stdrc via Ferry, 2026-11-14, onboarding redesign): how the
+  // person wrote the one thing they want done on the new flow's first screen,
+  // shown before the account exists (app.raft.build/signup, the desktop app's
+  // and the mobile app's first screen); submitted with the sign-up, like the
+  // campaign values (ONBOARDING_FIRST_TASKS). Absent when that screen was not
+  // shown (the old flow, company SSO), and also when a client showed it but
+  // does not send the value yet (the mobile app's native sign-up). Never the text.
   account_created: {
-    question: "On which client do new accounts sign up, with which method, and did an invite bring them? (Where new users come from; the start of new-user cohorts.)",
-    requestedBy: "xxchan (2026-10-22, task #13)",
+    question: "On which client do new accounts sign up, with which method, did an invite bring them, and which campaign link or referring site brought the sign-up? (Where new users come from; the start of new-user cohorts.)",
+    requestedBy: "xxchan (2026-10-22, task #13); artin / Edgar (2026-11-13, #triage:#363); cindyz (2026-11-13, user source work, #proj-analytics:72b5e0e2)",
     sources: ["server"],
     properties: {
       platform: { type: "enum", values: [...CLIENT_PLATFORMS, "unknown"], required: true },
       method: { type: "enum", values: ["email", "google", "github", "apple"], required: true },
       invited: { type: "boolean", required: true },
+      utm_source: CAMPAIGN_TOKEN,
+      utm_medium: CAMPAIGN_TOKEN,
+      utm_campaign: { type: "campaign_path" },
+      referrer_domain: { type: "hostname" },
+      first_task: { type: "enum", values: ONBOARDING_FIRST_TASKS },
     },
   },
   // The verification email of an email signup went out, at signup or on "Resend": whether the
@@ -1027,9 +1235,11 @@ export const PRODUCT_EVENT_REGISTRY = {
     question: ONBOARDING_SETUP_QUESTION,
     requestedBy: ONBOARDING_REQUESTED_BY,
     sources: WEB_CLIENTS,
-    properties: { step: SERVER_SETUP_STEP, native_host: SERVER_SETUP_NATIVE_HOST },
+    properties: { step: SERVER_SETUP_STEP, native_host: SERVER_SETUP_NATIVE_HOST, flow: SERVER_SETUP_FLOW },
   },
   // A button on a setup step. `os` only for the computer commands (the tab they were copied from).
+  // `name_changed` / `channel_changed` / `description_changed`: only with `create_agent_submitted`,
+  // whether the person changed what Cindy proposed; never the content.
   server_setup_step_action: {
     question: ONBOARDING_SETUP_QUESTION,
     requestedBy: ONBOARDING_REQUESTED_BY,
@@ -1039,9 +1249,15 @@ export const PRODUCT_EVENT_REGISTRY = {
       action: { type: "enum", values: SERVER_SETUP_ACTIONS, required: true },
       os: { type: "enum", values: ["mac_linux", "windows"] },
       native_host: SERVER_SETUP_NATIVE_HOST,
+      flow: SERVER_SETUP_FLOW,
+      name_changed: { type: "boolean" },
+      channel_changed: { type: "boolean" },
+      description_changed: { type: "boolean" },
     },
   },
   // A setup step cannot go on for this reason, once per step and reason per page load.
+  // `runtime` and `failure`: only with `cindy_start_failed` (SERVER_SETUP_START_RUNTIMES,
+  // SERVER_SETUP_START_FAILURES).
   server_setup_blocked: {
     question: ONBOARDING_SETUP_QUESTION,
     requestedBy: ONBOARDING_REQUESTED_BY,
@@ -1049,6 +1265,30 @@ export const PRODUCT_EVENT_REGISTRY = {
     properties: {
       step: SERVER_SETUP_STEP,
       reason: { type: "enum", values: SERVER_SETUP_BLOCK_REASONS, required: true },
+      native_host: SERVER_SETUP_NATIVE_HOST,
+      flow: SERVER_SETUP_FLOW,
+      runtime: { type: "enum", values: SERVER_SETUP_START_RUNTIMES },
+      failure: { type: "enum", values: SERVER_SETUP_START_FAILURES },
+    },
+  },
+  // A step of the tour after setup was on screen (the new flow; the mobile app shows the
+  // tour in its WebView, as it does the setup steps). `tour_step`, not `step`: a number here,
+  // while the setup events' `step` is a name.
+  onboarding_tour_step_shown: {
+    question: ONBOARDING_TOUR_QUESTION,
+    requestedBy: ONBOARDING_V2_REQUESTED_BY,
+    sources: WEB_CLIENTS,
+    properties: { tour_step: ONBOARDING_TOUR_STEP, native_host: SERVER_SETUP_NATIVE_HOST },
+  },
+  // The tour ended on `at_step`, and how (ONBOARDING_TOUR_ENDS). `left` is sent as the
+  // page goes away, so some are lost: it undercounts.
+  onboarding_tour_ended: {
+    question: ONBOARDING_TOUR_QUESTION,
+    requestedBy: ONBOARDING_V2_REQUESTED_BY,
+    sources: WEB_CLIENTS,
+    properties: {
+      at_step: ONBOARDING_TOUR_STEP,
+      how: { type: "enum", values: ONBOARDING_TOUR_ENDS, required: true },
       native_host: SERVER_SETUP_NATIVE_HOST,
     },
   },
@@ -1151,6 +1391,22 @@ export const PRODUCT_EVENT_REGISTRY = {
       platform: { type: "enum", values: [...CLIENT_PLATFORMS, "unknown"] },
     },
   },
+  /**
+   * An agent named a service this server cannot give it, at most once a UTC
+   * day per server, agent, service and outcome (retries add nothing). An
+   * agent's event: no analytics_id. A name that resolves to an app on the
+   * server (usable, suspended, or an MCP App) records nothing.
+   */
+  integration_service_requested: {
+    question: "Which services do agents ask for that Raft does not offer, or that the server has not installed? (Decides what the Apps page shows first and which apps to add.)",
+    requestedBy: "AppFather (2026-11-15, dm task #2)",
+    sources: ["server"],
+    properties: {
+      service: { type: "enum", values: [...REQUESTED_SERVICE_KEYS, "other"], required: true },
+      outcome: { type: "enum", values: REQUESTED_SERVICE_OUTCOMES, required: true },
+      command: { type: "enum", values: REQUESTED_SERVICE_COMMANDS, required: true },
+    },
+  },
   page_viewed: {
     question: "Which parts of the Raft app do people use, and how often? (In-app navigation only; not raft.build / docs site visits.)",
     requestedBy: JOURNEY_REVIEW,
@@ -1187,11 +1443,108 @@ export const PRODUCT_EVENT_REGISTRY = {
       trigger: { type: "enum", values: ["task_result_viewed", "action_card_approved"], required: true },
     },
   },
+  // Where an Android install came from (Google Play Install Referrer), mobile 1.25
+  // on. Read once at first launch, kept on the device, and sent once after the first
+  // sign-in on that install, for an account that shares usage data; never re-read
+  // or re-sent, and a first account that does not share ends the install's one
+  // chance. `store`: google_play (Play answered), direct (no Play referrer, e.g. a
+  // Hands install) or unknown. utm_* are the referrer's values under the rules of
+  // account_created; Play reports an organic install as google-play / organic.
+  // `fresh_install`: the first-install time equals the last-update time (false for
+  // someone who upgraded into this version; Play keeps the referrer for 90 days,
+  // so their utm_* are mostly absent). Never the raw referrer string, a click id
+  // (gclid), an install or click time, or a device identifier. Android only: iOS
+  // has no equivalent the app can read.
+  app_install_source_read: {
+    question: "Where do Android installs come from: which site or campaign sent people to Google Play, and how many install outside it?",
+    requestedBy: "cindyz via Nova and Lagoon (2026-11-13, user source work, #proj-mobile:16766892)",
+    sources: ["android"],
+    properties: {
+      store: { type: "enum", values: ["google_play", "direct", "unknown"], required: true },
+      fresh_install: { type: "boolean", required: true },
+      utm_source: CAMPAIGN_TOKEN,
+      utm_medium: CAMPAIGN_TOKEN,
+      utm_campaign: { type: "campaign_path" },
+    },
+  },
+  // The native apps' device settings (APP_SETTINGS above), mobile 1.26 on. A
+  // snapshot at most once per install per UTC day, after sign-in (or a return
+  // to the app on a new day): per install, not per account, so another account
+  // signed in the same day sends nothing new; the row belongs to the server and
+  // account signed in when it is sent. A setting the platform does not show is
+  // absent, not false (link_open_mode: iOS and Android; conversation_forward_gesture:
+  // where the gesture exists; ios_native_nav and ios_native_nav_chosen: iPhone;
+  // multi_shell_host: Android). `ios_native_nav_chosen`: the person set the
+  // switch (false: it follows the server flag). Raft Desktop does not send it.
+  app_settings_snapshot: {
+    question: "Which display and behaviour settings do people keep in the native apps (message side, compact and collapsed messages, the Beta switches)? Decides the defaults and which Beta switches to promote or retire.",
+    requestedBy: APP_SETTINGS_REQUESTED_BY,
+    sources: NATIVE_CLIENTS,
+    properties: {
+      message_alignment: { type: "enum", values: APP_SETTING_MESSAGE_ALIGNMENTS, required: true },
+      link_open_mode: { type: "enum", values: APP_SETTING_LINK_OPEN_MODES },
+      compact_messages: { type: "boolean", required: true },
+      long_message_collapse: { type: "boolean", required: true },
+      new_message_menu: { type: "boolean", required: true },
+      conversation_forward_gesture: { type: "boolean" },
+      ios_native_nav: { type: "boolean" },
+      ios_native_nav_chosen: { type: "boolean" },
+      activity_task_status_badges: { type: "boolean", required: true },
+      composer_enter_sends: { type: "boolean", required: true },
+      multi_shell_host: { type: "boolean" },
+      desktop_mode_large_screen: { type: "boolean", required: true },
+      server_drawer: { type: "boolean", required: true },
+      home_server_avatar: { type: "boolean", required: true },
+    },
+  },
+  // A person changed one of those settings, once it is saved and only when the
+  // value differs from the one before.
+  app_setting_changed: {
+    question: "Which native app settings do people change, from what to what, and from which settings page?",
+    requestedBy: APP_SETTINGS_REQUESTED_BY,
+    sources: NATIVE_CLIENTS,
+    properties: {
+      setting: { type: "enum", values: APP_SETTINGS, required: true },
+      value: { type: "enum", values: APP_SETTING_VALUES, required: true },
+      previous_value: { type: "enum", values: APP_SETTING_VALUES, required: true },
+      surface: { type: "enum", values: APP_SETTING_SURFACES, required: true },
+    },
+  },
   agent_create_opened: {
     question: "From which entry points, outside the onboarding wizard, do people start creating an agent?",
     requestedBy: JOURNEY_REVIEW,
     sources: APP_CLIENTS,
     properties: { entry: { type: "enum", values: AGENT_CREATE_ENTRIES } },
+  },
+  external_agent_setup_progress: {
+    question: EXTERNAL_AGENT_SETUP_QUESTION,
+    requestedBy: EXTERNAL_AGENT_SETUP_REQUESTED_BY,
+    sources: WEB_CLIENTS,
+    properties: {
+      step: { type: "enum", values: EXTERNAL_AGENT_SETUP_STEPS, required: true },
+      surface: { type: "enum", values: EXTERNAL_AGENT_SETUP_SURFACES, required: true },
+      method: { type: "enum", values: EXTERNAL_AGENT_SETUP_METHODS, required: true },
+    },
+  },
+  external_agent_setup_action: {
+    question: EXTERNAL_AGENT_SETUP_QUESTION,
+    requestedBy: EXTERNAL_AGENT_SETUP_REQUESTED_BY,
+    sources: WEB_CLIENTS,
+    properties: {
+      action: { type: "enum", values: EXTERNAL_AGENT_SETUP_ACTIONS, required: true },
+      surface: { type: "enum", values: EXTERNAL_AGENT_SETUP_SURFACES, required: true },
+      /** The method shown when it happened; for `method_switched`, the one switched to. */
+      method: { type: "enum", values: EXTERNAL_AGENT_SETUP_METHODS, required: true },
+    },
+  },
+  external_agent_setup_closed: {
+    question: EXTERNAL_AGENT_SETUP_QUESTION,
+    requestedBy: EXTERNAL_AGENT_SETUP_REQUESTED_BY,
+    sources: WEB_CLIENTS,
+    properties: {
+      result: { type: "enum", values: EXTERNAL_AGENT_SETUP_CLOSE_RESULTS, required: true },
+      method: { type: "enum", values: EXTERNAL_AGENT_SETUP_METHODS, required: true },
+    },
   },
   // Group by announcement/version across contexts. A dismissal is not proof of reading.
   // announcement_id identifies operator-created content, never a person.
@@ -1834,6 +2187,58 @@ export const PRODUCT_EVENT_REGISTRY = {
       position: { type: "integer", min: 1, max: COMPUTERS_LIST_MAX_COUNT },
     },
   },
+  // cindyz (2026-11-13, user source work, #proj-analytics:72b5e0e2): a signed-in person
+  // clicked a link that downloads Raft Desktop or a mobile app, or opens its
+  // store listing, from inside the web or desktop app. One event per click, at
+  // the click: it says the link was followed, not that anything was installed.
+  // A scan of the QR code is not a click and is not counted.
+  app_download_clicked: {
+    question: "How many people go from inside the app to get the desktop or mobile app, from where, and to which target?",
+    requestedBy: "cindyz (2026-11-13, user source work, #proj-analytics:72b5e0e2)",
+    sources: WEB_CLIENTS,
+    properties: {
+      target: { type: "enum", values: APP_DOWNLOAD_TARGETS, required: true },
+      surface: { type: "enum", values: APP_DOWNLOAD_SURFACES, required: true },
+      /** Desktop targets only: which installer. */
+      desktop_build: { type: "enum", values: APP_DOWNLOAD_DESKTOP_BUILDS },
+    },
+  },
+  // Nova (2026-11-15, #proj-analytics:e9009f38): GET /api/desktop-download
+  // answered with the redirect to a Raft Desktop installer. A count of
+  // REQUESTS, not of downloads and not of people: one row per request, no
+  // dedupe (two clicks are two rows; a prefetcher or a crawler following the
+  // link is a row too, see `likely_bot`), and whether the file was fetched or
+  // installed is not known. Only that branch: nothing when `target` is missing
+  // or unknown (the /download chooser), when there is no build or the feed
+  // host failed (the fallback pages), for a HEAD probe, or for a link the Raft
+  // app itself made (`from=app`, DESKTOP_DOWNLOAD_FROM_APP: in-app clicks are
+  // app_download_clicked's, under the person's usage-data choice; this event
+  // is the requests that did NOT start inside the app). In-app auto-update reads the Hands feed
+  // itself and never calls this route, so updates are not counted. No
+  // analytics_id, no server_id, no device; the IP is not kept.
+  // `target`: the installer asked for, as the link's `target` parameter
+  // spells it (DESKTOP_DOWNLOAD_TARGETS; `-`, where
+  // app_download_clicked.desktop_build has `_`). `likely_bot`: a rough
+  // judgment from the User-Agent, which is never kept or logged.
+  // utm_source / utm_medium / utm_campaign / referrer_domain: where the
+  // visitor came from, as the link carries it (`ref_domain` for the last),
+  // sanitised by the same function as account_created's (the server's
+  // parseSignupCampaign); a value that does not pass is left out. They are what
+  // the link says, which anyone can write: an unauthenticated claim. Absent on
+  // links without them (a download link someone shared, an old landing page).
+  desktop_download_requested: {
+    question: "Which sources (a campaign link, a referring site) lead to requests for a Raft Desktop installer, and for which OS build?",
+    requestedBy: "Nova (2026-11-15, #proj-analytics:e9009f38; huxijin's landing change raft-landing #351; Tenny approved the event)",
+    sources: ["server"],
+    properties: {
+      target: { type: "enum", values: DESKTOP_DOWNLOAD_TARGETS, required: true },
+      likely_bot: { type: "boolean", required: true },
+      utm_source: CAMPAIGN_TOKEN,
+      utm_medium: CAMPAIGN_TOKEN,
+      utm_campaign: { type: "campaign_path" },
+      referrer_domain: { type: "hostname" },
+    },
+  },
 } as const satisfies Record<string, ProductEventSpec>;
 
 type Registry = typeof PRODUCT_EVENT_REGISTRY;
@@ -1884,6 +2289,8 @@ function isValidPropertyValue(spec: ProductEventPropertySpec, value: unknown): b
       return typeof value === "string" && value.length <= spec.maxLength && PRODUCT_EVENT_STRING_TOKEN.test(value);
     case "hostname":
       return typeof value === "string" && PRODUCT_EVENT_HOSTNAME.test(value) && !IPV4_ADDRESS.test(value);
+    case "campaign_path":
+      return typeof value === "string" && PRODUCT_EVENT_CAMPAIGN_PATH.test(value);
   }
 }
 
@@ -1900,8 +2307,23 @@ export function referrerHostname(referrer: string): string | null {
     return null;
   }
   if (url.protocol !== "https:" && url.protocol !== "http:") return null;
-  const host = url.hostname.toLowerCase().replace(/^www\./, "");
+  return referrerHost(url.hostname);
+}
+
+/**
+ * A bare host name (a `ref_domain` link parameter, a URL's host) as the
+ * `hostname` type stores it: trimmed, lowercase, without a leading `www.`; or
+ * null when it is not one (a URL, a path, a port, an email, an IP address).
+ * Never rewritten otherwise.
+ */
+export function referrerHost(value: string | null | undefined): string | null {
+  const host = (value ?? "").trim().toLowerCase().replace(/^www\./, "");
   return PRODUCT_EVENT_HOSTNAME.test(host) && !IPV4_ADDRESS.test(host) ? host : null;
+}
+
+/** Raft's landing site and every host under it: where a sign-up link itself lives, never where a visitor came from. */
+export function isRaftSiteHost(host: string): boolean {
+  return host === "raft.build" || host.endsWith(".raft.build");
 }
 
 /**
@@ -1912,6 +2334,15 @@ export function referrerHostname(referrer: string): string | null {
 export function campaignToken(value: string | null | undefined, maxLength = 64): string | null {
   const token = (value ?? "").trim().toLowerCase();
   return token !== "" && token.length <= maxLength && PRODUCT_EVENT_STRING_TOKEN.test(token) ? token : null;
+}
+
+/**
+ * A campaign parameter as a `campaign_path` (a token or `owner/repo`), or null
+ * when it is not one. Lowercased, never rewritten otherwise.
+ */
+export function campaignPath(value: string | null | undefined): string | null {
+  const path = (value ?? "").trim().toLowerCase();
+  return PRODUCT_EVENT_CAMPAIGN_PATH.test(path) ? path : null;
 }
 
 /**

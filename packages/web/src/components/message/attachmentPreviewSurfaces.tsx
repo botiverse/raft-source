@@ -6,6 +6,7 @@ import {
   LOCATED_MS,
   ScrollArea,
   Spinner,
+  TableScroll,
   Tabs,
   TabsLabel,
   TabsList,
@@ -468,11 +469,11 @@ export function CsvPreviewPane({ preview, truncated }: { preview: Extract<Docume
         <span>{formatMessage({ id: "message.messageItem.csvPreview" })}</span>
         <span>{truncated ? formatMessage({ id: "message.messageItem.csvRowsFirst" }, { count: preview.rows.length }) : formatMessage({ id: "message.messageItem.csvRows" }, { count: preview.rowCount })}{formatMessage({ id: "message.messageItem.csvColumns" }, { count: preview.columnCount })}</span>
       </div>
-      {/* Horizontal-only ScrollArea in the card: wide tables pan sideways, the
+      {/* Horizontal-only TableScroll (raft-ui) in the card: wide tables pan sideways, the
           vertical axis flows into the document scroll so ⌘F reaches every
           row. Known trade-off: the sticky thead pins to this area (a scroll
           container), not the viewport — wide-table panning beats a pinned header. */}
-      <Card><ScrollArea orientation="horizontal" overscroll="auto" role="region" aria-label={formatMessage({ id: "message.messageItem.csvPreview" })}>
+      <Card><TableScroll overscroll="auto" role="region" aria-label={formatMessage({ id: "message.messageItem.csvPreview" })}>
         <table className="min-w-full border-collapse bg-layer-card">
           <thead className="sticky top-0 z-sticky bg-fill-muted">
             <tr>
@@ -498,7 +499,7 @@ export function CsvPreviewPane({ preview, truncated }: { preview: Extract<Docume
             ))}
           </tbody>
         </table>
-      </ScrollArea></Card>
+      </TableScroll></Card>
       <div className="mt-2 text-foreground-hint">
         {truncated
           ? formatMessage({ id: "message.messageItem.csvTruncatedPerf" }, { count: preview.rows.length })
@@ -547,7 +548,7 @@ export function XlsxPreviewPane({ preview, truncated }: { preview: Extract<Docum
       {isEmpty ? (
         <XlsxPreviewEmpty />
       ) : (
-        <Card><ScrollArea orientation="horizontal" overscroll="auto" role="region" aria-label={formatMessage({ id: "message.messageItem.xlsxPreview" })}>
+        <Card><TableScroll overscroll="auto" role="region" aria-label={formatMessage({ id: "message.messageItem.xlsxPreview" })}>
           <table className="min-w-full border-collapse bg-layer-card">
             <thead className="sticky top-0 z-sticky bg-fill-muted"><tr>{selected.headers.map((header, index) => (
               <th key={`${header}-${index}`} className="max-w-[220px] border border-line-hairline px-2 py-1 text-left font-bold"><AttachmentTooltip content={header}><span className="block truncate">{header || formatMessage({ id: "message.messageItem.columnFallback" }, { index: index + 1 })}</span></AttachmentTooltip></th>
@@ -558,7 +559,7 @@ export function XlsxPreviewPane({ preview, truncated }: { preview: Extract<Docum
               </tr>
             ))}</tbody>
           </table>
-        </ScrollArea></Card>
+        </TableScroll></Card>
       )}
       <div className="mt-2 text-foreground-hint">
         {sheetTruncated

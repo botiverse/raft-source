@@ -120,7 +120,7 @@ export type WebEventName =
   | UploadCapabilityFallbackTraceEventName | DirectPutFailureTraceEventName
   | MediaPreviewErrorTraceEventName
   | BootTimingTraceEventName | "slock.web.shell_keep_failed"
-  | ContextViewTraceEventName;
+  | ContextViewTraceEventName | "slock.open_in_app"; // the latter: utils/openInAppTrace.ts (#proj-mobile:#128)
 
 // Spans with a real duration. `slock.channel.join`: Join clicked to the channel on screen; `web.view.switch`: observability/viewSwitchSpan.ts.
 export type WebSpanName = AuthTraceSpanName | WebHttpClientTraceEventName | "slock.channel.join" | "web.view.switch";

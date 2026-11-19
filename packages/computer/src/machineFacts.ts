@@ -3,6 +3,7 @@ import {
   serverConnectedMarkerPath,
   serverRunnerLockConflictPath,
   serverRunnerPidReadFallback,
+  serverRunnerSpawnedPath,
   serverRunnerVersionPath,
 } from "./paths";
 import { listManagedServerIds } from "./serverState";
@@ -11,6 +12,7 @@ import {
   type ProcessVersionEvidence,
 } from "./versionEvidence";
 import { readRunnerLockConflictMarker, type RunnerLockConflictMarker } from "./runnerLockConflict";
+import { readRunnerSpawnRecord, type RunnerSpawnRecord } from "./runnerSpawnRecord";
 import {
   readResidentConnectedMarker,
   type ResidentConnectionEvidence,
@@ -25,6 +27,11 @@ export interface RunnerMachineFacts {
   readonly connectionEvidence: ResidentConnectionEvidence | null;
   /** The machine-lock conflict the service last resolved for this runner, if any. */
   readonly lockConflict?: RunnerLockConflictMarker | null;
+  /**
+   * The child the service spawned and has not seen exit (runner.spawned.json),
+   * with its liveness. Present before the runner connects, unlike `pid`.
+   */
+  readonly spawned?: (RunnerSpawnRecord & { readonly alive: boolean }) | null;
 }
 
 /**
@@ -47,6 +54,7 @@ export interface CollectMachineFactsOptions {
   readVersionEvidence?: typeof readProcessVersionEvidence;
   readConnectionEvidence?: typeof readResidentConnectedMarker;
   readLockConflict?: typeof readRunnerLockConflictMarker;
+  readSpawnRecord?: typeof readRunnerSpawnRecord;
 }
 
 async function readRunnerProcess(
@@ -76,18 +84,21 @@ export async function collectMachineFacts(
   const readVersionEvidence = options.readVersionEvidence ?? readProcessVersionEvidence;
   const readConnectionEvidence = options.readConnectionEvidence ?? readResidentConnectedMarker;
   const readLockConflict = options.readLockConflict ?? readRunnerLockConflictMarker;
+  const readSpawnRecord = options.readSpawnRecord ?? readRunnerSpawnRecord;
 
   const runners = await Promise.all(runnerServerIds.map(async (serverId): Promise<RunnerMachineFacts> => {
     const [processFacts, versionEvidence] = await Promise.all([
       readRunnerProcess(slockHome, serverId, readPidfile, isAlive),
       readVersionEvidence(serverRunnerVersionPath(slockHome, serverId)),
     ]);
+    const spawnRecord = readSpawnRecord(serverRunnerSpawnedPath(slockHome, serverId));
     return {
       serverId,
       ...processFacts,
       versionEvidence,
       connectionEvidence: readConnectionEvidence(serverConnectedMarkerPath(slockHome, serverId)),
       lockConflict: readLockConflict(serverRunnerLockConflictPath(slockHome, serverId)),
+      spawned: spawnRecord ? { ...spawnRecord, alive: isAlive(spawnRecord.pid) } : null,
     };
   }));
 

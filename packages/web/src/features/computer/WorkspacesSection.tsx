@@ -194,7 +194,7 @@ export function WorkspacesSection({ machineId, canManageMachines }: { machineId:
 
       {deleteTarget && (
         <ConfirmDialog
-          title={formatMessage({ id: "machine.detail.deleteWorkspaceTitle" })}
+          title={formatMessage({ id: "machine.detail.deleteWorkspaceConfirmTitle" })}
           message={formatMessage(
             { id: "machine.detail.deleteWorkspaceMessage" },
             { name: deleteEntry?.agentName || deleteTarget },

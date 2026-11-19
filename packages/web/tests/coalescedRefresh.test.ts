@@ -90,3 +90,26 @@ test("coalescedRefresh: cancel drops scheduled and deferred reloads", () => {
   h.fire();
   assert.equal(h.runs(), 0);
 });
+
+test("a reload is told how many requests it stands for, deferred ones included", () => {
+  const runs: number[] = [];
+  let visible = true;
+  const pending: Array<() => void> = [];
+  const refresh = createCoalescedRefresh({
+    run: (asks) => runs.push(asks),
+    delayMs: 10,
+    isVisible: () => visible,
+    schedule: (callback) => { pending.push(callback); return pending.length; },
+    clear: () => {},
+  });
+  refresh.request();
+  refresh.request();
+  refresh.request();
+  pending.shift()!();
+  visible = false;
+  refresh.request();
+  visible = true;
+  refresh.flushIfPending();
+  pending.shift()!();
+  assert.deepEqual(runs, [3, 1]);
+});

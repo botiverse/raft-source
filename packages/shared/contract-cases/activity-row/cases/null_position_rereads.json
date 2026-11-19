@@ -1,0 +1,40 @@
+{
+  "formatVersion": 1,
+  "id": "null_position_rereads",
+  "rule": "position",
+  "title": "A row without a position takes no live patch: an event for it re-reads the row",
+  "why": "The server fails closed to a null position when it cannot pair the seq with the row's latest message (latestActivitySeqSameSource).",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/shared/src/activityRowPosition.ts (reduceActivityRow; not wired yet, step 2)"
+    ],
+    "server": [
+      "packages/server/src/services/channelService.ts (latestActivitySeqSameSource; the row's latestActivitySeq)",
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (unread_count and latest_seq from one materialized row)"
+    ]
+  },
+  "given": {
+    "row": {
+      "unreadCount": 3,
+      "hasMention": false,
+      "position": null,
+      "mentionOnly": false
+    }
+  },
+  "steps": [
+    {
+      "act": "liveMessage",
+      "seq": "100",
+      "counts": true,
+      "mentionsViewer": false
+    }
+  ],
+  "expect": {
+    "row": {
+      "unreadCount": 3,
+      "position": null
+    },
+    "reread": true
+  }
+}

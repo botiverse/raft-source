@@ -4,10 +4,10 @@
 // the dispatcher's batched read.
 import assert from "node:assert/strict";
 import { and, eq } from "drizzle-orm";
-import { DEFAULT_NOTIFICATION_ACCOUNT_SETTINGS } from "@botiverse/raft-shared";
+import { DEFAULT_NOTIFICATION_ACCOUNT_SETTINGS, NOTIFICATION_FOLLOWED_THREAD_REPLIES_SWITCH_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
 import { createApiTest } from "../test/integration/apiTest";
 import { getDb } from "../db/index";
-import { inboxTargetMuteStates, serverMembers, threadFollows, userChannelNotificationPrefs, users } from "../db/schema";
+import { featureFlags, inboxTargetMuteStates, serverMembers, threadFollows, userChannelNotificationPrefs, userNotificationSettings, users } from "../db/schema";
 import { createServer } from "../services/serverService";
 import { addHuman, createChannel, getOrCreateThread } from "../services/channelService";
 import { createMessage } from "../services/messageService";
@@ -45,6 +45,13 @@ async function seed(slug: string) {
   return { owner, member, outsider, server, general, secret, parent, thread };
 }
 
+/** notification_followed_thread_replies_switch on for everyone (no row = off, as in production). */
+async function turnOnFollowedThreadRepliesSwitch() {
+  await getDb().insert(featureFlags)
+    .values({ key: NOTIFICATION_FOLLOWED_THREAD_REPLIES_SWITCH_FEATURE_FLAG_KEY, randomizationUnit: "user", salt: "test", defaultEnabled: true })
+    .onConflictDoUpdate({ target: featureFlags.key, set: { defaultEnabled: true } });
+}
+
 function json(body: unknown): RequestInit {
   return { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
 }
@@ -69,7 +76,6 @@ test("account settings read as the defaults, patch with optimistic versions, val
       previewMode: "full",
       sound: true,
       mobileDelay: "inactive",
-      followedThreadReplies: true,
       version: 0,
     },
     servers: [{ serverId: server.id, level: "all" }],
@@ -97,7 +103,7 @@ test("account settings read as the defaults, patch with optimistic versions, val
   const quietHours = { enabled: true, startMinute: 1320, endMinute: 420, timeZone: "Europe/Berlin" };
   const first = await me.request("/api/me/notification-settings", { method: "PATCH", ...json({ pausedUntil, quietHours, previewMode: "sender_only", sound: false, mobileDelay: "5m", version: 0 }) });
   assert.equal(first.status, 200, await first.clone().text());
-  const settings = { pausedUntil, quietHours, previewMode: "sender_only", sound: false, mobileDelay: "5m", followedThreadReplies: true, version: 1 };
+  const settings = { pausedUntil, quietHours, previewMode: "sender_only", sound: false, mobileDelay: "5m", version: 1 };
   assert.deepEqual(await first.json(), { settings });
   assert.deepEqual(events.at(-1), { room: `user:${member.id}`, event: "notification_prefs:updated", payload: { type: "account", settings } });
 
@@ -114,9 +120,10 @@ test("account settings read as the defaults, patch with optimistic versions, val
   assert.deepEqual(((await resume.json()) as { settings: { pausedUntil: null; version: number } }).settings, { ...settings, pausedUntil: null, version: 2 });
 });
 
-test("followedThreadReplies: absent reads as on, a PATCH round-trips and syncs, and the dispatcher read sees it", async ({ app, http }) => {
+test("followedThreadReplies, its flag on: absent reads as on, a PATCH round-trips and syncs, and the dispatcher read sees it", async ({ app, http }) => {
   const events = installFakeIo(app.app);
   const { member, server, general, thread } = await seed("notif-ftr");
+  await turnOnFollowedThreadRepliesSwitch();
   const me = http.as(member);
   const decision = async () => {
     const prefs = await loadNotificationPolicyPrefs(getDb(), {
@@ -150,6 +157,67 @@ test("followedThreadReplies: absent reads as on, a PATCH round-trips and syncs, 
   const on = await me.request("/api/me/notification-settings", { method: "PATCH", ...json({ followedThreadReplies: true, version: 2 }) });
   assert.equal(((await on.json()) as { settings: { followedThreadReplies: boolean } }).settings.followedThreadReplies, true);
   assert.deepEqual(await decision(), { kind: "notify" });
+});
+
+test("followedThreadReplies, its flag off (the default): left out of every answer, not written, and a stored off is ignored", async ({ app, http }) => {
+  const events = installFakeIo(app.app);
+  const { member, server, general, thread } = await seed("notif-ftr-hidden");
+  const me = http.as(member);
+  const decision = async () => {
+    const prefs = await loadNotificationPolicyPrefs(getDb(), {
+      userIds: [member.id], serverIds: [server.id], channelIds: [general.id], threadChannelIds: [thread.id],
+    });
+    return decide({
+      receiverId: member.id, serverId: server.id, category: "thread", personal: false,
+      levelChannelId: general.id, threadChannelId: thread.id, levelChannelSeq: null, mentioned: false,
+    }, prefs, new Date(), DEFAULT_NOTIFICATION_ACCOUNT_SETTINGS);
+  };
+  const stored = async () => (await getDb().select().from(userNotificationSettings).where(eq(userNotificationSettings.userId, member.id)))[0] ?? null;
+
+  // A person who turned it off while it was offered: the stored row stays as it is.
+  await getDb().insert(userNotificationSettings).values({ userId: member.id, followedThreadReplies: false, version: 3 });
+
+  const read = await me.get("/api/me/notification-settings");
+  assert.equal(read.status, 200);
+  const readSettings = ((await read.json()) as { settings: Record<string, unknown> }).settings;
+  assert.equal("followedThreadReplies" in readSettings, false, "GET leaves the field out");
+  assert.equal(readSettings.version, 3);
+
+  // The stored off is not obeyed: a followed-thread reply notifies.
+  assert.deepEqual(await decision(), { kind: "notify" });
+
+  // A PATCH that sends it (an older client) is accepted, written nowhere, and emits nothing.
+  const eventCount = events.length;
+  const ignored = await me.request("/api/me/notification-settings", { method: "PATCH", ...json({ followedThreadReplies: true, version: 3 }) });
+  assert.equal(ignored.status, 200, await ignored.clone().text());
+  const ignoredSettings = ((await ignored.json()) as { settings: Record<string, unknown> }).settings;
+  assert.equal("followedThreadReplies" in ignoredSettings, false);
+  assert.equal(ignoredSettings.version, 3, "nothing changed, so the version stays");
+  assert.equal(events.length, eventCount);
+  assert.equal((await stored())?.followedThreadReplies, false, "the stored value is kept");
+  assert.equal((await stored())?.version, 3);
+  assert.equal((await me.request("/api/me/notification-settings", { method: "PATCH", ...json({ followedThreadReplies: "no" }) })).status, 400, "still validated");
+
+  // Mixed with another setting: that one is written; the event and answer leave the field out.
+  const mixed = await me.request("/api/me/notification-settings", { method: "PATCH", ...json({ sound: false, followedThreadReplies: true }) });
+  assert.equal(mixed.status, 200);
+  const mixedSettings = ((await mixed.json()) as { settings: Record<string, unknown> }).settings;
+  assert.equal(mixedSettings.sound, false);
+  assert.equal(mixedSettings.version, 4);
+  assert.equal("followedThreadReplies" in mixedSettings, false);
+  assert.deepEqual(events.at(-1), { room: `user:${member.id}`, event: "notification_prefs:updated", payload: { type: "account", settings: mixedSettings } });
+  assert.equal((await stored())?.followedThreadReplies, false, "still kept");
+
+  // A stale version: the 409's settings leave it out too.
+  const stale = await me.request("/api/me/notification-settings", { method: "PATCH", ...json({ sound: true, version: 0 }) });
+  assert.equal(stale.status, 409);
+  assert.equal("followedThreadReplies" in ((await stale.json()) as { settings: Record<string, unknown> }).settings, false);
+
+  // The flag turned on: the stored off is offered and obeyed again.
+  await turnOnFollowedThreadRepliesSwitch();
+  const shown = await me.get("/api/me/notification-settings");
+  assert.equal(((await shown.json()) as { settings: { followedThreadReplies?: boolean } }).settings.followedThreadReplies, false, "GET includes it");
+  assert.deepEqual(await decision(), { kind: "suppressed", reason: "followed_thread_replies_off" });
 });
 
 test("levels: one write path for server and channel; the channel level beats the server level", async ({ app, http }) => {

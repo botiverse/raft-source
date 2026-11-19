@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import type { ApiResponse } from "../../client";
 import type { AgentContext } from "../../auth/env";
 import { createCommandContext } from "../../core/context";
-import { assertReminderNotSealed } from "./sealGuard";
+import { assertReminderNotSealed, matchesReminderId, parseReminderIdInput } from "./sealGuard";
 
 const agentContext: AgentContext = {
   agentId: "agent-1",
@@ -114,4 +114,16 @@ test("cancel guard blocks a detached seal even when no Inbox item remains", asyn
     async () => assertReminderNotSealed(ctx, "12345678", "cancel"),
     /revision 7 is sealed/,
   );
+});
+
+test("parseReminderIdInput reads every id form an agent may paste", () => {
+  const id = "12345678-1234-4123-8123-123456789abc";
+  assert.deepEqual(parseReminderIdInput(id), { id });
+  assert.deepEqual(parseReminderIdInput(" 12345678 "), { id: "12345678" });
+  assert.deepEqual(parseReminderIdInput(`reminder:${id}`), { id });
+  assert.deepEqual(parseReminderIdInput(`reminder:${id}:12`), { id, revision: "12" });
+  assert.deepEqual(parseReminderIdInput(`${id}:3`), { id, revision: "3" });
+  assert.deepEqual(parseReminderIdInput("reminder:"), { id: "" });
+  assert.equal(matchesReminderId(id, "reminder:"), false);
+  assert.equal(matchesReminderId(id, `reminder:${id.slice(0, 8)}:2`), true);
 });

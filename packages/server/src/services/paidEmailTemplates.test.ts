@@ -14,7 +14,7 @@ test("paid copy separates history from files and keeps the approved action desti
   const welcome = renderPaidWelcomeEmailHtml();
   assert.match(welcome, /<li><strong>Unlimited message history:<\/strong>/);
   assert.match(welcome, /<li[^>]*><strong>More room to create:<\/strong>/);
-  assert.match(welcome, /href="https:\/\/docs.raft.build\/features\/messaging\/joint-channels\/"/);
+  assert.match(welcome, /href="https:\/\/docs.raft.build\/features\/messaging\/external-channels\/"/);
   assert.match(welcome, /href="https:\/\/docs.raft.build\/features\/server\/computers\/#move-an-agent-to-another-computer"/);
   assert.equal((welcome.match(/class="slock-button"/g) ?? []).length, 1);
   const checkin = renderPaidCheckInEmailHtml();

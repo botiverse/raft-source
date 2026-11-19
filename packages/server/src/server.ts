@@ -10,6 +10,7 @@ import { runChangeLogMaintenance } from "./services/changeLogMaintenance";
 import { sweepRecoveryRequests } from "./services/secondFactor/recovery";
 import { runAccountDeletionCleanup } from "./services/accountDeletion/cleanup";
 import { runClosedServerPurge } from "./services/closedServerPurge";
+import { featureFlagDefaultPolicyStartupLine } from "./services/featureFlagService";
 import { getChannelConversionAudienceCutover, applyChannelConversionAudienceRealtimeCutover } from "./services/channelConversionService";
 import { startChannelConversionWorker } from "./services/channelConversionWorker";
 import { publishExternalConnection } from "./services/externalInviteConnectService";
@@ -35,6 +36,7 @@ import { registerHostedCindyTriggers, startHostedCindyRecapWorker } from "./serv
 import { startHostedRuntimeDailySpendWorker } from "./services/hostedRuntimeDailySpend";
 import { startMachineFirstConnectRecorder, startOnboardingFunnelWorker } from "./services/onboardingFunnel";
 import { triggerOwnerOnboardingOnAgentActivation } from "./services/onboardingService";
+import { startOnboardingHeldWakeRelease } from "./services/onboardingHeldWakes";
 import { setIO as setBillingIO, cleanupWebhookEvents } from "./services/billingService";
 import { setActivityRealtimeIO } from "./services/activityRealtime";
 import { setListChangedRealtimeIO } from "./services/listChangedRealtime";
@@ -140,6 +142,7 @@ import { shutdownServerRuntime } from "./serverShutdown";
 import { startDrainCoordinator, type DrainSignalSourceName } from "./services/drainCoordinator";
 import { DEFAULT_DRAIN_CLOSE_SPREAD_MS, spreadClosesForDrain } from "./services/machineDrain";
 import { sharedSseStreamRegistry } from "./services/sseStreamRegistry";
+import { markDraining, setDrainRefusalSink } from "./services/drainState";
 import { isRisingWaveConfigured } from "./db/risingwave";
 import { warmContractSchemas } from "@botiverse/raft-shared";
 
@@ -206,6 +209,8 @@ async function bootstrap() {
   // here instead: a broken schema fails startup, not the first request to its
   // route, and no request pays the build.
   console.log(`[Slock] Built ${warmContractSchemas()} contract schemas`);
+  const featureFlagDefaultOnLine = featureFlagDefaultPolicyStartupLine();
+  if (featureFlagDefaultOnLine) console.log(featureFlagDefaultOnLine);
   // Every system app whose agent events need a delivery guard has it here
   // (first-party apps' come from their registration); none missing, or no start.
   console.log(`[Slock] System-app delivery guards: ${assertRequiredSystemAppDeliveryGuards().join(", ") || "none"}`);
@@ -431,6 +436,8 @@ async function bootstrap() {
   // daemon, which touches no HTTP route, and that was the one path the briefing retry did
   // not cover.
   startOnboardingBriefingOnActivation({ io, orchestrator: agentOrchestrator });
+  // Onboarding wakes held for a per-turn runtime driver go once its process is idle.
+  startOnboardingHeldWakeRelease({ orchestrator: agentOrchestrator });
   // Hosted Cindy is briefed when her workspace import lands, not on machine:online.
   registerHostedCindyTriggers({ io, orchestrator: agentOrchestrator, trigger: triggerOwnerOnboardingOnAgentActivation, tracer: serverTracer.tracer });
   // A hosted Cindy has no computer to fire her Day-2 recap; the server does.
@@ -937,9 +944,19 @@ async function bootstrap() {
   };
 
   let goingAwayStarted = false;
+  // The browser (Socket.IO + SSE) going-away spreads; shutdown waits for them
+  // before closing what is still open. They never reject (each is observed).
+  let browserDrainSpreads: Promise<unknown> = Promise.resolve();
   const beginGoingAway = (trigger: "ecs_drain" | "signal", source: DrainSignalSourceName | "sigterm") => {
     if (goingAwayStarted) return;
     goingAwayStarted = true;
+    // First, before the snapshots below: from here on the Socket.IO
+    // handshake, `/daemon/connect` and the SSE stream refuse new connections
+    // with 503 (services/drainState.ts). The ALB still routes new connections
+    // here for a few seconds after the drain starts, and one accepted then is
+    // outside every snapshot and got hard-cut at deregistration expiry
+    // (deployment thread 3f292dc3).
+    markDraining();
     // The SIGTERM fallback must finish its stagger before the deadline;
     // the ECS-drain trigger fires minutes early and can afford the full
     // configured spread.
@@ -989,10 +1006,11 @@ async function bootstrap() {
     // Browser tabs (Socket.IO and SSE) get the same spread as daemons. Each
     // reconnect reloads the page's data (machines, agents, messages/sync,
     // inbox), and closing them all at once on every old task put that whole
-    // reload on Neon in one second (#proj-o11y:7c3aaf2e). Streams opened
-    // after this point would be a new client on a draining task; the ALB
-    // has stopped routing to it, so the snapshot is the whole set.
-    void spreadClosesForDrain(sharedSseStreamRegistry.snapshot(), (res) => sharedSseStreamRegistry.end(res), { spreadMs }).then(({ closed, spanMs }) => {
+    // reload on Neon in one second (#proj-o11y:7c3aaf2e). New streams and
+    // sockets are refused from here on (markDraining above), so the snapshot
+    // is the whole set apart from a request already past its check; shutdown
+    // closes those (closeRemainingConnections).
+    const sseSpread = spreadClosesForDrain(sharedSseStreamRegistry.snapshot(), (res) => sharedSseStreamRegistry.end(res), { spreadMs }).then(({ closed, spanMs }) => {
       console.log(`[Slock] Drain going-away: ended ${closed} SSE stream(s), actual span ${spanMs}ms (configured spreadMs=${spreadMs})`);
       emitDrainSpread("sse", { closed, spanMs });
     }).catch((err: unknown) => {
@@ -1004,7 +1022,7 @@ async function bootstrap() {
     // is the one case socket.io-client does NOT reconnect from, so every open
     // tab stayed offline after each deploy until refocused. A transport close
     // is reconnected automatically, with the client's own jittered backoff.
-    void spreadClosesForDrain(io.of("/").sockets.values(), (socket) => {
+    const browserSpread = spreadClosesForDrain(io.of("/").sockets.values(), (socket) => {
       if (!socket.connected) return false;
       socket.conn.close();
       return true;
@@ -1015,6 +1033,7 @@ async function bootstrap() {
       console.warn("[Slock] Drain going-away: browser socket spread failed:", err);
       emitDrainSpread("browser", null, err);
     });
+    browserDrainSpreads = Promise.all([sseSpread, browserSpread]);
     // Observed: a detached rejection would be the #426 failure shape.
     stopBackgroundWorkers().catch((err: unknown) => {
       console.warn("[Slock] Drain going-away: background worker stop failed:", err);
@@ -1033,6 +1052,15 @@ async function bootstrap() {
   // the task role, modules/server-service), with the metadata endpoint as a
   // second path into the same latch. SLOCK_DRAIN_DETECTOR_DISABLED=1 is the
   // operational kill switch.
+  // One event per connection refused while draining (services/drainState.ts):
+  // the intentional 503s must be countable apart from real errors.
+  setDrainRefusalSink((kind) => {
+    serverTracer.tracer.emitEvent("slock.server.drain_refused", {
+      surface: "server",
+      attrs: { drain_refusal_kind: kind, reason: "server_draining" },
+    });
+  });
+
   const ecsMetadataUri = process.env.SLOCK_DRAIN_DETECTOR_DISABLED === "1"
     ? undefined
     : process.env.ECS_CONTAINER_METADATA_URI_V4;
@@ -1068,6 +1096,9 @@ async function bootstrap() {
     beginGoingAway("signal", "sigterm");
     // Already stopped at drain start on the ECS path; this returns the same promise.
     const provisionWorkerStopped = stopBackgroundWorkers();
+    // Leaves the same 5 s before the exit deadline as the SIGTERM spread,
+    // for the close below and the Redis shutdown after it.
+    const closeRemainingBy = Date.now() + Math.max(0, shutdownDeadlineMs - 5_000);
     shutdownServerRuntime({
       stopAcceptingHttp: () => new Promise<void>((resolve) => {
         server.close((error) => {
@@ -1099,6 +1130,34 @@ async function bootstrap() {
         ]),
         shutdownTracer: () => serverTracer.shutdown(),
       }),
+      // Before shutdownSharedState: a browser socket still open once the
+      // Redis adapter is gone silently misses every cross-replica emit
+      // (deployment thread 3f292dc3). The going-away spread finishes first so
+      // its pacing holds (on the SIGTERM fallback it is sized to end before
+      // closeRemainingBy); what is left is a connection that got past its
+      // drain check just before it was set, or one the spread skipped.
+      closeRemainingConnections: async () => {
+        let waitTimer: NodeJS.Timeout | undefined;
+        await Promise.race([
+          browserDrainSpreads,
+          new Promise<void>((resolve) => {
+            waitTimer = setTimeout(resolve, Math.max(0, closeRemainingBy - Date.now()));
+          }),
+        ]);
+        clearTimeout(waitTimer);
+        let sockets = 0;
+        for (const socket of io.of("/").sockets.values()) {
+          if (!socket.connected) continue;
+          // Transport close, as in the spread: socket.io-client reconnects.
+          socket.conn.close();
+          sockets += 1;
+        }
+        let streams = 0;
+        for (const res of sharedSseStreamRegistry.snapshot()) {
+          if (sharedSseStreamRegistry.end(res)) streams += 1;
+        }
+        console.log(`[Slock] Shutdown: closed ${sockets} remaining browser socket transport(s) and ${streams} SSE stream(s) before Redis shutdown`);
+      },
       shutdownSharedState: shutdownRedis,
       warn: (message, reason) => console.warn(`[Slock] ${message}:`, reason),
     }).then(() => {

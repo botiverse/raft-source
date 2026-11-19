@@ -1,0 +1,47 @@
+{
+  "formatVersion": 1,
+  "id": "predicate_unfollowed_thread",
+  "rule": "predicate",
+  "title": "An unfollowed thread row counts nothing",
+  "why": "The server counts none for it.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/web/src/store/inboxInPlaceUnread.ts (liveActivityUnread, liveUnreadFields)",
+      "packages/web/src/store/inboxRowPosition.ts (rowPositionVerdict, with inbox_row_position_v1 on)"
+    ],
+    "server": [
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (unread_count FILTER)",
+      "packages/server/src/services/inboxUnreadEligibility.ts (isMessageUnreadEligibleForReceiver)"
+    ]
+  },
+  "given": {
+    "viewer": {
+      "type": "user",
+      "id": "viewer-1"
+    },
+    "scope": {
+      "rowKind": "thread",
+      "threadFollowed": false
+    },
+    "message": {
+      "senderType": "user",
+      "senderId": "user-2",
+      "messageType": "chat",
+      "systemSubtype": null,
+      "mentions": [
+        {
+          "type": "user",
+          "id": "viewer-1"
+        }
+      ]
+    }
+  },
+  "steps": [],
+  "expect": {
+    "verdict": {
+      "counts": false,
+      "mention": false
+    }
+  }
+}

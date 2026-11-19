@@ -36,6 +36,7 @@ import {
   deleteFeatureFlagRule,
   evaluateFeatureFlag,
   evaluateFeatureFlags,
+  evaluatePreAuthFeatureFlags,
   getFeatureFlag,
   getFeatureFlagConfigVersion,
   listFeatureFlagRules,
@@ -442,6 +443,70 @@ test("feature flags: desktop web preview view is default-off, server-scoped and 
   assert.equal(mapped.enabled, "true");
   assert.equal(mapped.kill_switch, "false");
   assert.equal(mapped.default_enabled, "false", "the desktop web preview view must be disabled by default");
+  assert.equal(mapped.randomization_unit, "'server'");
+  assert.equal(mapped.pre_auth_evaluable, "false");
+  assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
+});
+
+test("feature flags: desktop browser Raft sign-in is default-off, server-scoped and without rules", () => {
+  const migration = readFileSync(
+    resolve(import.meta.dirname, "../../drizzle/0699_desktop_browser_raft_sign_in_flag.sql"),
+    "utf8",
+  );
+
+  const mapped = parseChannelJointMigration(migration);
+  assert.equal(mapped.key, "'desktop_browser_raft_sign_in_v0'");
+  assert.equal(mapped.enabled, "true");
+  assert.equal(mapped.kill_switch, "false");
+  assert.equal(mapped.default_enabled, "false", "Sign in with Raft in the desktop browser must be disabled by default");
+  assert.equal(mapped.randomization_unit, "'server'");
+  assert.equal(mapped.pre_auth_evaluable, "false");
+  assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
+});
+
+test("feature flags: inbox message in place (#244 step 3b) is default-off, server-scoped and without rules", () => {
+  const migration = readFileSync(
+    resolve(import.meta.dirname, "../../drizzle/0700_inbox_message_inplace_flag.sql"),
+    "utf8",
+  );
+
+  const mapped = parseChannelJointMigration(migration);
+  assert.equal(mapped.key, "'inbox_message_inplace_v1'");
+  assert.equal(mapped.enabled, "true");
+  assert.equal(mapped.kill_switch, "false");
+  assert.equal(mapped.default_enabled, "false", "inbox message in place must be disabled by default");
+  assert.equal(mapped.randomization_unit, "'server'");
+  assert.equal(mapped.pre_auth_evaluable, "false");
+  assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
+});
+
+test("feature flags: inbox row position (#244 step 2) is default-off, server-scoped and without rules", () => {
+  const migration = readFileSync(
+    resolve(import.meta.dirname, "../../drizzle/0714_inbox_row_position_flag.sql"),
+    "utf8",
+  );
+
+  const mapped = parseChannelJointMigration(migration);
+  assert.equal(mapped.key, "'inbox_row_position_v1'");
+  assert.equal(mapped.enabled, "true");
+  assert.equal(mapped.kill_switch, "false");
+  assert.equal(mapped.default_enabled, "false", "inbox row position must be disabled by default");
+  assert.equal(mapped.randomization_unit, "'server'");
+  assert.equal(mapped.pre_auth_evaluable, "false");
+  assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
+});
+
+test("feature flags: Raft voice (agent_voice_v1) is default-off, server-scoped and without rules", () => {
+  const migration = readFileSync(
+    resolve(import.meta.dirname, "../../drizzle/0701_agent_voice_flag.sql"),
+    "utf8",
+  );
+
+  const mapped = parseChannelJointMigration(migration);
+  assert.equal(mapped.key, "'agent_voice_v1'");
+  assert.equal(mapped.enabled, "true");
+  assert.equal(mapped.kill_switch, "false");
+  assert.equal(mapped.default_enabled, "false", "Raft voice must be disabled by default");
   assert.equal(mapped.randomization_unit, "'server'");
   assert.equal(mapped.pre_auth_evaluable, "false");
   assert.doesNotMatch(migration, /INSERT INTO "feature_flag_rules"/);
@@ -1445,6 +1510,88 @@ test("feature flags: a batch spanning servers answers each server on its own ide
       );
       assert.equal(evaluations[order.indexOf(rampedServerId)].reason, "server_rule");
     }
+  } finally {
+    await close();
+  }
+});
+
+test("feature flags: rules tied on stage, priority, and createdAt break ties deterministically by id ASC", async () => {
+  const { close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
+  try {
+    const db = getDb();
+    const key = "tied_priority_created_at_v0";
+    const serverId = "00000000-0000-4000-8000-00000000ee99";
+    const tiedTime = new Date("2026-11-14T12:00:00.000Z");
+    const largerId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    const smallerId = "00000000-0000-4000-8000-000000000001";
+
+    await db.insert(featureFlags).values({
+      key,
+      randomizationUnit: "server",
+      defaultEnabled: false,
+      preAuthEvaluable: true,
+      salt: "tied-priority-created-at",
+    });
+
+    // Insert the larger UUID (`deny`) FIRST in heap order so without `id ASC` tie-breaking,
+    // Postgres seqscan + stable JS sort would pick `deny` instead of `allow`.
+    await db.insert(featureFlagRules).values([
+      {
+        id: largerId,
+        flagKey: key,
+        stage: "server",
+        priority: 0,
+        decision: "deny",
+        values: [serverId],
+        createdAt: tiedTime,
+        updatedAt: tiedTime,
+      },
+      {
+        id: smallerId,
+        flagKey: key,
+        stage: "server",
+        priority: 0,
+        decision: "allow",
+        values: [serverId],
+        createdAt: tiedTime,
+        updatedAt: tiedTime,
+      },
+      {
+        id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        flagKey: key,
+        stage: "platform",
+        priority: 0,
+        decision: "deny",
+        values: ["mobile"],
+        createdAt: tiedTime,
+        updatedAt: tiedTime,
+      },
+      {
+        id: "00000000-0000-4000-8000-000000000002",
+        flagKey: key,
+        stage: "platform",
+        priority: 0,
+        decision: "allow",
+        values: ["mobile"],
+        createdAt: tiedTime,
+        updatedAt: tiedTime,
+      },
+    ]);
+
+    assert.deepEqual(await evaluateFeatureFlag({ key, serverId }), {
+      key,
+      enabled: true,
+      reason: "server_rule",
+    });
+
+    const preAuth = await evaluatePreAuthFeatureFlags([key], "mobile");
+    assert.equal(preAuth[key], true);
+
+    const listed = await listFeatureFlagRules(key);
+    assert.deepEqual(
+      listed.filter((rule) => rule.stage === "server").map((rule) => rule.id),
+      [smallerId, largerId],
+    );
   } finally {
     await close();
   }

@@ -5,7 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "vitest";
 import { SERVER_CAPABILITY_MIGRATION_BACKUP_IGNORE_SOURCES_V1, SERVER_CAPABILITY_RUNTIME_DETECTION_ASYNC_V1, type MachineToServerMessage, type ServerToMachineMessage } from "@botiverse/raft-shared";
-import { DaemonCore, migrationSummaryMayReportIgnoreSources, type RuntimeDetection } from "./core";
+import { DaemonCore, migrationSummaryMayReportIgnoreSources,
+  migrationSummaryMayReportIgnoredPartial, type RuntimeDetection } from "./core";
 import type { WebSocketLike } from "./connection";
 import type { RuntimeDetectionRoundOptions, RuntimeDetectionRoundResult } from "./runtimeDetectionRound";
 
@@ -437,4 +438,11 @@ test("per-source ignore counts need both the Server and the target Computer to a
   assert.equal(migrationSummaryMayReportIgnoreSources(true, {}), false);
   assert.equal(migrationSummaryMayReportIgnoreSources(true, { targetAcceptsIgnoreSources: false }), false);
   assert.equal(migrationSummaryMayReportIgnoreSources(false, { targetAcceptsIgnoreSources: true }), false);
+});
+
+test("a partial mark on the ignored totals needs both the Server and the target Computer to accept it", () => {
+  assert.equal(migrationSummaryMayReportIgnoredPartial(true, { targetAcceptsIgnoredPartial: true }), true);
+  assert.equal(migrationSummaryMayReportIgnoredPartial(true, {}), false);
+  assert.equal(migrationSummaryMayReportIgnoredPartial(true, { targetAcceptsIgnoredPartial: false }), false);
+  assert.equal(migrationSummaryMayReportIgnoredPartial(false, { targetAcceptsIgnoredPartial: true }), false);
 });

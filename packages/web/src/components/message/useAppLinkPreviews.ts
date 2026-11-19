@@ -1,13 +1,11 @@
 import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { IntlContext } from "react-intl";
 import type { RefObject } from "react";
-import { z } from "zod";
 import { useShallow } from "zustand/react/shallow";
 import { clearClockTimeout, currentTimeMs, setClockTimeout } from "@botiverse/raft-shared";
 import type { AppLinkPreviewContent, LinkCardReadAnswerItem, LinkCardV2 } from "@botiverse/raft-shared/src/appLinkPreview";
-import { appLinkPreviewListResponseSchema, appLinkReadUrls, publicPreviewUrl } from "@botiverse/raft-shared/src/appLinkPreview";
+import { appLinkReadUrls, publicPreviewUrl } from "@botiverse/raft-shared/src/appLinkPreview";
 import { useArtifactAppHosts } from "../../apps/artifacts";
-import { parseRetryAfterMs } from "../../api/overloadRetry";
 import { htmlLangForLocale } from "../../i18n/locale";
 import { useLocale } from "../../i18n/LocaleProvider";
 import { useAuthStore } from "../../store/authStore";
@@ -20,15 +18,24 @@ import {
 import type { LinkPreviewApp } from "../../store/linkPreviewConsentStore";
 import { INTERACTIVE_LINK_CARDS_FEATURE_FLAG_KEY, useServerFeatureFlag } from "../../store/serverFeatureFlags";
 import { useServerStore } from "../../store/serverStore";
-import { registerLinkCardMessageView } from "./linkCardExecute";
+import { followedLinkCardUrls, registerLinkCardMessageView } from "./linkCardExecute";
 import type { LinkCardMessageView, LinkCardReread } from "./linkCardExecute";
 import { bumpLinkCardViewSeq, newLinkCardView, readMessageLinks } from "./linkCardRead";
-import { appLinkResultOfItem } from "./linkCardItems";
+import {
+  appLinkResultKey, jitterMs, nextLinkCardRetry, rateLimitedBackoffMs, readAppLinkPreviewAnswer, readLinkCardAnswer, retryAfterMsOf, setLinkCardRetryRandomForTests,
+} from "./linkCardAnswers";
+import type { LinkCardRetry } from "./linkCardAnswers";
 import type { AppLinkDrawn } from "./linkCardItems";
 import type { LinkCardView, MessageLinksRead } from "./linkCardRead";
+import type { LinkCardSealTo } from "./linkCardSeal";
+import { loadedMessageCard, messageCardActionResult, messageCardActionUrls } from "./messageCardActions";
+import type { LoadedMessageCard, MessageCardActing, MessageCardActionsRead } from "./messageCardActions";
 
-/** The App as Raft stores it: its name and its uploaded icon (never an image from the preview). */
-export type AppLinkApp = { name: string; icon: string | null };
+export { appLinkResultKey, nextLinkCardRetry, readAppLinkPreviewAnswer, readLinkCardAnswer, setLinkCardRetryRandomForTests } from "./linkCardAnswers";
+export type { LinkCardRetry } from "./linkCardAnswers";
+
+/** The App as Raft stores it: its name and uploaded icon (never the preview's); `reviewed: false` if Raft hasn't reviewed it (RFC 076 §17). */
+export type AppLinkApp = { name: string; icon: string | null; reviewed?: false };
 
 /** A handle Raft signed for one enabled execute button of this view (protocol §4.1 step 7). */
 export type LinkCardActionHandle = Extract<LinkCardReadAnswerItem, { kind: "v2" }>["actions"][number];
@@ -46,7 +53,9 @@ export type LinkCardActionHandle = Extract<LinkCardReadAnswerItem, { kind: "v2" 
  *   mounted message returns it, a v2 card also carries `view`: the message
  *   view its buttons act through (linkCardExecute.tsx; never cached). A v3
  *   answer is read the same way, with `drawn` (linkCardItems.ts): whether
- *   the link is a chip and where its card goes (hover, block or none).
+ *   the link is a chip and where its card goes (hover, block or none). A
+ *   card message's press result carries `sealsTo`: by action_id, what a
+ *   SecretInput button's values are sealed to (linkCardSeal.ts).
  * - `connect_account`: a chip with the App's icon and the shortened address;
  *   the hover card holds Raft's own words and a button to `connectUrl`. Only
  *   a v2 or v3 read produces it.
@@ -59,6 +68,7 @@ export type AppLinkResult =
   | {
     kind: "card"; url: string; app: AppLinkApp; title: string; card?: AppLinkPreviewContent["card"]; cardV2?: LinkCardV2; inlineTitle?: string;
     actions?: readonly LinkCardActionHandle[]; businessRevision?: string; readAt?: number; view?: LinkCardMessageView; drawn?: AppLinkDrawn;
+    sealsTo?: Readonly<Record<string, LinkCardSealTo>>;
   }
   | { kind: "connect_account"; url: string; app: AppLinkApp; connectUrl: string }
   | { kind: "consent"; url: string; app: LinkPreviewApp }
@@ -69,11 +79,6 @@ export type AppLinkResults = ReadonlyMap<string, AppLinkResult>;
 
 const NO_RESULTS: AppLinkResults = new Map();
 
-/** The key a message link is looked up by: its WHATWG href, for previewable links only. */
-export function appLinkResultKey(url: string): string | null {
-  return publicPreviewUrl(url)?.href ?? null;
-}
-
 /**
  * The words on a card chip. v1 has only `title`; a v2 answer's `inline.title`
  * takes its place when it has one (addendum 5 §2). `inline.badge` is never on
@@ -83,115 +88,6 @@ export function appLinkChipTitle(result: Extract<AppLinkResult, { kind: "card" }
   return result.inlineTitle ?? result.title;
 }
 
-// `prompts` is read on its own: a prompt the client can't read is dropped
-// without hiding the previews next to it (and the reverse).
-const promptListSchema = z.array(z.object({
-  url: z.string().refine((value) => !!publicPreviewUrl(value)),
-  app: z.object({ id: z.string().min(1).max(200), name: z.string().min(1).max(300), icon: z.string().max(2000).nullable() }),
-})).max(10);
-
-/** Reads a v1 list answer into per-link results. Anything it can't read is no result; one prompt per App. */
-export function readAppLinkPreviewAnswer(data: unknown): AppLinkResults {
-  const results = new Map<string, AppLinkResult>();
-  const previews = appLinkPreviewListResponseSchema.safeParse(data);
-  if (previews.success) {
-    const icons = previews.data.appIcons ?? {};
-    for (const preview of previews.data.previews) {
-      const key = appLinkResultKey(preview.url);
-      if (!key || results.has(key)) continue;
-      const icon = Object.hasOwn(icons, preview.url) ? icons[preview.url] ?? null : null;
-      results.set(key, { kind: "card", url: key, app: { name: preview.appName, icon }, title: preview.title, card: preview.card });
-    }
-  }
-  return withPrompts(results, data);
-}
-
-/**
- * Links a batched read answered `rate_limited`, read again after `afterMs`.
- * `backoffMs` is the wait without the jitter: the answer's longest
- * `retry_after` (clamped to 1-60 s), or, for the view's later re-reads,
- * double the last wait if that is longer (nextLinkCardRetry), 60 s at most.
- * `afterMs` adds up to a second at random, so a page's links don't retry
- * together; 60 s at most.
- */
-export type LinkCardRetry = { urls: string[]; afterMs: number; backoffMs: number };
-
-const RETRY_AFTER_MAX_MS = 60_000;
-/** Up to this much is added at random to a retry's wait, so a page's links don't all retry at the same moment. */
-const RETRY_JITTER_MS = 1_000;
-let retryRandom: () => number = Math.random;
-/** Tests: the random source of the retry jitter (`null`: Math.random again). */
-export function setLinkCardRetryRandomForTests(random: (() => number) | null) {
-  retryRandom = random ?? Math.random;
-}
-const jitterMs = () => Math.floor(retryRandom() * RETRY_JITTER_MS);
-const withJitter = (backoffMs: number) => Math.min(RETRY_AFTER_MAX_MS, backoffMs + jitterMs());
-
-/**
- * The view's next re-read of `urls`: never sooner than Raft asked
- * (`retryAfterMs`: the answer's `retry_after`, a 429's `Retry-After`, or 0
- * when the re-read got no answer), and at least double the last wait
- * (`lastBackoffMs`), 60 s at most; plus the jitter.
- */
-export function nextLinkCardRetry(urls: string[], lastBackoffMs: number, retryAfterMs: number): LinkCardRetry {
-  const backoffMs = Math.min(RETRY_AFTER_MAX_MS, Math.max(retryAfterMs, lastBackoffMs * 2));
-  return { urls, backoffMs, afterMs: withJitter(backoffMs) };
-}
-
-/** A read answered 429: its response's headers. */
-const tooManyRequestsSchema = z.object({ response: z.object({ status: z.literal(429), headers: z.unknown() }) });
-/**
- * How long a read that failed with a 429 was asked to wait: its `Retry-After`
- * (seconds or an HTTP date; parseRetryAfterMs), 60 s at most; 0 otherwise.
- * Both reads' limiters send it on a 429 (the server exposes it to the web).
- */
-function retryAfterMsOf(error: unknown): number {
-  const tooMany = tooManyRequestsSchema.safeParse(error);
-  const waitMs = tooMany.success ? parseRetryAfterMs(tooMany.data.response.headers, currentTimeMs()) : null;
-  return waitMs ? Math.min(RETRY_AFTER_MAX_MS, waitMs) : 0;
-}
-
-/** The wait rate_limited links ask for: their longest `retry_after` (seconds), clamped to 1-60 s, in ms. */
-const rateLimitedBackoffMs = (retryAfters: number[]) => Math.min(60, Math.max(1, ...retryAfters)) * 1000;
-
-/**
- * Reads a batched read's items (linkCardRead.ts) into per-link results, with
- * the answer's prompts read as the GET's, and the links to read again. `v1`
- * is the card it is today; `v2` and `v3` as appLinkResultOfItem reads them;
- * `rate_limited` stays the plain link for now.
- */
-export function readLinkCardAnswer(items: LinkCardReadAnswerItem[], data: unknown): { results: AppLinkResults; retry: LinkCardRetry | null } {
-  const results = new Map<string, AppLinkResult>();
-  const later = new Map<string, number>();
-  for (const item of items) {
-    const key = appLinkResultKey(item.url);
-    if (!key || results.has(key) || later.has(key)) continue;
-    if (item.kind === "rate_limited") { later.set(key, item.retry_after); continue; }
-    const app = { name: item.app.name, icon: item.app.icon };
-    if (item.kind === "v1") { results.set(key, { kind: "card", url: key, app, title: item.preview.title, card: item.preview.card }); continue; }
-    // v2 and v3 (linkCardItems.ts): a card, a connect_account chip, or (v3) a chip with no card.
-    const result = appLinkResultOfItem(item, key, app);
-    if (result) results.set(key, result);
-  }
-  if (!later.size) return { results: withPrompts(results, data), retry: null };
-  const backoffMs = rateLimitedBackoffMs([...later.values()]);
-  return { results: withPrompts(results, data), retry: { urls: [...later.keys()], backoffMs, afterMs: withJitter(backoffMs) } };
-}
-
-/** Adds an answer's prompts (the GET's and the batched read's are alike) to its results. */
-function withPrompts(results: Map<string, AppLinkResult>, data: unknown): AppLinkResults {
-  const prompts = promptListSchema.safeParse((data as { prompts?: unknown } | null)?.prompts ?? []);
-  if (prompts.success) {
-    const asked = new Set<string>();
-    for (const prompt of prompts.data) {
-      const key = appLinkResultKey(prompt.url);
-      if (!key || results.has(key) || asked.has(prompt.app.id)) continue;
-      asked.add(prompt.app.id);
-      results.set(key, { kind: "consent", url: key, app: prompt.app });
-    }
-  }
-  return results;
-}
 
 type Loaded = {
   scope: string;
@@ -225,6 +121,8 @@ type Loaded = {
    * by what is read into the answer meanwhile. Never cached.
    */
   failure?: number;
+  /** A card message's acting buttons (RFC 086): this viewer's `message_card` answer, read with the same request (messageCardActions.ts). */
+  card?: LoadedMessageCard;
 };
 type ConsentResult = Extract<AppLinkResult, { kind: "consent" }>;
 const consentsOf = (results: AppLinkResults) => [...results.values()].filter((result): result is ConsentResult => result.kind === "consent");
@@ -363,7 +261,7 @@ export function clearAppLinkPreviewCacheForTests() {
   wholeReadSentAt.clear();
   hoverNotBefore.clear();
   readHold = null;
-  retryRandom = Math.random;
+  setLinkCardRetryRandomForTests(null);
 }
 useLinkPreviewConsentStore.subscribe((state, previous) => {
   const answered = Object.entries(state.status).filter(([key, status]) => previous.status[key] !== status);
@@ -553,8 +451,13 @@ const rereadsLeft = (views: MessageViews, scope: string) => views.current?.scope
  * every message: after Allow, the ones that carried that App's prompt read
  * their links again (its links pending meanwhile); after Don't Allow the
  * links stay plain.
+ *
+ * A card message with acting buttons (RFC 086; `card`) is read by the same
+ * request: its answer's `message_card` comes back as `card`, per stored
+ * revision (a new revision is a new scope, so it is read again), and its
+ * buttons act through the same message view, each fallback page a link of it.
  */
-export function useAppLinkPreviews({ messageId, content, conversationId, enabled, target, seen }: {
+export function useAppLinkPreviews({ messageId, content, conversationId, enabled, target, seen, card = null }: {
   messageId: string;
   content: string;
   conversationId: string;
@@ -568,16 +471,18 @@ export function useAppLinkPreviews({ messageId, content, conversationId, enabled
    * the links stay plain.
    */
   seen: boolean;
-}): AppLinkResults {
+  /** The message's acting buttons as stored (messageCardRead.ts), or null: not a card message with any. */
+  card?: MessageCardActing | null;
+}): { results: AppLinkResults; card: MessageCardActionsRead | null } {
   const viewer = useAuthStore((s) => s.user?.id);
   const server = useServerStore((s) => s.current?.id);
   const batched = useServerFeatureFlag(INTERACTIVE_LINK_CARDS_FEATURE_FLAG_KEY).enabled;
   const locale = htmlLangForLocale(useLocale().locale);
-  const active = enabled && !!viewer && !!server && /https:\/\//.test(content);
+  const active = enabled && !!viewer && !!server && (!!card || /https:\/\//.test(content));
   // The one host list the message's links are split on (with the Artifacts
   // it names, useMessageLinkCards): a new one when the server's arrives.
   const hosts = useArtifactAppHosts();
-  const scope = `${viewer}:${server}:${messageId}:${content}`;
+  const scope = `${viewer}:${server}:${messageId}:${content}${card ? `\ncard:${card.revision}` : ""}`;
   const mode = batched ? `v2:${locale}` : "v1";
   const views = useRef<MessageView | null>(null);
   const viewerKey = linkPreviewViewerKey(viewer, server);
@@ -593,8 +498,8 @@ export function useAppLinkPreviews({ messageId, content, conversationId, enabled
   const cached = active && loaded?.scope !== scope ? cachedAnswer(scope) : undefined;
   const current = !active ? null : loaded?.scope === scope ? loaded : cached ?? null;
   // What the reads of some links read with, and the answer shown: the latest render's.
-  const latest = useRef({ scope, reader, messageId, locale, batched, hosts, shown: current?.scope === scope, answer: current });
-  latest.current = { scope, reader, messageId, locale, batched, hosts, shown: current?.scope === scope, answer: current };
+  const latest = useRef({ scope, reader, messageId, locale, batched, hosts, shown: current?.scope === scope, answer: current, card });
+  latest.current = { scope, reader, messageId, locale, batched, hosts, shown: current?.scope === scope, answer: current, card };
   // Reads of some links (a button's re-read, a rate-limited re-read), one at
   // a time and never while a whole read is in flight. They share the view's
   // request count with the whole message (§7.1), so two at once would make
@@ -625,7 +530,8 @@ export function useAppLinkPreviews({ messageId, content, conversationId, enabled
     partialReads.current = result.catch(() => {});
     return result;
   }).current;
-  const prompts = useMemo(() => (current ? consentsOf(current.results) : []), [current]);
+  // A card message's App the viewer hasn't allowed (or declined) counts as a prompt here: allowing it reads the card again.
+  const prompts = useMemo(() => (current ? [...consentsOf(current.results), ...(current.card?.consent ? [current.card.consent] : [])] : []), [current]);
 
   // One "status|epoch|asksHere" entry per prompt, so only an answer about
   // this message's Apps re-renders it.
@@ -667,7 +573,14 @@ export function useAppLinkPreviews({ messageId, content, conversationId, enabled
   // read the other way: with the GET before the flag was known, or in another
   // language, or when its whole read failed and the row came back on screen.
   // That answer stays until the new one comes.
-  const wantsAnswer = active && (current ? stale || current.mode !== mode || reentered : seen);
+  // A card message whose answer brought nothing usable is read again when its drawing asks (`retry`, bounded there).
+  const [cardRetry, setCardRetry] = useState<{ scope: string; n: number } | null>(null);
+  const cardTries = cardRetry?.scope === scope ? cardRetry.n : 0;
+  const retryCard = useCallback(() => {
+    const shown = latest.current.answer;
+    if (shown?.scope === scope) setCardRetry({ scope, n: (shown.card?.attempt ?? 0) + 1 });
+  }, [scope]);
+  const wantsAnswer = active && (current ? stale || current.mode !== mode || reentered || (!!card && cardTries > (current.card?.attempt ?? 0)) : seen);
   useEffect(() => {
     if (!wantsAnswer) return;
     const controller = new AbortController();
@@ -706,8 +619,9 @@ export function useAppLinkPreviews({ messageId, content, conversationId, enabled
         // content (the server picks the same ones; this keeps a prompt that
         // could never show from claiming the conversation).
         const bare = new Set(readLinks(content, read.batched, latest.current.hosts));
-        const results = new Map([...parsed.results].filter(([url, result]) => result.kind !== "consent" || bare.has(url)));
+        const results = new Map([...parsed.results].filter(([url, result]) => result.kind !== "consent" || (!card && bare.has(url))));
         const answer: Loaded = { scope, mode, batched: read.batched, results, epochs: askedAt, generation };
+        if (card) answer.card = loadedMessageCard(read.batched ? read.messageCard : null, cardTries);
         if (parsed.retry) {
           // Its rate_limited links: unread, and read again while the view has re-reads left.
           const at = currentTimeMs() + parsed.retry.backoffMs;
@@ -741,11 +655,13 @@ export function useAppLinkPreviews({ messageId, content, conversationId, enabled
         setLoaded((previous) => {
           const base = previous?.scope === scope ? previous : cachedBefore;
           // Nothing shown yet: every link is unread.
-          if (!base) return { scope, mode, batched, results: new Map(), epochs: askedAt, generation, unread: new Set(links), failure: failedRead };
+          // A card's last answer stays (its handles are read again before use); with none, it has none.
+          const failedCard = card ? { card: { ...(base?.card ?? loadedMessageCard(null, 0)), attempt: cardTries } } : {};
+          if (!base) return { scope, mode, batched, results: new Map(), epochs: askedAt, generation, unread: new Set(links), failure: failedRead, ...failedCard };
           const results = new Map([...base.results].filter(([, result]) => result.kind !== "consent" || status[linkPreviewAppKey(viewerKey, result.app.id)] !== "allowed"));
           // The allowed App's prompts go: their links are unread now.
           const unread = new Set([...base.unread ?? [], ...[...base.results.keys()].filter((url) => !results.has(url))]);
-          return { ...base, results, epochs: askedAt, unread, failure: failedRead };
+          return { ...base, results, epochs: askedAt, unread, failure: failedRead, ...failedCard };
         });
       });
     return () => {
@@ -754,7 +670,7 @@ export function useAppLinkPreviews({ messageId, content, conversationId, enabled
       // changed): what waits for it goes on. Not a failure.
       finish("cancelled");
     };
-  }, [wantsAnswer, reentries, epochSignature, markHeldPlain, scope, mode, messageId, content, conversationKey, viewerKey, reader, batched, locale]);
+  }, [wantsAnswer, reentries, cardTries, epochSignature, markHeldPlain, scope, mode, messageId, content, conversationKey, viewerKey, reader, batched, locale, card]);
 
   // A row whose whole read failed or timed out: read again when it comes back
   // on screen (it was off screen, then on; the IntersectionObserver's first
@@ -968,11 +884,17 @@ export function useAppLinkPreviews({ messageId, content, conversationId, enabled
       if (!asked.batched || !viewFor(views, asked.scope)) return { kind: "failed" };
       let read: MessageLinksRead | null;
       try {
-        read = await readSome([url], mounted.current?.signal ?? new AbortController().signal);
+        // A card message is read whole (Raft answers every acting button of it), with the ticket of each fallback page.
+        read = await readSome(asked.card ? messageCardActionUrls(asked.card) : [url], mounted.current?.signal ?? new AbortController().signal);
       } catch {
         return { kind: "failed" };
       }
       if (!read?.batched || latest.current.scope !== asked.scope) return { kind: "superseded" };
+      if (asked.card) {
+        const again = loadedMessageCard(read.messageCard, 0);
+        setLoaded((previous) => (previous?.scope === asked.scope ? { ...previous, card: { ...again, attempt: previous.card?.attempt ?? 0 } } : previous));
+        return { kind: "read", result: messageCardActionResult(url, asked.card, again) };
+      }
       const again = readLinkCardAnswer(read.items, null);
       if (again.retry?.urls.includes(url)) return { kind: "failed" }; // rate_limited: the card stays as it was
       const result = again.results.get(url) ?? null;
@@ -1004,16 +926,24 @@ export function useAppLinkPreviews({ messageId, content, conversationId, enabled
   intl.current = intlContext;
   // Split again when the host list arrives; the same links keep their array,
   // so only a message whose read changed registers again.
-  const readNow = useMemo(() => readLinks(content, true, hosts), [content, hosts]);
+  // A card message's fallback pages are links of the view too, and stay so while it is mounted (and while this tab
+  // follows an operation on one): the App replacing the card mid-operation takes the button, not the operation's toast.
+  const cardUrls = useRef<string[] | null>(null);
+  cardUrls.current ??= followedLinkCardUrls(`${viewerKey}|${messageId}`);
+  const actingUrls = card ? messageCardActionUrls(card).filter((url) => !cardUrls.current?.includes(url)) : [];
+  if (actingUrls.length) cardUrls.current = [...cardUrls.current, ...actingUrls];
+  const keptCardUrls = cardUrls.current;
+  const readNow = useMemo(() => [...readLinks(content, true, hosts), ...keptCardUrls], [content, hosts, keptCardUrls]);
   const registered = useRef(readNow);
   if (registered.current !== readNow && !sameLinks(registered.current, readNow)) registered.current = readNow;
   const links = registered.current;
+  const registers = batched && (active || (keptCardUrls.length > 0 && !!viewer && !!server));
   useEffect(() => {
-    if (!active || !batched) return;
+    if (!registers) return;
     return registerLinkCardMessageView({ viewerKey, messageId, urls: links, view: messageView, format: () => intl.current?.formatMessage ?? null });
-  }, [active, batched, viewerKey, messageId, links, messageView]);
+  }, [registers, viewerKey, messageId, links, messageView]);
 
-  return useMemo(() => {
+  const results = useMemo(() => {
     if (!current) return NO_RESULTS;
     const withViews = (results: AppLinkResults): AppLinkResults => {
       if (![...results.values()].some((result) => result.kind === "card" && result.cardV2)) return results;
@@ -1041,4 +971,12 @@ export function useAppLinkPreviews({ messageId, content, conversationId, enabled
     }
     return withViews(results);
   }, [current, promptViews, stale, plainWhileHeld, content, hosts, messageView]);
+  // The card's answer for its drawing (MessageCardActingButtons.tsx): no answer yet, or one being read again, is `loading`.
+  const shownCard = current?.card;
+  const loading = active && (!current || wantsAnswer);
+  const cardRead = useMemo<MessageCardActionsRead | null>(
+    () => (card ? { acting: card, answer: shownCard?.answer ?? null, readAt: shownCard?.readAt ?? 0, loading, view: messageView, retry: retryCard } : null),
+    [card, shownCard, loading, messageView, retryCard],
+  );
+  return useMemo(() => ({ results, card: cardRead }), [results, cardRead]);
 }

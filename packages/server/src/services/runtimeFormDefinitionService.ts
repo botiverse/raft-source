@@ -140,7 +140,7 @@ export function buildBuiltInPiFormOptionSource(sourceId: string): AgentCreateFor
         PI_BUILTIN_PROVIDER_DEFAULT_MODELS[providerId as keyof typeof PI_BUILTIN_PROVIDER_DEFAULT_MODELS] ?? "",
       ])),
       // A gateway, and a preset provider that also takes a typed id (task #10:
-      // OpenRouter). A Computer that cannot run one turns it back off
+      // BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS). A Computer that cannot run one turns it back off
       // (filterBuiltInPiFormOptionSourceForCatalog).
       customValueAllowedByValue: Object.fromEntries(allProviderIds.map((providerId) => [
         providerId,
@@ -153,7 +153,7 @@ export function buildBuiltInPiFormOptionSource(sourceId: string): AgentCreateFor
 
 /**
  * The list-only projection: a preset provider that takes a typed id (task #10:
- * OpenRouter) stays list-only. Served on v1 (v1 clients build runtimeConfig
+ * OpenRouter, Qwen Token Plan, ...) stays list-only. Served on v1 (v1 clients build runtimeConfig
  * themselves and only ever build a custom model for a gateway) and on v2 to a
  * client without `dependent_select.custom_value_with_options`.
  */

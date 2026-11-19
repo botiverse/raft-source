@@ -181,7 +181,13 @@ test("an App status answer that is not exactly the schema, or none in time, move
     ["a duplicate key", () => '{"status":"unknown","status":"done"}', "invalid_answer"],
     ["a toast tone outside the protocol", () => appAnswer({ status: "done", toast: { tone: "error", text: "x" } }), "invalid_answer"],
     ["a toast over 200 code points", () => appAnswer({ status: "done", toast: { tone: "info", text: "x".repeat(201) } }), "invalid_answer"],
+    ["an empty toast text", () => appAnswer({ status: "refused", toast: { tone: "warning", text: "" } }), "invalid_answer"],
+    ["a toast with a field the protocol lacks", () => appAnswer({ status: "done", toast: { tone: "info", text: "x", html: "<b>x</b>" } }), "invalid_answer"],
+    ["a toast that is not an object", () => appAnswer({ status: "done", toast: "Merged" }), "invalid_answer"],
     ["a code over 64", () => appAnswer({ status: "done", code: "C".repeat(65) }), "invalid_answer"],
+    ["an empty code", () => appAnswer({ status: "failed_not_sent", code: "" }), "invalid_answer"],
+    ["a code that is not a string", () => appAnswer({ status: "done", code: 7 }), "invalid_answer"],
+    ["an attribution over 200", () => appAnswer({ status: "done", attribution: "a".repeat(201) }), "invalid_answer"],
     ["an empty attribution", () => appAnswer({ status: "done", attribution: "" }), "invalid_answer"],
     ["Raft's own state as an answer", () => appAnswer({ status: "needs_reconciliation" }), "invalid_answer"],
     ["an unknown status", () => appAnswer({ status: "maybe" }), "invalid_answer"],
@@ -530,6 +536,16 @@ test("one live-state module: the receipt and update services and the routes neve
   const receiptSource = readFileSync(new URL("../services/linkCardReceiptService.ts", import.meta.url), "utf8");
   assert.equal(receiptSource.match(/linkCardStatusTargetInForce\(/g)?.length, 1, "one forwarding decision");
   assert.equal(receiptSource.match(/matchLinkCardUrlIdentity\(\{/g)?.length, 1, "one URL match");
+});
+
+test("one App-answer parser: status and execute both read the App's answer through parseLinkCardAppAnswer, so code, attribution and toast have one set of bounds", () => {
+  const receiptSource = readFileSync(new URL("../services/linkCardReceiptService.ts", import.meta.url), "utf8");
+  const actionSource = readFileSync(new URL("../services/linkCardActionService.ts", import.meta.url), "utf8");
+  for (const [file, source] of [["linkCardReceiptService.ts", receiptSource], ["linkCardActionService.ts", actionSource]] as const) {
+    assert.equal(source.match(/parseLinkCardAppAnswer\(result\.text, /g)?.length, 1, `${file} reads its App answer through the shared parser`);
+  }
+  for (const copy of ["linkCardToastSchema", "parseStrictJson", "boundedText", "codePoints"]) assert.ok(!receiptSource.includes(copy), `status keeps no copy of the parser (${copy})`);
+  assert.equal(actionSource.match(/linkCardToastSchema\.safeParse\(/g)?.length, 1, "one toast check, in the parser");
 });
 
 test("execute and status name the id the App last proved in its domain file, not its current one (RFC 084 §4)", async ({ app, db, seed }) => {

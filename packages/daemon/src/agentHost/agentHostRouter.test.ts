@@ -25,7 +25,8 @@ class FakeLegacy {
   agentHostState(): "none" | "idle" | "active" { return this.state; }
   readonly forgottenHandbacks: string[] = [];
   forgetSpecHandback(agentId: string): void { this.forgottenHandbacks.push(agentId); }
-  async startAgent(...args: unknown[]): Promise<void> { this.calls.push("start"); this.starts.push(args); this.state = "active"; }
+  startOutcome: "started" | "cancelled" = "started";
+  async startAgent(...args: unknown[]): Promise<"started" | "cancelled"> { this.calls.push("start"); this.starts.push(args); this.state = "active"; return this.startOutcome; }
   getAgentStartAcceptance(): AgentStartAcceptance { return { queueState: "queued", queueDepth: 1, queueAgeMs: 0 }; }
   async stopAgent(_agentId: string, options?: { silent?: boolean }): Promise<void> { this.calls.push(`stop:${options?.silent ? "silent" : "loud"}`); this.state = "none"; }
   async stopAll(): Promise<void> {}
@@ -74,6 +75,10 @@ class FakeOar {
   setServerTurnEndedCapable() {}
   readonly features: unknown[] = [];
   applyServerFeatures(features: unknown): void { this.features.push(features); }
+  readonly droppedReports: Array<{ agentId: string; launchId: string | null; reason: string; eventIds: readonly string[] }> = [];
+  reportDroppedAppEvents(agentId: string, launchId: string | null, reason: string, eventIds: readonly string[]): void {
+    this.droppedReports.push({ agentId, launchId, reason, eventIds });
+  }
 }
 
 function router() {
@@ -148,7 +153,7 @@ test("a start the OAR host hands back runs on the legacy host with the same sess
   const { legacy, oar, traces, hosts } = router();
   const held: AgentMessage = { ...exampleMessage, message_id: "held-1" };
   let settled: boolean | Promise<boolean> | undefined;
-  const heldDelivery: HeldDelivery = { message: held, context: {}, settle: (accepted) => { settled = accepted; } };
+  const heldDelivery: HeldDelivery = { message: held, context: {}, droppedAppEventIds: ["evt-1"], settle: (accepted) => { settled = accepted; } };
   oar.outcome = {
     kind: "fallback",
     reason: "resume_failed:SessionNotFoundError",
@@ -161,10 +166,45 @@ test("a start the OAR host hands back runs on the legacy host with the same sess
   assert.equal(legacy.starts[0]![5], "launch-2", "the newest launch the OAR start carried");
   assert.deepEqual(legacy.delivered, [held]);
   assert.equal(settled, true);
+  assert.deepEqual(oar.droppedReports, [], "the legacy host takes them: nothing dropped");
   assert.deepEqual(traces.map((trace) => [trace.host, trace.stage, trace.fallback_reason]), [
     ["oar", "start", undefined],
     ["legacy", "oar_fallback", "resume_failed:SessionNotFoundError"],
   ]);
+});
+
+test("a start kept on OAR (failHere) fails without the legacy host; its held app event is reported", async () => {
+  const { legacy, oar, hosts } = router();
+  let settled: boolean | Promise<boolean> | undefined;
+  oar.outcome = {
+    kind: "fallback",
+    reason: "cursor_sdk_status_unknown",
+    request: { agentId: "agent-1", config: config(), launchId: "launch-2", wakeMessageTransient: false, recoveryGrant: null, claimedConnectionEpochId: null },
+    held: [{ message: { ...exampleMessage, message_id: "held-1" }, context: {}, droppedAppEventIds: ["evt-1"], settle: (accepted) => { settled = accepted; } }],
+    failHere: "Cursor's sign-in could not be read.",
+  };
+  await rejectsOarOnly(hosts.startAgent("agent-1", config(), undefined, undefined, undefined, "launch-1"));
+  assert.deepEqual(legacy.calls, []);
+  assert.equal(settled, false);
+  assert.deepEqual(oar.droppedReports, [{ agentId: "agent-1", launchId: "launch-2", reason: "oar_kept_failed", eventIds: ["evt-1"] }]);
+});
+
+// Core acks a delivery it promoted to a start's wake only when the start was
+// not cancelled (a start a drain held, ended by a stop or the shutdown).
+test("a start's outcome reaches the core: an OAR start a stop ended is cancelled, on either host", async () => {
+  const { legacy, oar, hosts } = router();
+  oar.outcome = { kind: "stopped" };
+  assert.equal(await hosts.startAgent("agent-oar", config(), undefined, undefined, undefined, "launch-1"), "cancelled");
+  // A later start carried by the session OAR still holds.
+  oar.owned.add("agent-oar");
+  assert.equal(await hosts.startAgent("agent-oar", config(), undefined, undefined, undefined, "launch-2"), "cancelled");
+  oar.outcome = { kind: "rebound" };
+  assert.equal(await hosts.startAgent("agent-oar", config(), undefined, undefined, undefined, "launch-3"), "started");
+
+  legacy.startOutcome = "cancelled";
+  assert.equal(await hosts.startAgent("agent-legacy", config({ runtimeHost: undefined }), undefined, undefined, undefined, "launch-4"), "cancelled");
+  legacy.startOutcome = "started";
+  assert.equal(await hosts.startAgent("agent-legacy-2", config({ runtimeHost: undefined }), undefined, undefined, undefined, "launch-5"), "started");
 });
 
 test("lifecycle calls follow the agent's current host", async () => {
@@ -186,7 +226,7 @@ function oarOnlyConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
 
 function oarOnlyFallback(reason: string, extra: Partial<Extract<OarStartOutcome, { kind: "fallback" }>> = {}): { outcome: OarStartOutcome; settled: () => unknown } {
   let settled: unknown;
-  const held: HeldDelivery = { message: { ...exampleMessage, message_id: "held-1" }, context: {}, settle: (accepted) => { settled = accepted; } };
+  const held: HeldDelivery = { message: { ...exampleMessage, message_id: "held-1" }, context: {}, droppedAppEventIds: ["evt-1"], settle: (accepted) => { settled = accepted; } };
   return {
     outcome: {
       kind: "fallback",
@@ -208,7 +248,7 @@ async function rejectsOarOnly(promise: Promise<unknown>): Promise<OarOnlyStartEr
 
 test("structure: every OAR-only driver has an OAR launch, and its spawn is never a way to run it", () => {
   const oarOnly = registeredRuntimeIds().filter((id) => getDriver(id).oarOnly);
-  assert.deepEqual(oarOnly.sort(), ["codebuddy", "qoder", "qwen"]);
+  assert.deepEqual(oarOnly.sort(), ["qoder", "qwen"]);
   for (const id of oarOnly) {
     assert.ok(OAR_HOSTED_RUNTIMES.has(id), `${id} is launched by the OAR host`);
     assert.throws(() => getDriver(id).spawn({} as never), /runs only on the OAR host/);
@@ -252,6 +292,8 @@ test("an OAR-only start the OAR host hands back fails with the launch's own erro
   assert.deepEqual(legacy.calls, []);
   assert.deepEqual(legacy.delivered, []);
   assert.equal(missing.settled(), false);
+  // Its app event is reported, to be sent again at the next start.
+  assert.deepEqual(oar.droppedReports, [{ agentId: "agent-1", launchId: "launch-1", reason: "oar_only_failed", eventIds: ["evt-1"] }]);
   const classified = classifySpawnFailure(error);
   assert.equal(classified.reason, "runtime_not_found");
   assert.match(classified.userMessage, /Qwen Code is not installed on this Computer/);

@@ -122,6 +122,23 @@ export async function firstSeenToday(key: string, now: number = Date.now()): Pro
   return true;
 }
 
+/**
+ * Whether `firstSeenToday` has already taken this key, without taking it: for
+ * a caller that wants to skip the work before an event it would then drop.
+ * A Redis error reads as "not seen", so the caller does the work and
+ * `firstSeenToday` decides.
+ */
+export async function seenToday(key: string, now: number = Date.now()): Promise<boolean> {
+  dropExpiredLocalKeys(now);
+  if (localOnceADayKeys.has(key)) return true;
+  if (!isRedisAvailable()) return false;
+  try {
+    return await getRedis().exists(key) === 1;
+  } catch {
+    return false;
+  }
+}
+
 /** The `upload_monthly_quota` usage numbers of a paywall_hit (the registry's `requested_bytes`, `month_used_bytes`). */
 export interface PaywallHitUsage {
   requestedBytes: number;

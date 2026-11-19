@@ -245,7 +245,8 @@ export function actionCardErrorText(err: unknown, fallback: string): string {
  * migration route does, a seat request (seats:add) an owner who manages billing; a question card asked of one person
  * (`question:ask`, addressee `user`) is theirs alone to answer, everyone else
  * waits for them (question-card spec §3.1; the server answers anyone else 403
- * NOT_ADDRESSEE); and whoever sent the card doesn't answer it. Display only:
+ * NOT_ADDRESSEE), and a request card (`request:prepare`) is decided only by
+ * the person it is for (RFC 085 §4.2); and whoever sent the card doesn't answer it. Display only:
  * the server checks again on every mutation, visibility first.
  */
 export function useActionCardAccess({ messageId, metadata, channelId, parentChannelId }: {
@@ -313,8 +314,11 @@ export function useActionCardAccess({ messageId, metadata, channelId, parentChan
           : metadata.action.type === "seats:add" && !(role === "owner" && capabilities.manageBilling)
             ? { id: "actionCard.blocked.ownerOnly" as const }
             // Asked of someone else: the person asked answers, by their id (never the handle the agent wrote).
+            // A request card for someone else: they decide.
             : addresseeId && addresseeId !== viewerId?.toLowerCase()
-              ? { id: "actionCard.question.waiting" as const }
+              ? metadata.action.type === "request:prepare"
+                ? { id: "actionCard.preparedRequest.waiting" as const }
+                : { id: "actionCard.question.waiting" as const }
             // Whoever sent a card doesn't answer it (an agent never runs its own).
             : metadata.requesterUserId && metadata.requesterUserId === viewerId
               ? { id: "actionCard.blocked.ownRequest" as const }
@@ -326,7 +330,7 @@ export function useActionCardAccess({ messageId, metadata, channelId, parentChan
         { id: blockedReason.id },
         { channel: carrierChannel?.name ?? formatMessage({ id: "actionCard.title.channelFallback" }) },
       )
-    : blockedReason?.id === "actionCard.question.waiting"
+    : blockedReason?.id === "actionCard.question.waiting" || blockedReason?.id === "actionCard.preparedRequest.waiting"
     ? formatMessage({ id: blockedReason.id }, { person: addresseeName ?? "" })
     : blockedReason?.id === "actionCard.blocked.needMigrateAgents"
     ? formatMessage(

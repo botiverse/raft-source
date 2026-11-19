@@ -2,6 +2,7 @@ import type { ReminderStatus, ReminderSummary } from "@botiverse/raft-shared";
 import type { ApiClient } from "../../client";
 import { createAgentApiSurfaceClient } from "../../agentApiPath";
 import { cliError } from "../../core/errors";
+import { parseReminderIdInput } from "../../apps/reminder/sealGuard";
 
 export async function resolveReminderId(
   client: ApiClient,
@@ -12,7 +13,7 @@ export async function resolveReminderId(
     failureCode: string;
   },
 ): Promise<string> {
-  const trimmed = id.trim();
+  const trimmed = parseReminderIdInput(id).id;
   if (!trimmed) throw cliError("INVALID_ARG", "--id is required");
   if (trimmed.length >= 32) return trimmed;
 

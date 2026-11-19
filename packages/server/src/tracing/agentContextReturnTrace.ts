@@ -1,6 +1,6 @@
 import type { Tracer } from "@botiverse/raft-shared";
 import { recordTraceEvent } from "./semanticTrace";
-import { traceAgentIdHash, traceIdentityHash } from "./traceIdentity";
+import { launchIdHashAttrs, traceAgentIdHash, traceIdentityHash } from "./traceIdentity";
 
 // Glimpse, input-side duplication (layer 1, "what the server offered"): one
 // standalone event each time the server returns message bodies to an agent —
@@ -51,6 +51,7 @@ export function recordAgentContextReturned(input: {
   if (seqs.length === 0) return;
   const agentIdHash = traceAgentIdHash(input.agentId);
   const conversationIdHash = traceIdentityHash("conversation_id_hash", input.channelId);
+  const contextIdHash = traceIdentityHash("context_id_hash", input.contextId);
   recordTraceEvent(AGENT_CONTEXT_RETURNED_EVENT, {
     source: input.source,
     seq_min: Math.min(...seqs),
@@ -58,8 +59,12 @@ export function recordAgentContextReturned(input: {
     seq_count: seqs.length,
     launch_id_present: Boolean(input.launchId),
     ...(input.launchId ? { launch_id: input.launchId } : {}),
+    // The keyed hash joins this event with the wake breaker's events, which
+    // carry only the hash (traceIdentity.ts).
+    ...launchIdHashAttrs(input.launchId),
     context_id_present: Boolean(input.contextId),
     ...(input.contextId ? { context_id: input.contextId } : {}),
+    ...(contextIdHash ? { context_id_hash: contextIdHash } : {}),
     ...(agentIdHash ? { agent_id_hash: agentIdHash } : {}),
     ...(conversationIdHash ? { conversation_id_hash: conversationIdHash } : {}),
   }, fallbackTracer);

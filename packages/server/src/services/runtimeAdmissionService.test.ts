@@ -130,7 +130,7 @@ test("the runtimeFormV2 marker is on exactly the runtimes with a v2 form, indepe
     options.filter((option) => option.runtimeFormV2 !== undefined).map((option) => option.runtimeId).sort();
   const created = projectNewAgentRuntimeOptions(everyRuntime);
   // Deprecated runtimes with a v2 form (kimi, gemini, antigravity, copilot) are not offered for new agents.
-  assert.deepEqual(withMarker(created), ["builtin", "claude", "codebuddy", "codex", "cursor", "grok", "kimi-sdk", "opencode", "pi", "qoder", "qwen"]);
+  assert.deepEqual(withMarker(created), ["builtin", "claude", "codex", "cursor", "grok", "kimi-sdk", "opencode", "pi", "qoder", "qwen"]);
   for (const option of created.filter((candidate) => candidate.runtimeFormV2)) {
     assert.deepEqual(option.runtimeFormV2, { protocolVersion: 2 });
   }
@@ -138,12 +138,12 @@ test("the runtimeFormV2 marker is on exactly the runtimes with a v2 form, indepe
   assert.deepEqual(withMarker(projectSetupRuntimeOptions(everyRuntime)), []);
   assert.deepEqual(
     withMarker(projectExistingAgentRuntimeOptions(everyRuntime, "kimi-sdk")),
-    ["builtin", "claude", "codebuddy", "codex", "cursor", "grok", "kimi-sdk", "opencode", "pi", "qoder", "qwen"],
+    ["builtin", "claude", "codex", "cursor", "grok", "kimi-sdk", "opencode", "pi", "qoder", "qwen"],
   );
   // ...and appear, with the marker, only as an edited agent's current runtime.
   for (const deprecated of ["kimi", "gemini", "antigravity", "copilot"]) {
     const options = projectExistingAgentRuntimeOptions(everyRuntime, deprecated);
-    assert.deepEqual(withMarker(options), ["builtin", "claude", "codebuddy", "codex", "cursor", deprecated, "grok", "kimi-sdk", "opencode", "pi", "qoder", "qwen"].sort(), deprecated);
+    assert.deepEqual(withMarker(options), ["builtin", "claude", "codex", "cursor", deprecated, "grok", "kimi-sdk", "opencode", "pi", "qoder", "qwen"].sort(), deprecated);
     const current = options.find((option) => option.runtimeId === deprecated);
     assert.equal(current?.current, true, deprecated);
     assert.equal(current?.admissionReason, "deprecated", deprecated);
@@ -218,11 +218,11 @@ test("the opt-in header is exact: only `1` turns the marker on", () => {
   }
 });
 
-// OAR-only runtimes (Qwen Code, Qoder, CodeBuddy Code) have no server flag:
-// the Computer's report decides (xxchan, #proj-runtime:a5762001).
+// OAR-only runtimes (Qwen Code, Qoder) have no server flag: the Computer's
+// report decides (xxchan, #proj-runtime:a5762001).
 test("an OAR-only runtime is offered whenever the Computer reports it, with no server flag", () => {
-  const reported = projectNewAgentRuntimeOptionsFor(["qwen", "qoder", "codebuddy", "codex"], WEB);
-  for (const runtimeId of ["qwen", "qoder", "codebuddy"]) {
+  const reported = projectNewAgentRuntimeOptionsFor(["qwen", "qoder", "codex"], WEB);
+  for (const runtimeId of ["qwen", "qoder"]) {
     const option = reported.find((candidate) => candidate.runtimeId === runtimeId);
     assert.equal(option?.capabilityStatus, "available", runtimeId);
     assert.equal(option?.canSelectInThisContext, true, runtimeId);
@@ -240,7 +240,7 @@ test("an agent can switch into an OAR-only runtime its Computer reports", () => 
 });
 
 test("server setup never offers an OAR-only runtime", () => {
-  assert.equal(projectSetupRuntimeOptions(["qwen", "qoder", "codebuddy", "codex"]).some((option) => ["qwen", "qoder", "codebuddy"].includes(option.runtimeId)), false);
+  assert.equal(projectSetupRuntimeOptions(["qwen", "qoder", "codex"]).some((option) => option.runtimeId === "qwen" || option.runtimeId === "qoder"), false);
 });
 
 test("with no flag-gated runtime a failing flag store disables nothing and revives nothing", async () => {

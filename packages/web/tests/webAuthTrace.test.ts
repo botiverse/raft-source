@@ -581,6 +581,9 @@ test("urgent terminal verdict is sent immediately and mirrored onto terminal ses
     assert.equal(terminalClear?.attrs?.logoutTrigger, "terminal_verdict");
     assert.equal(terminalClear?.attrs?.authVerdict, "logout");
     assert.equal(terminalClear?.attrs?.statusBucket, "auth_401_403");
+    // The bucket merges 401 and 403; the exact status rides along so they can be told apart.
+    assert.equal(verdict?.attrs?.status, 401);
+    assert.equal(terminalClear?.attrs?.status, 401);
     assert.equal(terminalClear?.attrs?.hasRefreshToken, true);
     assert.equal(terminalClear?.attrs?.restoreState, "authenticated");
     assert.equal(terminalClear?.attrs?.routeFamily, "auth_refresh");

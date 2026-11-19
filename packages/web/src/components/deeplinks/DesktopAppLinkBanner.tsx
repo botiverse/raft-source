@@ -1,17 +1,21 @@
-import { useCallback, useEffect, useId, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useState } from "react";
 import { useIntl } from "react-intl";
 import { Laptop } from "lucide-react";
 import { Banner, BannerAction, BannerClose, BannerDescription, BannerTitle, Button, Checkbox, TextLink } from "@botiverse/raft-ui";
 import api from "../../api/client";
+import { trackDesktopDownloadClicked } from "../../analytics/appDownload";
 import type { MessageId } from "../../i18n/messages";
 import { useAuthStore } from "../../store/authStore";
 import { quietLinkOpenOffer, useLinkOpenPreference, useLinkOpenQuiet, writeLinkOpenPreference } from "../../store/linkOpenPreference";
 import { isAppClaimedPath } from "../../utils/appClaimedPath";
-import { canOpenInDesktopApp, DESKTOP_APP_OPENING_MS, desktopAppDeepLink, openInDesktopApp } from "../../utils/desktopAppLink";
+import { DESKTOP_APP_OPENING_MS, desktopAppDeepLink, offersDesktopAppInThisWindow, openInDesktopApp } from "../../utils/desktopAppLink";
 import { desktopDownloadUrl } from "../../utils/desktopDownload";
 import type { DesktopTarget } from "../../utils/desktopDownload";
+import { openInAppLinkOf, reportOncePerOffer, reportOpenInAppDownload, reportOpenInAppOffered, reportOpenInAppOpen, reportOpenInAppStay } from "../../utils/openInAppTrace";
+import type { OpenInAppContext } from "../../utils/openInAppTrace";
+import ReportShown from "./ReportShown";
 import { parseMessageLink } from "../../utils/messageLinkLanding";
-import { answerPageLandingOffer, isPageLandingOfferAnswered } from "../../utils/pageLanding";
+import { answerPageLandingOffer, isComingBackToWeb, isPageLandingOfferAnswered } from "../../utils/pageLanding";
 import { useDesktopDownloadView } from "../settings/DesktopDownloadOptions";
 import Tooltip from "../ui/Tooltip";
 import { useOpenInAppOfferFlag, usePageLanding } from "./deepLinksFlag";
@@ -20,7 +24,9 @@ import { useOpenInAppOfferFlag, usePageLanding } from "./deepLinksFlag";
  * Deep links v1, frame c: a desktop browser that opened a Raft address from
  * outside Raft (another app, an email, a chat; the first load, with no
  * referrer or another site's) offers to open it in Raft Desktop: any address
- * the app takes (utils/appClaimedPath.ts), a message link or not. It is about
+ * the app takes (utils/appClaimedPath.ts), a message link or not. Not a mere
+ * place opened with no referrer, a bookmark of a channel say
+ * (utils/pageLanding.ts isComingBackToWeb). It is about
  * the window, so it sits in the strip across its top (OpenInAppOffers), and
  * changes nothing else on the page.
  *
@@ -104,7 +110,7 @@ export default function DesktopAppLinkBanner() {
   // The address as it landed, while its page is on screen: the app may later
   // drop `msg` from it (Back to Bottom), and the offer is still about it.
   const landing = usePageLanding();
-  if (!landing?.fromOutside || !isAppClaimedPath(landing.pathname, "desktop") || !canOpenInDesktopApp()) return null;
+  if (!landing?.fromOutside || isComingBackToWeb(landing) || !isAppClaimedPath(landing.pathname, "desktop") || !offersDesktopAppInThisWindow()) return null;
   return <DesktopAppLinkBannerGate pathname={landing.pathname} search={landing.search} />;
 }
 
@@ -132,16 +138,27 @@ function DesktopAppLinkBannerGate({ pathname, search }: { pathname: string; sear
     setPhase(next);
   }, []);
   const close = useCallback(() => setPhase("done"), []);
+  // What the offer's events say about it (utils/openInAppTrace: kinds, never the address).
+  const link = openInAppLinkOf(pathname, search);
+  const event = useMemo<OpenInAppContext>(() => ({ surface: "desktop_banner", link, signedIn }), [link, signedIn]);
+  const offered = enabled && phase === "offer" && preference !== "web" && !quiet && !(preference === "ask" && signedIn && hint === null);
+  // Once for this offer, once it can be sent (openInAppTrace reportOncePerOffer: not lost on a cold start).
+  const [reportOffered] = useState(() => reportOncePerOffer(reportOpenInAppOffered));
+  const offerShown = useCallback(() => reportOffered(event), [reportOffered, event]);
   if (!enabled || phase === "done" || preference === "web") return null;
-  if (phase === "opening") return <DesktopAppOpeningBanner onClose={close} />;
-  if (quiet || (preference === "ask" && signedIn && hint === null)) return null;
+  if (phase === "opening") return <DesktopAppOpeningBanner event={event} onClose={close} />;
+  if (!offered) return null;
   return (
-    <DesktopAppLinkBannerView
-      sign={preference === "app" ? "remembered" : hint ? "used" : "none"}
-      message={parseMessageLink(pathname, search) !== null}
-      deepLink={desktopAppDeepLink({ pathname, search })}
-      onAnswer={answer}
-    />
+    <>
+      <DesktopAppLinkBannerView
+        sign={preference === "app" ? "remembered" : hint ? "used" : "none"}
+        message={parseMessageLink(pathname, search) !== null}
+        deepLink={desktopAppDeepLink({ pathname, search })}
+        event={event}
+        onAnswer={answer}
+      />
+      <ReportShown onShown={offerShown} />
+    </>
   );
 }
 
@@ -155,9 +172,15 @@ function DesktopAppLinkBannerGate({ pathname, search }: { pathname: string; sear
  * names the Intel one. Nothing when the release has no build for this
  * computer. After the click the same links follow "Nothing happened?".
  */
-function DesktopAppDownload({ messageId }: { messageId: "desktopAppLink.banner.download" | "desktopAppLink.banner.nothingHappened" }) {
+function DesktopAppDownload({ messageId, event }: { messageId: "desktopAppLink.banner.download" | "desktopAppLink.banner.nothingHappened"; event: OpenInAppContext }) {
   const { formatMessage, formatList } = useIntl();
   const { recommended } = useDesktopDownloadView();
+  const phase = messageId === "desktopAppLink.banner.download" ? "offer" : "opening";
+  // The trace's step (slock.open_in_app) and the product event (app_download_clicked), both at the click.
+  const reportDownload = useCallback((target: DesktopTarget) => {
+    reportOpenInAppDownload(event, phase);
+    trackDesktopDownloadClicked("desktop_banner", target, "same_tab"); // a file download: the page stays
+  }, [event, phase]);
   if (!recommended) return null;
   const builds: Array<{ target: DesktopTarget; labelId: MessageId }> = [recommended];
   if (recommended.intelHint) builds.push({ target: "mac-x64", labelId: "settings.desktopApp.download.macIntel" });
@@ -165,7 +188,7 @@ function DesktopAppDownload({ messageId }: { messageId: "desktopAppLink.banner.d
     <TextLink
       key={build.target}
       variant="strong"
-      render={<a href={desktopDownloadUrl(build.target)} data-target={build.target}>{formatMessage({ id: build.labelId })}</a>}
+      render={<a href={desktopDownloadUrl(build.target)} data-target={build.target} onClick={() => reportDownload(build.target)}>{formatMessage({ id: build.labelId })}</a>}
     />
   ));
   return (
@@ -183,7 +206,7 @@ function DesktopAppDownload({ messageId }: { messageId: "desktopAppLink.banner.d
  * DESKTOP_APP_OPENING_MS. Leaving the page spends the landing, and the
  * banner with it.
  */
-function DesktopAppOpeningBanner({ onClose }: { onClose: () => void }) {
+function DesktopAppOpeningBanner({ event, onClose }: { event: OpenInAppContext; onClose: () => void }) {
   const { formatMessage } = useIntl();
   useEffect(() => {
     const timer = window.setTimeout(onClose, DESKTOP_APP_OPENING_MS);
@@ -202,7 +225,7 @@ function DesktopAppOpeningBanner({ onClose }: { onClose: () => void }) {
       <Banner status="info" className="rounded-none ring-0">
         <Laptop aria-hidden="true" />
         <BannerTitle>{formatMessage({ id: "desktopAppLink.banner.opening" })}</BannerTitle>
-        <DesktopAppDownload messageId="desktopAppLink.banner.nothingHappened" />
+        <DesktopAppDownload messageId="desktopAppLink.banner.nothingHappened" event={event} />
         <Tooltip content={closeLabel}>
           <BannerClose type="button" onClick={onClose} aria-label={closeLabel} data-testid="desktop-app-link-close" />
         </Tooltip>
@@ -215,12 +238,14 @@ function DesktopAppLinkBannerView({
   sign,
   message,
   deepLink,
+  event,
   onAnswer,
 }: {
   sign: DesktopAppSign;
   /** The landed address is a message link; otherwise the title says "page". */
   message: boolean;
   deepLink: string;
+  event: OpenInAppContext;
   /** Open in Desktop App: "opening". Continue on Web: "done". */
   onAnswer: (next: "opening" | "done") => void;
 }) {
@@ -231,22 +256,24 @@ function DesktopAppLinkBannerView({
 
   const openApp = useCallback(() => {
     if (remember) writeLinkOpenPreference("app");
+    reportOpenInAppOpen(event, remember);
     openInDesktopApp(deepLink);
     onAnswer("opening");
-  }, [deepLink, onAnswer, remember]);
+  }, [deepLink, event, onAnswer, remember]);
   const stayOnWeb = useCallback(() => {
     if (remember) writeLinkOpenPreference("web");
     // Not remembered, and not where this browser was told "app" (no checkbox there): quiet for 7 days.
     else if (sign !== "remembered") quietLinkOpenOffer();
+    reportOpenInAppStay(event, remember);
     onAnswer("done");
-  }, [onAnswer, remember, sign]);
+  }, [event, onAnswer, remember, sign]);
 
   return (
     <div className="shrink-0 border-b border-line-seam" data-testid="desktop-app-link-banner">
       <Banner status="info" className="rounded-none ring-0">
         <Laptop aria-hidden="true" />
         <BannerTitle>{formatMessage({ id: message ? "desktopAppLink.banner.title" : "desktopAppLink.banner.titlePage" })}</BannerTitle>
-        {sign === "none" ? <DesktopAppDownload messageId="desktopAppLink.banner.download" /> : (
+        {sign === "none" ? <DesktopAppDownload messageId="desktopAppLink.banner.download" event={event} /> : (
           <BannerDescription>
             {formatMessage({ id: sign === "remembered" ? "desktopAppLink.banner.descriptionRemembered" : "desktopAppLink.banner.description" })}
           </BannerDescription>

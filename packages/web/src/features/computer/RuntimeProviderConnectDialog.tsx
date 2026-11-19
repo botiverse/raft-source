@@ -77,9 +77,6 @@ export function RuntimeProviderConnectDialog({
   const promptId = useId();
   const mountedRef = useRef(false);
   const listAttemptRef = useRef(0);
-  // The endpoint list opens inside the dialog's form: portalled to the page it would sit under the dialog.
-  const formRef = useRef<HTMLFormElement>(null);
-  const selectPortalProps = useMemo(() => ({ container: formRef }), []);
 
   // Read once on open and again from Try Again, never by a re-run effect
   // (StrictMode's second pass would read twice; each read starts Qwen on the Computer).
@@ -242,7 +239,7 @@ export function RuntimeProviderConnectDialog({
           </DialogHeader>
         )}
       >
-        <DialogBody className="grid gap-4 font-normal">
+        <DialogBody className="grid gap-4 font-normal" unstable_scrollArea>
           {step === "done" ? (
             <Banner intent="success" icon={<CircleCheck size={20} aria-hidden="true" />} data-testid="runtime-provider-saved">
               {formatMessage({ id: "machine.runtimeAuth.provider.success" }, values)}
@@ -274,19 +271,19 @@ export function RuntimeProviderConnectDialog({
               />
             </div>
           ) : (
-            <form ref={formRef} id={`${promptId}-form`} className="grid gap-4 md:pointer-fine:gap-3" onSubmit={handleConnect} noValidate data-testid="runtime-provider-details">
+            <form id={`${promptId}-form`} className="grid gap-4 md:pointer-fine:gap-3" onSubmit={handleConnect} noValidate data-testid="runtime-provider-details">
               <p className="text-subhead text-foreground" data-testid="runtime-provider-chosen">
                 {groupLabel(chosen)} · {chosen.label}
               </p>
               {needsEndpoint ? (
                 <Field>
-                  <FieldLabel required>{formatMessage({ id: "machine.runtimeAuth.provider.endpointLabel" })}</FieldLabel>
+                  <FieldLabel>{formatMessage({ id: "machine.runtimeAuth.provider.endpointLabel" })}</FieldLabel>
                   <Select chrome="field" items={endpointItems} value={endpointId} onValueChange={handleEndpoint}>
-                    <SelectTrigger className="w-full" data-testid="runtime-provider-endpoint">
+                    <SelectTrigger className="w-full" aria-required="true" data-testid="runtime-provider-endpoint">
                       <SelectValue placeholder={formatMessage({ id: "machine.runtimeAuth.provider.endpointPlaceholder" })} />
                       <SelectIcon />
                     </SelectTrigger>
-                    <SelectContent portalProps={selectPortalProps}>
+                    <SelectContent>
                       <SelectList>
                         {endpointItems.map((item) => (
                           <SelectItem key={item.value} value={item.value}>
@@ -302,9 +299,10 @@ export function RuntimeProviderConnectDialog({
               ) : null}
               {needsBaseUrl ? (
                 <Field invalid={fieldError === "baseUrl"}>
-                  <FieldLabel required>{formatMessage({ id: "machine.runtimeAuth.provider.baseUrlLabel" })}</FieldLabel>
+                  <FieldLabel>{formatMessage({ id: "machine.runtimeAuth.provider.baseUrlLabel" })}</FieldLabel>
                   <Input
                     type="url"
+                    aria-required="true"
                     value={baseUrl}
                     onChange={handleBaseUrl}
                     placeholder={chosen.endpoint.kind === "custom" ? chosen.endpoint.placeholder : undefined}
@@ -321,8 +319,9 @@ export function RuntimeProviderConnectDialog({
               ) : null}
               {needsModel ? (
                 <Field invalid={fieldError === "model"}>
-                  <FieldLabel required>{formatMessage({ id: "machine.runtimeAuth.provider.modelLabel" })}</FieldLabel>
+                  <FieldLabel>{formatMessage({ id: "machine.runtimeAuth.provider.modelLabel" })}</FieldLabel>
                   <Input
+                    aria-required="true"
                     value={model}
                     onChange={handleModel}
                     autoComplete="off"
@@ -337,11 +336,12 @@ export function RuntimeProviderConnectDialog({
                 </Field>
               ) : null}
               <Field invalid={fieldError === "apiKey"}>
-                <FieldLabel required>{formatMessage({ id: "machine.runtimeAuth.provider.apiKeyLabel" })}</FieldLabel>
+                <FieldLabel>{formatMessage({ id: "machine.runtimeAuth.provider.apiKeyLabel" })}</FieldLabel>
                 {/* A password field that no password manager offers to keep: the key is
                     the provider's, not a sign-in to this site. */}
                 <Input
                   type="password"
+                  aria-required="true"
                   value={apiKey}
                   onChange={handleApiKey}
                   autoComplete="off"

@@ -298,9 +298,11 @@ export class ChildProcessRuntimeSession implements RuntimeSession {
     await handle.done;
   }
 
-  private emitExitOnce(info: RuntimeExitInfo): void {
+  private emitExitOnce(info: RuntimeExitInfo, beforeExit?: () => void): void {
     if (this.exitEmitted) return;
     this.exitEmitted = true;
+    // Runs with the session already marked exited (a stop it triggers is a no-op).
+    beforeExit?.();
     this.events.emit("exit", info);
   }
 
@@ -329,7 +331,42 @@ export class ChildProcessRuntimeSession implements RuntimeSession {
       const text = chunk.toString().trim();
       if (text) this.events.emit("stderr", text);
     };
+    // The driver's end-of-stdout events: once per child, only when stdout has
+    // ended (its `end`, or at the latest `close`: a child that ended before
+    // this session listened has no `end` to see) AND the child exited
+    // cleanly (code 0, no signal) without a stop the daemon asked for. A
+    // crash or kill mid-turn is not a finished turn; nor is output a stall,
+    // interrupt or recycle cut short (that stop keeps its own reason).
+    // With stdout ending first (the usual order) they go out just before the
+    // session's `exit`.
+    let stdoutEnded = false;
+    let exited: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+    let endEventsDone = false;
+    const emitEndEvents = () => {
+      if (endEventsDone || !stdoutEnded || !exited) return;
+      endEventsDone = true;
+      if (this.stopRequest || exited.code !== 0 || exited.signal) return;
+      for (const event of this.driver.parseStdoutEnd?.() ?? []) {
+        this.events.emit("runtime_event", event);
+      }
+    };
+    const onStdoutEnd = () => {
+      if (stdoutEnded) return;
+      stdoutEnded = true;
+      // A last line without a trailing newline is still a line.
+      const tail = this.stdoutDecoder.end();
+      if (tail) this.events.emit("stdout", tail);
+      const rest = this.stdoutBuffer + tail;
+      this.stdoutBuffer = "";
+      if (rest.trim()) {
+        for (const event of this.driver.parseLine(rest)) {
+          this.events.emit("runtime_event", event);
+        }
+      }
+      emitEndEvents();
+    };
     process.stdout?.on("data", onStdout);
+    process.stdout?.on?.("end", onStdoutEnd);
     process.stderr?.on("data", onStderr);
 
     let errored = false;
@@ -345,12 +382,17 @@ export class ChildProcessRuntimeSession implements RuntimeSession {
         code,
         signal,
         reason: this.requestedStopReason ? "requested" : "runtime_exit",
-      } satisfies RuntimeExitInfo);
+      } satisfies RuntimeExitInfo, () => {
+        exited = { code, signal };
+        emitEndEvents();
+      });
     };
     const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
       // A failed spawn (EACCES, ENOENT) gets `error` and `close`, never
       // `exit`; `exit` is the session's one end-of-process event, so emit it.
       if (errored) this.emitExitOnce({ code, signal, reason: "error" } satisfies RuntimeExitInfo);
+      exited ??= errored ? { code: code ?? -1, signal } : { code, signal };
+      onStdoutEnd();
       this.emitCloseOnce({
         code,
         signal,

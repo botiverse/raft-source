@@ -10,6 +10,7 @@ import { CHANNEL_SIDE_SECTION_MIN_WIDTH, channelSideColumnMinWidth, channelSideS
 
 import ColumnResizeHandle from "../ui/ColumnResizeHandle";
 import { useRowLayout, useRowPlan } from "../layout/rowLayout";
+import { useRowFacts } from "../layout/rowFacts";
 import { stackExpanded, useColumnAfter, useRowPlanStore } from "../layout/rowPlanStore";
 import { RowRegionChrome } from "../layout/RowRegionChrome";
 import { sideColumnKey, withShortcutHelpColumn, withTasksPageTaskColumn } from "../layout/rowPlan";
@@ -179,6 +180,7 @@ interface SideSectionsState {
   containers: Partial<Record<PortalSection, HTMLElement>>;
   /** Each section's host once the area has put it in the document: its content renders only then (a composite mounted detached keeps no Tab stop). */
   attached: Partial<Record<PortalSection, HTMLElement>>;
+  /** The area is mounted (in the row, with the shell): what renders before it in its commit can't find it in the DOM. */ mounted: boolean;
   register: (section: PortalSection, entry: SectionEntry) => void;
   unregister: (section: PortalSection, host: HTMLElement) => void;
 }
@@ -189,7 +191,7 @@ export const useSideSections = create<SideSectionsState>((set, get) => ({
   placement: NO_PLACEMENT,
   floatSlot: null,
   containers: {},
-  attached: {},
+  attached: {}, mounted: false,
   register: (section, entry) => {
     const current = get().entries[section];
     if (current?.host === entry.host && current.title === entry.title && current.artifact === entry.artifact) return;
@@ -837,6 +839,7 @@ export function ThreadColumnSections({ side, part }: { side: ThreadColumnSide; p
 export default function ChannelSideArea() {
   const [marker, setMarker] = useState<HTMLElement | null>(null);
   const row = marker?.closest<HTMLElement>(ROW_SELECTOR) ?? null;
+  useLayoutEffect(() => { useSideSections.setState({ mounted: true }); return () => useSideSections.setState({ mounted: false }); }, []);
   // A drag shows nothing but where the section will land until it is dropped (sideSectionDrag): the saved layout.
   const layout = useChannelSideLayoutStore((s) => s.layout);
   const entries = useSideSections((s) => s.entries);
@@ -845,6 +848,8 @@ export default function ChannelSideArea() {
   const collapsedCards = useChannelSideCardStore((s) => s.collapsed);
   const setCardCollapsed = useChannelSideCardStore((s) => s.setCardCollapsed);
   const cardFocusAt = useChannelSideCardStore((s) => s.cardFocusAt);
+  // Before useSideRoom: its observer measures styles the row's facts decide (rowFacts, #proj-frontend:#58).
+  useRowFacts(row);
   const room = useSideRoom(row, floatSlot);
 
   const open = useMemo(() => {
@@ -978,7 +983,7 @@ export default function ChannelSideArea() {
 
   return (
     <>
-      <div ref={setMarker} hidden data-side-area="" data-testid="channel-side-area" />
+      <div ref={setMarker} hidden data-testid="channel-side-area" />
       <SideDragLayer />
       {placement.row.map((column) => (
         <SideColumn

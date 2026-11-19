@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import {
   __setEmailDeliveryObserverForTests,
+  __setResendEmailsForTests,
+  cancelScheduledEmail,
   APP_ADMIN_REVIEW_URL,
   MOBILE_APP_EMAIL_COPY,
   MOBILE_APP_EMAIL_LOCALES,
@@ -820,4 +822,50 @@ test("account deletion distinguishes scheduled renewal cancellation from unconfi
   assert.doesNotMatch(unconfirmed.text, /card is not charged again|subscription was scheduled to end/);
   assert.match(unconfirmed.text, /could not confirm cancellation of subscription renewal/i);
   assert.match(unconfirmed.text, /cancel account deletion first, then open Plan & Billing/i);
+});
+
+// Account deletion (#triage:#444): a scheduled email Resend can no longer
+// cancel must not block the cleanup forever, and an unknown error must still
+// retry. Resend's error is logged by name and status only.
+test("cancelScheduledEmail: nothing left to cancel when Resend has no such email, the send time has passed, or Resend shows it past scheduled; anything else retries", async () => {
+  const logged: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => { logged.push(args.map(String).join(" ")); };
+  const resendError = (name: string, statusCode: number) => ({ data: null, error: { name, statusCode, message: "x" } });
+  const setResend = (getResult: unknown) => __setResendEmailsForTests({
+    cancel: (async () => resendError("validation_error", 422)) as never,
+    get: (async () => getResult) as never,
+  });
+  const past = new Date(Date.now() - 2 * 60 * 60_000);
+  const justPast = new Date(Date.now() - 5 * 60_000);
+  const future = new Date(Date.now() + 60 * 60_000);
+  try {
+    // Not in this Resend account (e.g. scheduled under an older key): done.
+    setResend(resendError("not_found", 404));
+    await cancelScheduledEmail("email-1", { scheduledAt: future });
+    // Send time passed more than an hour ago: done, whatever get says.
+    setResend(resendError("internal_server_error", 500));
+    await cancelScheduledEmail("email-2", { scheduledAt: past });
+    // Send time passed only minutes ago (Resend may still be sending): retry.
+    setResend(resendError("internal_server_error", 500));
+    await assert.rejects(cancelScheduledEmail("email-7", { scheduledAt: justPast }), /Failed to cancel scheduled email/);
+    // Resend confirms it is no longer scheduled: done (today's rule).
+    setResend({ data: { last_event: "delivered" }, error: null });
+    await cancelScheduledEmail("email-3");
+    // Any other error, send time not passed: retry.
+    setResend(resendError("rate_limit_exceeded", 429));
+    await assert.rejects(cancelScheduledEmail("email-4", { scheduledAt: future }), /Failed to cancel scheduled email/);
+    // No send time known (the bounce webhook): an unknown error retries too.
+    setResend(resendError("internal_server_error", 500));
+    await assert.rejects(cancelScheduledEmail("email-5"), /Failed to cancel scheduled email/);
+    // Still scheduled at Resend and the time not passed: retry.
+    setResend({ data: { last_event: "scheduled" }, error: null });
+    await assert.rejects(cancelScheduledEmail("email-6", { scheduledAt: future }), /Failed to cancel scheduled email/);
+  } finally {
+    __setResendEmailsForTests(null);
+    console.warn = originalWarn;
+  }
+  assert.ok(logged.some((line) => line.includes("emails.cancel failed name=validation_error statusCode=422")));
+  assert.ok(logged.some((line) => line.includes("emails.get failed name=not_found statusCode=404")));
+  assert.ok(logged.every((line) => !/email-\d/.test(line)), "no email id in the log");
 });

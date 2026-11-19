@@ -2,7 +2,8 @@ import { useSyncExternalStore } from "react";
 
 /**
  * A view choice kept in this browser's localStorage (the Computers overview's
- * grid / list, the Members page's Agents grouping): read on every render
+ * grid / list; a choice kept per server is createServerViewPreference's,
+ * store/serverViewPreference.ts): read on every render
  * through useSyncExternalStore, followed across tabs by the `storage` event,
  * and held for the page alone when storage refuses it (blocked or full).
  * A stored value that is not one of `values` reads as `fallback`.

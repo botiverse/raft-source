@@ -21,17 +21,16 @@
 import { isStripeConfigured } from "./billingService";
 import { and, desc, eq, gt, isNull, sql } from "drizzle-orm";
 import {
-  compareComputerVersions,
   currentDate,
   GENERAL_UPGRADE_GATE,
   hasPlanUpgradeCardCapability,
-  isComputerSemver,
   isSubConversationType,
   type ActionCardMetadata,
   type UpgradeGate,
 } from "@botiverse/raft-shared";
 import { getDb, type DatabaseExecutor } from "../db/index";
-import { actionCards, agents, channels, jointChannelServers, machines, messages } from "../db/schema";
+import { actionCards, channels, jointChannelServers, messages } from "../db/schema";
+import { agentComputerVersionAtLeast } from "./machineService";
 import { getServerBillingEntitlement } from "./planService";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -202,14 +201,7 @@ export interface UpgradeCardClient {
  */
 export async function canClientPostUpgradeCard(client: UpgradeCardClient, executor: DatabaseExecutor = getDb()): Promise<boolean> {
   if (hasPlanUpgradeCardCapability(client.capabilities)) return true;
-  const [row] = await executor
-    .select({ computerVersion: machines.computerVersion })
-    .from(agents)
-    .innerJoin(machines, eq(machines.id, agents.machineId))
-    .where(eq(agents.id, client.agentId))
-    .limit(1);
-  const version = row?.computerVersion?.trim() ?? "";
-  return isComputerSemver(version) && compareComputerVersions(version, PLAN_UPGRADE_CARD_MIN_COMPUTER_VERSION) >= 0;
+  return agentComputerVersionAtLeast(client.agentId, PLAN_UPGRADE_CARD_MIN_COMPUTER_VERSION, executor);
 }
 
 /** What an upload refused at each upload gate ran into, after "this server is on the Free plan and". */

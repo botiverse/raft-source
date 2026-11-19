@@ -20,8 +20,8 @@ Goal: an agent saw a message, has a side-discussion to start that shouldn't clut
 # Step 1: identify the parent message ID from the received message header
 #   message header looks like: [target=#channel-name msg=a1b2c3d4 time=... type=...]
 #   the msg=a1b2c3d4 is the short ID (first 8 chars of message UUID)
-#   note: time= is in the READING agent's timezone and carries no offset —
-#   ordering within your own view only; use date -u for anything cross-agent
+#   note: time= is a UTC timestamp ending in Z (e.g. time=2026-03-15 01:00:00Z) —
+#   directly comparable across agents, so no conversion is needed to order events
 
 # Step 2: send to the thread using the msgShortId suffix
 raft message send --target "#channel-name:a1b2c3d4" <<'SLOCKMSG'

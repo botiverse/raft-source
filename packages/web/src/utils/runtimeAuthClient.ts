@@ -1,5 +1,10 @@
 import {
+  MACHINE_OPERATION_POLL_MS,
+  RUNTIME_AUTH_LOGOUT_RELAY_BUDGET_MS,
   RUNTIME_AUTH_V1_RUNTIMES,
+  RUNTIME_LIMIT_RESET_CLAUDE_RELAY_BUDGET_MS,
+  RUNTIME_LIMIT_RESET_RELAY_BUDGET_MS,
+  asMachineOperationId,
   asRuntimeAuthLoginId,
   isRuntimeAuthRuntime,
   runtimeAuthLoginEventSchema,
@@ -10,9 +15,9 @@ import {
   runtimeAuthSupports,
   runtimeLimitResetResultSchema,
   runtimeLimitResetsReadResultSchema,
-  safeParseRuntimeAccountUsageSnapshot,
 } from "@botiverse/raft-shared";
 import type {
+  MachineOperationView,
   RuntimeAccountUsageProvider,
   RuntimeAccountUsageSnapshot,
   RuntimeLimitResetResult,
@@ -34,7 +39,7 @@ import type {
 import type { Socket } from "socket.io-client";
 import api from "../api/client";
 import { getSocket, onSocketCreated } from "../api/socket";
-import { RUNTIME_USAGE_REQUEST_HEADERS } from "./runtimeAccountUsageClient";
+import { RUNTIME_USAGE_REQUEST_HEADERS, usageSnapshotOf } from "./runtimeAccountUsageClient";
 
 /**
  * task #17: the web side of logging a Computer's Claude Code / Codex in and
@@ -80,8 +85,9 @@ export interface RuntimeAuthView {
    * What this viewer may do with those resets, beside `claudeLimitResets`.
    * Only the person who connected the Computer spends its Claude resets
    * (`canUse`: a redeem; `canConsent`: a read with consent at the 5-hour
-   * limit); an owner or admin may only view them. Absent from an older
-   * server: both allowed (the server enforces either way).
+   * limit); an owner or admin may only view them, where the read needs no
+   * consent (`claudeLimitResetOffer`). Absent from an older server: both allowed
+   * (the server enforces either way).
    */
   claudeLimitResetAccess?: { canUse: boolean; canConsent: boolean };
 }
@@ -116,6 +122,9 @@ export interface RuntimeAuthSocketSource {
   current(): RuntimeAuthSocket | null;
   onReplaced(listener: () => void): () => void;
 }
+
+/** Past the server's relay budget, for the last poll and transport. */
+const MACHINE_OPERATION_SLACK_MS = 10_000;
 
 export interface RuntimeAuthHttp {
   get<T>(url: string): Promise<T>;
@@ -157,6 +166,38 @@ function loginPushHeader(payload: unknown): { serverId: string; machineId: strin
 }
 
 export class RuntimeAuthClient {
+  /**
+   * A POST that waits on the Computer (#otter-lounge:#1): the edge in front of
+   * the API closes a request that sends nothing for 30 s, so the server starts
+   * it (`respondAsync`) and this reads its answer until the server's own relay
+   * budget (plus slack) is over. An older server answers directly. The answer's
+   * status and body come back as the direct request's would have: a failure
+   * throws with `response` as the HTTP error would. No answer in time throws
+   * with no response, an outcome never learned, as a cut request did.
+   */
+  private async postWaitingOnComputer<T>(serverId: string, url: string, body: Record<string, unknown>, budgetMs: number): Promise<T> {
+    const started = await this.http.post<T | { operationId?: unknown }>(url, { ...body, respondAsync: true });
+    const operationId = asMachineOperationId((started as { operationId?: unknown } | null)?.operationId);
+    if (!operationId) return started as T;
+    const deadline = this.now() + budgetMs + MACHINE_OPERATION_SLACK_MS;
+    const path = `/servers/${encodeURIComponent(serverId)}/machine-operations/${operationId}`;
+    while (this.now() < deadline) {
+      await this.sleep(MACHINE_OPERATION_POLL_MS);
+      let view: MachineOperationView;
+      try {
+        view = await this.http.get<MachineOperationView>(path);
+      } catch (error) {
+        // Gone (expired, another replica's restart): never learned. A blip: read again.
+        if (runtimeAuthRequestError(error).status === 404) break;
+        continue;
+      }
+      if (view.state !== "done") continue;
+      if (view.status >= 400) throw Object.assign(new Error(`Request failed with status code ${view.status}`), { response: { status: view.status, data: view.body } });
+      return view.body as T;
+    }
+    throw new Error("The Computer's answer did not arrive in time");
+  }
+
   private readonly cache = new Map<string, { value: RuntimeAuthView; expiresAt: number }>();
   private readonly reads = new Map<string, Promise<RuntimeAuthView>>();
   private readonly listeners = new Map<string, Set<() => void>>();
@@ -169,6 +210,7 @@ export class RuntimeAuthClient {
     private readonly http: RuntimeAuthHttp,
     private readonly socketSource: RuntimeAuthSocketSource,
     private readonly now: () => number = Date.now,
+    private readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   ) {}
 
   read(serverId: string, machineId: string): Promise<RuntimeAuthView> {
@@ -257,7 +299,12 @@ export class RuntimeAuthClient {
 
   /** `providerId`: the one provider to sign out, for a runtime that signs in per provider (Pi). */
   async logout(serverId: string, machineId: string, runtime: RuntimeAuthRuntime, providerId?: string): Promise<RuntimeAuthLogoutResult> {
-    const { result } = await this.http.post<{ result: RuntimeAuthLogoutResult }>(`${base(serverId, machineId)}/${runtime}/logout`, providerId ? { providerId } : undefined);
+    const { result } = await this.postWaitingOnComputer<{ result: RuntimeAuthLogoutResult }>(
+      serverId,
+      `${base(serverId, machineId)}/${runtime}/logout`,
+      providerId ? { providerId } : {},
+      RUNTIME_AUTH_LOGOUT_RELAY_BUDGET_MS,
+    );
     return result;
   }
 
@@ -277,11 +324,15 @@ export class RuntimeAuthClient {
     kind?: RuntimeLimitResetKind,
   ): Promise<{ result: RuntimeLimitResetResult; snapshot: RuntimeAccountUsageSnapshot | null }> {
     const url = `/servers/${encodeURIComponent(serverId)}/machines/${encodeURIComponent(machineId)}/runtime-account-usage/${provider}/limit-reset`;
-    const answer = await this.http.post<{ result?: unknown; snapshot?: unknown } | null>(url, kind ? { idempotencyKey, kind } : { idempotencyKey });
+    const answer = await this.postWaitingOnComputer<{ result?: unknown; snapshot?: unknown } | null>(
+      serverId,
+      url,
+      kind ? { idempotencyKey, kind } : { idempotencyKey },
+      kind ? RUNTIME_LIMIT_RESET_CLAUDE_RELAY_BUDGET_MS : RUNTIME_LIMIT_RESET_RELAY_BUDGET_MS,
+    );
     const result = runtimeLimitResetResultSchema.safeParse(answer?.result);
     if (!result.success) throw new RuntimeAuthMalformedResponseError();
-    const snapshot = answer?.snapshot ? safeParseRuntimeAccountUsageSnapshot(answer.snapshot) : null;
-    return { result: result.data, snapshot: snapshot?.success ? snapshot.data : null };
+    return { result: result.data, snapshot: answer?.snapshot ? usageSnapshotOf(answer.snapshot) : null };
   }
 
   /**
@@ -292,7 +343,7 @@ export class RuntimeAuthClient {
    */
   async readLimitResets(serverId: string, machineId: string, consent: boolean): Promise<RuntimeLimitResetsReadResult> {
     const url = `/servers/${encodeURIComponent(serverId)}/machines/${encodeURIComponent(machineId)}/runtime-account-usage/claude/limit-resets/read`;
-    const answer = await this.http.post<{ result?: unknown } | null>(url, consent ? { consent: true } : {});
+    const answer = await this.postWaitingOnComputer<{ result?: unknown } | null>(serverId, url, consent ? { consent: true } : {}, RUNTIME_LIMIT_RESET_CLAUDE_RELAY_BUDGET_MS);
     const parsed = runtimeLimitResetsReadResultSchema.safeParse(answer?.result);
     if (!parsed.success) throw new RuntimeAuthMalformedResponseError();
     return parsed.data;

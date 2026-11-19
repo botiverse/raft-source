@@ -3,7 +3,7 @@
 // registration and pins the bytes with its snapshot tests).
 
 import { AGENT_API_MESSAGE_SEARCH_DEFAULT_LIMIT, AGENT_API_MESSAGE_SEARCH_MAX_LIMIT } from "../agentApiContract";
-import { AGENT_BODY_CONTINUATION_PREFIX, foldAgentOneLineText, formatAgentTaskCurrentProjection, indentAgentBodyContinuationLines, type AgentMessageTaskCurrentProjectionLike } from "../agentMessageText";
+import { AGENT_BODY_CONTINUATION_PREFIX, foldAgentOneLineText, formatAgentPostedByHeaderField, formatAgentTaskCurrentProjection, indentAgentBodyContinuationLines, type AgentMessageTaskCurrentProjectionLike } from "../agentMessageText";
 import { formatHint, formatHintFlag, RAFT_HINTS, type RaftHintStyle } from "../agentOps/hint";
 
 export interface AgentSearchResultLike {
@@ -18,6 +18,8 @@ export interface AgentSearchResultLike {
   senderType?: string;
   /** RFC 077: an assistant sent this for its owner (the sender); shown as on message lines. */
   delegated_by?: { name: string } | null;
+  /** Raft voice calls: posted in the sender agent's name by something else (`voice_call`). */
+  posted_by?: string | null;
   content?: string;
   snippet?: string;
   threadId?: string;
@@ -315,11 +317,12 @@ export function formatAgentSearchResults(
     const sender = neutralizeAgentRaftRefLiterals(foldAgentOneLineText(result.senderName ?? "unknown"));
     const senderType = result.senderType ? ` (${result.senderType})` : "";
     const delegated = result.delegated_by?.name ? ` delegated_by=@${neutralizeAgentRaftRefLiterals(result.delegated_by.name)}` : "";
+    const postedBy = formatAgentPostedByHeaderField(result.posted_by);
     const taskProjection = formatAgentTaskCurrentProjection(result.taskCurrentProjection, result.taskNumber, renderAgentSearchPreviewText).trimStart();
     return [
       `<result ref="${ref}">`,
       `Source: ${renderSearchSource(result)}`,
-      `Sender: ${sender}${senderType}${delegated}`,
+      `Sender: ${sender}${senderType}${delegated}${postedBy}`,
       `Time: ${result.createdAt ? formatLocalTimeWithOffset(result.createdAt) : "-"}`,
       ...(taskProjection ? [taskProjection] : []),
       "",

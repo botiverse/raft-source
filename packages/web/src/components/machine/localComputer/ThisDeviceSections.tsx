@@ -10,12 +10,15 @@
 // ① Status: a status light, the state and how it starts ("Running · Starts
 //   when Raft Desktop opens at login"), then at most one Banner for the most
 //   urgent problem (thisDeviceLogic.ts).
-// ② Controls: Restart / Stop, or Start. Stop while agents are mid-turn asks,
-//   and by default waits for the turns to finish (product decision 7).
+// ② Actions: what thisDeviceActions offers for the state, the same for both
+//   shells: never a dead end, never a button known to fail. Restart / Stop,
+//   or Start; Install; Try again / Repair; Open logs; … Stop while agents
+//   are mid-turn asks, and by default waits for the turns to finish
+//   (product decision 7).
 // ③ Servers (ThisDeviceServers.tsx). ④ Updates: its own version, Update now
 //   (Computer's own `upgrade`), and the minimum this Raft Desktop needs.
 // ⑤ Troubleshoot, collapsed unless something is wrong (ThisDeviceDiagnostics.tsx).
-import { useCallback, useId, useMemo, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
 import {
@@ -38,6 +41,7 @@ import {
   TextLink,
 } from "@botiverse/raft-ui";
 import type { DesktopThisDeviceSection } from "@botiverse/raft-shared";
+import type { MessageId } from "../../../i18n/messages";
 import SectionEyebrow from "../../ui/SectionEyebrow";
 import type { Machine } from "../../../store/machineStore";
 import { useMachineStore } from "../../../store/machineStore";
@@ -46,13 +50,15 @@ import type { LocalComputerHost } from "./useLocalComputerHost";
 import { localComputerErrorMessage } from "./localComputerCopy";
 import { missingFeaturesText, thisDeviceMigratingPhrase, thisDevicePresence, thisDeviceStatusPhrase } from "./thisDeviceCopy";
 import { startsWithMessageId, missingFeatures } from "./thisDeviceLogic";
+import { checkingStallMs, thisDeviceCanAdd, thisDevicePlanFor } from "./thisDevicePlan";
+import type { ThisDeviceAction, ThisDeviceStateKind } from "./thisDeviceLogic";
 import { ThisDeviceServers } from "./ThisDeviceServers";
 import { ThisDeviceTroubleshoot } from "./ThisDeviceDiagnostics";
 import type { DiagnosticsState } from "./ThisDeviceDiagnostics";
 import { DisclosureTitle, TechnicalDetails, ThisDeviceConfirm } from "./thisDeviceParts";
 import { useAddThisComputer } from "./useAddThisComputer";
 
-type Operation = "start" | "stop" | "restart" | "update" | "retry-migration";
+type Operation = "start" | "stop" | "restart" | "update" | "retry-migration" | "install" | "repair" | "retry-read";
 
 /** A section of the panel, shaped like its neighbours: content in px-5 py-4, then a Separator. */
 function Section({ title, children, testId }: { title?: string; children: ReactNode; testId?: string }) {
@@ -103,6 +109,19 @@ export function ThisDeviceSections({ host, machine, currentServer, variant, init
   const [confirmRestart, setConfirmRestart] = useState<number | null>(null);
   const [waitingStop, setWaitingStop] = useState<number | null>(null);
   const troubleshootId = `this-device-troubleshoot-${useId()}`;
+  // Still "Checking…" after a while (a read that never answers): say it is
+  // unknown, with Try again. Reset whenever the state changes.
+  const [checkingStalled, setCheckingStalled] = useState(false);
+  const [kindSeen, setKindSeen] = useState<ThisDeviceStateKind>(state.kind);
+  if (kindSeen !== state.kind) {
+    setKindSeen(state.kind);
+    setCheckingStalled(false);
+  }
+  useEffect(() => {
+    if (state.kind !== "checking") return undefined;
+    const timer = setTimeout(() => setCheckingStalled(true), checkingStallMs());
+    return () => clearTimeout(timer);
+  }, [state.kind]);
 
   const run = useCallback((op: Operation, action: (() => Promise<unknown>) | null) => {
     if (!action) return;
@@ -158,6 +177,10 @@ export function ThisDeviceSections({ host, machine, currentServer, variant, init
   const closeRestart = useCallback(() => setConfirmRestart(null), []);
   const updateNow = useCallback(() => run("update", host.updateComputer), [host, run]);
   const retryMigration = useCallback(() => run("retry-migration", host.retryMigration), [host, run]);
+  const installNow = useCallback(() => run("install", host.updateComputer), [host, run]);
+  const repair = useCallback(() => run("repair", host.updateComputer), [host, run]);
+  const retryRead = useCallback(() => run("retry-read", host.retryRead), [host, run]);
+  const openLogs = host.openComputerLogs ?? host.openDesktopLogs;
 
   const runDiagnostics = useCallback((options?: { cleanup?: boolean }) => {
     const diagnose = host.runDiagnostics;
@@ -179,61 +202,149 @@ export function ThisDeviceSections({ host, machine, currentServer, variant, init
 
   const stopNowLabel = formatMessage({ id: "computerHost.thisDevice.stop.now" });
   const stopNowChoice = useMemo(() => (host.stopWhenIdle ? { label: stopNowLabel, onClick: stopNow } : undefined), [host.stopWhenIdle, stopNowLabel, stopNow]);
-  const canAdd = currentServer !== null && host.canAttach && (state.kind === "not-installed" || state.flags.notAttachedHere);
+  const canAdd = thisDeviceCanAdd(host, currentServer);
   const disabled = busy !== null || waitingStop !== null;
   const migrating = state.kind === "migrating";
+  const standaloneEmpty = variant === "standalone" && state.kind === "not-installed";
+  const unsupported = hostState !== null && !hostState.installed && !hostState.installSupported;
+
+  // ② What this state offers (thisDeviceLogic.ts), the same in both shells.
+  const plan = thisDevicePlanFor(host, variant, { canAdd, checkingStalled });
+  const statusActions = plan.actions.filter((candidate) => candidate.place === "status");
+  const offers = (id: ThisDeviceAction["id"]) => plan.actions.some((candidate) => candidate.id === id);
+  const couldNotRead = plan.statusMessageId === "computerHost.thisDevice.state.couldNotRead";
 
   // ── ① Status ───────────────────────────────────────────────────────────
   // What the person cares about is that it comes back on its own, and when.
   const startsWith = state.kind === "running" && hostState ? formatMessage({ id: startsWithMessageId(hostState.startsWith) }) : null;
   const migratingStep = hostState?.migration.state === "running" ? hostState.migration.step : null;
-  const statusFacts = [migrating ? thisDeviceMigratingPhrase(migratingStep, intl) : thisDeviceStatusPhrase(state, self.deviceKind, currentServer?.name ?? "", intl), startsWith]
-    .filter((fact): fact is string => !!fact);
+  const statusPhrase = plan.statusMessageId
+    ? formatMessage({ id: plan.statusMessageId })
+    : migrating ? thisDeviceMigratingPhrase(migratingStep, intl) : thisDeviceStatusPhrase(state, self.deviceKind, currentServer?.name ?? "", intl);
+  const statusFacts = [statusPhrase, startsWith].filter((fact): fact is string => !!fact);
 
+  const opButton = (op: "start" | "stop" | "restart", onClick: () => void) => {
+    const label = formatMessage({ id: `computerHost.${op}` });
+    return (
+      <Button key={op} variant="outline" size="md" data-computer-op={op} disabled={disabled} loading={busy === op} loadingLabel={label} onClick={onClick}>
+        {label}
+      </Button>
+    );
+  };
+
+  // One button per action; in a Banner the first step is "default", elsewhere "primary".
+  const actionButton = (item: ThisDeviceAction, surface: "banner" | "row") => {
+    const emphasis = item.primary ? (surface === "banner" ? "default" : "primary") : "outline";
+    const operation = (op: Operation, id: string, labelId: MessageId, onClick: () => void) => {
+      const label = formatMessage({ id: labelId });
+      return (
+        <Button key={id} variant={emphasis} size="md" onClick={onClick} disabled={disabled} loading={busy === op} loadingLabel={label} data-computer-op={id}>
+          {label}
+        </Button>
+      );
+    };
+    switch (item.id) {
+      case "start":
+        return opButton("start", start);
+      case "restart":
+        return opButton("restart", restart);
+      case "stop":
+        return opButton("stop", stop);
+      case "install":
+        return operation("install", "install", "computerHost.thisDevice.install", installNow);
+      case "finish-move":
+        return operation("install", "finish-move", "computerHost.thisDevice.finishMove", installNow);
+      case "repair":
+        return operation("repair", "repair", "computerHost.thisDevice.repair", repair);
+      case "retry-read":
+        return operation("retry-read", "retry-read", "computerHost.thisDevice.tryAgain", retryRead);
+      case "retry-migration":
+        return (
+          <Button
+            key="retry-migration"
+            variant={emphasis}
+            size="md"
+            onClick={retryMigration}
+            loading={busy === "retry-migration"}
+            disabled={busy !== null}
+            loadingLabel={formatMessage({ id: "computerHost.thisDevice.tryAgain" })}
+            data-computer-op="retry-migration"
+          >
+            {formatMessage({ id: "computerHost.thisDevice.tryAgain" })}
+          </Button>
+        );
+      case "add":
+        return (
+          <Button key="add" variant={emphasis} size="md" onClick={openAdd} data-computer-op="enable" data-testid="this-device-add">
+            {formatMessage({ id: "computerHost.thisDevice.addToServer" })}
+          </Button>
+        );
+      case "install-elsewhere":
+        return (
+          <Button key="install-elsewhere" variant={emphasis} size="md" onClick={installElsewhere} data-computer-op="install-elsewhere" data-testid="this-device-install-elsewhere">
+            {formatMessage({ id: "computerHost.thisDevice.installAnother" })}
+          </Button>
+        );
+      case "run-diagnostics":
+        return (
+          <Button key="run-diagnostics" variant={emphasis} size="md" onClick={runDiagnosticsLink} loading={diagnostics.running} disabled={diagnostics.running} loadingLabel={formatMessage({ id: "computerHost.thisDevice.troubleshoot.runDiagnostics" })} data-computer-op="run-diagnostics">
+            {formatMessage({ id: "computerHost.thisDevice.troubleshoot.runDiagnostics" })}
+          </Button>
+        );
+      case "open-logs":
+        return openLogs ? (
+          <Button key="open-logs" variant={emphasis} size="md" onClick={openLogs} data-computer-op="open-logs">
+            {formatMessage({ id: "computerHost.thisDevice.openLogs" })}
+          </Button>
+        ) : null;
+      // In the Updates section (below).
+      case "update":
+      case "update-now":
+        return null;
+    }
+  };
+  const bannerActions = statusActions.length > 0 ? <BannerAction>{statusActions.map((item) => actionButton(item, "banner"))}</BannerAction> : null;
+
+  // The state's notice holds its actions (the recovery is here, once).
   const notice = (() => {
+    if (couldNotRead) {
+      return (
+        <Banner status="warning" size="sm" data-testid="this-device-notice-unreadable">
+          <BannerDescription>
+            {formatMessage({ id: state.kind === "checking" ? "computerHost.thisDevice.notice.checkingStalledBody" : "computerHost.thisDevice.notice.couldNotReadBody" })}
+          </BannerDescription>
+          {bannerActions}
+        </Banner>
+      );
+    }
     switch (state.kind) {
+      case "not-installed": {
+        // The standalone page has its empty state (below); here this machine
+        // is one of the server's computers and Raft Computer is missing.
+        if (variant === "standalone") return null;
+        const leftover = offers("finish-move");
+        return (
+          <Banner status={unsupported ? "warning" : "info"} size="sm" data-testid="this-device-notice-not-installed">
+            <BannerTitle>
+              {formatMessage({ id: leftover ? "computerHost.thisDevice.notice.finishMoveTitle" : "computerHost.thisDevice.notice.notInstalledTitle" })}
+            </BannerTitle>
+            <BannerDescription>
+              {unsupported
+                ? formatMessage({ id: "computerHost.thisDevice.empty.unsupported" })
+                : leftover
+                  ? formatMessage({ id: "computerHost.thisDevice.notice.finishMoveBody" })
+                  : formatMessage({ id: "computerHost.thisDevice.notice.notInstalledBody" })}
+            </BannerDescription>
+            {bannerActions}
+          </Banner>
+        );
+      }
       case "migration-failed":
         return (
           <Banner status="warning" size="sm" data-testid="this-device-notice-migration-failed">
             <BannerTitle>{formatMessage({ id: "computerHost.thisDevice.notice.migrationFailedTitle" })}</BannerTitle>
             <BannerDescription>{formatMessage({ id: "computerHost.thisDevice.notice.migrationFailedBody" })}</BannerDescription>
-            {/* The recovery is here, once: Try again, and Run diagnostics to see why. */}
-            {host.retryMigration || host.runDiagnostics ? (
-              <BannerAction>
-                {host.retryMigration ? (
-                  <Button
-                    variant="default"
-                    size="md"
-                    onClick={retryMigration}
-                    loading={busy === "retry-migration"}
-                    disabled={busy !== null}
-                    loadingLabel={formatMessage({ id: "computerHost.thisDevice.tryAgain" })}
-                    data-computer-op="retry-migration"
-                  >
-                    {formatMessage({ id: "computerHost.thisDevice.tryAgain" })}
-                  </Button>
-                ) : null}
-                {host.runDiagnostics ? (
-                  <Button variant="outline" size="md" onClick={runDiagnosticsLink} data-computer-op="run-diagnostics">
-                    {formatMessage({ id: "computerHost.thisDevice.troubleshoot.runDiagnostics" })}
-                  </Button>
-                ) : null}
-              </BannerAction>
-            ) : null}
-          </Banner>
-        );
-      case "unreadable":
-        return (
-          <Banner status="warning" size="sm" data-testid="this-device-notice-unreadable">
-            <BannerTitle>{formatMessage({ id: "computerHost.thisDevice.notice.unreadableTitle" })}</BannerTitle>
-            <BannerDescription>{formatMessage({ id: "computerHost.thisDevice.notice.unreadableBody" })}</BannerDescription>
-            {host.runDiagnostics ? (
-              <BannerAction>
-                <Button variant="default" size="md" onClick={runDiagnosticsLink} data-computer-op="run-diagnostics">
-                  {formatMessage({ id: "computerHost.thisDevice.troubleshoot.runDiagnostics" })}
-                </Button>
-              </BannerAction>
-            ) : null}
+            {bannerActions}
           </Banner>
         );
       case "duplicate-key":
@@ -244,13 +355,7 @@ export function ThisDeviceSections({ host, machine, currentServer, variant, init
               {formatMessage({ id: "computerHost.thisDevice.notice.duplicateKeyBody" })}
               {self.lastErrorRaw ? <TechnicalDetails text={self.lastErrorRaw} /> : null}
             </BannerDescription>
-            {host.runDiagnostics ? (
-              <BannerAction>
-                <Button variant="default" size="md" onClick={runDiagnosticsLink} data-computer-op="run-diagnostics">
-                  {formatMessage({ id: "computerHost.thisDevice.troubleshoot.runDiagnostics" })}
-                </Button>
-              </BannerAction>
-            ) : null}
+            {bannerActions}
           </Banner>
         );
       default:
@@ -266,18 +371,12 @@ export function ThisDeviceSections({ host, machine, currentServer, variant, init
   ) : null;
 
   // ── ② Controls ─────────────────────────────────────────────────────────
-  const opButton = (op: "start" | "stop" | "restart", onClick: () => void) => {
-    const label = formatMessage({ id: `computerHost.${op}` });
-    return (
-      <Button variant="outline" size="md" data-computer-op={op} disabled={disabled} loading={busy === op} loadingLabel={label} onClick={onClick}>
-        {label}
-      </Button>
-    );
-  };
   // While it updates, its progress shows in one place (Updates, under the
-  // version) and there are no lifecycle buttons.
-  const lifecycle = state.controllable && self.management === "host" && state.kind !== "updating";
-  const controls = !lifecycle ? null : waitingStop !== null ? (
+  // version) and there are no lifecycle buttons (thisDeviceActions).
+  const LIFECYCLE = new Set<ThisDeviceAction["id"]>(["start", "stop", "restart"]);
+  const lifecycleActions = notice ? [] : statusActions.filter((item) => LIFECYCLE.has(item.id));
+  const otherActions = notice || standaloneEmpty ? [] : statusActions.filter((item) => !LIFECYCLE.has(item.id));
+  const controls = waitingStop !== null && state.controllable ? (
     <Banner status="info" size="sm" className="mt-3" data-testid="this-device-stop-waiting">
       <BannerDescription>
         {formatMessage({ id: "computerHost.thisDevice.stop.waiting" }, { count: waitingStop })}
@@ -293,16 +392,13 @@ export function ThisDeviceSections({ host, machine, currentServer, variant, init
         </Button>
       </BannerAction>
     </Banner>
-  ) : (
-    <div className="mt-3 flex flex-wrap items-center gap-2" data-testid="this-computer-local-controls">
-      {self.running ? (
-        <>
-          {opButton("restart", restart)}
-          {opButton("stop", stop)}
-        </>
-      ) : state.kind === "stopped" || state.kind === "update-required" ? (
-        opButton("start", start)
-      ) : null}
+  ) : lifecycleActions.length === 0 && otherActions.length === 0 ? null : (
+    <div className="mt-3 flex flex-wrap items-center gap-2">
+      {/* Start / Stop / Restart, then the state's other steps (Open logs, …). */}
+      <div className="contents" data-testid="this-computer-local-controls">
+        {lifecycleActions.map((item) => actionButton(item, "row"))}
+      </div>
+      {otherActions.map((item) => actionButton(item, "row"))}
     </div>
   );
 
@@ -319,8 +415,6 @@ export function ThisDeviceSections({ host, machine, currentServer, variant, init
   const failedMigration = hostState?.migration.state === "failed" ? hostState.migration : null;
   const migrationDetails = failedMigration?.message ?? null;
 
-  const standaloneEmpty = variant === "standalone" && state.kind === "not-installed";
-  const unsupported = hostState !== null && !hostState.installed && !hostState.installSupported;
 
   return (
     <div data-testid="this-device-sections" data-state={state.kind}>
@@ -328,22 +422,14 @@ export function ThisDeviceSections({ host, machine, currentServer, variant, init
         {variant === "embedded" ? <SectionEyebrow as="div" className="mb-2">{formatMessage({ id: "computerHost.thisDevice" })}</SectionEyebrow> : null}
         {standaloneEmpty ? (
           <EmptyState className="py-6" data-testid="this-device-empty">
-            <EmptyStateTitle>{formatMessage({ id: mac ? "computerHost.thisDevice.empty.titleMac" : "computerHost.thisDevice.empty.titleOther" })}</EmptyStateTitle>
+            <EmptyStateTitle>
+              {formatMessage({ id: offers("finish-move") ? "computerHost.thisDevice.notice.finishMoveTitle" : mac ? "computerHost.thisDevice.empty.titleMac" : "computerHost.thisDevice.empty.titleOther" })}
+            </EmptyStateTitle>
             <EmptyStateDescription>
-              {formatMessage({ id: unsupported ? "computerHost.thisDevice.empty.unsupported" : "computerHost.thisDevice.empty.body" })}
+              {formatMessage({ id: unsupported ? "computerHost.thisDevice.empty.unsupported" : offers("finish-move") ? "computerHost.thisDevice.notice.finishMoveBody" : "computerHost.thisDevice.empty.body" })}
             </EmptyStateDescription>
-            {canAdd ? (
-              <EmptyStateActions>
-                <Button variant="primary" size="md" onClick={openAdd} data-computer-op="enable" data-testid="this-device-add">
-                  {formatMessage({ id: "computerHost.thisDevice.addToServer" })}
-                </Button>
-              </EmptyStateActions>
-            ) : unsupported ? (
-              <EmptyStateActions>
-                <Button variant="outline" size="md" onClick={installElsewhere} data-testid="this-device-install-elsewhere">
-                  {formatMessage({ id: "computerHost.thisDevice.installAnother" })}
-                </Button>
-              </EmptyStateActions>
+            {statusActions.length > 0 ? (
+              <EmptyStateActions>{statusActions.map((item) => actionButton(item, "row"))}</EmptyStateActions>
             ) : null}
           </EmptyState>
         ) : (
@@ -351,7 +437,7 @@ export function ThisDeviceSections({ host, machine, currentServer, variant, init
             {migrating ? (
               <Spinner size="sm" aria-hidden="true" className="mt-0.5" />
             ) : (
-              <Status presence={thisDevicePresence(state.kind, state.problem, state.flags.awaitingListing)} className="lead-dot" aria-hidden />
+              <Status presence={couldNotRead ? "error" : thisDevicePresence(state.kind, state.problem, state.flags.awaitingListing)} className="lead-dot" aria-hidden />
             )}
             <Text.Sans size="body" className="min-w-0">{statusFacts.join(" · ")}</Text.Sans>
           </div>
@@ -361,11 +447,10 @@ export function ThisDeviceSections({ host, machine, currentServer, variant, init
       </Section>
 
       {/* Nothing installed, or being moved: the status alone says it; Servers come once Raft Computer is here. */}
-      {standaloneEmpty || migrating ? null : (
+      {/* Nothing to list (its status unread, no attachment): no empty heading either. */}
+      {state.kind === "not-installed" || migrating || !(variant === "standalone" || self.servers.length > 0 || state.flags.notAttachedHere) ? null : (
         <Section title={formatMessage({ id: "computerHost.thisDevice.section.servers" })}>
-          {variant === "standalone" || self.servers.length > 0 || state.flags.notAttachedHere ? (
-            <ThisDeviceServers host={host} machine={machine} currentServer={currentServer} onAdd={canAdd && state.kind !== "setting-up" ? openAdd : null} />
-          ) : null}
+          <ThisDeviceServers host={host} machine={machine} currentServer={currentServer} onAdd={canAdd && state.kind !== "setting-up" ? openAdd : null} />
         </Section>
       )}
 
@@ -386,7 +471,7 @@ export function ThisDeviceSections({ host, machine, currentServer, variant, init
               )}
             </div>
             {/* While it updates, the progress below is the answer: no second Update now. */}
-            {host.updateComputer && latest && !updating && !belowMinimum ? (
+            {host.updateComputer && latest && !updating && !belowMinimum && offers("update-now") ? (
               <Button variant="outline" size="md" onClick={updateNow} disabled={disabled} loading={busy === "update"} loadingLabel={updateLabel} data-computer-op="update-now">
                 {updateLabel}
               </Button>
@@ -396,7 +481,7 @@ export function ThisDeviceSections({ host, machine, currentServer, variant, init
             <Banner status="warning" size="sm" className="mt-3" data-testid="this-device-update-required">
               <BannerTitle>{formatMessage({ id: "computerHost.thisDevice.notice.updateRequiredTitle" }, { features: missingFeaturesText(missingFeatures(hostState), intl) })}</BannerTitle>
               <BannerDescription>{formatMessage({ id: "computerHost.thisDevice.notice.updateRequiredBody" })}</BannerDescription>
-              {host.updateComputer ? (
+              {host.updateComputer && offers("update") ? (
                 <BannerAction>
                   <Button variant="default" size="md" onClick={updateNow} disabled={disabled} loading={busy === "update"} loadingLabel={formatMessage({ id: "computerHost.thisDevice.update" })} data-computer-op="update-required">
                     {formatMessage({ id: "computerHost.thisDevice.update" })}

@@ -8,7 +8,7 @@ import { PublicVisibilitySection } from "../server/PublicVisibilitySection";
 import { useServerStore } from "../../../store/serverStore";
 import { renderWithIntl } from "../../../../tests/helpers/intl";
 import { assertScrollAreaRailsOn } from "../../../../tests/helpers/scrollAreaRails";
-import { PUBLIC_SERVER_FEATURE_FLAG_KEY, SERVER_GUEST_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
+import { PUBLIC_SERVER_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
 import {
   resetServerFeatureFlagsForTests,
   setServerFeatureFlagForTests,
@@ -40,7 +40,6 @@ function seed(role: "owner" | "admin", publicServerEnabled = true) {
     serverEpoch: 1,
   } as never);
   setServerFeatureFlagForTests("server-1", PUBLIC_SERVER_FEATURE_FLAG_KEY, publicServerEnabled);
-  setServerFeatureFlagForTests("server-1", SERVER_GUEST_FEATURE_FLAG_KEY, true);
 }
 
 test("owner sees a structured exposed-channel list and must confirm the audience expansion", async () => {
@@ -143,7 +142,7 @@ test("turning public access off is immediate and does not require confirmation",
 
 // #wg-rbac:#15 P1 c: a Guest is never made from the public page (the server's
 // join-as-guest route is gone), so the Guest-join switch is not offered,
-// whatever server_guest_v0 says. The public visibility setting itself stays.
+// The public visibility setting itself stays.
 for (const publiclyVisible of [true, false]) {
   test(`no Guest-join setting while public access is ${publiclyVisible ? "on" : "off"}`, async () => {
     seed("owner");

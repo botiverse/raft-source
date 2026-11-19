@@ -17,7 +17,7 @@ import { getDb } from "../db/index";
 import { channelHumans, channels, serverMembers } from "../db/schema";
 import { UUID_RE } from "../lib/messageId";
 import * as channelService from "../services/channelService";
-import { AGENT_LOUNGE_OUTSIDER_REFUSAL, isLoungeOutsiderAgent } from "../services/agentLoungeService";
+import { isLoungeOutsiderAgent } from "../services/agentLoungeService";
 import { DmTargetResolutionError } from "../services/dmTargetResolutionError";
 import { renderRelatedTargets } from "../services/agentInboxItems";
 import { isChannelReadOnlyByBillingFeature, isChannelReadOnlyByQuota } from "../services/planService";
@@ -65,7 +65,8 @@ export interface ResolvedConversationTarget {
  * the target came from a thread.
  */
 /** Why an agent may not put something in another agent's lounge (the apps' refusal text). */
-export const AGENT_LOUNGE_PLACEMENT_REFUSAL = AGENT_LOUNGE_OUTSIDER_REFUSAL;
+export const AGENT_LOUNGE_PLACEMENT_REFUSAL =
+  "This is another agent's lounge: you can read it, but only its own agent takes part, so give it another home or tell whoever asked you.";
 
 /**
  * Whether an agent may put an object in a conversation (an Artifact homed

@@ -6,7 +6,7 @@ import { ArtifactIcon } from "@botiverse/ricons";
 import { PanelAction, Separator } from "@botiverse/raft-ui";
 
 import Tooltip from "../../components/ui/Tooltip";
-import { useBrowserTabsStore } from "./browserTabsStore";
+import { browserOf, useBrowserTabsStore } from "./browserTabsStore";
 
 /**
  * The side window's switch chip (desktop_web_preview_view_v0, Raft Desktop):
@@ -45,7 +45,7 @@ function Chip({ kind, label, onClick, tight, children }: {
       </Tooltip>
       <Separator
         orientation="vertical"
-        className={`${tight ? "-mx-1" : "mx-1"} h-4 data-[orientation=vertical]:self-center`}
+        className={`${tight ? "-mx-1" : "mx-1"} h-4 self-center`}
         data-testid="side-window-switch-separator"
       />
     </>
@@ -69,7 +69,7 @@ export function ArtifactSwitchChip({ conversationId, title, titleRoom }: { conve
 /** In the Artifact's head: the browser open behind it, with how many tabs it holds. Nothing once it has closed. */
 export function BrowserSwitchChip({ conversationId }: { conversationId: string }) {
   const { formatMessage } = useIntl();
-  const count = useBrowserTabsStore((s) => s.browsers[conversationId]?.tabs.length ?? 0);
+  const count = useBrowserTabsStore((s) => browserOf(s, conversationId)?.tabs.length ?? 0);
   const toFront = useBrowserTabsStore((s) => s.toFront);
   const toBrowser = useCallback(() => toFront(conversationId), [conversationId, toFront]);
   if (count === 0) return null;

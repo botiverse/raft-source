@@ -41,7 +41,7 @@ export async function executeActionCardKeepalive(
   if (serverId) headers["X-Server-Id"] = serverId;
   let span: WebHttpClientSpan | null = null;
   try {
-    span = startWebHttpClientSpan("POST");
+    span = startWebHttpClientSpan("POST", `/actions/${messageId}/execute`, undefined, RUNTIME_API_BASE);
     headers.traceparent = span.traceparent;
   } catch {
     // Tracing is diagnostic only: the answer goes without it.
@@ -58,7 +58,7 @@ export async function executeActionCardKeepalive(
       body: JSON.stringify({ expectedState: "prepared", expectedConfirmationVersion: confirmationVersion, form }),
     });
   } catch (err) {
-    endSpan(span, { requestUrl: url });
+    endSpan(span, { requestUrl: url, failure: err });
     throw err;
   }
   const data: unknown = await response.json().catch(() => null);

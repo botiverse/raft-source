@@ -24,6 +24,7 @@
 // - Every other lifecycle call goes to whichever host owns the agent now.
 
 import { getRuntimeDisplayName, redactDiagnosticText } from "@botiverse/raft-shared";
+import type { AgentSideAskOutcome, AgentSideAskRequest } from "@botiverse/raft-shared";
 import type {
   AgentConfig,
   AgentInboxAppItem,
@@ -36,6 +37,7 @@ import type {
 } from "@botiverse/raft-shared";
 import type { AgentAppInboxNoticeOptions } from "../agentAppInbox";
 import { clampAgentDrainDeadlineMs, type AgentDrainOptions, type AgentDrainProgress, type AgentDrainSummary } from "../agentDrain";
+import type { AgentStartOutcome } from "../agentStartCoordinator";
 import type { AgentStartAcceptance } from "../agentStartDispatchProjection";
 import { logger } from "../logger";
 import { getDriver, isOarOnlyRuntimeId, OAR_ONLY_RUNTIMES } from "../drivers/index";
@@ -69,6 +71,16 @@ interface WaitingLegacyStart {
   pass(): void;
   /** Its start's runner credential, held while it waits (#wg-rbac:#27). */
   config: AgentConfig;
+}
+
+/**
+ * An OAR start a stop or the shutdown ended (a start held by a drain, say)
+ * carried nothing to a process. A stop that lands while the first input is
+ * being written also ends as `stopped`: the session is disposed before the
+ * agent acts on it, so the wake counts as not delivered and may be sent again.
+ */
+function oarStartOutcome(outcome: OarStartOutcome): AgentStartOutcome {
+  return outcome.kind === "stopped" ? "cancelled" : "started";
 }
 
 /** Resolves when `promise` settles or `signal` aborts, whichever is first. */
@@ -113,7 +125,7 @@ export class AgentHostRouter implements AgentLifecycleHost {
     catchupBatchId?: string,
     recoveryGrant: RecoveryGrant | null = null,
     claimedConnectionEpochId: string | null = null,
-  ): Promise<void> {
+  ): Promise<AgentStartOutcome> {
     const request: AgentStartRequest = {
       agentId, config, wakeMessage, unreadSummary, resumePrompt, launchId, wakeMessageTransient,
       resumeMessages, startDispatchId, traceParent, catchupBatchId, recoveryGrant, claimedConnectionEpochId,
@@ -125,8 +137,7 @@ export class AgentHostRouter implements AgentLifecycleHost {
     if (this.oar.owns(agentId)) {
       // Running or starting on OAR: this start is carried by that session.
       this.traceSelection(request, requested, "oar", requested === "oar" ? undefined : "oar_holds_agent");
-      await this.oar.start(request);
-      return;
+      return oarStartOutcome(await this.oar.start(request));
     }
     // A start waiting to run on the legacy host holds the agent there.
     const legacyState = this.waitingForOarUnwind.has(agentId) ? "active" : this.legacy.agentHostState(agentId);
@@ -155,7 +166,7 @@ export class AgentHostRouter implements AgentLifecycleHost {
     const started = this.oar.start(request);
     await releasedIdle;
     const outcome = await started;
-    if (outcome.kind !== "fallback") return;
+    if (outcome.kind !== "fallback") return oarStartOutcome(outcome);
     if (oarOnly) return this.failOarOnlyFallback(outcome);
     if (outcome.failHere) return this.failKeptOnOar(outcome, outcome.failHere);
     // Nothing runs on OAR: the legacy host runs this start, as it would have.
@@ -163,7 +174,7 @@ export class AgentHostRouter implements AgentLifecycleHost {
     this.traceSelection(outcome.request, requested, "legacy", outcome.reason, "oar_fallback");
     const legacyStart = this.startOnLegacy(outcome.request);
     for (const held of outcome.held) held.settle(this.legacy.deliverMessage(agentId, held.message, held.context));
-    await legacyStart;
+    return legacyStart;
   }
 
   /**
@@ -193,6 +204,7 @@ export class AgentHostRouter implements AgentLifecycleHost {
   private failKeptOnOar(outcome: Extract<OarStartOutcome, { kind: "fallback" }>, userMessage: string): never {
     const { request, reason } = outcome;
     this.traceSelection(request, "oar", "none", reason, "oar_kept_failed");
+    this.oar.reportDroppedAppEvents(request.agentId, request.launchId ?? null, "oar_kept_failed", outcome.held.flatMap((held) => held.droppedAppEventIds ?? []));
     for (const held of outcome.held) held.settle(false);
     this.releaseCredential(request);
     throw new OarOnlyStartError({ runtimeId: request.config.runtime, hostReason: reason, userMessage });
@@ -202,12 +214,14 @@ export class AgentHostRouter implements AgentLifecycleHost {
    * The OAR host handed back an OAR-only start: there is no legacy host to
    * run it, so it fails with the launch's own error where there is one (a
    * missing executable stays `runtime_not_found`), the RFC 071 gate's
-   * refusal, or the reason. The deliveries the OAR host held are not taken;
-   * the server delivers them again with the next start.
+   * refusal, or the reason. The deliveries the OAR host held are not taken:
+   * chat stays unread on the server for the next start's catch-up, and app
+   * events are reported (`reportDroppedAppEvents`) to be sent again at that start.
    */
   private failOarOnlyFallback(outcome: Extract<OarStartOutcome, { kind: "fallback" }>): never {
     const { request, reason } = outcome;
     this.traceSelection(request, "oar", "none", reason, "oar_only_failed");
+    this.oar.reportDroppedAppEvents(request.agentId, request.launchId ?? null, "oar_only_failed", outcome.held.flatMap((held) => held.droppedAppEventIds ?? []));
     for (const held of outcome.held) held.settle(false);
     this.releaseCredential(request);
     const runtime = request.config.runtime;
@@ -268,7 +282,7 @@ export class AgentHostRouter implements AgentLifecycleHost {
    * next start waits for its stopped process's exit itself, and an OAR
    * launch waits for it through `legacyRuntimeExited`.)
    */
-  private startOnLegacy(request: AgentStartRequest): Promise<void> {
+  private startOnLegacy(request: AgentStartRequest): Promise<AgentStartOutcome> {
     const { agentId } = request;
     if (!this.oar.isUnwinding(agentId) && !this.waitingForOarUnwind.has(agentId)) return this.runOnLegacy(request);
     const queue = this.waitingForOarUnwind.get(agentId) ?? new Set<WaitingLegacyStart>();
@@ -282,7 +296,7 @@ export class AgentHostRouter implements AgentLifecycleHost {
     return this.runAfterOarUnwind(request, waiting, previous).finally(pass);
   }
 
-  private async runAfterOarUnwind(request: AgentStartRequest, waiting: WaitingLegacyStart, previous: WaitingLegacyStart | undefined): Promise<void> {
+  private async runAfterOarUnwind(request: AgentStartRequest, waiting: WaitingLegacyStart, previous: WaitingLegacyStart | undefined): Promise<AgentStartOutcome> {
     const { agentId } = request;
     const { signal } = waiting.abort;
     await this.oar.unwound(agentId, signal);
@@ -294,11 +308,11 @@ export class AgentHostRouter implements AgentLifecycleHost {
       if (request.launchId) this.deps.settleNotSpawned(agentId, request.launchId, "cancelled");
       this.deps.recordEvent("daemon.agent.host.start_cancelled", { agentId, launchId: request.launchId, stage: "oar_unwind" });
       this.releaseCredential(request);
-      return;
+      return "cancelled";
     }
     const started = this.runOnLegacy(request);
     waiting.pass();
-    await started;
+    return started;
   }
 
   /** A start no host runs: its runner credential is revoked (#wg-rbac:#27). */
@@ -306,7 +320,7 @@ export class AgentHostRouter implements AgentLifecycleHost {
     this.deps.releaseUnusedCredential(request.agentId, request.config, request.launchId || null);
   }
 
-  private runOnLegacy(request: AgentStartRequest): Promise<void> {
+  private runOnLegacy(request: AgentStartRequest): Promise<AgentStartOutcome> {
     return this.legacy.startAgent(
       request.agentId,
       request.config,
@@ -392,6 +406,17 @@ export class AgentHostRouter implements AgentLifecycleHost {
 
   interruptTurn(agentId: string): Promise<AgentTurnInterruptReport> {
     return this.hostFor(agentId).interruptTurn(agentId);
+  }
+
+  /** #wg-runtime-form:#22: answered for agents on the legacy host (v0: Claude); an agent on the OAR host is not forked here. */
+  sideAsk(request: AgentSideAskRequest): Promise<{ outcome: AgentSideAskOutcome; text?: string }> {
+    if (this.oar.owns(request.agentId)) return Promise.resolve({ outcome: "unsupported_runtime" });
+    return this.legacy.sideAsk(request);
+  }
+
+  /** Kill the agent's side-question fork (its stop, delete or migration). */
+  stopSideAsk(agentId: string): void {
+    this.legacy.stopSideAsk(agentId);
   }
 
   interruptSubagent(agentId: string, subagentTaskId: string): Promise<AgentSubagentInterruptOutcome> {

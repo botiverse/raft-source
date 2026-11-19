@@ -66,6 +66,7 @@
     "src/runnerChildEnv.test.ts",
     "src/runnerLockConflict.test.ts",
     "src/runnerMemory.test.ts",
+    "src/runnerSpawnRecord.test.ts",
     "src/runners.test.ts",
     "src/runtimeCliNotices.test.ts",
     "src/serverState.test.ts",

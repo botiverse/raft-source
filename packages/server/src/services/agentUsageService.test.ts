@@ -2,11 +2,11 @@ import { dbTest as test } from "../test/integration/dbTest";
 import { closeTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
 import { eq } from "drizzle-orm";
-import { AGENT_USAGE_FEATURE_FLAG_KEY, type ActivityTurnSummary } from "@botiverse/raft-shared";
+import { AGENT_USAGE_FEATURE_FLAG_KEY, type ActivityTurnSummary, runtimeReportsTurnTokens } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
-import { agents, agentUsageContext, agentUsageDaily, featureFlagRules, featureFlags, servers, users } from "../db/schema";
+import { agents, agentUsageContext, agentUsageDaily, featureFlagRules, featureFlags, machines, servers, users } from "../db/schema";
 import { upsertAgentTurnSummaries } from "./agentActivityLogService";
-import { netUsageBuckets, pruneAgentUsage, readAgentUsage } from "./agentUsageService";
+import { computerReportsUsage, netUsageBuckets, pruneAgentUsage, readAgentUsage } from "./agentUsageService";
 
 afterEach(async () => {
   await closeTestDatabase();
@@ -34,7 +34,7 @@ async function seed(suffix: string, usageOn: boolean) {
     await db.insert(featureFlags).values({ key: AGENT_USAGE_FEATURE_FLAG_KEY, randomizationUnit: "server", salt: "test", defaultEnabled: false }).onConflictDoNothing();
     await db.insert(featureFlagRules).values({ flagKey: AGENT_USAGE_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [server.id] });
   }
-  return { agentId, serverId: server.id };
+  return { agentId, serverId: server.id, ownerId: owner.id };
 }
 
 const DAY1 = Date.parse("2026-11-12T10:00:00Z");
@@ -110,13 +110,86 @@ test("readAgentUsage answers rows in range, per-agent first days and the server'
   const answer = await readAgentUsage({ serverId, agentIds: [agentId, "30000000-0000-4000-8000-000000009999"], from: "2026-11-13", to: "2026-11-13", now: new Date(DAY2) });
   assert.equal(answer.since, "2026-11-12");
   assert.deepEqual(answer.agents, [
-    { agent_id: agentId, since: "2026-11-12", usage_reported: true },
-    { agent_id: "30000000-0000-4000-8000-000000009999", since: null, usage_reported: false },
+    { agent_id: agentId, since: "2026-11-12", usage_reported: true, computer_reports_usage: null, runtime_reports_usage: true },
+    { agent_id: "30000000-0000-4000-8000-000000009999", since: null, usage_reported: false, computer_reports_usage: null, runtime_reports_usage: false },
   ]);
   assert.deepEqual(answer.rows, [{
     day: "2026-11-13", agent_id: agentId, runtime: "codex", model: "m",
     input_new: 3, cache_read: null, cache_write: null, output: 4, reasoning_output: null, turns: 1,
   }]);
+});
+
+test("computerReportsUsage: 1.25.0 and newer report, prereleases of 1.25.0 count, older or unknown do not", () => {
+  assert.equal(computerReportsUsage("1.25.0"), true);
+  assert.equal(computerReportsUsage("1.25.1"), true);
+  assert.equal(computerReportsUsage("1.26.0"), true);
+  assert.equal(computerReportsUsage("2.0.0"), true);
+  assert.equal(computerReportsUsage(" 1.25.0 "), true);
+  assert.equal(computerReportsUsage("1.25.0-rc.1"), true);
+  assert.equal(computerReportsUsage("1.25.0-staging.20261113.sha.abc123"), true);
+  assert.equal(computerReportsUsage("1.25.0+build.7"), true);
+  assert.equal(computerReportsUsage("1.24.9"), false);
+  assert.equal(computerReportsUsage("1.0.70"), false);
+  assert.equal(computerReportsUsage("1.24.0-rc.1"), false);
+  assert.equal(computerReportsUsage("0.55.5"), false);
+  assert.equal(computerReportsUsage(null), false);
+  assert.equal(computerReportsUsage(undefined), false);
+  assert.equal(computerReportsUsage(""), false);
+  assert.equal(computerReportsUsage("unknown"), false);
+});
+
+test("readAgentUsage says whether each agent's Computer can report usage, null without a Computer", async ({ db }) => {
+  void db;
+  const { agentId, serverId, ownerId } = await seed("507", true);
+  const machine = async (name: string, computerVersion: string | null) => (await getDb().insert(machines)
+    .values({ serverId, userId: ownerId, name, apiKeyHash: `hash-${name}`, computerVersion }).returning())[0]!.id;
+  const agent = async (n: number, machineId: string | null) => {
+    const id = `30000000-0000-4000-8000-0000005070${n}0`;
+    await getDb().insert(agents).values({ id, serverId, name: `agent-507-${n}`, status: "active", model: "gpt-5", runtime: "codex", machineId });
+    return id;
+  };
+  await getDb().update(agents).set({ machineId: await machine("new", "1.25.0") }).where(eq(agents.id, agentId));
+  const older = await agent(1, await machine("old", "1.24.3"));
+  const prerelease = await agent(2, await machine("rc", "1.25.0-rc.1"));
+  const unknown = await agent(3, await machine("unknown", null));
+  const noMachine = await agent(4, null);
+  const answer = await readAgentUsage({ serverId, agentIds: [agentId, older, prerelease, unknown, noMachine], from: "2026-11-13", to: "2026-11-13", now: new Date(DAY2) });
+  assert.deepEqual(answer.agents.map((entry) => [entry.agent_id, entry.computer_reports_usage]), [
+    [agentId, true],
+    [older, false],
+    [prerelease, true],
+    [unknown, false],
+    [noMachine, null],
+  ]);
+});
+
+test("readAgentUsage says whether each agent's runtime reports per-turn tokens, false for one that does not or an unknown agent", async ({ db }) => {
+  void db;
+  const { agentId, serverId } = await seed("508", true);
+  const agent = async (n: number, runtime: string) => {
+    const id = `30000000-0000-4000-8000-0000005080${n}0`;
+    await getDb().insert(agents).values({ id, serverId, name: `agent-508-${n}`, status: "active", model: "m", runtime });
+    return id;
+  };
+  const claude = await agent(1, "claude");
+  const qwen = await agent(2, "qwen");
+  const antigravity = await agent(3, "antigravity");
+  const grok = await agent(4, "grok");
+  const unknownRuntime = await agent(5, "not-a-runtime");
+  const missing = "30000000-0000-4000-8000-000000509999";
+  const answer = await readAgentUsage({ serverId, agentIds: [agentId, claude, qwen, antigravity, grok, unknownRuntime, missing], from: "2026-11-13", to: "2026-11-13", now: new Date(DAY2) });
+  assert.deepEqual(answer.agents.map((entry) => [entry.agent_id, entry.runtime_reports_usage]), [
+    [agentId, true], // codex
+    [claude, true],
+    [qwen, true],
+    [antigravity, false],
+    [grok, false],
+    [unknownRuntime, false],
+    [missing, false], // no agent row, so no runtime
+  ]);
+  // agents.runtime is NOT NULL; a null runtime can only reach the check as absent.
+  assert.equal(runtimeReportsTurnTokens(null), false);
+  assert.equal(runtimeReportsTurnTokens(undefined), false);
 });
 
 test("netUsageBuckets keeps a never-reported count null and drops a bucket whose net is zero", () => {

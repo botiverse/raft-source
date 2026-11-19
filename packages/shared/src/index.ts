@@ -4,7 +4,7 @@ export { APPSUMO_PLAN_LIMITS, isAppSumoTier } from "./appsumoPlans";
 export type { AppSumoTier, AppSumoEntitlement, AppSumoPlanLimits } from "./appsumoPlans";
 export { normalizeAppSetupUrl, normalizeAppSetupDescription, projectAppSetup, asAppSetupInstallationId, AppSetupValidationError } from "./appSetup";
 export type { AppSetupState, AppSetupInstallationId } from "./appSetup";
-export { validateAnnouncementAudience, matchesAnnouncementAudience, matchesAnnouncementClient, asAnnouncementRecipientUserId, ANNOUNCEMENT_AUDIENCE_MAX_IDS, ANNOUNCEMENT_AUDIENCE_MAX_CLIENTS, ANNOUNCEMENT_CLIENT_PLATFORMS, validateAnnouncementAudienceRules, matchesAnnouncementRules, matchesAnnouncementDevices, announcementDeviceOf, ANNOUNCEMENT_DEVICES, announcementRuleFlagKeys, ANNOUNCEMENT_RULE_MAX_GROUPS, ANNOUNCEMENT_RULE_MAX_CONDITIONS, ANNOUNCEMENT_RULE_ROLES, ANNOUNCEMENT_RULE_PLANS, ANNOUNCEMENT_RULE_PLATFORMS, ANNOUNCEMENT_RULE_TIME_OPS, ANNOUNCEMENT_RULE_MAX_DAYS } from "../announcement-audience";
+export { validateAnnouncementAudience, matchesAnnouncementAudience, matchesAnnouncementClient, asAnnouncementRecipientUserId, ANNOUNCEMENT_AUDIENCE_MAX_IDS, ANNOUNCEMENT_AUDIENCE_MAX_CLIENTS, ANNOUNCEMENT_CLIENT_PLATFORMS, validateAnnouncementAudienceRules, matchesAnnouncementRules, matchesAnnouncementDevices, announcementDeviceOf, ANNOUNCEMENT_DEVICES, announcementRuleFlagKeys, announcementRulesNeedComputers, computerVersionBelow, ANNOUNCEMENT_COMPUTER_ACTIVE_DAYS, ANNOUNCEMENT_RULE_MAX_GROUPS, ANNOUNCEMENT_RULE_MAX_CONDITIONS, ANNOUNCEMENT_RULE_ROLES, ANNOUNCEMENT_RULE_PLANS, ANNOUNCEMENT_RULE_PLATFORMS, ANNOUNCEMENT_RULE_TIME_OPS, ANNOUNCEMENT_RULE_MAX_DAYS } from "../announcement-audience";
 export type { AnnouncementAudience, AnnouncementClient, AnnouncementClientPlatform, AnnouncementClientTarget, AnnouncementDeliveryScope, AnnouncementAudienceSnapshot, AnnouncementRecipientUserId, AnnouncementAudienceRules, AnnouncementConditionGroup, AnnouncementCondition, AnnouncementRuleContext, AnnouncementRulePlatform, AnnouncementRuleMatch, AnnouncementDevice } from "../announcement-audience";
 import type { ActivityTurnSummary, ActivityTurnTrigger } from "./activityTurnSummary";
 import type { AnnouncementContent, AnnouncementPresentation } from "../announcement-presentation";
@@ -21,6 +21,8 @@ import {
   PI_BUILTIN_PROVIDER_CONNECTION_PROBES_GENERATED,
   PI_BUILTIN_PROVIDER_DEFAULT_MODELS_GENERATED,
   PI_BUILTIN_PROVIDER_MODELS_GENERATED,
+  PI_BUILTIN_ALL_REASONING_PROVIDER_IDS_GENERATED,
+  PI_BUILTIN_UNIFORM_TRANSPORT_PROVIDER_IDS_GENERATED,
 } from "./piBuiltinModels.generated";
 import { formatRuntimeProviderModelLabel } from "./runtimeProviderDisplay";
 import { hydrateLegacyRuntimeConfigWithTrace } from "./runtimeConfigLegacy";
@@ -110,6 +112,7 @@ export {
   FEATURE_FLAG_ADMIN_COLUMN_PROJECTIONS,
   FEATURE_FLAG_ADMIN_OPERATOR_ROLE,
   FEATURE_FLAG_ADMIN_ANNOUNCEMENT_RULES_REACH_FUNCTION,
+  FEATURE_FLAG_ADMIN_SERVER_PLAN_ENTITLEMENT_INPUTS_FUNCTION,
   FORBIDDEN_FEATURE_FLAG_ADMIN_PRIVILEGES,
   REQUIRED_FEATURE_FLAG_ADMIN_PRIVILEGES,
   FeatureFlagAdminPrivilegeError,
@@ -161,6 +164,8 @@ export interface AgentThreadContextMessage {
   sender_timezone?: string | null;
   /** RFC 077: the personal assistant that sent this as its owner (the sender). */
   delegated_by?: { name: string } | null;
+  /** Raft voice calls: a voice call posted this in the sender agent's name; the voice model wrote it, not the agent. */
+  posted_by?: "voice_call" | null;
   sender_type: AgentMessageSenderType;
   content: string;
   timestamp: string;
@@ -212,6 +217,8 @@ export interface AgentMessage {
   sender_timezone?: string | null;
   /** RFC 077: the personal assistant that sent this as its owner (the sender). */
   delegated_by?: { name: string } | null;
+  /** Raft voice calls: a voice call posted this in the sender agent's name; the voice model wrote it, not the agent. */
+  posted_by?: "voice_call" | null;
   /**
    * RFC 082: set on a card message. `content` is its fallback text; renderers
    * add `card=r<revision>` (and `updated=` once replaced) to the header line,
@@ -359,6 +366,7 @@ export * from "./observedFailureSummary";
 export * from "./agentNameGenerator";
 export * from "./agentEnvVarPolicy";
 export * from "./agentTyping";
+export * from "./appNameReservation";
 export * from "./agentModelLimits";
 export * from "./runtimeErrorVisibility";
 export * from "./agentActivitySubscriptions";
@@ -418,17 +426,21 @@ export * from "./actionCardAuthority";
 export * from "./actionCardSpec";
 export * from "./actionCardMessages";
 export * from "./actionCardSpecBuilder";
+export * from "./preparedRequestCard";
 export * from "./delegatedReceipt";
 export * from "./messageCard";
+export * from "./messageCardActions";
 export * from "./messageCardMarkdown";
 export * from "./featureFlags";
 export * from "./featuresChanged";
 export * from "./agentContextView";
+export * from "./agentSideAsk";
 export * from "./agentContextEntries";
 export * from "./agentContextViewStatus";
 export * from "./agentContextViewGrant";
 export * from "./upgradeGates";
 export * from "./productEvents";
+export * from "./integrationServiceCatalog";
 export * from "./externalProjection";
 export * from "./slackBridgeDelivery";
 export * from "./slackBridgeProvisioning";
@@ -479,6 +491,8 @@ export * from "./agentInboxItemRow";
 export * from "./attentionDependencyOracle";
 export * from "./runtimeProviderDisplay";
 export * from "./runtimeAccountUsage";
+export * from "./machineOperation";
+export * from "./agentVoiceCall";
 export * from "./runtimeAuth";
 export * from "./readiness";
 export * from "./systemAttention";
@@ -487,6 +501,7 @@ export * from "./externalAgentIntegration";
 export * from "./translationLanguages";
 export * from "./displayLocales";
 export * from "./externalLinkSchemes";
+export * from "./linkRouter";
 export * from "./computerReleaseNotes";
 export * from "./timeFormatPreference";
 export * from "./legalAcceptance";
@@ -851,14 +866,6 @@ export const DAEMON_CAPABILITY_RUNTIME_AUTH_GROK = "machine:runtime-auth:grok";
  * offers an upgrade instead.
  */
 export const DAEMON_CAPABILITY_RUNTIME_AUTH_OPENCODE = "machine:runtime-auth:opencode";
-/**
- * The daemon also reports CodeBuddy Code's sign-in status and runs its login
- * and logout (OAR 0.100+: the stream-json `authenticate`, its link relayed;
- * `logout`, confirmed by `initialize.account`). A daemon without it (no
- * CodeBuddy in its OAR runtimes) drops both and never reports CodeBuddy's
- * status, so it is never sent either: the web offers an upgrade instead.
- */
-export const DAEMON_CAPABILITY_RUNTIME_AUTH_CODEBUDDY = "machine:runtime-auth:codebuddy";
 
 /**
  * The daemon also logs Antigravity out (OAR 0.98 agy ACP `logout`, confirmed
@@ -901,7 +908,6 @@ const RUNTIME_AUTH_OPTIONAL_CAPABILITIES: ReadonlyArray<readonly [RuntimeAuthRun
   ["pi", DAEMON_CAPABILITY_RUNTIME_AUTH_PI],
   ["grok", DAEMON_CAPABILITY_RUNTIME_AUTH_GROK],
   ["opencode", DAEMON_CAPABILITY_RUNTIME_AUTH_OPENCODE],
-  ["codebuddy", DAEMON_CAPABILITY_RUNTIME_AUTH_CODEBUDDY],
 ];
 const runtimeAuthRuntimeLists = new Map<string, readonly RuntimeAuthRuntime[]>();
 
@@ -1047,6 +1053,14 @@ export const DAEMON_CAPABILITY_RUNTIME_HOST_OAR_GROK = "runtime-host:oar:grok";
  */
 export const DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR = "runtime-host:oar:cursor";
 /**
+ * (daemon capability, on `ready.capabilities`): this daemon's OAR host can run
+ * OpenCode (`opencode acp`: 1.x from 1.18.30, 2.x from 2.0.27, below 3).
+ * Advertised on Linux and macOS (the OAR host runs only Codex on Windows).
+ * The server asks for the OAR host for OpenCode only with this and its
+ * `agent_runtime_oar_opencode` flag on, so older Computers keep the driver.
+ */
+export const DAEMON_CAPABILITY_RUNTIME_HOST_OAR_OPENCODE = "runtime-host:oar:opencode";
+/**
  * #wg-rbac:#27 (daemon capability, on `ready.capabilities`): every `ready`
  * carries `runnerCredentialIds`, the runner credentials
  * (`AgentConfig.agentCredentialId`) the daemon holds when it builds the frame:
@@ -1162,6 +1176,14 @@ export const SERVER_CAPABILITY_STICKY_FAILURE_REASONS_V1 = "agent:sticky-failure
 export const SERVER_CAPABILITY_MIGRATION_BACKUP_IGNORE_SOURCES_V1 = "migration:backup-ignore-sources-v1";
 /**
  * Server capability (on `machine:context.capabilities`): the server accepts
+ * `transferSummary.excludedIgnoredPartial` (shared agentMigration.ts) in a
+ * migration control manifest and reads the ignored totals as "at least" then.
+ * A Computer includes that field only when the Server advertises this; an
+ * older Server's strict summary schema would reject the manifest.
+ */
+export const SERVER_CAPABILITY_MIGRATION_IGNORED_PARTIAL_V1 = "migration:ignored-partial-v1";
+/**
+ * Server capability (on `machine:context.capabilities`): the server accepts
  * `userIgnoreAdditions` (the receipt, ./agentMigrationUserIgnore) in a migration
  * source-progress report. A Computer includes it only when the Server
  * advertises this; an older Server's strict report schema would reject it.
@@ -1211,26 +1233,129 @@ export const COMPUTER_CAPABILITY_SERVICE_IPC_UNREACHABLE = "computer:service-ipc
  * read once by the successor process and carried on `ready`. Only the
  * failure reason is consumed (one human-readable line); the outcome is the
  * version comparison the Server performs itself.
+ * `code` / `diagnosticCode`: the receipt's fixed failure codes
+ * (ComputerUpgradeInstallerReport); absent on older Computers and when the
+ * receipt has none. The Server reads them through
+ * parseComputerUpgradeInstallerReport, never as given.
  */
 export interface ComputerLastUpgradeReceipt {
   targetVersion: string;
   outcome: "promoted" | "rolled_back" | "failed" | "held" | "unresolved";
   reason?: string;
+  code?: string;
+  diagnosticCode?: string;
+}
+
+/**
+ * The installer receipt of a web upgrade the installer did not promote, as
+ * fixed fields next to the text of `computer:upgrade:done`
+ * (`installerOutcome`, `installerCode`, `installerDiagnosticCode`); the text
+ * stays as before for older Servers. Absent on older Computers.
+ *   installerOutcome — the receipt's outcome, reduced as on `ready`
+ *     (ComputerLastUpgradeReceipt["outcome"] without `promoted`).
+ *   installerCode — the receipt's own `code` (raft-computer-installer
+ *     rust/report.rs FailureCode, snake_case: `release_resolution_failed`,
+ *     `install_failed`, ...).
+ *   installerDiagnosticCode — the error class leading the receipt's
+ *     `detail.diagnostic`, the update engine's own error
+ *     (`DOWNLOAD_FAILED: idle timeout` → `DOWNLOAD_FAILED`).
+ * Codes are bounded tokens, never text; a value outside the closed set or the
+ * pattern is dropped (parseComputerUpgradeInstallerReport).
+ */
+export const COMPUTER_UPGRADE_INSTALLER_OUTCOMES = ["failed", "rolled_back", "held", "unresolved"] as const;
+export type ComputerUpgradeInstallerOutcome = (typeof COMPUTER_UPGRADE_INSTALLER_OUTCOMES)[number];
+export interface ComputerUpgradeInstallerReport {
+  installerOutcome: ComputerUpgradeInstallerOutcome;
+  installerCode?: string;
+  installerDiagnosticCode?: string;
+}
+const COMPUTER_UPGRADE_INSTALLER_CODE_PATTERN = /^[a-z][a-z0-9_]{0,63}$/u;
+const COMPUTER_UPGRADE_INSTALLER_DIAGNOSTIC_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/u;
+
+/** An installer receipt `code` (snake_case token), else null. */
+export function normalizeComputerUpgradeInstallerCode(value: unknown): string | null {
+  return typeof value === "string" && COMPUTER_UPGRADE_INSTALLER_CODE_PATTERN.test(value) ? value : null;
+}
+
+/** An engine error class (`DOWNLOAD_FAILED`), else null. */
+export function normalizeComputerUpgradeInstallerDiagnosticCode(value: unknown): string | null {
+  return typeof value === "string" && COMPUTER_UPGRADE_INSTALLER_DIAGNOSTIC_CODE_PATTERN.test(value) ? value : null;
+}
+
+/**
+ * The report when `installerOutcome` is one of the closed set, else null
+ * (absent: an older Computer). A code that does not match its pattern is
+ * left out; nothing else is kept.
+ */
+export function parseComputerUpgradeInstallerReport(value: {
+  installerOutcome?: unknown;
+  installerCode?: unknown;
+  installerDiagnosticCode?: unknown;
+} | null | undefined): ComputerUpgradeInstallerReport | null {
+  const outcome = value?.installerOutcome;
+  if (typeof outcome !== "string" || !(COMPUTER_UPGRADE_INSTALLER_OUTCOMES as readonly string[]).includes(outcome)) return null;
+  const code = normalizeComputerUpgradeInstallerCode(value?.installerCode);
+  const diagnosticCode = normalizeComputerUpgradeInstallerDiagnosticCode(value?.installerDiagnosticCode);
+  return {
+    installerOutcome: outcome as ComputerUpgradeInstallerOutcome,
+    ...(code ? { installerCode: code } : {}),
+    ...(diagnosticCode ? { installerDiagnosticCode: diagnosticCode } : {}),
+  };
+}
+
+/**
+ * The same report from a non-promoted `ready.lastUpgradeReceipt`, when it
+ * carries the receipt's `code` (Computers from this change on), else null.
+ */
+export function computerUpgradeInstallerReportOfReceipt(receipt: ComputerLastUpgradeReceipt | null | undefined): ComputerUpgradeInstallerReport | null {
+  if (!receipt || normalizeComputerUpgradeInstallerCode(receipt.code) === null) return null;
+  return parseComputerUpgradeInstallerReport({
+    installerOutcome: receipt.outcome,
+    installerCode: receipt.code,
+    installerDiagnosticCode: receipt.diagnosticCode,
+  });
+}
+
+const COMPUTER_UPGRADE_INSTALLER_REPORT_KEY = "computerUpgradeInstallerReport";
+
+/**
+ * The Computer's upgrade relay throws the installer's failure to the daemon
+ * in the same process; the report rides on the error so the daemon can put
+ * it on `computer:upgrade:done` next to the message.
+ */
+export function withComputerUpgradeInstallerReport<E extends Error>(error: E, report: ComputerUpgradeInstallerReport): E {
+  Object.defineProperty(error, COMPUTER_UPGRADE_INSTALLER_REPORT_KEY, { value: report, enumerable: false });
+  return error;
+}
+
+/** The report a thrown error carries (withComputerUpgradeInstallerReport), validated, else null. */
+export function computerUpgradeInstallerReportOfError(error: unknown): ComputerUpgradeInstallerReport | null {
+  if (typeof error !== "object" || error === null) return null;
+  const report = (error as Record<string, unknown>)[COMPUTER_UPGRADE_INSTALLER_REPORT_KEY];
+  return typeof report === "object" && report !== null ? parseComputerUpgradeInstallerReport(report) : null;
 }
 
 /**
  * Advisory on a failed web upgrade request (`upgradeRequest.failureHint` in
  * the machine list and `machine:upgrade-request`): the failure is one only a
  * run of the install command on the machine gets past, recognized by the
- * server in the reason the Computer gave (Computers up to today send only
- * text, no code). Never changes whether Upgrade is offered.
+ * server from the installer's receipt code where one came, else from the
+ * reason text the Computer gave. Never changes whether Upgrade is offered.
  *   unsafe_kill_mode — the service's systemd unit has a KillMode under which
  *     the installer would be killed with the service, so the Computer refused.
  *   installation_held — the installer could not move out of that unit, so it
  *     held the upgrade before stopping anything.
+ *   earlier_recovery_pending — the installer refused because an earlier
+ *     installation on the machine is unfinished; nothing was changed, and a
+ *     repair on the machine (the install command) is what gets past it
+ *     (raft-computer-installer receipt code `earlier_recovery_pending`).
  * `unit` / `killMode` / `scope` only when the reason names them.
+ * A web bundle older than `earlier_recovery_pending` renders an unknown
+ * reason with the generic systemd-unit copy until it reloads.
  */
-export interface ComputerUpgradeFailureHint {
+export type ComputerUpgradeFailureHint = ComputerUpgradeUnitFailureHint | { reason: "earlier_recovery_pending" };
+/** The failure hints about the systemd unit the Computer runs under. */
+export interface ComputerUpgradeUnitFailureHint {
   reason: "unsafe_kill_mode" | "installation_held";
   unit?: string;
   killMode?: string;
@@ -1325,6 +1450,13 @@ export interface AgentRuntimeOutcomeGapCounts {
   exited: number;
   startOutcome: number;
 }
+
+/**
+ * `agent:inbox:dropped_app_events`: the most app event ids one frame carries.
+ * The frame comes from a user-controlled machine: the server acts on the
+ * first this many and counts the rest in a trace.
+ */
+export const AGENT_INBOX_DROPPED_APP_EVENTS_MAX_IDS = 100;
 
 /** RFC 071 §7: the `outcome` of an `agent:runtime:outcome` v1 frame. */
 export type AgentRuntimeOutcome =
@@ -1478,6 +1610,8 @@ export type ServerToMachineMessage =
   | { type: "agent:stop"; agentId: string; reason?: AgentStopReason }
   /** task #25 step 2: stop the agent's current turn, not the agent (DAEMON_CAPABILITY_INTERRUPT_TURN). */
   | { type: "agent:interrupt-turn"; agentId: string; requestId: string }
+  /** #wg-runtime-form:#22: what the agent is doing now, or one question to a read-only fork of its session (DAEMON_CAPABILITY_AGENT_SIDE_ASK). */
+  | import("./agentSideAsk").AgentSideAskRequest
   /** #proj-runtime:#41: stop one running sub-agent, by its `SubagentLineage.taskId` (DAEMON_CAPABILITY_INTERRUPT_SUBAGENT). */
   | { type: "agent:interrupt-subagent"; agentId: string; requestId: string; subagentTaskId: string }
   /**
@@ -1693,6 +1827,12 @@ export type ServerToMachineMessage =
        * Absent or false: the source sends the summary without it.
        */
       targetAcceptsIgnoreSources?: boolean;
+      /**
+       * Source lease only: the target Computer accepts `excludedIgnoredPartial` in the
+       * transfer summary (AGENT_MIGRATION_TARGET_IGNORED_PARTIAL_CAPABILITY).
+       * Absent or false: the source sends the summary without it.
+       */
+      targetAcceptsIgnoredPartial?: boolean;
       /**
        * Source lease only (Computer 1.0.63+, AGENT_MIGRATION_SOURCE_USER_IGNORE_CAPABILITY):
        * paths the user picked to leave behind. Read it with
@@ -2469,6 +2609,8 @@ export type MachineToServerMessage =
    */
   /** task #25 step 2: the answer to `agent:interrupt-turn`; tool name and a duration only. */
   | { type: "agent:interrupt-turn:result"; agentId: string; requestId: string; outcome: AgentTurnInterruptOutcome; toolName?: string; stuckForMs?: number }
+  /** #wg-runtime-form:#22: the answer to `agent:side-ask`. */
+  | import("./agentSideAsk").AgentSideAskResult
   /** #proj-runtime:#41: the answer to `agent:interrupt-subagent`. */
   | { type: "agent:interrupt-subagent:result"; agentId: string; requestId: string; outcome: AgentSubagentInterruptOutcome }
   | { type: "agent:activity"; agentId: string; activity?: string; activityKind?: AgentActivityKind; detail: string; detailKind?: AgentActivityDetailKind; entries?: DaemonTrajectoryEntry[]; launchId?: string; daemonInstanceId?: string; probeId?: string; clientSeq?: number; producerFactId?: string; observedAtMs?: number; isHeartbeat?: boolean; runtimeError?: RuntimeErrorActivityDiagnostic; deliveryConsumption?: DeliveryConsumptionActivityDiagnostic; spawnFailure?: SpawnFailureActivityDiagnostic; providerRequest?: import("./providerRequestActivity").ProviderRequestActivity; toolStuck?: ToolStuckActivityDiagnostic; credentialHold?: CredentialHoldActivityDiagnostic }
@@ -2638,6 +2780,23 @@ export type MachineToServerMessage =
    * turn). Older servers ignore it.
    */
   | { type: "agent:runtime:ready"; agentId: string; launchId: string }
+  /**
+   * A runtime process ended abnormally (a stop, the fence, a crash, a
+   * provider-stream failure, a recoverable close with no wake, ...) holding
+   * app events it had acked and never handed to the agent. `exitReason` is
+   * the daemon's `daemon.agent.inbox.dropped_on_exit` exit reason (on the
+   * OAR host, `daemon.agent.oar.held_dropped`'s reason, or `restart_failed`,
+   * `first_input_refused`, `refused_<code>`, `oar_only_failed`,
+   * `oar_kept_failed`); an idle
+   * hand-over (`clean_exit_deferred`, `cold_idle_recycle`,
+   * `idle_process_stop`, `warm_recycle`) or a per-turn normal exit never
+   * sends it. `eventIds` are the dropped
+   * `third_party_event` ids, at most AGENT_INBOX_DROPPED_APP_EVENTS_MAX_IDS
+   * (the server ignores the rest). The server puts them back in the queue
+   * for the agent's next runtime start. Additive: older servers ignore the
+   * type (no capability needed).
+   */
+  | { type: "agent:inbox:dropped_app_events"; agentId: string; launchId: string | null; daemonInstanceId: string; exitReason: string; eventIds: string[] }
   /**
    * #proj-raft-computer:#48 (reconciler step 4b): the daemon no longer counts
    * this agent's credential invalid for `reason`, and the agent had shown
@@ -2833,7 +2992,7 @@ export type MachineToServerMessage =
    * of waiting out its deadline; the same receipt is also written to disk and
    * relayed on the next `ready`. Older servers ignore the type.
    */
-  | { type: "computer:upgrade:done"; requestId: string; ok: boolean; reason?: string; code?: string }
+  | { type: "computer:upgrade:done"; requestId: string; ok: boolean; reason?: string; code?: string; /** ComputerUpgradeInstallerReport: the installer receipt's outcome and fixed codes, when the failure is an installer receipt; absent on older Computers. Read through parseComputerUpgradeInstallerReport. */ installerOutcome?: ComputerUpgradeInstallerOutcome; installerCode?: string; installerDiagnosticCode?: string }
   /** Reconciler step 13: a drained web upgrade's progress (./computerUpgradeDrain). Sent only for a request that carried `drain`. */
   | import("./computerUpgradeDrain").ComputerUpgradeDrainingMessage
   | { type: "ready"; capabilities?: string[]; /** RFC 069 §8: this daemon process's generation. */ daemonInstanceId?: string; /** RFC 071 outbox: agents whose outcome storage is unreliable; `agent:runtime-outcome-v1` does not apply to them. */ runtimeOutcomeUnreliableAgents?: string[]; /** task #1268: omitted entirely while `runtimeDetection.status` is "pending" (a pending ready carries no inventory); otherwise this round's detected runtime ids. */ runtimes?: string[]; runtimeVersions?: Record<string, string>; /** task #1268: absent on daemons that detect synchronously before ready (= complete). */ runtimeDetection?: RuntimeDetectionReport; runningAgents: string[]; hostname?: string; os?: string; /** Set only on WSL (`os` still says `linux`); absent on older daemons and other hosts. */ osVariant?: "wsl1" | "wsl2"; /** Coarse kind of machine for the Computer icon, classified on the machine (the model it comes from is not sent); absent when unknown and on older daemons. */ deviceClass?: DeviceClass; /** Cloud / VM platform recognized on the machine; absent when not recognized and on older daemons. */ hostProvider?: HostProvider; /** OS name and version, e.g. "Ubuntu 26.04" (Linux `/etc/os-release`); absent when unknown and on older daemons. */ osRelease?: string; /** os-release `ID` ("ubuntu"), for a distribution icon; absent when unknown and on older daemons. */ osId?: string; /** os-release `ID_LIKE` ("rhel", "fedora"), fallback for the icon; absent when empty. */ osIdLike?: string[]; /** How the daemon itself runs (DAEMON_INSTALL_KINDS); absent when unknown and on older daemons. */ installKind?: DaemonInstallKind; /** COMPUTER_MIGRATED_FROM: on the first ready to each server after Raft Desktop moved this Computer from its embedded one; absent otherwise and on older daemons. */ migratedFrom?: ComputerMigratedFrom; /** Whether an executable `node` is on the daemon's PATH (no path is sent); absent on older daemons. */ nodeOnPath?: boolean; daemonVersion?: string; computerVersion?: string; migrationTransport?: AgentMigrationTransportReady; lifecycleAcks?: ComputerLifecycleExecutionAck[]; lastUpgradeReceipt?: ComputerLastUpgradeReceipt; /** #proj-raft-computer task #38: this machine's CURRENT `sk_machine_*` key was found in a legacy file inside an agent workspace (removed since), so an agent may have read it. Fingerprint = first 16 hex of sha256(key), never the key; the server keeps it only while it is still the stored key. Absent on older daemons and when nothing was found. */ legacyCredentialExposure?: LegacyCredentialExposureReport; /** #proj-raft-computer task #34: advisory, the installer state looks like it needs a repair run on the machine (COMPUTER_INSTALLER_REPAIR_HINT_REASONS); never blocks a web upgrade. Absent when there is nothing to hint and on older Computers. */ installerRepairHint?: ComputerInstallerRepairHint ; /** #wg-rbac:#27: with DAEMON_CAPABILITY_RUNNER_CREDENTIAL_RECONCILE_V1 (always then, possibly empty), the runner credential ids (`AgentConfig.agentCredentialId`) the daemon holds as it builds this frame; read it through `readyRunnerCredentialIds`. Absent on older daemons. */ runnerCredentialIds?: string[]; /** Reconciler step 11d: with DAEMON_CAPABILITY_AGENT_CONFIG_PUSH, the highest config revision the daemon applied (`agent:config` `revision` or `agent:start` `configRevision`) for each agent in `runningAgents` whose revision it knows; the server re-sends the agent's config when its own revision is newer (a push lost on the way). An agent without an entry is not compared. Absent on older daemons. */ runningAgentConfigRevisions?: Record<string, number> };
@@ -2881,7 +3040,6 @@ export type RuntimeId =
   | "pi"
   | "qwen"
   | "qoder"
-  | "codebuddy"
   | "external";
 
 /**
@@ -4272,6 +4430,14 @@ export interface RuntimeModelCatalogCapability {
    * parser rejects such a config: treat absent as none.
    */
   customModelProviderIds?: string[];
+  /**
+   * Additive: the preset providers for which this Computer also runs such a
+   * typed id through a saved provider connection (the connection supplies
+   * only the key; the transport stays the provider's). Absent on older
+   * Computers, which run a typed id only on a direct preset: treat absent as
+   * none.
+   */
+  customModelConnectionProviderIds?: string[];
 }
 
 /**
@@ -4825,17 +4991,36 @@ export function isBuiltInRuntimeGatewayProviderId(value: string): value is Built
 /**
  * Built-in preset providers whose Model field also accepts a typed model id
  * that is not in Pi's catalog, and whose limits are explicit overrides for any
- * model, listed ones included (task #10, #wg-runtime-form). A stored custom
- * name is the provider's own API id (an OpenRouter id such as
- * `moonshotai/kimi-k2.6`), never Raft's `provider/` catalog value
- * (normalizeBuiltInPresetCustomModel). A Computer that runs such a model reports
- * the provider in its Built-in catalog's `customModelProviderIds`; an older
- * Computer's parser rejects the config, so the server checks that first.
+ * model, listed ones included (task #10, #wg-runtime-form): every provider
+ * whose catalog models all share one transport (api, base URL, static
+ * headers; computed by the generator), which a typed id then runs on, plus
+ * OpenRouter, whose catalog mixes its Anthropic and OpenAI endpoints (a typed
+ * id keeps the transport of its first catalog entry, as it always has). A stored
+ * custom name is the provider's own API id (`moonshotai/kimi-k2.6` on
+ * OpenRouter, `qwen4-preview` on Qwen Token Plan), never Raft's `provider/`
+ * catalog value (normalizeBuiltInPresetCustomModel). A Computer that runs such
+ * a model reports the provider in its Built-in catalog's
+ * `customModelProviderIds`; an older Computer's parser rejects the config, so
+ * the server checks that first.
  */
-export const BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS: readonly BuiltInRuntimeProviderId[] = ["openrouter"];
+export const BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS: readonly BuiltInRuntimeProviderId[] = [
+  ...new Set<BuiltInRuntimeProviderId>(["openrouter", ...PI_BUILTIN_UNIFORM_TRANSPORT_PROVIDER_IDS_GENERATED]),
+];
 
 export function isBuiltInRuntimeCustomModelPresetProviderId(value: string): boolean {
   return (BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS as readonly string[]).includes(value);
+}
+
+/**
+ * Whether a typed model id outside Pi's catalog runs with reasoning on, so a
+ * reasoning effort applies to it: on a provider every catalog model of which
+ * reasons (computed by the generator), and on OpenRouter, whose typed ids
+ * always have. Elsewhere (OpenAI, whose catalog has non-reasoning models)
+ * nothing tells, so it runs without, and the form refuses an effort for it.
+ */
+export function builtInPresetTypedModelReasons(providerId: string): boolean {
+  return providerId === "openrouter"
+    || (PI_BUILTIN_ALL_REASONING_PROVIDER_IDS_GENERATED as readonly string[]).includes(providerId);
 }
 
 function normalizeEnvVars(envVars: unknown): Record<string, string> | null {
@@ -4910,42 +5095,65 @@ export function builtInPresetProviderModelId(providerId: string, catalogId: stri
 }
 
 /**
+ * Whether a provider's own API ids can begin with its Raft id, so that an
+ * unlisted `<provider>/<x>` may be one of them: true when its catalog lists
+ * such an id (OpenRouter's `openrouter/auto`, Raft's
+ * `openrouter/openrouter/auto`). Elsewhere (`qwen3.8-max` on Qwen Token Plan)
+ * a leading `<provider>/` is only ever Raft's namespace.
+ */
+function builtInProviderApiIdsMayCarryProviderPrefix(providerId: string): boolean {
+  const ownPrefix = `${providerId}/${providerId}/`;
+  return (PI_BUILTIN_PROVIDER_MODELS[providerId] ?? []).some((candidate) => candidate.id.startsWith(ownPrefix));
+}
+
+/**
  * task #10: how every write path stores a typed model on a preset provider
- * that takes one (OpenRouter). Two steps, and the model a name means never
- * depends on its limits:
+ * that takes one (BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS). Two
+ * steps, and the model a name means never depends on its limits:
  *
  * 1. Resolve `custom.name` to the provider's API id (the "Pi id"), ignoring
  *    limits:
- *    - a name that is itself a listed API id (`openrouter/<name>` is a catalog
+ *    - a name that is itself a listed API id (`<provider>/<name>` is a catalog
  *      id) IS that API id, unchanged: `openrouter/auto` (Pi lists
- *      `openrouter/openrouter/auto`), `moonshotai/kimi-k2.6`, `auto`;
+ *      `openrouter/openrouter/auto`), `moonshotai/kimi-k2.6`, `auto`,
+ *      `qwen3.8-max`;
  *    - else a name that is a listed catalog id is Raft's form: exactly one
- *      `openrouter/` comes off (`openrouter/openrouter/auto` ->
- *      `openrouter/auto`, `openrouter/moonshotai/kimi-k2.6` ->
- *      `moonshotai/kimi-k2.6`);
- *    - else (unlisted) the name is kept as typed, prefix and all: it is the
- *      API id the user gave. An unlisted `openrouter/<x>/<y>` could be an
- *      OpenRouter id or a mistyped Raft id; nothing can tell, so the name the
- *      provider gets is the one typed. The form never produces Raft's form for
- *      an unlisted model (a catalog selection is converted explicitly there).
+ *      `<provider>/` comes off (`openrouter/openrouter/auto` ->
+ *      `openrouter/auto`, `qwen-token-plan/qwen3.8-max` -> `qwen3.8-max`);
+ *    - else (unlisted) the name is the API id the user gave, kept as typed.
+ *      On OpenRouter an unlisted `openrouter/<x>/<y>` could be an OpenRouter
+ *      id or a mistyped Raft id; nothing can tell.
+ *    Where the provider's own ids never start with `<provider>/`
+ *    (builtInProviderApiIdsMayCarryProviderPrefix: every provider but
+ *    OpenRouter) a leading `<provider>/` is only ever Raft's namespace, so
+ *    every one comes off first: `qwen-token-plan/qwen4-preview` and
+ *    `qwen4-preview` both store `qwen4-preview`, and
+ *    `qwen-token-plan/qwen-token-plan/qwen3.8-max` is `qwen3.8-max` at once
+ *    (stripping one per read would change it again on the next).
  * 2. Then the limits decide only how it is stored: a listed API id without a
- *    limit is its preset (`openrouter/<API id>`); with a limit (an explicit
+ *    limit is its preset (`<provider>/<API id>`); with a limit (an explicit
  *    override of the catalog's value) it is a custom model named by its API
- *    id; an unlisted id is custom as typed. So the provider only ever sees its
- *    own id, never Raft's `openrouter/` namespace, a stored config parses to
- *    itself, and clearing the limits gives the preset of the same model.
+ *    id; an unlisted id is custom. So the provider only ever sees its own id,
+ *    never Raft's namespace, a stored config parses to itself, and clearing
+ *    the limits gives the preset of the same model.
+ *
+ * The parser applies it to a direct preset; a saved preset connection's
+ * provider is known only to the server, which applies it once it has
+ * resolved the connection.
  */
-function normalizeBuiltInPresetCustomModel(
+export function normalizeBuiltInPresetCustomModel(
   providerId: string,
   model: Extract<RuntimeModelConfig, { kind: "custom" }>,
 ): RuntimeModelConfig {
   const prefix = `${providerId}/`;
-  const apiId = isBuiltInProviderModel(providerId, `${prefix}${model.name}`)
-    ? model.name
-    : isBuiltInProviderModel(providerId, model.name)
-      ? builtInPresetProviderModelId(providerId, model.name)
-      : model.name;
-  if (!isBuiltInProviderModel(providerId, `${prefix}${apiId}`)) return model;
+  let apiId = model.name;
+  if (!builtInProviderApiIdsMayCarryProviderPrefix(providerId)) {
+    // A bare prefix is not an id: kept as typed rather than emptied.
+    while (apiId.startsWith(prefix) && apiId.length > prefix.length) apiId = apiId.slice(prefix.length);
+  } else if (!isBuiltInProviderModel(providerId, `${prefix}${apiId}`) && isBuiltInProviderModel(providerId, apiId)) {
+    apiId = builtInPresetProviderModelId(providerId, apiId);
+  }
+  if (!isBuiltInProviderModel(providerId, `${prefix}${apiId}`)) return apiId === model.name ? model : { ...model, name: apiId };
   const limited = model.contextWindow !== undefined || model.maxOutputTokens !== undefined;
   return limited ? { ...model, name: apiId } : { kind: "preset", id: `${prefix}${apiId}` };
 }
@@ -5577,12 +5785,6 @@ const RUNTIME_CREDENTIAL_HOME_ENV: Readonly<Record<RuntimeAuthRuntime, readonly 
   // OpenCode keeps its sign-ins under $XDG_DATA_HOME/opencode (~/.local/share
   // by default); an agent with its own data dir reads its own.
   opencode: ["XDG_DATA_HOME"],
-  // CodeBuddy Code: CODEBUDDY_API_KEY signs it in without the account (OAR
-  // reads it as configured, unvalidated); CODEBUDDY_INTERNET_ENVIRONMENT picks
-  // the account service (OAR's login keeps it), so an agent with either is on
-  // its own credential. Its sign-in store's location is not known: only
-  // `HOME` moves it otherwise.
-  codebuddy: ["CODEBUDDY_API_KEY", "CODEBUDDY_INTERNET_ENVIRONMENT"],
 };
 
 /**
@@ -5661,13 +5863,12 @@ export function defaultReasoningEffortsForRuntime(runtime: string): readonly Rea
 
 /**
  * Whether a model that declares no efforts still offers the runtime's base set
- * in the pickers (the v2 form, the bulk change). Antigravity and CodeBuddy Code
- * do not: their thought levels are per model and they can only apply a level
- * the Computer listed for that model (OAR `listModels` reads them for the
- * current model only).
+ * in the pickers (the v2 form, the bulk change). Antigravity does not: agy's
+ * thought levels are per model and it can only apply a level the Computer
+ * listed for that model (OAR `listModels` reads them for the current model only).
  */
 export function runtimeOffersUndeclaredReasoningEfforts(runtime: string): boolean {
-  return runtime !== "antigravity" && runtime !== "codebuddy";
+  return runtime !== "antigravity";
 }
 
 /**
@@ -5714,11 +5915,10 @@ export function isReasoningEffortAllowedForModel(runtime: string, modelId: strin
 
 /**
  * Runtimes that support configurable reasoning effort. Antigravity's is agy's
- * thought level, and CodeBuddy Code's its ACP thought level, each offered only
- * for a model whose levels the Computer lists (OAR `listModels`) and passed as
- * the OAR session's `effort`.
+ * thought level, offered only for a model whose levels the Computer lists
+ * (OAR `listModels`) and passed as the OAR session's `effort`.
  */
-export const REASONING_EFFORT_RUNTIMES = new Set(["builtin", "claude", "codex", "grok", "antigravity", "copilot", "pi", "kimi-sdk", "codebuddy"]);
+export const REASONING_EFFORT_RUNTIMES = new Set(["builtin", "claude", "codex", "grok", "antigravity", "copilot", "pi", "kimi-sdk"]);
 
 /** Runtimes that support the shared fast-mode launch variant. */
 export const RUNTIME_FAST_MODE_RUNTIMES = new Set(["claude", "codex"]);
@@ -5842,8 +6042,24 @@ export * from "./taskPermissions";
 
 // ── Server Plans ──
 
-/** Plan identifiers stored in the database. */
-export type ServerPlan = "free" | "founder" | "partner" | "pro";
+import {
+  TRIAL_DURATION_DAYS,
+  TRIAL_END_DATE,
+  TRIAL_START_DATE,
+  canUseProBillingFeatures,
+  canUseTeamBillingFeatures,
+  isTrialActive,
+  type ServerPlan,
+} from "./billingPlanFeatures";
+export {
+  TRIAL_DURATION_DAYS,
+  TRIAL_END_DATE,
+  TRIAL_START_DATE,
+  canUseProBillingFeatures,
+  canUseTeamBillingFeatures,
+  isTrialActive,
+  type ServerPlan,
+};
 
 /** Plans shown in the pricing comparison UI (includes coming-soon tiers). */
 export type DisplayPlan = "free" | "pro" | "enterprise";
@@ -5921,17 +6137,36 @@ export interface CapacityLimitDetail {
   agents: number;
 }
 
-/** Prepaid Pro time a Server has (task #19): the period that covers now, or the one that just ended while its grace days run. */
-export interface PrepaidEntitlement {
-  /** End of the paid time, ISO. Later periods already bought are included: renewing early extends it. */
-  endsAt: string;
-  /** endsAt plus PRO_PREPAID_GRACE_DAYS: the Server drops to Free after this. */
-  graceEndsAt: string;
-  /** Paid time is over and the grace days are running. */
-  inGrace: boolean;
-  /** Seats bought for now (in grace, the seats at the end). */
-  seatQuantity: number;
-}
+import {
+  PRO_PREPAID_GRACE_DAYS,
+  isInternalEntitlementPlan,
+  isSubscriptionEntitling,
+  parseFfaServerPlanEntitlementInputs,
+  prepaidGrantOf,
+  resolveEffectiveServerBillingPlan,
+  resolveServerBillingPlanSource,
+  type ParsedFfaServerPlanEntitlementInputs,
+  type PrepaidEntitlement,
+  type PrepaidGrantPurchaseInput,
+  type ResolvedServerBillingPlanSource,
+  type ServerBillingPlanInputs,
+  type ServerPlanEntitlementSource,
+} from "./serverBillingEntitlement";
+export {
+  PRO_PREPAID_GRACE_DAYS,
+  isInternalEntitlementPlan,
+  isSubscriptionEntitling,
+  parseFfaServerPlanEntitlementInputs,
+  prepaidGrantOf,
+  resolveEffectiveServerBillingPlan,
+  resolveServerBillingPlanSource,
+  type ParsedFfaServerPlanEntitlementInputs,
+  type PrepaidEntitlement,
+  type PrepaidGrantPurchaseInput,
+  type ResolvedServerBillingPlanSource,
+  type ServerBillingPlanInputs,
+  type ServerPlanEntitlementSource,
+};
 
 export interface BillingEntitlementProjection {
   plan: ServerPlan;
@@ -5990,8 +6225,6 @@ export const PRO_PACK_ANNUAL_USD = PRO_SEAT_ANNUAL_USD;
 
 export const PRO_PREPAID_MONTHS = [1, 12] as const;
 export type ProPrepaidMonths = (typeof PRO_PREPAID_MONTHS)[number];
-/** Days a lapsed prepaid period keeps Pro, with a reminder each day, before the Server drops to Free. */
-export const PRO_PREPAID_GRACE_DAYS = 3;
 
 export function isProPrepaidMonths(value: unknown): value is ProPrepaidMonths {
   return typeof value === "number" && (PRO_PREPAID_MONTHS as readonly number[]).includes(value);
@@ -6151,26 +6384,6 @@ export function getSingleFileUploadLimitLabel(plan: ServerPlan, now: Date = new 
 function nonNegativeInteger(value: number): number {
   if (!Number.isFinite(value)) return 0;
   return Math.max(0, Math.ceil(value));
-}
-
-/** Start date of the extended free trial for Free plan users. */
-export const TRIAL_START_DATE = new Date("2026-04-18T00:00:00Z");
-
-/**
- * End instant of the free full-featured trial.
- * 2026-06-05: extended +7 (51 → 58) per @tygg #proj-release directive (task #7) —
- * trial end 2026-06-08 → 2026-06-15 UTC; TRIAL_START_DATE unchanged.
- * 2026-06-13: final billing acceptance window ends 2026-06-22 UTC (58 → 65);
- * 2026-06-21: keep the trial active through all of 2026-06-22 in every time zone.
- */
-export const TRIAL_END_DATE = new Date("2026-06-23T12:00:00Z");
-
-/** Duration retained for UI/compatibility consumers; the actual cutoff is TRIAL_END_DATE. */
-export const TRIAL_DURATION_DAYS = (TRIAL_END_DATE.getTime() - TRIAL_START_DATE.getTime()) / (24 * 60 * 60 * 1000);
-
-/** Check if the free trial period is currently active. */
-export function isTrialActive(now: Date = new Date()): boolean {
-  return now >= TRIAL_START_DATE && now < TRIAL_END_DATE;
 }
 
 export function calculateProPackQuantity(provisionedHumans: number, provisionedAgents: number): number {
@@ -6406,12 +6619,6 @@ export function formatProAgentSeatFraction(): string {
     ? String(PRO_AGENT_SEAT_FRACTION)
     : String(Number(PRO_AGENT_SEAT_FRACTION.toFixed(6)));
 }
-
-export function canUseProBillingFeatures(plan: ServerPlan, now: Date = new Date()): boolean {
-  return plan === "pro" || plan === "founder" || plan === "partner" || (plan === "free" && isTrialActive(now));
-}
-
-export const canUseTeamBillingFeatures = canUseProBillingFeatures;
 
 // ── Downgrade Grace Period ──
 
@@ -6954,9 +7161,12 @@ export {
 //
 // The "how did you hear about us" half is NOT new: `referralSource` already exists
 // on users, is already written by PATCH /api/auth/me, and already has a canonical
-// option set that the owner-onboarding modal asks with. These are those exact
-// values, lifted here so both surfaces read one list instead of two copies drifting.
-// Changing a value here is a data migration, not a copy edit.
+// option set, first asked by the owner-onboarding modal (since removed). These are
+// those exact values, lifted here so every surface that asks (the owner setup survey,
+// the web's ReferralSourcePrompt) reads one list instead of copies drifting.
+// Changing a value here is a data migration, not a copy edit. `label` is the English the
+// server uses (the onboarding agent's briefing); the web shows each option from its own
+// catalog by `id` (web components/onboarding/referralSourceLabels.ts).
 export const REFERRAL_SOURCES = [
   { id: "twitter_x", label: "Twitter / X" },
   { id: "linkedin", label: "LinkedIn" },
@@ -7067,6 +7277,8 @@ export function accountNeedsIdentitySetup(user: {
   return hasPlaceholderHandle(user.name) || !user.name;
 }
 export * from "./inboxScopeReadFrontier";
+export * from "./activityUnreadPredicate";
+export * from "./activityRowPosition";
 
 export * from "./channelConversionState";
 export * from "./providerRequestActivity";

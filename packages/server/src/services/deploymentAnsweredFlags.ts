@@ -30,6 +30,11 @@ export function deploymentAnswerOf(key: string): boolean | undefined {
   return answeredForTests.get(key) ?? answers.get(key)?.();
 }
 
+/** Keys registered via `answerFlagFromDeployment` in this server process. */
+export function registeredDeploymentAnsweredFlagKeys(): string[] {
+  return [...answers.keys()];
+}
+
 /**
  * Tests: `key` answers `enabled` whatever the deployment has, also where
  * nothing registered an answer; undefined: back to what is

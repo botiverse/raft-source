@@ -2,18 +2,12 @@ import { useCallback, useId, useRef, useState } from "react";
 import type { ChangeEvent, FormEvent } from "react";
 import { useIntl } from "react-intl";
 import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogBody,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
   Banner,
   Button,
   Dialog,
   DialogBody,
+  DialogClose,
+  DialogContent,
   DialogDescription,
   DialogFooter,
   DialogHeader,
@@ -42,8 +36,8 @@ type SaveError = "tooLong" | "failed" | null;
  * from the saved notes. Save is not optimistic: the dialog stays with the
  * draft until the server answers, closes on success, and shows a failure as an
  * orange banner inside it (DS Feedback). Closing with unsaved edits asks first,
- * as Edit Profile does (DS Overlays: discarding unsaved edits is an
- * AlertDialog).
+ * as Edit Profile does, in a small Dialog titled Discard changes? (DS Dialog:
+ * AlertDialog is only for the confirmations Raft Chat lists).
  */
 export default function AssistantInstructionsDialog({
   open,
@@ -193,23 +187,24 @@ export default function AssistantInstructionsDialog({
         </NarrowDialogContent>
       </Dialog>
 
-      <AlertDialog open={confirmDiscard} onOpenChange={handleDiscardOpenChange}>
+      <Dialog open={confirmDiscard} onOpenChange={handleDiscardOpenChange}>
         {/* Keep Editing returns to the field, not to the menu behind the dialog. */}
-        <AlertDialogContent finalFocus={fieldRef} data-testid="assistant-instructions-discard">
-          <AlertDialogHeader>
-            <AlertDialogTitle>{formatMessage({ id: "message.chatPanel.overflow.unsavedTitle" })}</AlertDialogTitle>
-          </AlertDialogHeader>
-          <AlertDialogBody>{formatMessage({ id: "agent.detail.editProfile.discardBody" })}</AlertDialogBody>
-          <AlertDialogFooter>
-            <AlertDialogCancel size="lg" data-testid="assistant-instructions-keep-editing">
+        <DialogContent size="sm" finalFocus={fieldRef} data-testid="assistant-instructions-discard">
+          <DialogHeader>
+            <DialogTitle>{formatMessage({ id: "agent.detail.editProfile.discardTitle" })}</DialogTitle>
+            <DialogClose aria-label={formatMessage({ id: "common.confirm.closeDialog" })} />
+          </DialogHeader>
+          <DialogBody>{formatMessage({ id: "agent.detail.editProfile.discardBody" })}</DialogBody>
+          <DialogFooter>
+            <DialogClose render={<Button variant="ghost" size="lg" />} data-testid="assistant-instructions-keep-editing">
               {formatMessage({ id: "message.chatPanel.overflow.keepEditing" })}
-            </AlertDialogCancel>
-            <AlertDialogAction variant="danger" size="lg" onClick={handleDiscard} data-testid="assistant-instructions-discard-action">
-              {formatMessage({ id: "message.chatPanel.overflow.discardChanges" })}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+            </DialogClose>
+            <Button variant="danger" size="lg" onClick={handleDiscard} data-testid="assistant-instructions-discard-action">
+              {formatMessage({ id: "agent.detail.editProfile.discard" })}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </>
   );
 }

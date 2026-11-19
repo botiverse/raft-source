@@ -845,6 +845,68 @@ test("parseLine: tool-calls step_finish is an internal boundary, final stop ends
   })), [{ kind: "turn_end", sessionId: "ses_turn" }]);
 });
 
+test("2.x: a finished reply ends the turn only at the end of stdout, after background sub-agents (2.3.0)", () => {
+  const driver = new OpenCodeDriver();
+  driver.launchedCliVersion = "2.3.0";
+  // The event order of a real 2.3.0 `opencode run` that started one sub-agent.
+  const lines = [
+    { type: "step_start", sessionID: "ses_bg", part: { type: "step-start" } },
+    { type: "tool_use", sessionID: "ses_bg", part: { type: "tool", tool: "subagent", id: "call_1", state: { status: "completed", input: { agent: "general" } } } },
+    { type: "step_finish", sessionID: "ses_bg", part: { type: "step-finish", reason: "tool-calls" } },
+    { type: "step_start", sessionID: "ses_bg", part: { type: "step-start" } },
+    { type: "text", sessionID: "ses_bg", part: { type: "text", text: "Sub-agent launched." } },
+    { type: "step_finish", sessionID: "ses_bg", part: { type: "step-finish", reason: "stop" } },
+    { type: "background_wait", sessionID: "ses_bg", jobs: [{ id: "ses_child", kind: "subagent", title: "t" }] },
+    { type: "step_start", sessionID: "ses_bg", part: { type: "step-start" } },
+    { type: "text", sessionID: "ses_bg", part: { type: "text", text: "FINISHED" } },
+    { type: "step_finish", sessionID: "ses_bg", part: { type: "step-finish", reason: "stop" } },
+  ];
+  const events = lines.flatMap((line) => driver.parseLine(JSON.stringify(line)));
+  // No turn_end mid-run: it would make the daemon terminate the process and the sub-agent with it.
+  assert.equal(events.some((event) => event.kind === "turn_end"), false, JSON.stringify(events));
+  assert.deepEqual(events.filter((event) => event.kind === "text").map((event) => (event as { text: string }).text), ["Sub-agent launched.", "FINISHED"]);
+  assert.deepEqual(driver.parseStdoutEnd(), [{ kind: "turn_end", sessionId: "ses_bg" }]);
+  assert.deepEqual(driver.parseStdoutEnd(), [], "once");
+});
+
+test("2.x: output that ends while sub-agents run, mid-step, or after an error gets no extra turn_end", () => {
+  const run = (lines: Array<Record<string, unknown>>) => {
+    const driver = new OpenCodeDriver();
+    driver.launchedCliVersion = "2.3.0";
+    const parsed = lines.flatMap((line) => driver.parseLine(JSON.stringify({ sessionID: "ses_x", ...line })));
+    return { parsed, end: driver.parseStdoutEnd() };
+  };
+  const reply = [{ type: "step_start", part: { type: "step-start" } }, { type: "step_finish", part: { type: "step-finish", reason: "stop" } }];
+  assert.deepEqual(run([...reply, { type: "background_wait", jobs: [] }]).end, []);
+  assert.deepEqual(run([...reply, { type: "step_start", part: { type: "step-start" } }]).end, []);
+  const errored = run([...reply, { type: "error", error: { name: "X", data: { message: "boom" } } }]);
+  assert.deepEqual(errored.parsed.filter((event) => event.kind === "turn_end").length, 1);
+  assert.deepEqual(errored.end, []);
+});
+
+test("2.0.27: a plain reply (text, no final step_finish) ends at the end of stdout; text followed by a tool call does not", () => {
+  const run = (lines: Array<Record<string, unknown>>) => {
+    const driver = new OpenCodeDriver();
+    driver.launchedCliVersion = "2.0.27";
+    for (const line of lines) driver.parseLine(JSON.stringify({ sessionID: "ses_p", ...line }));
+    return driver.parseStdoutEnd();
+  };
+  const start = { type: "step_start", part: { type: "step-start" } };
+  const text = { type: "text", part: { type: "text", text: "hi" } };
+  assert.deepEqual(run([start, text]), [{ kind: "turn_end", sessionId: "ses_p" }]);
+  assert.deepEqual(run([start, text, { type: "tool_use", part: { type: "tool", tool: "bash", id: "c1", state: { status: "completed", input: {} } } }]), []);
+});
+
+test("1.x: the final step_finish ends the turn as before and the end of stdout adds nothing", () => {
+  const driver = new OpenCodeDriver();
+  driver.launchedCliVersion = "1.19.5";
+  assert.deepEqual(driver.parseLine(JSON.stringify({ type: "step_finish", sessionID: "ses_1", part: { type: "step-finish", reason: "stop" } })), [
+    { kind: "session_init", sessionId: "ses_1" },
+    { kind: "turn_end", sessionId: "ses_1" },
+  ]);
+  assert.deepEqual(driver.parseStdoutEnd(), []);
+});
+
 test("parseLine: error event has no part wrapper", () => {
   const driver = new OpenCodeDriver();
   const events = driver.parseLine(JSON.stringify({
@@ -936,6 +998,8 @@ test("task #1258: buildOpenCodeLaunchOptions on 2.x uses the standalone contract
       assert.equal(launch.args.includes(removed), false, `${removed} does not exist on 2.x`);
     }
     assert.equal(launch.env.OPENCODE_DISABLE_PROJECT_CONFIG, "1");
+    // 2.x works in $PWD, not the process cwd: it must name the workspace, not the daemon's directory.
+    assert.equal(launch.env.PWD, ctx.workingDirectory);
     const emptyDir = String(launch.env.OPENCODE_CONFIG_DIR);
     assert.equal(emptyDir, path.join(process.env.SLOCK_HOME!, "opencode-config-empty"));
     assert.deepEqual(readdirSync(emptyDir), [], "the config directory handed to 2.x exists and is empty");
@@ -1172,8 +1236,9 @@ test("task #1258: a permitted resume with a matching record needs no write and k
       writeFileSync(path.dirname(recordPath), "now a file", "utf8");
       const events = driver.parseLine(JSON.stringify({ type: "step_start", sessionID: "ses_kept", part: { type: "step-start" } }));
       assert.deepEqual(events[0], { kind: "session_init", sessionId: "ses_kept" });
+      // 2.x: step_finish(stop) is not the turn's end (process exit is), so it carries nothing.
       const end = driver.parseLine(JSON.stringify({ type: "step_finish", sessionID: "ses_kept", part: { type: "step-finish", reason: "stop" } }));
-      assert.deepEqual(end, [{ kind: "turn_end", sessionId: "ses_kept" }]);
+      assert.deepEqual(end, []);
       rmSync(path.dirname(recordPath), { force: true });
       mkdirSync(path.dirname(recordPath), { recursive: true });
       writeFileSync(recordPath, before, "utf8");
@@ -1202,7 +1267,7 @@ test("task #1258: a CLI that reports a different session id than the one resumed
       const events = driver.parseLine(JSON.stringify({ type: "step_start", sessionID: "ses_other", part: { type: "step-start" } }));
       assert.deepEqual(events[0], { kind: "session_init", sessionId: "ses_other" });
       assert.equal(recordAt(recordPath)?.sessionId, "ses_other");
-      assert.deepEqual(driver.parseLine(JSON.stringify({ type: "step_finish", sessionID: "ses_other", part: { type: "step-finish", reason: "stop" } })), [{ kind: "turn_end", sessionId: "ses_other" }]);
+      assert.deepEqual(driver.parseLine(JSON.stringify({ type: "error", sessionID: "ses_other", error: { name: "X", data: { message: "boom" } } })), [{ kind: "error", message: "boom" }, { kind: "turn_end", sessionId: "ses_other" }]);
 
       // Unwritable: the switched-to id is a persistence failure like any other; neither id is announced for it.
       writeOpenCodeSessionRecord(recordPath, { version: 1, sessionId: "ses_kept", opencodeMajor: 2, opencodeVersion: "2.0.27", recordedAt: "" });
@@ -1222,7 +1287,7 @@ test("task #1258: a CLI that reports a different session id than the one resumed
       } finally {
         console.warn = originalWarn;
       }
-      assert.deepEqual(all.map((event) => event.kind), ["error", "turn_end", "thinking", "turn_end"]);
+      assert.deepEqual(all.map((event) => event.kind), ["error", "turn_end", "thinking"]);
       assert.equal(JSON.stringify(all).includes("ses_other"), false);
       assert.equal(all.some((event) => event.kind === "session_init"), false);
     } finally {

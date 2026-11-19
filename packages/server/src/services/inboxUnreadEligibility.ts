@@ -113,3 +113,54 @@ export function countsTowardTaskConversationUnread(message: Pick<InboxEligibilit
 export function taskConversationUnreadMessageSql(messageAlias: SQL, isTaskConversation: SQL): SQL {
   return sql`(NOT (${isTaskConversation}) OR ${messageAlias}.message_type = 'chat')`;
 }
+
+/**
+ * The canonical Postgres Activity read's unread rule (getInboxItems: search,
+ * guest access, forced reads) for one message on one of a user's rows, as a SQL
+ * condition over a `messages` alias. It counts toward the row's `unreadCount`,
+ * the first unread anchor and the active unread total when it is after the read
+ * cursor (the caller's half) and:
+ *
+ * - not the user's own message;
+ * - not a system message the user caused, and not a noise subtype
+ *   (INBOX_NOISE_SYSTEM_SUBTYPES), on every row kind;
+ * - before the row's mute boundary (`muteFromSeq`; NULL = no boundary): in a
+ *   muted conversation a later message does not count, a mention of the user
+ *   included (it lights the @ through inboxPersonalMentionSql instead);
+ * - on a task conversation, a chat message (taskConversationUnreadMessageSql).
+ *
+ * SYNC REQUIRED with the RisingWave unread_count FILTER
+ * (infra/risingwave/sql/075-inbox-cursor-decouple.sql rw_inbox_normal_v5 and
+ * the rw_inbox_muted_prefix_v2 boundary; 078-task-conversations.sql
+ * rw_task_conversation_unread_v1) and the shared predicate
+ * (packages/shared/src/activityUnreadPredicate.ts). Both SQL rules run the
+ * activity-row predicate contract cases
+ * (activityUnreadPredicate.contractCases.test.ts).
+ */
+export function inboxRowMessageCountsUnreadSql(opts: {
+  message: SQL;
+  userId: string;
+  muteFromSeq: SQL;
+  isTaskConversation: SQL;
+}): SQL {
+  const m = opts.message;
+  return sql`(NOT (${m}.sender_type = 'user' AND ${m}.sender_id = ${opts.userId})
+    AND NOT COALESCE(${m}.message_type = 'system' AND ${m}.causal_actor_type = 'user' AND ${m}.causal_actor_id = ${opts.userId}, FALSE)
+    AND (${m}.system_subtype IS NULL OR ${m}.system_subtype NOT IN (${sql.join(INBOX_NOISE_SYSTEM_SUBTYPES.map((subtype) => sql`${subtype}`), sql`, `)}))
+    AND (${opts.muteFromSeq} IS NULL OR ${m}.seq < ${opts.muteFromSeq})
+    AND ${taskConversationUnreadMessageSql(m, opts.isTaskConversation)})`;
+}
+
+/**
+ * The canonical Postgres Activity read's @ rule, as a SQL condition over a
+ * `message_mentions` alias: a notifying personal mention of the user (notifiable
+ * at send, or notified later). Neither the mute nor the system exclusions of
+ * inboxRowMessageCountsUnreadSql apply: a mention in a muted conversation, or on
+ * a system line the user caused, still lights the @. The caller adds the read
+ * cursor / done boundary and the row's channel. SYNC REQUIRED with
+ * rw_inbox_mention_v7 (infra/risingwave/sql/078-task-conversations.sql).
+ */
+export function inboxPersonalMentionSql(mention: SQL, userId: string): SQL {
+  return sql`(${mention}.target_type = 'user' AND ${mention}.target_id = ${userId}::uuid
+    AND (${mention}.notifiable_at_send OR ${mention}.notified_at IS NOT NULL))`;
+}

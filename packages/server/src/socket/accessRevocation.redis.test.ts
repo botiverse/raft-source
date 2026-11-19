@@ -2,8 +2,6 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import Redis from "ioredis";
 import WebSocket from "ws";
-import { SERVER_GUEST_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
-import { featureFlagRules } from "../db/schema";
 import { createHttpClient } from "../test/integration/http";
 import { accessTokenForTest, signInForTest } from "../test/integration/credentials";
 import { updateChannel } from "../services/channelService";
@@ -23,9 +21,6 @@ dbTest.skipIf(!redisUrl)("Redis peers acknowledge authorized channel subscriptio
   const server = await seed.server({ owner, members: [guest] });
   // A Guest always has its one channel (server_members_guest_has_channel).
   await seedBoundGuest({ serverId: server.id, userId: guest.id }, db);
-  await db.insert(featureFlagRules).values({
-    flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [server.id],
-  });
   const firstSession = await signInForTest(owner.id);
   const secondSession = await signInForTest(owner.id);
   const clients = Array.from({ length: 5 }, () => new Redis(redisUrl!));

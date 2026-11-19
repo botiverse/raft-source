@@ -4,6 +4,8 @@ import { markBootMilestone, markBootTokenRefreshedFirst } from "../boot/bootTimi
 import type { PendingAccountLink } from "../utils/pendingAccountLink";
 import type { StoredComposerSendKey, StoredShortcutOverrides } from "@botiverse/raft-shared";
 import { create } from "zustand";
+import { clearSignupCampaign, signupCampaignBody } from "../analytics/signupCampaign";
+import { landingBody } from "../utils/verificationLandingBody";
 import api from "../api/client";
 import { disconnectSocket, updateSocketAuthFromStorage } from "../api/socket";
 import {
@@ -11,7 +13,7 @@ import {
   shouldLogoutAfterRefreshFailure,
   shouldLogoutAfterPostRefreshLoadUserFailure,
   shouldRetryLoadUserAfterError,
-  isUnreachableFailure,
+  isUnreachableFailure, noteStoredSessionRejected,
 } from "../utils/authSessionPolicy";
 import type { RefreshTrigger } from "../utils/authSessionPolicy";
 import { refreshTokensWithDedupe } from "../utils/refreshCoordinator";
@@ -208,12 +210,6 @@ interface AuthState {
 // and boot_init events emitted while it runs carry its trace and span ids.
 let activeLoadUserSpan: WebSpanHandle | null = null;
 
-/** The page to land back on after verifying, sent only when it isn't the home page (the server validates it again). */
-function landingBody(returnTo: string | null | undefined): { returnTo?: string } {
-  const path = sanitizeAppLocalReturnPath(returnTo);
-  return path === "/" ? {} : { returnTo: path };
-}
-
 function loadUserSpanContext(): EmitWebEventOptions {
   if (!activeLoadUserSpan) return {};
   return { traceId: activeLoadUserSpan.traceId, spanId: activeLoadUserSpan.spanId };
@@ -370,7 +366,7 @@ async function restoreUserWithinLoadUserSpan(set: AuthStoreSet, get: AuthStoreGe
     if (isAccountDeletionPendingError(err)) return void set({ initialized: true });
     // Non-auth failures should not force logout.
     if (shouldKeepSessionAfterLoadUserFailure(status)) return void set(restoreTransientFailure(get, err));
-
+    noteStoredSessionRejected(); // Likely signed out: sign-in's code starts now (main.tsx), beside the refresh.
     // Token might be expired. Try refresh.
     if (!shouldRetryLoadUserAfterError(status)) return void set(restoreTransientFailure(get, err));
 
@@ -434,6 +430,8 @@ function applyPasswordSignIn(set: AuthStoreSet, get: AuthStoreGet, data: Passwor
   if (pendingLink) assertAccountLinkCompleted(data, pendingLink);
   // Signing in on purpose retires the "I logged out" suppression.
   clearSlockdevManualLogout();
+  // Signed in to an existing account: a later sign-up in this tab is not the landing campaign's.
+  clearSignupCampaign();
   localStorage.setItem("slock_access_token", data.accessToken);
   localStorage.setItem("slock_refresh_token", data.refreshToken);
   // Scheduled for deletion: the pending page before any boot request answers 403. No field (nothing scheduled, or a server without
@@ -503,7 +501,8 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   register: async (email, password, legalAcceptance, returnTo) => {
     set({ loading: true });
     try {
-      const { data } = await api.post("/auth/register", { email, password, ...legalAcceptance, ...landingBody(returnTo) });
+      const { data } = await api.post("/auth/register", { email, password, ...legalAcceptance, ...landingBody(returnTo), ...signupCampaignBody() });
+      clearSignupCampaign();
       localStorage.setItem("slock_access_token", data.accessToken);
       localStorage.setItem("slock_refresh_token", data.refreshToken);
       seedMessageBodyFontSizeFromProfile(data.user.preferredMessageBodyFontSize);
@@ -591,6 +590,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     forgetActionCardFormDrafts();
     localStorage.removeItem("slock_access_token");
     localStorage.removeItem("slock_refresh_token");
+    clearSignupCampaign(); // however they signed in: the next account in this tab is not their campaign link's
     // Task #164: the saved unread counts and Activity rows are this person's;
     // the next one to sign in on this browser must not see them.
     clearAllLastCounts();

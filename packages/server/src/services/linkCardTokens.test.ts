@@ -170,3 +170,14 @@ test("the by-URL lookup cursor: signed with its own key, round-trips its binding
   assert.throws(() => signLinkCardOperationsCursor({ ...cursorClaims, exp: iat + LINK_CARD_TOKEN_MAX_TTL_SECONDS + 1 }), RangeError);
   assert.throws(() => signLinkCardOperationsCursor({ ...cursorClaims, lastCreatedAt: 1.5 }), RangeError);
 });
+
+test("RFC 086 §5.2: a card message's handle may bind the App's encryption kid; it round-trips, is signed, and a malformed one is never minted", () => {
+  const withKid: LinkCardHandleClaims = { ...handleClaims, messageCard: { elementId: "approve", encryptionKid: "vault-1" } };
+  const handle = signLinkCardHandle(withKid);
+  assert.deepEqual(verifyLinkCardHandle(handle, now)?.claims.messageCard, { elementId: "approve", encryptionKid: "vault-1" });
+  assert.deepEqual(verifyLinkCardHandle(signLinkCardHandle({ ...handleClaims, messageCard: { elementId: "approve" } }), now)?.claims.messageCard, { elementId: "approve" });
+  assert.notEqual(signLinkCardHandle({ ...withKid, messageCard: { elementId: "approve", encryptionKid: "vault-2" } }), handle, "the kid is part of what is signed");
+  for (const kid of ["", "has space", "x".repeat(65)]) {
+    assert.throws(() => signLinkCardHandle({ ...withKid, messageCard: { elementId: "approve", encryptionKid: kid } }), RangeError, JSON.stringify(kid));
+  }
+});

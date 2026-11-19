@@ -27,11 +27,15 @@ import {
   INTERACTIVE_LINK_CARDS_FEATURE_FLAG_KEY,
   WEB_PREVIEW_FLAG_KEY,
   DESKTOP_WEB_PREVIEW_VIEW_FLAG_KEY,
+  DESKTOP_BROWSER_RAFT_SIGN_IN_FLAG_KEY,
   INBOX_READ_INPLACE_FLAG_KEY,
+  INBOX_MESSAGE_INPLACE_FLAG_KEY,
+  INBOX_ROW_POSITION_FLAG_KEY,
   DEEP_LINKS_FLAG_KEY,
   DRAFTS_SECTION_FLAG_KEY,
   AGENT_READ_PROGRESS_FEATURE_FLAG_KEY,
   HUMAN_AVATAR_BUILDER_FEATURE_FLAG_KEY,
+  REFERRAL_SOURCE_PROMPT_FEATURE_FLAG_KEY,
 } from "../src/store/serverFeatureFlags";
 
 const originalPost = api.post.bind(api);
@@ -64,7 +68,7 @@ test("Slack Bridge master gate is registered and fail-closed before server evalu
 });
 
 test("retired flags are not registered: the web never asks for them (#raft-architecture:#32)", () => {
-  for (const key of ["activity_overview_web_v0", "app_bot_ui_v0", "bulk_change_model_web_v0", "thread_unread_badge_v0", "sidebar_mark_all_read_v0", "computers_rack_overview_v0", "agent_upgrade_card"]) {
+  for (const key of ["activity_overview_web_v0", "app_bot_ui_v0", "bulk_change_model_web_v0", "thread_unread_badge_v0", "sidebar_mark_all_read_v0", "computers_rack_overview_v0", "agent_upgrade_card", "server_guest_v0"]) {
     assert.equal((REGISTERED_SERVER_FEATURE_FLAG_KEYS as readonly string[]).includes(key), false, key);
   }
 });
@@ -122,10 +126,28 @@ test("desktop web preview view is registered under the migration's key and fail 
   assert.equal(readServerFeatureFlag("server-a", DESKTOP_WEB_PREVIEW_VIEW_FLAG_KEY), false);
 });
 
+test("desktop browser Raft sign-in is registered under the migration's key and fail closed before server evaluation", () => {
+  assert.equal(DESKTOP_BROWSER_RAFT_SIGN_IN_FLAG_KEY, "desktop_browser_raft_sign_in_v0");
+  assert.ok(REGISTERED_SERVER_FEATURE_FLAG_KEYS.includes(DESKTOP_BROWSER_RAFT_SIGN_IN_FLAG_KEY));
+  assert.equal(readServerFeatureFlag("server-a", DESKTOP_BROWSER_RAFT_SIGN_IN_FLAG_KEY), false);
+});
+
 test("inbox read in place is registered under the migration's key and fail closed before server evaluation", () => {
   assert.equal(INBOX_READ_INPLACE_FLAG_KEY, "inbox_read_inplace_v1");
   assert.ok(REGISTERED_SERVER_FEATURE_FLAG_KEYS.includes(INBOX_READ_INPLACE_FLAG_KEY));
   assert.equal(readServerFeatureFlag("server-a", INBOX_READ_INPLACE_FLAG_KEY), false);
+});
+
+test("inbox message in place is registered under the migration's key and fail closed before server evaluation", () => {
+  assert.equal(INBOX_MESSAGE_INPLACE_FLAG_KEY, "inbox_message_inplace_v1");
+  assert.ok(REGISTERED_SERVER_FEATURE_FLAG_KEYS.includes(INBOX_MESSAGE_INPLACE_FLAG_KEY));
+  assert.equal(readServerFeatureFlag("server-a", INBOX_MESSAGE_INPLACE_FLAG_KEY), false);
+});
+
+test("inbox row position is registered under the migration's key and fail closed before server evaluation", () => {
+  assert.equal(INBOX_ROW_POSITION_FLAG_KEY, "inbox_row_position_v1");
+  assert.ok(REGISTERED_SERVER_FEATURE_FLAG_KEYS.includes(INBOX_ROW_POSITION_FLAG_KEY));
+  assert.equal(readServerFeatureFlag("server-a", INBOX_ROW_POSITION_FLAG_KEY), false);
 });
 
 test("Claude limit resets are registered under the shared key and fail closed before server evaluation", () => {
@@ -138,6 +160,12 @@ test("agent usage is registered under the shared key and fail closed before serv
   assert.equal(AGENT_USAGE_FEATURE_FLAG_KEY, "agent_usage_v0");
   assert.ok(REGISTERED_SERVER_FEATURE_FLAG_KEYS.includes(AGENT_USAGE_FEATURE_FLAG_KEY));
   assert.equal(readServerFeatureFlag("server-a", AGENT_USAGE_FEATURE_FLAG_KEY), false);
+});
+
+test("the referral source prompt is registered under the shared key and fail closed before server evaluation", () => {
+  assert.equal(REFERRAL_SOURCE_PROMPT_FEATURE_FLAG_KEY, "referral_source_prompt_v0");
+  assert.ok(REGISTERED_SERVER_FEATURE_FLAG_KEYS.includes(REFERRAL_SOURCE_PROMPT_FEATURE_FLAG_KEY));
+  assert.equal(readServerFeatureFlag("server-a", REFERRAL_SOURCE_PROMPT_FEATURE_FLAG_KEY), false);
 });
 
 test("the human avatar builder is registered under the shared key and fail closed before server evaluation", () => {

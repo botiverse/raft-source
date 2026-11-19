@@ -2949,6 +2949,31 @@ test("Claude APM: the same real error three times still trips the fence, and its
   }, { tracer });
 });
 
+// A turn end resets the fence only when its turn had output. Claude Code has
+// no turn-start thinking marker, so the same text-classified error (no typed
+// code: a provider 500 during an outage) in three output-less turns trips it;
+// before, each turn's bare turn_end reset the count.
+test("Claude APM: the same text-classified error in three turns without output trips the fence despite each turn end", async () => {
+  const { sink, tracer } = makeDeterministicTracer();
+  await withManager(async ({ driver, manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ sessionId: "session-1" }));
+    await flush();
+    for (let i = 0; i < 3; i += 1) {
+      driver.parsedLines.set(`failed-turn-${i}`, [
+        { kind: "error", message: "API Error: 500 Internal server error" },
+        { kind: "turn_end", sessionId: "session-1" },
+      ]);
+      driver.processes[0].stdout.emit("data", Buffer.from(`failed-turn-${i}\n`));
+      await flush();
+    }
+    const counted = traceRows(sink).filter((row) => row.name === "daemon.agent.runtime_error_fingerprint_fence");
+    assert.deepEqual(counted.map((row) => row.attrs?.attempts), [1, 2, 3]);
+    assert.equal(traceRows(sink).filter((row) => row.name === "daemon.agent.runtime_error_fingerprint_fence.tripped").length, 1);
+    assert.equal(traceRows(sink).some((row) => row.name === "daemon.agent.runtime_error_fingerprint_fence.reset" && row.attrs?.reset_source === "runtime_progress:turn_end"), false);
+    assert.equal(getProcess(manager, "agent-1"), undefined, "the fence stopped the runtime");
+  }, { tracer });
+});
+
 test("Claude APM: a turn that failed on verification_required carries AuthError and 403 on its span", async () => {
   const { span } = await failedClaudeTurnSpanAttrs({
     kind: "error",

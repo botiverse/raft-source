@@ -92,10 +92,22 @@ test("provider catalog is secret-free and launch resolves the exact assignment",
   // Usability for selection/assignment depends strictly on enabled state, not test status
   const selected = await resolveProviderConnectionSelection(server.id, created.id);
   assertProviderConnectionModelCompatible(selected.providerId, { kind: "preset", id: "deepseek/deepseek-v4-pro" });
-  assert.throws(
-    () => assertProviderConnectionModelCompatible(selected.providerId, { kind: "custom", name: "wrong-shape" }),
-    (error: unknown) => error instanceof ProviderConnectionError && error.code === "provider_connection_invalid",
-  );
+  // A typed id, as DeepSeek takes directly, stored as the direct path stores it.
+  assertProviderConnectionModelCompatible(selected.providerId, { kind: "custom", name: "deepseek-v5-preview", contextWindow: 128_000 });
+  assertProviderConnectionModelCompatible(selected.providerId, { kind: "custom", name: "deepseek-v4-pro", maxOutputTokens: 8_000 });
+  for (const model of [
+    { kind: "preset" as const, id: "openai/gpt-5.5-pro" },
+    // Raft's namespace or a listed model without a limit: not how it is stored.
+    { kind: "custom" as const, name: "deepseek/deepseek-v5-preview" },
+    { kind: "custom" as const, name: "deepseek-v4-pro" },
+    { kind: "custom" as const, name: "  " },
+  ]) {
+    assert.throws(
+      () => assertProviderConnectionModelCompatible(selected.providerId, model),
+      (error: unknown) => error instanceof ProviderConnectionError && error.code === "provider_connection_invalid",
+      JSON.stringify(model),
+    );
+  }
   const agent = await createAgent(server.id, `agent-${randomUUID().slice(0, 8)}`, {
     creatorType: "user",
     creatorId: user.id,
@@ -524,8 +536,9 @@ test("preset providers use generated Pi launch metadata for storage, models, and
   assert.equal(created.endpointUrl, null);
   assert.equal(created.supportsImageInput, false);
   assertProviderConnectionModelCompatible("google", { kind: "preset", id: "google/gemini-3.1-pro-preview" });
+  assertProviderConnectionModelCompatible("google", { kind: "custom", name: "gemini-custom" });
   assert.throws(
-    () => assertProviderConnectionModelCompatible("google", { kind: "custom", name: "gemini-custom" }),
+    () => assertProviderConnectionModelCompatible("google", { kind: "preset", id: "deepseek/deepseek-v4-pro" }),
     (error: unknown) => error instanceof ProviderConnectionError && error.code === "provider_connection_invalid",
   );
   await assert.rejects(

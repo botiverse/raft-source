@@ -19,6 +19,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PGlite } from "@electric-sql/pglite";
+import { checkFfaDbDependencyManifest } from "../../../scripts/ci/check-ffa-db-manifest";
 import { migratePglite } from "../src/db/pgliteMigrations";
 
 const DRIZZLE_DIR = path.resolve(
@@ -272,6 +273,15 @@ async function main() {
        WHERE table_schema = 'public' AND table_name <> '__drizzle_migrations'`,
   );
   const tableCount = tables.rows[0]?.n ?? 0;
+  const ffaManifest = await checkFfaDbDependencyManifest(
+    path.resolve(DRIZZLE_DIR, "../../.."),
+    { query: (sql, params) => client.query(sql, params) },
+  );
+  if (!ffaManifest.ok) {
+    throw new Error(
+      `Feature Flag Admin DB dependency manifest failed against migrated PostgreSQL:\n  - ${ffaManifest.errors.join("\n  - ")}`,
+    );
+  }
   await client.close();
 
   await verifySecondAgentBackfillFixture();
@@ -299,6 +309,9 @@ async function main() {
   );
   console.log(
     "✓ Migration 0266 backfilled pending/running/failed retained conversion jobs with state and active fences.",
+  );
+  console.log(
+    "✓ Feature Flag Admin DB dependency manifest matches migrated PostgreSQL schema.",
   );
 }
 

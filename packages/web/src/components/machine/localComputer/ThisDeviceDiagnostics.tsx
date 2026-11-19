@@ -8,7 +8,7 @@
 import { useCallback } from "react";
 import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
-import { missingFeatures } from "./thisDeviceLogic";
+import { diagnosticsUsable } from "./thisDeviceLogic";
 import { missingFeaturesText } from "./thisDeviceCopy";
 import {
   Banner,
@@ -38,7 +38,8 @@ function Step({ title, description, children, testId }: { title: string; descrip
         <Text.Sans size="body" className="block">{title}</Text.Sans>
         <Text.Sans size="caption" variant="muted" className="block">{description}</Text.Sans>
       </div>
-      <div className="flex shrink-0 flex-wrap items-center gap-2">{children}</div>
+      {/* Wraps (and stacks) where the panel is narrow, never runs off its edge. */}
+      <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2">{children}</div>
     </div>
   );
 }
@@ -92,8 +93,14 @@ export function ThisDeviceTroubleshoot({ host, diagnostics, onRunDiagnostics, mi
   const intl = useIntl();
   const { formatMessage } = intl;
   const { state } = host.self;
-  // This Computer cannot run diagnostics for Raft Desktop yet: say what brings it.
-  const diagnosticsMissing = missingFeatures(host.self.host).includes("diagnostics");
+  // This Computer cannot run diagnostics for Raft Desktop (it lacks them, or
+  // what it can do is unknown on a Raft Desktop that then refuses): say what
+  // brings it. Nothing installed: nothing to diagnose, no step.
+  const hostState = host.self.host;
+  const nothingInstalled = hostState !== null && !hostState.installed;
+  // The host state could not be read: what it can do is unknown (Try again reads it first).
+  const unknownHost = hostState === null && state.kind === "unreadable";
+  const diagnosticsMissing = !diagnosticsUsable(hostState, hostState?.capabilities ?? null);
   const runDiagnostics = useCallback(() => onRunDiagnostics(), [onRunDiagnostics]);
   const cleanUp = useCallback(() => onRunDiagnostics({ cleanup: true }), [onRunDiagnostics]);
   return (
@@ -120,7 +127,7 @@ export function ThisDeviceTroubleshoot({ host, diagnostics, onRunDiagnostics, mi
           ) : null}
         </Step>
       ) : null}
-      {host.runDiagnostics ? (
+      {host.runDiagnostics && !nothingInstalled && !unknownHost ? (
         <div>
           <Step
             title={formatMessage({ id: "computerHost.thisDevice.troubleshoot.diagnosticsTitle" })}

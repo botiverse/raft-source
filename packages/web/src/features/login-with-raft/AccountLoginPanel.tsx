@@ -20,21 +20,7 @@ import { FIELD_HELP_CLASS, FIELD_LABEL_CLASS, LOGIN_STATUS_CLASS, TITLE_CLASS } 
  * a Server-scoped sign-in address) is the card's first notice, under the
  * title, and takes the place of that sentence and of the button.
  */
-export function AccountLoginPanel({
-  serviceName,
-  client,
-  scopes,
-  refusal,
-  refusalAfterLogin,
-  error,
-  loginModeChanged,
-  titleRef,
-  canLogin,
-  submitting,
-  status,
-  notice,
-  onLogin,
-}: {
+export interface AccountLoginPanelProps {
   serviceName: string;
   /** The App's details, from a Server where it is ready (else wherever it was found). */
   client: LoginClientSummary | null;
@@ -65,7 +51,23 @@ export function AccountLoginPanel({
   /** Something the step before (Install and Continue) wants said, e.g. the App's bot didn't join. */
   notice?: ReactNode;
   onLogin: () => void;
-}) {
+}
+
+export function AccountLoginPanel({
+  serviceName,
+  client,
+  scopes,
+  refusal,
+  refusalAfterLogin,
+  error,
+  loginModeChanged,
+  titleRef,
+  canLogin,
+  submitting,
+  status,
+  notice,
+  onLogin,
+}: AccountLoginPanelProps) {
   const { formatMessage } = useIntl();
   const user = useAuthStore((s) => s.user);
   const scopeValidation = client?.scopeValidation;

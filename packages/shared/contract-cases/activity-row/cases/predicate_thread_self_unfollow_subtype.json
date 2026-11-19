@@ -1,0 +1,44 @@
+{
+  "formatVersion": 1,
+  "id": "predicate_thread_self_unfollow_subtype",
+  "rule": "predicate",
+  "title": "On a thread row, channel.self_unfollow_thread never counts",
+  "why": "A noise subtype (the born-read registry's skip producers).",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/web/src/store/inboxInPlaceUnread.ts (liveActivityUnread, liveUnreadFields)",
+      "packages/web/src/store/inboxRowPosition.ts (rowPositionVerdict, with inbox_row_position_v1 on)"
+    ],
+    "server": [
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (unread_count FILTER)",
+      "packages/server/src/services/inboxUnreadEligibility.ts (isMessageUnreadEligibleForReceiver)"
+    ]
+  },
+  "given": {
+    "viewer": {
+      "type": "user",
+      "id": "viewer-1"
+    },
+    "scope": {
+      "rowKind": "thread",
+      "threadFollowed": true
+    },
+    "message": {
+      "senderType": "system",
+      "senderId": "system",
+      "messageType": "system",
+      "causalActorType": "user",
+      "causalActorId": "user-2",
+      "systemSubtype": "channel.self_unfollow_thread",
+      "mentions": []
+    }
+  },
+  "steps": [],
+  "expect": {
+    "verdict": {
+      "counts": false,
+      "mention": false
+    }
+  }
+}

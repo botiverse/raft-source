@@ -1,3 +1,4 @@
+import { compareActivitySeq } from "./activitySeq";
 import type { InboxScopeReadFrontier } from "@botiverse/raft-shared";
 // This file is on the STARTUP path, so it consumes the uint64 primitive from
 // its own narrow module rather than the barrel.
@@ -125,6 +126,23 @@ export interface ReadStateProjection {
   firstUnreadMessageId: string | null;
   firstMentionMessageId: string | null;
   complete: boolean;
+  /**
+   * #triage:#244: the newest seq the projection covers, when it was made
+   * from loaded messages: its read cursor or the newest loaded message. A message the page never received
+   * (the socket was down) is not in it, so a row whose served activity is
+   * newer than this is not covered: see projectionCoversActivity.
+   */
+  throughSeq?: number | null;
+}
+
+/** What a projection covers: its read cursor (all read, loaded or not) and the newest loaded message it counted. */
+export function projectionThroughSeq(messages: readonly { seq?: number | null }[], maxReadSeq: number): number {
+  return messages.reduce((max, message) => (message.seq != null && message.seq > max ? message.seq : max), maxReadSeq);
+}
+
+/** Does a projection cover a row served with activity through `activitySeq`? (An unknown side is covered, as before.) */
+export function projectionCoversActivity(projection: ReadStateProjection, activitySeq: string | null | undefined): boolean {
+  return projection.throughSeq == null || compareActivitySeq(activitySeq, String(projection.throughSeq)) <= 0;
 }
 
 function readStateKey(serverId: string, scopeId: string): string {

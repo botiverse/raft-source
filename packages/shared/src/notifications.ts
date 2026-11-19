@@ -58,7 +58,7 @@ function explicit(value: NotificationLevelSetting | null | undefined): Notificat
  * The level that applies: the most specific explicit setting wins
  * (thread > channel > server), then a mute caps it at `mentions`. The server's
  * policy and every client's display use this one function (mobile mirrors it
- * against the same fixtures, docs/contracts/fixtures/notification-levels.json).
+ * against the same fixtures, packages/shared/src/notification-levels.json).
  */
 export function resolveEffectiveLevel(input: EffectiveLevelInput): NotificationLevel {
   const level = explicit(input.thread) ?? explicit(input.channel) ?? input.server;
@@ -437,7 +437,9 @@ export interface NotificationAccountSettings {
   /**
    * "Replies in threads I follow" (contract §1.2, v1.2): off, a reply in a
    * followed thread or task conversation alerts only when it @mentions the
-   * person. Following and Activity are unchanged. Absent on the wire = true.
+   * person. Following and Activity are unchanged. The server sends it only
+   * while its flag (NOTIFICATION_FOLLOWED_THREAD_REPLIES_SWITCH_FEATURE_FLAG_KEY)
+   * is on for the person; absent on the wire = not offered, treated as true.
    */
   followedThreadReplies: boolean;
   /** Optimistic concurrency: send it back on PATCH; a stale one gets 409. */

@@ -12,7 +12,9 @@ import type { RuntimeAccountUsageProvider } from "@botiverse/raft-shared";
 // rows or cards (`rows`), and the lines of the attention summary above it
 // (`attentionLines`, 0 to 2). One entry per (user, server, part):
 // `slock:computersRack:{userId}:{serverId}:{part}`. Counts only, never names.
-// Desktop only: the phone's panel draws its own skeleton from the sidebar's count.
+// Desktop only: the phone's panel counts its placeholders from the sidebar's
+// rows and draws each card in DEFAULT_CARD_SHAPE (the remembered card shapes
+// start with the desktop's This-device card, which the phone does not draw).
 
 export type ComputersRackRememberedPart = "rows" | "attentionLines";
 
@@ -127,6 +129,13 @@ export function useRememberComputersRack(part: ComputersRackRememberedPart, coun
  * (rackUsageLines, the same memory the usage cells read).
  */
 export type RackCardShape = { usageLines: number; modelLines: number; leadUsage: boolean; otherRuntimes: boolean; offline: boolean };
+
+/**
+ * A card that never loaded here: the common online computer's card, three
+ * usage lines (Claude, Codex, Kimi) and the Other runtimes line (the built-in
+ * runtimes every Computer has), so the first card lands where it was drawn.
+ */
+export const DEFAULT_CARD_SHAPE: RackCardShape = { usageLines: 3, modelLines: 0, leadUsage: false, otherRuntimes: true, offline: false };
 
 const CARD_SHAPE_MAX_LINES = 8;
 

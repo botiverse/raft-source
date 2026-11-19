@@ -16,6 +16,7 @@ import {
   type ScopeDbTraceEventSinkSchemaCheckSkip,
 } from "./scopeDbTraceEventSink";
 import { scopeDbTraceExportSummaryWriter, TraceExportSummary, type TraceExportSummaryWriter } from "./traceExportSummary";
+import { TraceIdHashTraceSink } from "./traceIdHashTraceSink";
 import { TraceUserIdTraceSink } from "./traceUserIdTraceSink";
 import { SERVER_VERSION } from "../version";
 import {
@@ -102,7 +103,7 @@ export function createServerTracerFromEnv(
   const sink = sinks.length === 1 ? sinks[0]! : new FanoutTraceSink(sinks);
 
   // Wrapped so a stalled event loop can name the background spans still open (./eventLoopStall).
-  const tracer = trackActiveSpans(new BasicTracer({ sink: new TraceUserIdTraceSink(sink) }));
+  const tracer = trackActiveSpans(new BasicTracer({ sink: new TraceUserIdTraceSink(new TraceIdHashTraceSink(sink)) }));
   runtimeTracer = tracer;
   return {
     tracer,

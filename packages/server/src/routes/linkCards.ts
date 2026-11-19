@@ -11,7 +11,7 @@ import {
   LINK_CARD_STATUS_MAX_BODY_BYTES, lookupLinkCardOperations, parseLinkCardOperationsQuery, parseLinkCardStatusBody, readLinkCardOperationStatus,
 } from "../services/linkCardReceiptService";
 import { LINK_CARD_UPDATE_MAX_BODY_BYTES } from "../services/linkCardUpdateService";
-import { readPreviewableMessage } from "./messages";
+import { readCardActionMessage } from "./messages";
 
 // Interactive link card actions and receipts (RFC 076 §6.2-§6.4;
 // services/linkCardActionService.ts, services/linkCardReceiptService.ts):
@@ -65,8 +65,9 @@ export function sendLinkCardResponse(res: Response, result: LinkCardActionRespon
 }
 const send = sendLinkCardResponse;
 
+// A link's message, or a card message whose acting buttons act (RFC 086).
 const messageReader = (req: Request): LinkCardMessageReader => async (messageId) =>
-  (UUID_RE.test(messageId) ? await readPreviewableMessage(req, messageId) : null);
+  (UUID_RE.test(messageId) ? await readCardActionMessage(req, messageId) : null);
 
 /** Receipt hints through this app's Socket.IO server (RFC 076 §6.8). */
 export const requestLinkCardHints = (req: Request): LinkCardReceiptHints => linkCardReceiptHints(req.app.get("io") as SocketServer | undefined);
@@ -90,8 +91,13 @@ linkCardRouter.post("/prepare", async (req, res) => {
 
 linkCardRouter.post("/execute", async (req, res) => {
   res.setHeader("Cache-Control", "private, no-store");
+  // Fixed answers: nothing of the body (RFC 086 §5.4: `sealed_inputs`, `inputs`) is ever echoed or logged.
   const request = parseLinkCardExecuteBody(req.body);
-  if (!request) { res.status(400).json({ error: "Invalid link card request", code: "INVALID_REQUEST" }); return; }
+  if ("refused" in request) {
+    res.status(request.refused).json(request.refused === 413
+      ? { error: "Link card request too large", code: "INVALID_REQUEST" } : { error: "Invalid link card request", code: "INVALID_REQUEST" });
+    return;
+  }
   try {
     send(res, await executeLinkCardAction({
       viewerId: req.userId!, serverId: req.serverId!, request, locale: linkCardRequestLocale(req.get("accept-language")), readMessage: messageReader(req),

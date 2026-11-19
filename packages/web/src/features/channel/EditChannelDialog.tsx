@@ -1209,7 +1209,6 @@ export function EditChannelDialog({
           <FormField
             label={formatMessage({ id: "channel.edit.nameLabel" })}
             htmlFor="channel-settings-name"
-            required
             hint={isAllChannel ? formatMessage({ id: "channel.edit.allCannotRename" }) : undefined}
           >
             <Input
@@ -1292,13 +1291,13 @@ export function EditChannelDialog({
         action={(
           <div className="flex items-center gap-1">
             {/* The limit is a fact the name doesn't say: a hint it earns (raft-design writing.md). */}
-            <Tooltip content={formatMessage({ id: "channel.edit.connectedServersRule" })}>
+            <Tooltip content={formatMessage({ id: "channel.edit.connectedServersRule" }, { max: MAX_JOINT_CHANNEL_SERVERS })}>
               <Button
                 type="button"
                 variant="ghost"
                 size="icon-md"
                 className="-my-1 text-foreground-hint hover:text-foreground"
-                aria-label={formatMessage({ id: "channel.edit.connectedServersRule" })}
+                aria-label={formatMessage({ id: "channel.edit.connectedServersRule" }, { max: MAX_JOINT_CHANNEL_SERVERS })}
                 data-testid="channel-settings-joint-servers-rule"
               >
                 <Info aria-hidden="true" />
@@ -1386,10 +1385,10 @@ export function EditChannelDialog({
             <p className="text-callout text-foreground-hint">{formatMessage({ id: "channel.edit.maxServers" }, { max: MAX_JOINT_CHANNEL_SERVERS })}</p>
           ) : (
             <form className="stack-y-3" data-testid="channel-settings-joint-invite-form" onSubmit={handleInviteJointServer} noValidate>
-              <FormField label={formatMessage({ id: "channel.edit.serverSlugLabel" })} required htmlFor="channel-settings-joint-server-slug" error={inviteServerSlugError}>
+              <FormField label={formatMessage({ id: "channel.edit.serverSlugLabel" })} htmlFor="channel-settings-joint-server-slug" error={inviteServerSlugError}>
                 <SlugInput id="channel-settings-joint-server-slug" name="targetServerSlug" type="text" value={inviteServerSlug} onChange={handleInviteServerSlugChange} onBlur={handleInviteServerSlugBlur} placeholder={formatMessage({ id: "channel.edit.serverSlugPlaceholder" })} required autoCapitalize="none" autoCorrect="off" spellCheck={false} aria-invalid={inviteServerSlugError ? "true" : undefined} disabled={inviteBusy} />
               </FormField>
-              <FormField label={formatMessage({ id: "channel.edit.invitedPeopleLabel" })} required hint={formatMessage({ id: "channel.edit.invitedPeopleHint" })} htmlFor="channel-settings-joint-invited-people" error={invitePeopleError}>
+              <FormField label={formatMessage({ id: "channel.edit.invitedPeopleLabel" })} hint={formatMessage({ id: "channel.edit.invitedPeopleHint" })} htmlFor="channel-settings-joint-invited-people" error={invitePeopleError}>
                 <Textarea id="channel-settings-joint-invited-people" name="invitedPeople" value={invitePeopleText} onChange={handleInvitePeopleChange} onBlur={handleInvitePeopleBlur} className="w-full" placeholder={formatMessage({ id: "channel.edit.invitedPeoplePlaceholder" })} rows={2} required data-invalid={Boolean(invitePeopleError)} disabled={inviteBusy} />
               </FormField>
               {inviteSameAdminTarget && (
@@ -1512,7 +1511,7 @@ export function EditChannelDialog({
       {showArchiveConfirm && (
         <ConfirmDialog
           chromeLocale="active"
-          title={formatMessage({ id: "channel.edit.archiveChannel" })}
+          title={formatMessage({ id: "channel.edit.archiveChannelTitle" })}
           // The host's copy (it can't disconnect): say archiving reaches every server (cindyz: in the confirm).
           message={hostCannotDisconnect ? (
             <>
@@ -1534,7 +1533,7 @@ export function EditChannelDialog({
           chromeLocale="active"
           title={
             isAllChannel
-              ? currentVisibility === "private" ? formatMessage({ id: "channel.edit.restoreAll" }) : formatMessage({ id: "channel.edit.hideAll" })
+              ? currentVisibility === "private" ? formatMessage({ id: "channel.edit.restoreAllTitle" }) : formatMessage({ id: "channel.edit.hideAllTitle" })
               : currentVisibility === "private" ? formatMessage({ id: "channel.edit.makeChannelPublic" }) : formatMessage({ id: "channel.edit.makeChannelPrivate" })
           }
           message={
@@ -1582,7 +1581,7 @@ export function EditChannelDialog({
       {showDeleteConfirm && (
         <ConfirmDialog
           chromeLocale="active"
-          title={showCompletedJointSettings ? formatMessage({ id: "channel.edit.disconnectJointChannel" }) : formatMessage({ id: "channel.edit.deleteChannel" })}
+          title={showCompletedJointSettings ? formatMessage({ id: "channel.edit.disconnectJointChannel" }) : formatMessage({ id: "channel.edit.deleteChannelTitle" })}
           message={showCompletedJointSettings
             ? formatMessage({ id: "channel.edit.confirmDisconnect" }, { name: initialName })
             : formatMessage({ id: "channel.edit.confirmDelete" }, { name: initialName })}

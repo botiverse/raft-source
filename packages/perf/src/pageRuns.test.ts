@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { type LoadMetrics, toPageRunRows } from "./pageRuns";
 
 const load = (arm: "on" | "off", lcp: number): LoadMetrics => ({ arm, contentMs: lcp - 10, lcp, cls: 0.01, fcp: 100, ttfb: 50, inp: null, commitSha: "abc", messagesFetched: 300, bootReads: arm === "on" ? 2 : 0, preflights: 1, status429: 0, status5xx: 0, scriptBytes: 1000 });
-const ctx = { project: "raft-web", env: "staging", runId: "r1", toolVersion: "0.2.0", takenAt: "2026-11-12T00:00:00Z", origin: "https://web.example", page: "channel", state: "release", net: "fast", ab: "boot-prefetch", verdict: "better" };
+const ctx = { project: "raft-web", env: "staging", runId: "r1", toolVersion: "0.2.0", takenAt: "2026-11-12T00:00:00Z", origin: "https://web.example", page: "channel", state: "release", net: "fast", ab: "boot-prefetch", verdict: "better", host: { host_cpu_count: 10, host_benchmark_ms: 4.2 } };
 
 describe("toPageRunRows", () => {
   it("one row per load, both arms, indexed per arm, with the shared context", () => {
@@ -16,6 +16,12 @@ describe("toPageRunRows", () => {
     expect(r.extra).toMatchObject({ content_ms: 390, boot_read_count: 2, preflight_count: 1 });
     expect(r.inp_ms).toBeNull();
     expect(r.ttfb_ms).toBeNull();
+  });
+  it("says on every row which machine measured it", () => {
+    const rows = toPageRunRows({ on: [load("on", 400)], off: [load("off", 900)] }, ctx);
+    for (const r of rows) expect(r.extra).toMatchObject({ host_cpu_count: 10, host_benchmark_ms: 4.2 });
+    const [unknown] = toPageRunRows({ on: [load("on", 400)], off: [] }, { ...ctx, host: { host_cpu_count: 2, host_benchmark_ms: null } });
+    expect(unknown.extra.host_benchmark_ms).toBeNull();
   });
   it("takes each row's commit from its own load", () => {
     const rows = toPageRunRows({ on: [{ ...load("on", 400), commitSha: "old" }], off: [{ ...load("off", 900), commitSha: "new" }] }, ctx);

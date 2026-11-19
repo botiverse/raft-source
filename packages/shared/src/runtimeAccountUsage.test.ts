@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import type { ServerToMachineMessage } from "./index";
 import {
   RUNTIME_LIMIT_RESET_KINDS,
+  allModelsUsageAccount,
   claudeFiveHourLimitOf,
+  inferClaudeUsageWindowScopes,
   isRuntimeLimitResetIdempotencyKey,
   isRuntimeLimitResetKind,
   runtimeLimitResetKindSchema,
@@ -303,4 +305,30 @@ test("Antigravity's usage is read only where the daemon says it reads it; the ot
   assert.equal(runtimeAccountUsageReadableWith("antigravity", []), false);
   assert.equal(runtimeAccountUsageReadableWith("antigravity", new Set([DAEMON_CAPABILITY_RUNTIME_ACCOUNT_USAGE_ANTIGRAVITY])), true);
   for (const provider of ["claude", "codex", "kimi", "grok"] as const) assert.equal(runtimeAccountUsageReadableWith(provider, []), true, provider);
+});
+
+test("an older Computer's scope-less Claude windows: a model's label is its model's window; the account is used up only on all models", () => {
+  const snapshot = (provider: "claude" | "codex", allModels: "ok" | "limit_reached"): RuntimeAccountUsageSnapshot => ({
+    protocolVersion: 2,
+    provider,
+    collectedAt: "2026-08-02T02:00:00.000Z",
+    staleAfter: "2026-08-02T02:30:00.000Z",
+    collectorVersion: "test",
+    accounts: [{
+      accountKey: "a".repeat(64),
+      health: "rate_limited",
+      windows: [
+        { id: "w0", label: "Current week (all models)", status: allModels, usedRatio: allModels === "ok" ? 0.85 : 1 },
+        { id: "w1", label: "Current week (OAuth apps)", status: "ok", usedRatio: 0.9 },
+        { id: "w2", label: "Current week (Fable)", status: "limit_reached", usedRatio: 1 },
+        { id: "w3", label: "Current session (Opus)", status: "ok", usedRatio: 0.1, scope: { kind: "model", name: "Opus 4" } },
+      ],
+    }],
+  });
+  const read = inferClaudeUsageWindowScopes(snapshot("claude", "ok"));
+  assert.deepEqual(read.accounts[0]!.windows.map((window) => window.scope), [undefined, undefined, { kind: "model", name: "Fable" }, { kind: "model", name: "Opus 4" }], "a scope given stays as given");
+  assert.equal(allModelsUsageAccount(read.accounts[0]!).account.health, "ok", "only Fable at its limit: not used up");
+  assert.equal(allModelsUsageAccount(inferClaudeUsageWindowScopes(snapshot("claude", "limit_reached")).accounts[0]!).account.health, "rate_limited");
+  const codex = snapshot("codex", "ok");
+  assert.equal(inferClaudeUsageWindowScopes(codex), codex, "another provider's labels are not read");
 });

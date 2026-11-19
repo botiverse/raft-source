@@ -3,7 +3,7 @@ import { useMemo } from "react";
 import type { ArtifactCardPlace, ArtifactSideCard } from "../../apps/artifacts";
 import { PanelHeadLeadContext } from "../../components/layout/appPanelHead";
 import { browserChipWidth } from "./browserHeadFit";
-import { useBrowserTabsStore } from "./browserTabsStore";
+import { browserOf, useBrowserTabsStore } from "./browserTabsStore";
 import { BrowserSwitchChip } from "./SwitchChip";
 import { useDesktopBrowserTabs } from "./useWebPreview";
 import { useWebPreviewSideCard } from "./useWebPreviewSideCard";
@@ -34,10 +34,10 @@ export function useArtifactPlaceCard(
   const tabs = useDesktopBrowserTabs();
   const conversationId = tabs && channelId ? channelId : null;
   // How many tabs the conversation's browser holds (0: none open): the chip's room in the Artifact's head.
-  const browserTabs = useBrowserTabsStore((s) => (conversationId ? s.browsers[conversationId]?.tabs.length ?? 0 : 0));
+  const browserTabs = useBrowserTabsStore((s) => (conversationId ? browserOf(s, conversationId)?.tabs.length ?? 0 : 0));
   const closeBrowser = useBrowserTabsStore((s) => s.close);
   // When the switch chip last let the Artifact in front of the browser (0: never, or no browser).
-  const parkedAt = useBrowserTabsStore((s) => (conversationId ? s.browsers[conversationId]?.parkedAt ?? 0 : 0));
+  const parkedAt = useBrowserTabsStore((s) => (conversationId ? browserOf(s, conversationId)?.parkedAt ?? 0 : 0));
   // Of the two, the one that came to the front last: opened, or brought forward by the other's chip.
   const shown = webPreviewCard !== null && (artifactCard === null || webPreviewCard.openedAt >= Math.max(artifactCard.openedAt, parkedAt));
   const chipWidth = browserTabs > 0 ? browserChipWidth(browserTabs) : 0;

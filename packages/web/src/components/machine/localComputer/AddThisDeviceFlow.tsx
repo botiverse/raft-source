@@ -125,7 +125,8 @@ export function ThisDeviceSetupFlow({ host, setup, onRun: run, serverName, onFin
       ) : null}
       {phase === "failed" ? (
         <div className="mb-4">
-          <div className="flex flex-wrap gap-x-4 gap-y-1">
+          {/* text-callout: a TextLink takes its size from the text around it, and nothing here sets one (the links came out at the dialog's 17px beside 13px step text). */}
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-callout">
             {typeof bridge.openComputerLogs === "function" ? (
               <TextLink onClick={openLogs} data-testid="add-this-device-open-logs">{formatMessage({ id: "computerHost.thisDevice.openLogs" })}</TextLink>
             ) : null}

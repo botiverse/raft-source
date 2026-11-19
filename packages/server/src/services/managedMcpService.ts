@@ -59,6 +59,7 @@ import { findActiveMcpAppTemplate, listMcpAppTemplates } from "./mcpAppTemplates
 import { mapWithConcurrency } from "../lib/mapWithConcurrency";
 // Cyclic on purpose (the inventory reads this module's catalogue); used only inside functions.
 import { listAgentMcpAppsForIntegrationInventory } from "./managedMcpIntegrationInventory";
+import { notifyMcpConnectionNeedsSignIn } from "./managedMcpSignInNotice";
 
 /** Apps resolved at once when a list asks whether each App's creator may grant it automatically. */
 const MCP_AUTO_GRANT_CONCURRENCY = 4;
@@ -1809,11 +1810,18 @@ export async function executeManagedMcpCall(
   // so a pin naming another App's Connection resolves to nothing and is refused, not followed.
   // Revoked / never granted is decided here too (`admitFromRows`), before any Connection question.
   const autoGranted = await mcpAutoGrantResolver(db, serverId, agent)(row.server);
-  const { block, connection: admission, boundCredential, defaultCredential } = await admitWithConnections(
+  const { block, connection: admission, boundCredential, defaultCredential, used } = await admitWithConnections(
     db, serverId, row.server, row.assignment, autoGranted, mcpAgentOwnerUserId(agent),
   );
   if (block) throw new ManagedMcpServiceError(block.message, block.code);
-  if (!admission.allowed) throw connectionRefusal(admission);
+  if (!admission.allowed) {
+    // A Connection that needs signing in again: tell whoever can (once per expiry; a retry costs no
+    // query), since a call without a conversation raises no Connect card (#proj-apps:#70).
+    if (used && row.server.authMode === "oauth" && admission.detail !== "not_usable") {
+      await notifyMcpConnectionNeedsSignIn({ trigger: "admission", serverId, mcpServerId: row.server.id, connection: used });
+    }
+    throw connectionRefusal(admission);
+  }
   if (generic === "list") return listToolsResult(row.server, row.assignment);
   if (generic === "call") {
     const name = request.arguments.name;

@@ -10,18 +10,12 @@
 import { useCallback, useEffect, useId, useState } from "react";
 import { useIntl } from "react-intl";
 import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogBody,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
   Banner,
   Button,
   Dialog,
   DialogBody,
+  DialogClose,
+  DialogContent,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -224,19 +218,22 @@ export function AssistantOwnerSection({ agentId }: { agentId: string }) {
         </NarrowDialogContent>
       </Dialog>
 
-      <AlertDialog open={open === "delete"} onOpenChange={handleDeleteOpenChange}>
-        <AlertDialogContent data-testid="assistant-delete-confirm">
-          <AlertDialogHeader>
-            <AlertDialogTitle>{formatMessage({ id: "assistant.settings.delete" })}</AlertDialogTitle>
-          </AlertDialogHeader>
-          <AlertDialogBody>
+      {/* A confirmation: a small Dialog with × in the head, Cancel then the red confirm (DS Dialog; AlertDialog is
+          only for the cases Raft Chat lists). */}
+      <Dialog open={open === "delete"} onOpenChange={handleDeleteOpenChange}>
+        <DialogContent size="sm" aria-busy={busy || undefined} data-testid="assistant-delete-confirm">
+          <DialogHeader>
+            <DialogTitle>{formatMessage({ id: "assistant.settings.deleteTitle" })}</DialogTitle>
+            <DialogClose disabled={busy} aria-label={formatMessage({ id: "common.confirm.closeDialog" })} />
+          </DialogHeader>
+          <DialogBody>
             {formatMessage({ id: "assistant.settings.deleteBody" }, { name })}
-          </AlertDialogBody>
-          <AlertDialogFooter>
-            <AlertDialogCancel size="lg" disabled={busy}>
+          </DialogBody>
+          <DialogFooter>
+            <DialogClose render={<Button variant="ghost" size="lg" />} disabled={busy}>
               {formatMessage({ id: "assistant.settings.cancel" })}
-            </AlertDialogCancel>
-            <AlertDialogAction
+            </DialogClose>
+            <Button
               variant="danger"
               size="lg"
               disabled={busy}
@@ -244,10 +241,10 @@ export function AssistantOwnerSection({ agentId }: { agentId: string }) {
               data-testid="assistant-delete-confirm-action"
             >
               {formatMessage({ id: "assistant.settings.delete" })}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </>
   );
 }

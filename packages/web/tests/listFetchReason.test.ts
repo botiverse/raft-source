@@ -75,3 +75,55 @@ test("a background reset folded into one already in flight keeps its reason on t
     t.restore();
   }
 });
+
+test("a realtime_fallback reload of the followed-thread list carries its trigger and how many asks it folded", SERIAL, async () => {
+  const headers: Array<Record<string, string> | undefined> = [];
+  const get = vi.spyOn(api, "get").mockImplementation(async (url: string, config?: { headers?: Record<string, string> }) => {
+    if (url === "/channels/threads/followed") headers.push(config?.headers);
+    return { data: { threads: [] }, headers: {} } as never;
+  });
+  const savedServer = useServerStore.getState().current;
+  useServerStore.setState({ current: { id: "srv-reason", slug: "s", name: "S", role: "member", plan: "free" } } as never);
+  try {
+    await useThreadStore.getState().loadFollowedThreads("realtime_fallback", { trigger: "followed_not_listed", coalesced: 3 });
+    // A reason other than realtime_fallback carries no trigger.
+    await useThreadStore.getState().loadFollowedThreads("manual", { trigger: "followed_not_listed", coalesced: 1 });
+    assert.deepEqual(headers, [
+      { "X-Raft-Fetch-Reason": "realtime_fallback", "X-Raft-Fetch-Trigger": "followed_not_listed", "X-Raft-Fetch-Coalesced": "3" },
+      { "X-Raft-Fetch-Reason": "manual" },
+    ]);
+  } finally {
+    get.mockRestore();
+    useServerStore.setState({ current: savedServer } as never);
+  }
+});
+
+test("replies into a followed conversation the list does not hold reload it once, with trigger followed_not_listed", SERIAL, async () => {
+  const { applyTaskConversationReply, __cancelFollowedThreadsRefreshForTests } = await import("../src/store/socketBridge");
+  const headers: Array<Record<string, string> | undefined> = [];
+  const get = vi.spyOn(api, "get").mockImplementation(async (url: string, config?: { headers?: Record<string, string> }) => {
+    if (url === "/channels/threads/followed") headers.push(config?.headers);
+    return { data: { threads: [] }, headers: {} } as never;
+  });
+  const savedServer = useServerStore.getState().current;
+  useServerStore.setState({ current: { id: "srv-reason", slug: "s", name: "S", role: "member", plan: "free" } } as never);
+  useThreadStore.setState({ followedThreads: [] });
+  vi.useFakeTimers();
+  try {
+    for (const id of ["m1", "m2"]) {
+      applyTaskConversationReply({
+        id, channelId: "task-conv-1", seq: 1, content: "x", senderType: "user", senderId: "u2", senderName: "b",
+        createdAt: "2026-11-15T05:00:00.000Z", conversationContext: { channelType: "task" },
+      } as never);
+    }
+    await vi.advanceTimersByTimeAsync(1_500);
+    assert.deepEqual(headers, [
+      { "X-Raft-Fetch-Reason": "realtime_fallback", "X-Raft-Fetch-Trigger": "followed_not_listed", "X-Raft-Fetch-Coalesced": "2" },
+    ]);
+  } finally {
+    __cancelFollowedThreadsRefreshForTests();
+    vi.useRealTimers();
+    get.mockRestore();
+    useServerStore.setState({ current: savedServer } as never);
+  }
+});

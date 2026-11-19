@@ -13,6 +13,8 @@ type BridgedToast = {
   title: string;
   description?: string;
   type?: string;
+  /** "high" announces it assertively (an error that interrupts). */
+  priority?: "high" | "low";
   /** One button on the toast, e.g. "Retry". */
   actionProps?: { children: string; onClick: () => void };
   /** LocalizedToastProvider's extras, e.g. the person a toast is about. */

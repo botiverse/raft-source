@@ -78,4 +78,8 @@ describe("claim rows", () => {
     expect(metricRuns(rows, "lcp_ms")).toEqual([100, 120]);
     expect(metricRuns(rows, "ready_ms")).toEqual([5, 7]);
   });
+  it("skips rows their collection left out of its medians for a busy host", () => {
+    const rows = [{ extra: { channel_switch_ms: 500, host_left_out: 0 } }, { extra: { channel_switch_ms: 900, host_busy: 1, host_left_out: 1 } }, { extra: { channel_switch_ms: 510, host_busy: 1, host_left_out: 0 } }, { extra: { channel_switch_ms: 520 } }];
+    expect(metricRuns(rows, "channel_switch_ms")).toEqual([500, 510, 520]);
+  });
 });

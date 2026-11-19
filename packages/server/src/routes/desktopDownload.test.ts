@@ -2,6 +2,9 @@ import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
+import { DESKTOP_DOWNLOAD_TARGETS } from "@botiverse/raft-shared";
+import { PRODUCT_EVENT_SINK_APP_KEY } from "../services/productEventIngest";
+import { captureProductEvents } from "../test/integration/paywallHits";
 import {
   type DesktopFeedSource,
   HANDS_FEED_BASE,
@@ -364,6 +367,137 @@ test("mount: the platforms endpoint is public JSON", async ({ app }) => {
     assert.equal(body.windows.status, "none");
   } finally {
     globalThis.fetch = originalFetch;
+    await app.close();
+  }
+});
+
+// desktop_download_requested (Nova, #proj-analytics:e9009f38): a count of the
+// requests this route answered with an installer, by target and by source.
+const BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+
+/** The mounted route with the Hands feeds faked; `request` is the real fetch, with a browser's User-Agent unless one is given. */
+async function withFeeds(feeds: Record<string, string> | typeof fetch, run: (request: (path: string, userAgent?: string, method?: "GET" | "HEAD") => Promise<Response>) => Promise<void>): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  resetDesktopDownloadCacheForTest();
+  globalThis.fetch = typeof feeds === "function" ? feeds : feedFetch(feeds).fetch;
+  try {
+    await run((path, userAgent = BROWSER_UA, method = "GET") => originalFetch(path, { method, redirect: "manual", headers: { "user-agent": userAgent } }));
+  } finally {
+    resetDesktopDownloadCacheForTest();
+    globalThis.fetch = originalFetch;
+  }
+}
+
+test("the registry's targets are the route's: every one is accepted, nothing else", () => {
+  for (const target of DESKTOP_DOWNLOAD_TARGETS) assert.equal(isDesktopTarget(target), true, target);
+  assert.equal(isDesktopTarget("mac_arm64"), false);
+});
+
+test("desktop_download_requested: an installer redirect records one request with its target, the sanitised source values and likely_bot; no person, server, User-Agent or IP", async ({ app }) => {
+  const events = captureProductEvents(app, "desktop_download_requested");
+  try {
+    await withFeeds(HANDS_FEEDS, async (request) => {
+      const query = "target=mac-arm64&utm_source=Newsletter_Oct&utm_medium=email&utm_campaign=Acme/Widgets.JS&ref_domain=News.Example.com";
+      const response = await request(`${app.baseUrl}/api/desktop-download?${query}`);
+      assert.equal(response.status, 302);
+      assert.equal(response.headers.get("location"), `${HANDS_FEED_BASE}/Raft-Desktop-1.21.26-universal.dmg`);
+      assert.equal(response.headers.get("cache-control"), "private, max-age=300");
+      const [row] = await events.expect(1, "one request, one row");
+      assert.deepEqual(row.properties, {
+        target: "mac-arm64",
+        likely_bot: false,
+        utm_source: "newsletter_oct",
+        utm_medium: "email",
+        utm_campaign: "acme/widgets.js",
+        referrer_domain: "example.com",
+      });
+      assert.equal(row.analytics_id, null);
+      assert.equal(row.server_id, null);
+      assert.equal(row.source, "server");
+      assert.doesNotMatch(JSON.stringify(row), /Mozilla|Chrome|127\.0\.0\.1|::1/, "neither the User-Agent nor the address is on the row");
+
+      // Requests, not people: the same link again is another row. A crawler is one too, marked.
+      await request(`${app.baseUrl}/api/desktop-download?target=windows`);
+      await request(`${app.baseUrl}/api/desktop-download?target=windows`, "Googlebot/2.1 (+http://www.google.com/bot.html)");
+      const rows = await events.expect(3, "no dedupe");
+      assert.deepEqual(rows.slice(1).map((r) => r.properties), [
+        { target: "windows", likely_bot: false },
+        { target: "windows", likely_bot: true },
+      ]);
+    });
+  } finally {
+    await app.close();
+  }
+});
+
+test("desktop_download_requested: a source value that does not pass is left out, never recorded as sent; repeated or nested query values are ignored", async ({ app }) => {
+  const events = captureProductEvents(app, "desktop_download_requested");
+  try {
+    await withFeeds(HANDS_FEEDS, async (request) => {
+      const invalid = "target=linux-deb&utm_source=Has%20Space&utm_medium=email&utm_campaign=a/b/c&ref_domain=www.raft.build";
+      assert.equal((await request(`${app.baseUrl}/api/desktop-download?${invalid}`)).status, 302);
+      const arrays = "target=linux-deb&utm_source=a&utm_source=b&utm_medium[x]=email&utm_campaign=one&utm_campaign=two&ref_domain=example.com&ref_domain=example.org";
+      assert.equal((await request(`${app.baseUrl}/api/desktop-download?${arrays}`)).status, 302);
+      const rows = await events.expect(2, "both requests are counted, without the values");
+      assert.deepEqual(rows.map((row) => row.properties), [
+        { target: "linux-deb", likely_bot: false, utm_medium: "email" },
+        { target: "linux-deb", likely_bot: false },
+      ]);
+    });
+  } finally {
+    await app.close();
+  }
+});
+
+test("desktop_download_requested: nothing for a missing or unknown target (the chooser), for the fallbacks (no build, feed host failing), for a HEAD probe, nor for a link the app made", async ({ app }) => {
+  const events = captureProductEvents(app, "desktop_download_requested");
+  try {
+    await withFeeds(HANDS_FEEDS, async (request) => {
+      for (const query of ["utm_source=newsletter", "target=ipad&utm_source=newsletter", "target=mac&target=windows"]) {
+        const response = await request(`${app.baseUrl}/api/desktop-download?${query}`);
+        assert.match(response.headers.get("location") ?? "", /\/download$/, query);
+      }
+    });
+    // No Windows build on the release: the chooser again.
+    await withFeeds({ "latest-mac.yml": HANDS_MAC_FEED }, async (request) => {
+      const response = await request(`${app.baseUrl}/api/desktop-download?target=windows&utm_source=newsletter`);
+      assert.match(response.headers.get("location") ?? "", /\/download$/);
+    });
+    await withFeeds((async () => new Response("boom", { status: 500 })) as typeof fetch, async (request) => {
+      const response = await request(`${app.baseUrl}/api/desktop-download?target=mac&utm_source=newsletter`);
+      assert.equal(response.headers.get("location"), `${GITHUB_RELEASES_BASE}/latest`);
+    });
+    // A HEAD probe of a working link (a link checker, a mail scanner) gets the same redirect and is not a request.
+    await withFeeds(HANDS_FEEDS, async (request) => {
+      const response = await request(`${app.baseUrl}/api/desktop-download?target=mac&utm_source=newsletter`, BROWSER_UA, "HEAD");
+      assert.equal(response.status, 302);
+    });
+    // A link the Raft app made (from=app) gets the installer and is not a request: in-app clicks are app_download_clicked's.
+    await withFeeds(HANDS_FEEDS, async (request) => {
+      const response = await request(`${app.baseUrl}/api/desktop-download?target=mac&from=app`);
+      assert.equal(response.headers.get("location"), `${HANDS_FEED_BASE}/Raft-Desktop-1.21.26-universal.dmg`);
+    });
+    await events.expect(0, "only an installer redirect answered to a GET that did not start in the app is a request");
+  } finally {
+    await app.close();
+  }
+});
+
+test("desktop_download_requested: a failing sink does not break the redirect", async ({ app }) => {
+  let enqueued = 0;
+  app.app.set(PRODUCT_EVENT_SINK_APP_KEY, { enqueue: () => { enqueued += 1; throw new Error("sink down"); }, flush: async () => {} });
+  try {
+    await withFeeds(HANDS_FEEDS, async (request) => {
+      const response = await request(`${app.baseUrl}/api/desktop-download?target=mac-x64&utm_source=newsletter`);
+      assert.equal(response.status, 302);
+      assert.equal(response.headers.get("location"), `${HANDS_FEED_BASE}/Raft-Desktop-1.21.26-universal.dmg`);
+      const until = Date.now() + 2000;
+      while (enqueued === 0 && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(enqueued, 1, "the sink was reached and threw");
+      // The server is still answering after the failed write.
+      assert.equal((await request(`${app.baseUrl}/api/desktop-download?target=mac-x64`)).status, 302);
+    });
+  } finally {
     await app.close();
   }
 });

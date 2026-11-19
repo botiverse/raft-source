@@ -59,6 +59,7 @@ import {
   formatArtifactComments,
   formatArtifactDeleted,
   formatArtifactError,
+  formatArtifactMoveToPublicRefusal,
   formatArtifactFileContent,
   formatArtifactList,
   formatArtifactMoved,
@@ -81,7 +82,7 @@ import { isArtifactName, parseArtifactRef } from "../artifactRef";
 import { lazySchema } from "../lazySchema";
 import { ARTIFACT_CHECK_SHOTS, type ArtifactCheckShot } from "../webArtifactsContract";
 import type { RaftHintOptions, RaftHintStyle } from "./hint";
-import { failureFromClientResult, failureOutcome, keyedWriteFailure, opError, opErrorFromClientError, validateOpRequest, type RaftFailure, type RaftOpError, type RaftOutcome } from "./outcome";
+import { failureFromClientResult, failureOutcome, keyedWriteFailure, opError, opErrorFromClientError, refusalSentence, restyleDefaultNextAction, validateOpRequest, type RaftFailure, type RaftOpError, type RaftOutcome } from "./outcome";
 import { requestSchema } from "./requestSchema";
 
 const artifactArg = () => z.string().min(1).describe("The artifact: its id, a link to it, or its exact title.");
@@ -122,9 +123,15 @@ type ArtifactRef = { ok: true; value: string; version?: number } | { ok: false; 
 const ARTIFACT_CODES = new Set<string>(AGENT_API_ARTIFACT_ERROR_CODES);
 
 /** A refusal made here, before any request (a bad link, path or length, no title, a move to anyone-with-link): INVALID_REQUEST, nothing was sent. */
-function clientRefusal(code: "INVALID_ARTIFACT_REF" | "INVALID_PATH" | "FIELD_TOO_LONG" | "FORBIDDEN" | "TOO_MANY_COMMENTS" | "TITLE_REQUIRED", input: ArtifactErrorInput, style: RaftHintStyle): RaftFailure {
+function clientRefusal(code: "INVALID_ARTIFACT_REF" | "INVALID_PATH" | "FIELD_TOO_LONG" | "TOO_MANY_COMMENTS" | "TITLE_REQUIRED", input: ArtifactErrorInput, style: RaftHintStyle): RaftFailure {
   const text = formatArtifactError(code, input, style);
   return failureOutcome(opError("INVALID_REQUEST", { message: text.message, nextAction: text.nextAction, serverCode: code }));
+}
+
+/** A move to "anyone with the link", refused here: only a person turns on link sharing (the Server's FORBIDDEN, said first). */
+function moveToPublicRefusal(artifact: string, style: RaftHintStyle): RaftFailure {
+  const text = formatArtifactMoveToPublicRefusal(artifact, style);
+  return failureOutcome(opError("INVALID_REQUEST", { message: text.message, nextAction: text.nextAction, serverCode: "FORBIDDEN" }));
 }
 
 /**
@@ -153,6 +160,49 @@ function invalidPath(path: string): boolean {
   return !isWellFormedArtifactFilePath(path);
 }
 
+/** The step for a Server sentence that carries its own (the Artifacts' `error` ends in what to do). */
+const SENTENCE_SAYS_THE_STEP = "Do what the error says.";
+
+/** Whether a refusal body carries a step of its own: a structured `next`, or a text one. */
+function sentAStep(response: unknown): boolean {
+  if (!response || typeof response !== "object") return false;
+  const b = response as { next?: unknown; suggestedNextAction?: unknown; suggested_next_action?: unknown };
+  const text = b.suggestedNextAction ?? b.suggested_next_action;
+  return (b.next !== undefined && b.next !== null) || (typeof text === "string" && text.trim() !== "");
+}
+
+/**
+ * The Artifacts' deliberate 503s: storage that isn't set up (or can't hand
+ * out a link, or take more files now). Their Server sentence says what
+ * happened and whether retrying helps, unlike the generic "could not serve
+ * this operation right now. Retry in a moment." a 5xx gets otherwise.
+ */
+const WORDED_UNAVAILABLE: ReadonlySet<string> = new Set<ArtifactErrorCode>(["ARTIFACTS_STORAGE_UNAVAILABLE", "CONTENT_UNAVAILABLE"]);
+
+/**
+ * A refusal this client has no words for (formatArtifactError's null: the
+ * Server words it as well, or a newer Server's code): the Server's sentence
+ * and step as sent (the caller puts the step in its style). Without a step of
+ * its own (nor a wait), the sentence holds it: said so, not the generic
+ * "change what the error says, then try again" a refusal like FORBIDDEN
+ * can't follow. A 5xx keeps the generic sentence and its retry, except a
+ * deliberate 503 (WORDED_UNAVAILABLE) whose body has a sentence: that, read
+ * as a 4xx's is (refusalSentence).
+ */
+function serverWordedError(error: RaftOpError, response: unknown): RaftOpError {
+  const sentence = error.status !== undefined && error.status >= 500 && error.serverCode !== undefined && WORDED_UNAVAILABLE.has(error.serverCode)
+    ? refusalSentence(response)
+    : null;
+  const worded = sentence === null ? error : { ...error, message: sentence };
+  const own = sentAStep(response) || error.retryAfterSeconds !== undefined || error.status === undefined || (error.status >= 500 && sentence === null);
+  return own ? worded : { ...worded, nextAction: SENTENCE_SAYS_THE_STEP };
+}
+
+/** serverWordedError as the caller's failure, its step in the caller's style. */
+function serverWorded(error: RaftOpError, response: unknown, style: RaftHintStyle): RaftFailure {
+  return restyleDefaultNextAction(failureOutcome(serverWordedError(error, response)), style);
+}
+
 function errorDetails(response: unknown): Record<string, unknown> | null {
   if (!response || typeof response !== "object") return null;
   const details = (response as { details?: unknown }).details;
@@ -174,7 +224,9 @@ function failureFrom<K extends AgentApiRouteKey>(
     // The refusal body's details win; when a refusal has none (an older client's binary
     // transport dropped the body), the details the caller already knows stand in.
     const text = formatArtifactError(error.errorCode as ArtifactErrorCode, { ...input, details: errorDetails(error.response) ?? input.details ?? null }, style);
-    return failureOutcome({ ...opErrorFromClientError(error, result.status), message: text.message, nextAction: text.nextAction, serverCode: error.errorCode });
+    const base = opErrorFromClientError(error, result.status);
+    if (text === null) return serverWorded({ ...base, serverCode: error.errorCode }, error.response, style);
+    return failureOutcome({ ...base, message: text.message, nextAction: text.nextAction, serverCode: error.errorCode });
   }
   return failureFromClientResult(result);
 }
@@ -606,7 +658,9 @@ export function artifactUploadFailure(status: number, errorBody: unknown, style:
   if (code && ARTIFACT_CODES.has(code)) {
     // An upload is only ever part of a push.
     const text = formatArtifactError(code as ArtifactErrorCode, { dir, publishing: true, details: errorDetails(errorBody) }, style);
-    return failureOutcome({ ...opErrorFromClientError(error, status), message: text.message, nextAction: text.nextAction, serverCode: code });
+    const base = opErrorFromClientError(error, status);
+    if (text === null) return serverWorded({ ...base, serverCode: code }, errorBody, style);
+    return failureOutcome({ ...base, message: text.message, nextAction: text.nextAction, serverCode: code });
   }
   return failureOutcome(opErrorFromClientError(error, status));
 }
@@ -791,14 +845,17 @@ export function artifactCommentImageUploadFailure(
     const errorInput = { artifact: input.artifact, commenting: true, uploadingImage: true, details, ...(reviewing ? { reviewing: true } : {}) };
     // Cut short on the way (SIZE_MISMATCH) names the comment and image too, its next step the same command again.
     if (input.reviewComment !== undefined && (refusesTheImage(code, details) || code === "SIZE_MISMATCH")) {
-      const text = formatArtifactReviewCommentImageUploadRefusal(code as ArtifactErrorCode, { ...errorInput, ...input.reviewComment, ...(input.named === undefined ? {} : { named: input.named }) }, style);
+      const text = formatArtifactReviewCommentImageUploadRefusal(code as "FILE_TOO_LARGE" | "IMAGE_REFUSED" | "SIZE_MISMATCH", { ...errorInput, ...input.reviewComment, ...(input.named === undefined ? {} : { named: input.named }) }, style);
       return failureOutcome({ ...base, message: text.message, nextAction: text.nextAction, serverCode: code });
     }
     const text = formatArtifactError(code as ArtifactErrorCode, errorInput, style);
+    // No local words (storage that isn't set up, the Artifact, a newer Server's code): the Server's sentence and step.
+    const said = text === null ? serverWordedError({ ...base, serverCode: code }, errorBody) : { ...base, message: text.message, nextAction: text.nextAction, serverCode: code };
     const message = input.named !== undefined && !reviewing && IMAGE_UPLOAD_REFUSALS.has(code)
-      ? `${foldAgentOneLineText(input.named)}: ${text.message} Nothing was posted.`
-      : text.message;
-    return reviewUploadFailure({ ...base, message, nextAction: text.nextAction, serverCode: code }, input.reviewComment);
+      ? `${foldAgentOneLineText(input.named)}: ${said.message} Nothing was posted.`
+      : said.message;
+    const failure = reviewUploadFailure({ ...said, message }, input.reviewComment);
+    return text === null ? restyleDefaultNextAction(failure, style) : failure;
   }
   if (status === 404) {
     const text = formatArtifactCommentImagesUnsupported(style, { reviewing: input.reviewComment !== undefined });
@@ -891,8 +948,8 @@ export async function artifactsCommentImage(
   const ref = resolveArtifactRef(request.artifact, style); if (!ref.ok) return ref.failure;
   const fileId = request.fileId.trim();
   const result = await client.artifacts.commentImage({ artifact: ref.value, fileId });
-  // The id stands in for the details when the refusal body carries none.
-  if (!result.ok) return failureFrom(result, { artifact: ref.value, downloadingImage: fileId, details: { fileId } }, style);
+  // IMAGE_NOT_FOUND: the Server's sentence, and its step to the comments (#wg-ax:#13 P3).
+  if (!result.ok) return failureFrom(result, { artifact: ref.value }, style);
   const data = { bytes: result.data, artifact: ref.value, fileId, contentType: artifactCommentImageTypeOf(result.data) };
   return { ok: true, state: "downloaded", data, next: null, text: `image ${foldAgentOneLineText(fileId)}: ${result.data.byteLength} bytes\n` };
 }
@@ -956,7 +1013,10 @@ function reviewFailureFrom(
     const path = typeof details?.path === "string" ? details.path : comments[index]?.path ?? null;
     const replyTo = comments[index]?.replyTo;
     const text = formatArtifactReviewCommentRefusal(error.errorCode as ArtifactErrorCode, { ...input, details, index, total: comments.length, commentPath: path, ...(replyTo === undefined ? {} : { replyTo }) }, style);
-    return failureOutcome({ ...opErrorFromClientError(error, result.status), message: text.message, nextAction: text.nextAction, serverCode: error.errorCode });
+    const base = opErrorFromClientError(error, result.status);
+    // No local words: the Server's sentence, which already names the comment, and its step.
+    if (text === null) return serverWorded({ ...base, serverCode: error.errorCode }, error.response, style);
+    return failureOutcome({ ...base, message: text.message, nextAction: text.nextAction, serverCode: error.errorCode });
   }
   return failureFrom(result, input, style);
 }
@@ -1175,7 +1235,7 @@ export async function artifactsMove(
   const style = options.hints ?? "cli";
   const invalid = validateOpRequest(artifactsMoveRequestSchema, request); if (invalid) return invalid;
   const ref = resolveArtifactRef(request.artifact, style); if (!ref.ok) return ref.failure;
-  if (request.to === "anyone-with-link") return clientRefusal("FORBIDDEN", { artifact: ref.value, moveTo: "public" }, style);
+  if (request.to === "anyone-with-link") return moveToPublicRefusal(ref.value, style);
   const result = await client.artifacts.move({ artifact: ref.value }, { to: request.to });
   if (!result.ok) return failureFrom(result, { artifact: ref.value, moveTo: request.to }, style);
   return { ok: true, state: "moved", data: result.data, next: null, text: formatArtifactMoved(result.data) };

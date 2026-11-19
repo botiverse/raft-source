@@ -17,6 +17,7 @@ import { artifactListCommand } from "./list";
 import { artifactReadCommand } from "./read";
 import { artifactPullCommand } from "./pull";
 import { buildRaftProgram } from "../../program";
+import { RAFT_HINTS } from "@botiverse/raft-shared/src/agentCliSurface";
 
 const agentContext: AgentContext = {
   agentId: "agent-1",
@@ -149,18 +150,21 @@ test("read: no artifact, an unrecognised link and a bad --rev fail before any re
 });
 
 test("read: the Server's NOT_VISIBLE and ARTIFACTS_NOT_ENABLED become their own codes with a next step", async () => {
-  const hidden = harness({ status: 404, errorCode: "NOT_VISIBLE", error: "not visible" });
+  // The Server words NOT_VISIBLE as well as a client could (#wg-ax:#13 P3): its sentence and step, its code.
+  const notVisible = "No artifact you can see has that id, link or title: it may not exist, may have been deleted, or may not be shared with you.";
+  const hidden = harness({ status: 404, errorCode: "NOT_VISIBLE", error: notVisible, errorBody: { error: notVisible, code: "NOT_VISIBLE", next: RAFT_HINTS.artifactList({}) } });
   const e = await rejects(artifactReadCommand.handler(hidden.ctx, "pt_zzz", {}));
   assert.equal(e.code, "NOT_VISIBLE");
-  assert.equal(e.message, `No artifact "pt_zzz" that you can see (by that id, link or exact title).`);
-  assert.equal(e.suggestedNextAction, "List the ones you can: raft artifact list");
+  assert.equal(e.message, notVisible);
+  assert.equal(e.suggestedNextAction, "raft artifact list");
 
-  // Several with that title: the candidates by id, and the next step by id.
-  const several = harness({ status: 409, errorCode: "AMBIGUOUS_ARTIFACT_NAME", error: "ambiguous", errorBody: { error: "ambiguous", code: "AMBIGUOUS_ARTIFACT_NAME", details: { ref: "Q3 report", candidates: [{ id: "pt_a", title: "Q3 report", home: { kind: "server" } }, { id: "pt_b", title: "Q3 Report", home: { kind: "server" } }] } } });
+  // Several with that title: the Server's sentence (the ids), and its step by the first id.
+  const sentence = "2 artifacts you can see are called that: pass the id of the one you mean instead (pt_a, pt_b).";
+  const several = harness({ status: 409, errorCode: "AMBIGUOUS_ARTIFACT_NAME", error: sentence, errorBody: { error: sentence, code: "AMBIGUOUS_ARTIFACT_NAME", next: RAFT_HINTS.artifactRead({ artifact: "pt_a" }), details: { ref: "Q3 report", candidates: [{ id: "pt_a", title: "Q3 report", home: { kind: "server" } }, { id: "pt_b", title: "Q3 Report", home: { kind: "server" } }] } } });
   const a = await rejects(artifactReadCommand.handler(several.ctx, "Q3 report", {}));
   assert.equal(a.code, "AMBIGUOUS_ARTIFACT_NAME");
-  assert.equal(a.message, `Several artifacts you can see are called "Q3 report": pt_a "Q3 report" (home: the whole server), pt_b "Q3 Report" (home: the whole server).`);
-  assert.equal(a.suggestedNextAction, "Pass the id instead, e.g. raft artifact read pt_a");
+  assert.equal(a.message, sentence);
+  assert.equal(a.suggestedNextAction, "raft artifact read pt_a");
 
   const off = harness({ status: 403, errorCode: "ARTIFACTS_NOT_ENABLED", error: "not enabled" });
   const f = await rejects(artifactReadCommand.handler(off.ctx, "pt_abc", {}));
@@ -204,11 +208,13 @@ test("download: one encoded path segment, bytes written as they are, receipt nam
     assert.deepEqual([...readFileSync(output)], [137, 80, 78, 71]);
     assert.equal(h.stdout.join(""), `Downloaded assets/logo.png (v3, 4 bytes) to ${output}\n`);
 
-    const missing = harness({ status: 404, errorCode: "FILE_NOT_FOUND", error: "no file" });
+    // The binary route's refusal reaches the operation whole: the Server's sentence and step.
+    const noFile = "Version 12 of this artifact has no file at that path: use a path exactly as its file list shows it.";
+    const missing = harness({ status: 404, errorCode: "FILE_NOT_FOUND", error: noFile, errorBody: { error: noFile, code: "FILE_NOT_FOUND", next: RAFT_HINTS.artifactRead({ artifact: "pt_abc", version: 12, files: true }), details: { path: "nope.png", version: 12 } } });
     const e = await rejects(artifactDownloadCommand.handler(missing.ctx, "pt_abc", "nope.png", { output }));
     assert.equal(e.code, "FILE_NOT_FOUND");
-    assert.equal(e.message, `"pt_abc" has no file "nope.png".`);
-    assert.equal(e.suggestedNextAction, "Its files: raft artifact read pt_abc --files");
+    assert.equal(e.message, noFile);
+    assert.equal(e.suggestedNextAction, "raft artifact read pt_abc --rev 12 --files");
 
     const noOutput = await rejects(artifactDownloadCommand.handler(h.ctx, "pt_abc", "a.html", {}));
     assert.equal(noOutput.code, "INVALID_ARG");
@@ -240,7 +246,7 @@ async function runArgv(argv: string[], reply: Reply): Promise<{ stdout: string; 
       },
       requestBinary: async (method: string, path: string): Promise<BinaryResponse> => {
         requests.push(`${method} ${path}`);
-        return { ok, status, body: ok ? (reply.bytes ?? new Uint8Array()) : new Uint8Array(), error: ok ? null : (reply.error ?? "error"), errorCode: ok ? null : (reply.errorCode ?? null) };
+        return { ok, status, body: ok ? (reply.bytes ?? new Uint8Array()) : new Uint8Array(), error: ok ? null : (reply.error ?? "error"), errorCode: ok ? null : (reply.errorCode ?? null), ...(ok || reply.errorBody === undefined ? {} : { errorBody: reply.errorBody }) };
       },
     }) as any,
   });
@@ -306,7 +312,8 @@ test("argv: download writes the file; the Server's FILE_NOT_FOUND on the binary 
     assert.deepEqual(run.requests, [`GET ${BASE}/artifacts/pt_abc/files/assets%2Flogo.png?version=3`]);
     assert.deepEqual([...readFileSync(output)], [1, 2]);
 
-    const missing = await runArgv(["artifact", "download", "pt_abc", "nope.png", "--output", output], { status: 404, errorCode: "FILE_NOT_FOUND" });
+    const noFile = "Version 12 of this artifact has no file at that path: use a path exactly as its file list shows it.";
+    const missing = await runArgv(["artifact", "download", "pt_abc", "nope.png", "--output", output], { status: 404, errorCode: "FILE_NOT_FOUND", error: noFile, errorBody: { error: noFile, code: "FILE_NOT_FOUND", next: RAFT_HINTS.artifactRead({ artifact: "pt_abc", files: true }) } });
     const text = `${missing.stderr}${missing.error instanceof Error ? missing.error.message : ""}${missing.error instanceof CliError ? ` ${missing.error.code} ${missing.error.suggestedNextAction}` : ""}`;
     assert.ok(text.includes("FILE_NOT_FOUND"), text);
     assert.ok(text.includes("raft artifact read pt_abc --files"), text);
@@ -356,12 +363,14 @@ test("argv: download --image saves a comment's image as it is and says its type 
     assert.ok(withRev.stderr.startsWith("Error: --rev picks a file's version; a comment's image has none. Leave it out.\n"), withRev.stderr);
     assert.deepEqual([...noOutput.requests, ...withRev.requests], []);
 
-    const missing = await runArgv(["artifact", "download", "pt_abc", "--image", "f-9", "--output", output], { status: 404, errorCode: "IMAGE_NOT_FOUND" });
+    // The Server's IMAGE_NOT_FOUND (commentImages.ts) through the binary route: its sentence, its step as a command.
+    const noImage = "No image on a comment of this artifact that you can see has that id: take the id from the comment's images in its comments.";
+    const missing = await runArgv(["artifact", "download", "pt_abc", "--image", "f-9", "--output", output], { status: 404, errorCode: "IMAGE_NOT_FOUND", error: noImage, errorBody: { error: noImage, code: "IMAGE_NOT_FOUND", next: RAFT_HINTS.artifactComments({ artifact: "pt_abc", all: true }), details: { fileId: "f-9" } } });
     assert.deepEqual(missing.requests, [`GET ${BASE}/artifacts/pt_abc/comment-images/f-9`]);
     assert.equal(missing.stderr, [
-      `Error: No image f-9 on a comment of "pt_abc" that you can see.`,
+      `Error: ${noImage}`,
       "Code: IMAGE_NOT_FOUND",
-      "Next action: Its id is on the comment's Images line: raft artifact comments pt_abc --all",
+      "Next action: raft artifact comments pt_abc --all",
       "",
     ].join("\n"));
   } finally {

@@ -2,8 +2,8 @@
 // docs/analytics/product-events.md "The new-user journey"): which step an owner
 // saw, what they did there and what held them, so the funnel can say where the
 // 30% who never connect a computer stop.
-import { SERVER_SETUP_BLOCK_REASONS } from "@botiverse/raft-shared";
-import type { SERVER_SETUP_ACTIONS, SERVER_SETUP_STEPS } from "@botiverse/raft-shared";
+import { SERVER_SETUP_GATE_BLOCK_REASONS } from "@botiverse/raft-shared";
+import type { SERVER_SETUP_ACTIONS, SERVER_SETUP_BLOCK_REASONS, SERVER_SETUP_STEPS } from "@botiverse/raft-shared";
 import type { CopyTarget } from "../components/machine/ComputerCommandGuide";
 import { readRaftHostOnboardingContext } from "../embed/hostBridge";
 import { isNativeOnboardingPath, readNativeOnboardingGeneration } from "../embed/nativeOnboarding";
@@ -47,7 +47,7 @@ export function trackServerSetupBlocked(
   step: ServerSetupStep | null,
   reason: string | null | undefined,
 ): void {
-  if (!serverId || !step || !reason || !(SERVER_SETUP_BLOCK_REASONS as readonly string[]).includes(reason)) return;
+  if (!serverId || !step || !reason || !(SERVER_SETUP_GATE_BLOCK_REASONS as readonly string[]).includes(reason)) return;
   if (!once(`blocked:${serverId}:${step}:${reason}`)) return;
   trackEvent("server_setup_blocked", { step, reason: reason as ServerSetupBlockReason, ...hostDetails() }, { serverId });
 }

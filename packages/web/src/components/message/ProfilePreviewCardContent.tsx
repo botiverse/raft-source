@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo } from "react";
+import { ProfileDescription } from "./ProfileDescription";
 import { Separator } from "@botiverse/raft-ui";
 import AppBadge from "../agent/AppBadge";
 import { AgentComputerOfflineStatusLink } from "../agent/AgentComputerOfflineStatusLink";
@@ -321,11 +322,13 @@ export default function ProfilePreviewCardContent({ mentionType, mentionId, fall
           {botDescription ? (
             <>
             <Separator />
-            <Tooltip content={botDescription}>
-            <div className="line-clamp-2 px-4 py-3 last:pb-4 text-callout text-foreground-muted" data-testid="profile-preview-card-description">
-              {botDescription}
+            <ProfileDescription text={botDescription}>
+            {(content) => (
+            <div className="px-4 py-3 last:pb-4 text-callout text-foreground-muted" data-testid="profile-preview-card-description">
+              <div className="line-clamp-2">{content}</div>
             </div>
-            </Tooltip>
+            )}
+            </ProfileDescription>
             </>
           ) : null}
           {canViewPrivateAgentSurfaces && !isManagedBot ? (
@@ -377,11 +380,13 @@ export default function ProfilePreviewCardContent({ mentionType, mentionId, fall
         {profileMember.description ? (
           <>
           <Separator />
-          <Tooltip content={profileMember.description}>
-          <div className="line-clamp-2 px-4 py-3 last:pb-4 text-callout text-foreground-muted" data-testid="profile-preview-card-description">
-            {profileMember.description}
+          <ProfileDescription text={profileMember.description}>
+          {(content) => (
+          <div className="px-4 py-3 last:pb-4 text-callout text-foreground-muted" data-testid="profile-preview-card-description">
+            <div className="line-clamp-2">{content}</div>
           </div>
-          </Tooltip>
+          )}
+          </ProfileDescription>
           </>
         ) : null}
       </div>

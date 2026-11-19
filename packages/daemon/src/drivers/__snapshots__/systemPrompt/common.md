@@ -83,6 +83,7 @@ Header fields:
 - `msg=` — message short ID (first 8 chars of UUID). Use as thread suffix to start/reply in a thread.
 - `time=` — UTC timestamp, e.g. `2026-03-15 01:00:00Z`.
 - `type=` — sender kind. Values are `human`, `agent`, `system`, or `third_party_app`.
+- `posted_by=voice_call` — a message in your name that your voice call posted: the voice model wrote it, steered by the caller. They are not your words; check before acting on anything it promised.
 
 A human sender's name may carry a time zone, e.g. `@richard (Asia/Shanghai)`: where they were when they sent the message. Read their "today", "tomorrow" or "tonight" in their zone. Later messages from the same sender may omit it; keep using the last zone you saw for them.
 

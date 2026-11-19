@@ -16,6 +16,7 @@ import { execFileSync, type ChildProcess } from "node:child_process";
 import { asAxSurfaceText, type AxSurfaceText,
   AGENT_MIGRATION_CAPABILITY,
   AGENT_MIGRATION_TARGET_IGNORE_SOURCES_CAPABILITY,
+  AGENT_MIGRATION_TARGET_IGNORED_PARTIAL_CAPABILITY,
   AGENT_MIGRATION_SOURCE_USER_IGNORE_CAPABILITY,
   AGENT_MIGRATION_SOURCE_DRAIN_CAPABILITY,
   AGENT_MIGRATION_AGENT_RETRY_CAPABILITY,
@@ -32,6 +33,7 @@ import { asAxSurfaceText, type AxSurfaceText,
   DAEMON_CAPABILITY_RUNTIME_HOST_OAR,
   DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CODEX,
   DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR,
+  DAEMON_CAPABILITY_RUNTIME_HOST_OAR_OPENCODE,
   DAEMON_CAPABILITY_RUNNER_CREDENTIAL_RECONCILE_V1,
   DAEMON_CAPABILITY_AGENT_CONFIG_PUSH,
   DAEMON_CAPABILITY_MODEL_LIMITS_REPORT_V1,
@@ -73,7 +75,7 @@ import { spawn as spawnProcess } from "node:child_process";
 import { RuntimeProcessLedger, RUNTIME_PROCESS_LEDGER_FILE } from "./drivers/runtimeProcessLedger";
 import { lookupCommandOnPath } from "./drivers/probe";
 import { OpenCodeDriver } from "./drivers/opencode";
-import { isRuntimeModelDetectionLookupReason } from "@botiverse/raft-shared";
+import { isRuntimeModelDetectionLookupReason, withComputerUpgradeInstallerReport } from "@botiverse/raft-shared";
 import { OUTBOX_NORMAL_CAP, RuntimeOutcomeOutbox, nodeOutboxFs, type OutboxFrame } from "./runtimeOutcomeOutbox";
 import { installDaemonFetchMockForTests } from "./daemonFetch";
 import type { AgentAppInboxStore } from "./agentAppInbox";
@@ -82,6 +84,7 @@ import {
   DAEMON_CORE_TRACE_ATTR_CONTRACTS,
   DaemonCore as RealDaemonCore,
   type ComputerControlContext,
+  type ComputerUpgradeStepTrace,
   type DaemonCoreOptions,
   selectWakeDeliveryIndex,
   detectRuntimes,
@@ -710,7 +713,7 @@ describe("DaemonCore limit reset", () => {
     const asked: unknown[] = [];
     const redeemer: RuntimeLimitResetRedeemer = async (provider, idempotencyKey, kind, observe) => {
       asked.push({ provider, idempotencyKey, kind });
-      observe?.({ oarOutcome: "not_attempted:busy" });
+      observe?.({ oarOutcome: "not_attempted:startup_failed", startupScreen: "prompt_with_text", claudeVersion: "2.1.323" });
       return { kind: "unsupported", reason: "not_attempted" };
     };
     await withCore({ serverCapabilities: [SERVER_CAPABILITY_RUNTIME_ACCOUNT_USAGE_LIMIT_RESETS_V1], redeemer, platform: "linux" }, async ({ socket, traceRows }) => {
@@ -724,8 +727,8 @@ describe("DaemonCore limit reset", () => {
       assert.deepEqual(results(socket)[0]?.result, { kind: "unsupported", reason: "not_attempted" });
       const trace = traceRows().find((row) => row.name === "daemon.runtime_account_usage.limit_reset");
       assert.deepEqual(
-        { provider: trace?.attrs?.provider, outcome: trace?.attrs?.outcome, reason: trace?.attrs?.reason, reset_kind: trace?.attrs?.reset_kind, oar_outcome: trace?.attrs?.oar_outcome },
-        { provider: "claude", outcome: "unsupported", reason: "not_attempted", reset_kind: "fable", oar_outcome: "not_attempted:busy" },
+        { provider: trace?.attrs?.provider, outcome: trace?.attrs?.outcome, reason: trace?.attrs?.reason, reset_kind: trace?.attrs?.reset_kind, oar_outcome: trace?.attrs?.oar_outcome, startup_screen: trace?.attrs?.startup_screen, claude_version: trace?.attrs?.claude_version },
+        { provider: "claude", outcome: "unsupported", reason: "not_attempted", reset_kind: "fable", oar_outcome: "not_attempted:startup_failed", startup_screen: "prompt_with_text", claude_version: "2.1.323" },
       );
 
       socket.emitServerMessage({ type: "machine:runtime_account_usage:limit_reset:redeem", requestId: "redeem-c3", provider: "claude", idempotencyKey: KEY, kind: "monthly" as RuntimeLimitResetKind });
@@ -4103,7 +4106,7 @@ test("detectRuntimes treats driver probe unavailable as authoritative", async ()
     assert.equal(detection.ids.includes("opencode"), false);
     assert.match(detection.versions.opencode ?? "", /requires >= 1\.14\.30/);
     const span = traceRows(sink, traceId).find((candidate) => candidate.name === "daemon.runtime.detect");
-    assert.equal(span?.attrs?.known_runtime_count, 15);
+    assert.equal(span?.attrs?.known_runtime_count, 14);
     assert.equal(span?.attrs?.detected_runtime_count, detection.ids.length);
     const opencodeEvent = eventsForSpan(sink, traceId, "daemon.runtime.detect")
       .find((event) => event.attrs?.runtime === "opencode");
@@ -4144,14 +4147,14 @@ test("detectRuntimes carries the structured not_installed reason for runtimes mi
   }
 });
 
-test("detectRuntimes reports an OAR-only runtime (Qwen Code, Qoder, CodeBuddy Code) only where the OAR host runs", async () => {
+test("detectRuntimes reports an OAR-only runtime (Qwen Code, Qoder) only where the OAR host runs", async () => {
   const tmp = await mkdtemp(path.join(os.tmpdir(), "slock-runtime-detect-oar-only-"));
   const binDir = path.join(tmp, "bin");
   const oldPath = process.env.PATH;
   const oldDisabled = process.env.RAFT_DAEMON_OAR_HOST_DISABLED;
   try {
     await mkdir(binDir, { recursive: true });
-    for (const binary of ["qwen", "qodercli", "codebuddy"]) {
+    for (const binary of ["qwen", "qodercli"]) {
       await writeFile(path.join(binDir, binary), "#!/bin/sh\necho '0.4.0'\n", "utf8");
       await chmod(path.join(binDir, binary), 0o755);
     }
@@ -4160,13 +4163,11 @@ test("detectRuntimes reports an OAR-only runtime (Qwen Code, Qoder, CodeBuddy Co
     const enabled = detectRuntimes();
     assert.equal(enabled.ids.includes("qwen"), true);
     assert.equal(enabled.ids.includes("qoder"), true);
-    assert.equal(enabled.ids.includes("codebuddy"), true, "found as `codebuddy` on PATH");
     assert.equal(enabled.versions.qwen, "0.4.0");
     process.env.RAFT_DAEMON_OAR_HOST_DISABLED = "1";
     const disabled = detectRuntimes();
     assert.equal(disabled.ids.includes("qwen"), false, "nothing could run it");
     assert.equal(disabled.ids.includes("qoder"), false);
-    assert.equal(disabled.ids.includes("codebuddy"), false);
   } finally {
     if (oldPath === undefined) delete process.env.PATH;
     else process.env.PATH = oldPath;
@@ -5197,6 +5198,7 @@ test("remote upgrade steps from the Computer's log go out as trace events after 
             fromVersion: "1.0.50", targetVersion: "1.0.51", durationMs: 40_000, errorCode: "candidate_start_failed", reason: "1.0.51 didn't start",
             diagnostic: "candidate did not become ready", startFailure: "exited", startExitCode: 1,
             installerVersion: "0.4.0", receiptOutcome: "rolled_back", engineDiagnostic: "probe failed: candidate was not started successfully",
+            installerPhasesMs: "{\"candidate_check\":41250,\"stop_product\":3100}", installerRequestCode: "release_resolution_failed",
             enginePhase: "rolled-back", engineOutcome: "rolled-back", engineReason: "probe failed",
             lastStartSlot: "previous", lastStartVersion: "1.0.50", lastStartSucceeded: false, lastStartFailure: "exited", lastStartExitCode: 2,
             afterReceipt: true,
@@ -5224,6 +5226,7 @@ test("remote upgrade steps from the Computer's log go out as trace events after 
       from_version: step.attrs.from_version, after_deadline: step.attrs.after_deadline, delivered_late_ms: step.attrs.delivered_late_ms, status: step.attrs.status,
       diagnostic: step.attrs.diagnostic, start_failure: step.attrs.start_failure, start_exit_code: step.attrs.start_exit_code,
       installer_version: step.attrs.installer_version, receipt_outcome: step.attrs.receipt_outcome, engine_diagnostic: step.attrs.engine_diagnostic,
+      installer_phases_ms: step.attrs.installer_phases_ms, installer_request_code: step.attrs.installer_request_code,
       engine_phase: step.attrs.engine_phase, engine_outcome: step.attrs.engine_outcome, engine_reason: step.attrs.engine_reason,
       last_start_slot: step.attrs.last_start_slot, last_start_version: step.attrs.last_start_version, last_start_succeeded: step.attrs.last_start_succeeded,
       last_start_failure: step.attrs.last_start_failure, last_start_exit_code: step.attrs.last_start_exit_code, after_receipt: step.attrs.after_receipt,
@@ -5232,6 +5235,7 @@ test("remote upgrade steps from the Computer's log go out as trace events after 
       from_version: "1.0.50", after_deadline: true, delivered_late_ms: 1_900_000, status: "error",
       diagnostic: "candidate did not become ready", start_failure: "exited", start_exit_code: 1,
       installer_version: "0.4.0", receipt_outcome: "rolled_back", engine_diagnostic: "probe failed: candidate was not started successfully",
+      installer_phases_ms: "{\"candidate_check\":41250,\"stop_product\":3100}", installer_request_code: "release_resolution_failed",
       engine_phase: "rolled-back", engine_outcome: "rolled-back", engine_reason: "probe failed",
       last_start_slot: "previous", last_start_version: "1.0.50", last_start_succeeded: false, last_start_failure: "exited", last_start_exit_code: 2,
       after_receipt: true,
@@ -5371,6 +5375,149 @@ test("a daemon that took over a stale machine lock says so once, without a pid o
   }
 });
 
+test("remote upgrade: computer:upgrade:done carries the installer receipt's outcome and codes as fixed fields on both paths", async () => {
+  // Normal path: the launching runner throws the installer's failure with its report attached.
+  // Late path: the successor's watch returns the receipt's codes.
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-upgrade-fields-test-"));
+  const sockets: FakeWebSocket[] = [];
+  let core: DaemonCore | null = null;
+  try {
+    const thrown = [
+      withComputerUpgradeInstallerReport(
+        new Error("UPGRADE_INSTALLER_FAILED: The requested Raft Computer release could not be resolved."),
+        { installerOutcome: "failed", installerCode: "release_resolution_failed" },
+      ),
+      // A report that is not valid is not sent; the text still is.
+      withComputerUpgradeInstallerReport(
+        new Error("UPGRADE_INSTALLER_FAILED: x"),
+        { installerOutcome: "promoted" as never, installerCode: "release_resolution_failed" },
+      ),
+      // Not an installer receipt: no fields.
+      new Error("CONTROL_BUSY: upgrade req-a is already in flight"),
+    ];
+    core = new DaemonCore({
+      serverUrl: "https://daemon.example.com",
+      apiKey: "sk_machine_test",
+      dataDir,
+      runtimeDetector: () => ({ ids: [], versions: {} }),
+      getComputerLastUpgradeReceipt: async () => null,
+      collectComputerUpgradeSteps: async () => ({ events: [], ack: async () => {} }),
+      watchComputerUpgradeOutcome: async () => ({
+        requestId: "req-late",
+        outcome: "failed",
+        reason: "Raft Computer could not be upgraded to 1.0.60.",
+        code: "install_failed",
+        // Malformed: dropped, never relayed as text.
+        diagnosticCode: "DOWNLOAD_FAILED: idle timeout",
+      }),
+      onComputerControl: async () => { throw thrown.shift() ?? new Error("unexpected"); },
+      connectionOptions: {
+        wsFactory: () => {
+          const socket = new FakeWebSocket();
+          sockets.push(socket);
+          return socket;
+        },
+      },
+    });
+    core.start();
+    const socket = sockets[0]!;
+    socket.emitOpen();
+    const doneFrames = () => socket.sent.filter((message) => (message as { type?: string }).type === "computer:upgrade:done") as Array<Record<string, unknown>>;
+    for (let i = 0; i < 20 && doneFrames().length === 0; i += 1) await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    assert.deepEqual(doneFrames()[0], {
+      type: "computer:upgrade:done",
+      requestId: "req-late",
+      ok: false,
+      code: "upgrade_installer_failed",
+      reason: "Raft Computer could not be upgraded to 1.0.60.",
+      installerOutcome: "failed",
+      installerCode: "install_failed",
+    });
+    for (const requestId of ["up-lookup", "up-invalid", "up-busy"]) {
+      socket.emitServerMessage({ type: "computer:upgrade", requestId, operationId: requestId });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    assert.deepEqual(doneFrames().slice(1), [
+      {
+        type: "computer:upgrade:done",
+        requestId: "up-lookup",
+        ok: false,
+        code: "upgrade_installer_failed",
+        reason: "UPGRADE_INSTALLER_FAILED: The requested Raft Computer release could not be resolved.",
+        installerOutcome: "failed",
+        installerCode: "release_resolution_failed",
+      },
+      { type: "computer:upgrade:done", requestId: "up-invalid", ok: false, code: "upgrade_installer_failed", reason: "UPGRADE_INSTALLER_FAILED: x" },
+      { type: "computer:upgrade:done", requestId: "up-busy", ok: false, code: "control_busy", reason: "CONTROL_BUSY: upgrade req-a is already in flight" },
+    ]);
+  } finally {
+    if (core) await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+// 9081e716 (Computer 1.25.3, 11-15): a successful upgrade's steps waited for
+// the next reconnect. A promotion seen by the watch flushes them at once:
+// one more collect, no upgrade:done (the new version's ready settles it), and
+// each step carries when it happened (`at_ms`) and the gap since the step
+// before, and `reported` (via late_receipt) is recorded. RED proof: ignore
+// `succeeded` in startComputerUpgradeOutcomeWatch and the second collect never
+// comes; drop `at_ms` or the `reported` record and their assertions fail.
+test("remote upgrade: a promotion after ready flushes the steps once more, each with its own time", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-upgrade-success-flush-test-"));
+  const sockets: FakeWebSocket[] = [];
+  const { sink, tracer } = makeDeterministicTracer();
+  const collected: boolean[] = [];
+  let core: DaemonCore | null = null;
+  try {
+    core = new DaemonCore({
+      serverUrl: "https://daemon.example.com",
+      apiKey: "sk_machine_test",
+      dataDir,
+      tracer,
+      runtimeDetector: () => ({ ids: [], versions: {} }),
+      getComputerLastUpgradeReceipt: async () => null,
+      collectComputerUpgradeSteps: async ({ relayedInReady }) => {
+        collected.push(relayedInReady);
+        // The ready's flush has the restart's steps; the promotion's has what the receipt adds.
+        const events: ComputerUpgradeStepTrace[] = collected.length === 1
+          ? [{ requestId: "req-ok", step: "installer_spawned", outcome: "ok", atMs: 1_700_000_000_000, deliveredLateMs: 180_000, afterDeadline: false, durationMs: 175_000, sinceStep: "drain", sinceStepMs: 175_000 }]
+          : [{ requestId: "req-ok", step: "new_version_started", outcome: "ok", atMs: 1_700_000_190_000, deliveredLateMs: 3_000, afterDeadline: false }];
+        return { events, ack: async () => {} };
+      },
+      watchComputerUpgradeOutcome: async () => ({ requestId: "req-ok", succeeded: true }),
+      connectionOptions: {
+        wsFactory: () => {
+          const socket = new FakeWebSocket();
+          sockets.push(socket);
+          return socket;
+        },
+      },
+    });
+    core.start();
+    const socket = sockets[0]!;
+    socket.emitOpen();
+    const steps = () => traceRows(sink).filter((row) => row.name === "daemon.computer_upgrade.step");
+    for (let i = 0; i < 40 && steps().length < 2; i += 1) await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(collected, [false, false], "the ready's flush, then exactly one for the promotion");
+    assert.equal(socket.sent.some((message) => (message as { type?: string }).type === "computer:upgrade:done"), false, "a promotion is not a failure to settle");
+    for (let i = 0; i < 40 && steps().length < 3; i += 1) await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    const fromLog = steps().filter((row) => row.attrs?.step !== "reported");
+    assert.deepEqual(fromLog.map((row) => [row.attrs?.step, row.attrs?.at_ms, row.attrs?.since_step, row.attrs?.since_step_ms]), [
+      ["installer_spawned", 1_700_000_000_000, "drain", 175_000],
+      ["new_version_started", 1_700_000_190_000, undefined, undefined],
+    ]);
+    // The flush removes the finished log, so the next ready has no `reported` to derive: this one is it.
+    const reported = steps().filter((row) => row.attrs?.step === "reported");
+    assert.equal(reported.length, 1);
+    assert.deepEqual([reported[0]!.attrs?.request_id, reported[0]!.attrs?.via, reported[0]!.attrs?.outcome, typeof reported[0]!.attrs?.at_ms], ["req-ok", "late_receipt", "ok", "number"]);
+  } finally {
+    if (core) await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("remote upgrade: a restored service whose receipt appears after ready settles the request with upgrade:done", async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-upgrade-late-receipt-test-"));
   const sockets: FakeWebSocket[] = [];
@@ -5409,6 +5556,8 @@ test("remote upgrade: a restored service whose receipt appears after ready settl
       ok: false,
       code: "upgrade_rolled_back",
       reason: "1.0.51 didn't start correctly",
+      // The receipt's own outcome as a fixed field (no code from this watch).
+      installerOutcome: "rolled_back",
     });
     assert.equal(watches, 1);
     const reported = traceRows(sink).find((row) => row.name === "daemon.computer_upgrade.step" && row.attrs?.step === "reported");
@@ -5453,7 +5602,7 @@ test("DaemonCore ready reports migration transport as not provisioned when no tr
       provisioned: false,
       endpoint: null,
       leaseSource: null,
-      capabilities: [AGENT_MIGRATION_CAPABILITY, AGENT_MIGRATION_TARGET_IGNORE_SOURCES_CAPABILITY, AGENT_MIGRATION_SOURCE_USER_IGNORE_CAPABILITY, AGENT_MIGRATION_SOURCE_DRAIN_CAPABILITY, AGENT_MIGRATION_AGENT_RETRY_CAPABILITY],
+      capabilities: [AGENT_MIGRATION_CAPABILITY, AGENT_MIGRATION_TARGET_IGNORE_SOURCES_CAPABILITY, AGENT_MIGRATION_TARGET_IGNORED_PARTIAL_CAPABILITY, AGENT_MIGRATION_SOURCE_USER_IGNORE_CAPABILITY, AGENT_MIGRATION_SOURCE_DRAIN_CAPABILITY, AGENT_MIGRATION_AGENT_RETRY_CAPABILITY],
       // No live transfer run in a fresh process: the server may re-provision.
       activeLeases: [],
       observedAt: ready.migrationTransport?.observedAt,
@@ -5675,7 +5824,7 @@ test("DaemonCore applies object-store migration transfer lease and re-emits prov
     const serverReady = readyMessages().find((msg) => msg.migrationTransport?.leaseSource === "server");
     assert.equal(serverReady?.migrationTransport?.provisioned, true);
     assert.equal(serverReady?.migrationTransport?.endpoint, null);
-    assert.deepEqual(serverReady?.migrationTransport?.capabilities, [AGENT_MIGRATION_CAPABILITY, AGENT_MIGRATION_TARGET_IGNORE_SOURCES_CAPABILITY, AGENT_MIGRATION_SOURCE_USER_IGNORE_CAPABILITY, AGENT_MIGRATION_SOURCE_DRAIN_CAPABILITY, AGENT_MIGRATION_AGENT_RETRY_CAPABILITY]);
+    assert.deepEqual(serverReady?.migrationTransport?.capabilities, [AGENT_MIGRATION_CAPABILITY, AGENT_MIGRATION_TARGET_IGNORE_SOURCES_CAPABILITY, AGENT_MIGRATION_TARGET_IGNORED_PARTIAL_CAPABILITY, AGENT_MIGRATION_SOURCE_USER_IGNORE_CAPABILITY, AGENT_MIGRATION_SOURCE_DRAIN_CAPABILITY, AGENT_MIGRATION_AGENT_RETRY_CAPABILITY]);
     assert.equal(serverReady?.migrationTransport?.provider, "object_store");
     assert.equal(serverReady?.migrationTransport?.role, "source");
     assert.equal(serverReady?.migrationTransport?.transferKind, "upload");
@@ -8344,6 +8493,129 @@ test("DaemonCore exposes tracked busy transition receipts and ACKs only after tu
   }
 });
 
+// Machine ca4239b1, 11-15: during a Computer upgrade drain a delivery to an
+// idle agent queued its restart behind the drain; the shutdown cancelled that
+// start, and the delivery was acked anyway. RED proof: resolve the cancelled
+// queued start as a start (cancelAllQueuedAgentStarts) and the first test
+// finds an `agent:deliver:ack`.
+async function withIdleAgentDelivery(
+  options: { drain: boolean; idle?: boolean },
+  fn: (ctx: { core: DaemonCore; socket: FakeWebSocket; driver: FakeDriver; deliver: () => void }) => Promise<void>,
+): Promise<void> {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-core-test-"));
+  const driver = new FakeDriver();
+  const sockets: FakeWebSocket[] = [];
+  const core = new DaemonCore({
+    serverUrl: "https://daemon.example.com",
+    apiKey: "sk_machine_test",
+    dataDir,
+    connectionOptions: {
+      wsFactory: (_url: string, _options?: Parameters<NonNullable<ConnectionOptions["wsFactory"]>>[1]) => {
+        const socket = new FakeWebSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    },
+    agentManagerFactory: (sendToServer, daemonApiKey, options) =>
+      new AgentProcessManager(sendToServer, daemonApiKey, {
+        dataDir: options?.dataDir,
+        serverUrl: options?.serverUrl ?? "https://daemon.example.com",
+        driverResolver: () => driver,
+        defaultAgentEnvVarsProvider: options?.defaultAgentEnvVarsProvider,
+        runtimeStartScheduler: { minStartIntervalMs: 0 },
+      }),
+  });
+  try {
+    core.start();
+    const socket = sockets[0];
+    assert.ok(socket, "wsFactory should create a websocket");
+    socket.emitOpen();
+    const manager = (core as any).agentManager as AgentProcessManager;
+    if (options.idle !== false) {
+      (manager as any).lifecycleRecords.setRestartSnapshot("agent-1", {
+        config: makeConfig({ sessionId: "session-1" }),
+        sessionId: "session-1",
+        launchId: "launch-1",
+      });
+    }
+    if (options.drain) await manager.beginDrain({ deadlineMs: 60_000 });
+    const deliver = () => socket.emitServerMessage({
+      type: "agent:deliver",
+      agentId: "agent-1",
+      seq: 51,
+      deliveryId: "delivery-51",
+      message: {
+        channel_id: "channel-1",
+        channel_name: "general",
+        channel_type: "channel",
+        sender_id: "app-reminder",
+        sender_name: "Reminder",
+        sender_type: "human",
+        content: "reminder for an idle agent",
+        timestamp: new Date(0).toISOString(),
+        seq: 51,
+        message_id: "msg-51",
+      },
+    });
+    await fn({ core, socket, driver, deliver });
+  } finally {
+    await core.stop();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+}
+
+test("DaemonCore does not acknowledge a delivery whose idle restart the drain held and the shutdown cancelled", async () => {
+  await withIdleAgentDelivery({ drain: true }, async ({ core, socket, driver, deliver }) => {
+    deliver();
+    await flush();
+    assert.equal(driver.spawnCalls.length, 0, "the restart waits behind the drain");
+
+    await core.stop();
+    await flush();
+    assert.equal(driver.spawnCalls.length, 0);
+    const deliveryFrames = socket.sent.filter((msg: any) => typeof msg.type === "string" && msg.type.startsWith("agent:deliver"));
+    // Nor `agent:delivery:rejected`, which would ask the server for a wake start.
+    assert.deepEqual(deliveryFrames, [], "neither an ack nor a rejection: the server still owns the delivery");
+  });
+});
+
+// The same loss through the server's start: a delivery that arrives while the
+// core prepares a start without a wake becomes that start's wake, and the core
+// acks it once the start resolves. RED proof: ack regardless of the start's
+// outcome (core.ts, `startOutcome !== "cancelled"`) and an ack goes out.
+test("DaemonCore does not acknowledge a delivery it made the wake of a server start the drain held and the shutdown cancelled", async () => {
+  await withIdleAgentDelivery({ drain: true, idle: false }, async ({ core, socket, driver, deliver }) => {
+    socket.emitServerMessage({ type: "agent:start", agentId: "agent-1", config: makeConfig({ sessionId: "session-1" }), launchId: "launch-1" });
+    deliver();
+    await flush();
+    await flush();
+    assert.equal(driver.spawnCalls.length, 0, "the start waits behind the drain");
+
+    await core.stop();
+    await flush();
+    assert.equal(driver.spawnCalls.length, 0);
+    assert.deepEqual(socket.sent.filter((msg: any) => msg.type === "agent:deliver:ack"), []);
+  });
+});
+
+test("DaemonCore acknowledges the delivery it made the wake of a server start once that start runs (control)", async () => {
+  await withIdleAgentDelivery({ drain: false, idle: false }, async ({ socket, driver, deliver }) => {
+    socket.emitServerMessage({ type: "agent:start", agentId: "agent-1", config: makeConfig({ sessionId: "session-1" }), launchId: "launch-1" });
+    deliver();
+    await waitFor(() => socket.sent.some((msg: any) => msg.type === "agent:deliver:ack" && msg.deliveryId === "delivery-51"), "ack after the start");
+    assert.equal(driver.spawnCalls.length, 1);
+    assert.match(driver.spawnCalls[0]!.prompt ?? "", /reminder for an idle agent/, "the delivery was the start's wake");
+  });
+});
+
+test("DaemonCore acknowledges a delivery that restarts an idle agent (control)", async () => {
+  await withIdleAgentDelivery({ drain: false }, async ({ socket, driver, deliver }) => {
+    deliver();
+    await waitFor(() => socket.sent.some((msg: any) => msg.type === "agent:deliver:ack" && msg.deliveryId === "delivery-51"), "ack after the restart");
+    assert.equal(driver.spawnCalls.length, 1);
+  });
+});
+
 test("DaemonCore does not acknowledge delivery when no process or idle cache can accept it", async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-core-test-"));
   const driver = new FakeDriver();
@@ -10507,8 +10779,8 @@ test("task #17: runtime auth status is reported only to a server that advertises
     await flush();
     assert.deepEqual(host.calls, [], "a server that does not read it gets no report and no status query runs");
     const ready = socket.sent.find((message): message is Extract<MachineToServerMessage, { type: "ready" }> => (message as { type?: string }).type === "ready");
-    assert.deepEqual(runtimeAuthRuntimesOfComputer(ready?.capabilities ?? []), ["claude", "codex", "kimi", "qoder", "qwen", "antigravity", "pi", "grok", "opencode", "codebuddy"], "the server may send Kimi, Qoder, Antigravity, Pi, Grok, OpenCode and CodeBuddy sign-ins and Qwen provider connects here");
-    assert.deepEqual(runtimeAuthLogoutRuntimesOfComputer(ready?.capabilities ?? []), ["claude", "codex", "kimi", "antigravity", "pi", "grok", "opencode", "codebuddy"], "and Antigravity (OAR 0.98), Pi, Grok (OAR 0.99), OpenCode (OAR 0.100) and CodeBuddy sign-outs");
+    assert.deepEqual(runtimeAuthRuntimesOfComputer(ready?.capabilities ?? []), ["claude", "codex", "kimi", "qoder", "qwen", "antigravity", "pi", "grok", "opencode"], "the server may send Kimi, Qoder, Antigravity, Pi, Grok and OpenCode sign-ins and Qwen provider connects here");
+    assert.deepEqual(runtimeAuthLogoutRuntimesOfComputer(ready?.capabilities ?? []), ["claude", "codex", "kimi", "antigravity", "pi", "grok", "opencode"], "and Antigravity (OAR 0.98), Pi, Grok (OAR 0.99) and OpenCode (OAR 0.100) sign-outs");
 
     socket.emitServerMessage({ type: "machine:context", machineId: "machine-test", serverId: "server-test", capabilities: [SERVER_CAPABILITY_RUNTIME_AUTH_V1] } as ServerToMachineMessage);
     await waitFor(() => host.calls.length > 0, "a report once the server says it reads one");
@@ -10666,6 +10938,8 @@ test("RFC 060: ready offers runtime-host:oar unless the daemon's OAR host is off
       // #oar-raft:#10: with the OAR host, where this daemon can run the Cursor SDK's child (a daemon
       // dependency; the platform, SEA, Node and resolve rules: oarCursorLaunch.test.ts).
       assert.equal(ready.capabilities?.includes(DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR), expected && cursorSdkAvailable());
+      // OpenCode on the OAR host: with the OAR host, off Windows (where it runs only Codex).
+      assert.equal(ready.capabilities?.includes(DAEMON_CAPABILITY_RUNTIME_HOST_OAR_OPENCODE), expected && process.platform !== "win32");
     } finally {
       await core.stop();
       await rm(dataDir, { recursive: true, force: true });

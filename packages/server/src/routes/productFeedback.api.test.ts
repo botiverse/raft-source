@@ -1051,6 +1051,10 @@ test("the list answers a transient Hands failure with a degraded page only for a
           .flatMap((span) => span.events)
           .filter((event) => event.name === "server.product_feedback.list_degraded")
           .map((event) => event.attrs);
+        const failedEvents = () => sink.getAllSpans()
+          .flatMap((span) => span.events)
+          .filter((event) => event.name === "server.product_feedback.list_failed")
+          .map((event) => event.attrs);
         const user = await seedUser("-degraded");
         const token = await accessTokenForTest(user.id);
         const list = (query: string) => fetch(`${app.baseUrl}/api/product-feedback/tickets${query}`, {
@@ -1077,6 +1081,10 @@ test("the list answers a transient Hands failure with a degraded page only for a
           { step: "binding", reason: "hands_status_503" },
           { step: "read", reason: "upstream_response" },
         ], "each degraded answer is counted by step and reason, and only those");
+        assert.deepEqual(failedEvents(), [
+          { code: "feedback_service_unavailable", step: "read", reason: "upstream_response", upstream_status: 500 },
+          { code: "feedback_integration_unavailable", step: "read", reason: "upstream_response", upstream_status: 401 },
+        ], "each 503 says which code it was, what failed and Hands' status; a degraded 200 adds none");
       } finally {
         await app.close();
       }

@@ -18,6 +18,7 @@ import "./buildIdentity";
 import { trackVisualViewport } from "./utils/visualViewport";
 import { installViewSwitchTracking } from "./observability/viewSwitchSpan";
 import { captureLandingPage } from "./analytics/publicVisits";
+import { rememberSignupCampaign } from "./analytics/signupCampaign";
 import { captureMessageLinkLanding } from "./utils/messageLinkLanding";
 import { applyBootServerTheme } from "./theme/serverTheme";
 import { isBootTimingReported, markBootMilestone, startBootTiming } from "./boot/bootTiming";
@@ -25,7 +26,8 @@ import { armFirstScreenGate, openFirstScreenGate } from "./boot/deferredUi";
 import { fetchDeferredUiAfterFirstScreen } from "./boot/deferredUiStart";
 import { openServerFromDevice } from "./boot/openServerFromDevice";
 import { preloadComputersRackForRoute } from "./features/computer/computersRackChunk";
-import { preloadLandingPageForLocation } from "./pages/landingPages";
+import { preloadLandingPageForLocation, preloadSignInPageEarly } from "./pages/landingPages";
+import { onStoredSessionRejected } from "./utils/authSessionPolicy";
 import { preloadThreadPanelForLocation } from "./features/thread/threadPanelChunk";
 import { openArtifactFromDevice, shortenArtifactAddress, startArtifactPermalink } from "./boot/openArtifactFromDevice";
 import { flushLocalTables, hydrateLocalTables } from "./store/localTables/persistence";
@@ -83,6 +85,8 @@ installExternalTranslationGuard();
 shortenArtifactAddress(window.location, window.history);
 // Before the first render moves the URL: where a Public Server visit came from.
 captureLandingPage();
+// The same URL's campaign values, kept for the sign-up request (account_created).
+rememberSignupCampaign();
 captureMessageLinkLanding();
 // The server this page opens shows its own theme from the first frame.
 applyBootServerTheme(window.location.pathname);
@@ -101,6 +105,16 @@ void openServerFromDevice(window.location, localTablesHydrated);
 preloadComputersRackForRoute(window.location.pathname);
 // A link to a landing page (sign-in setup, an invite, a reset email...) starts that page's code now too.
 preloadLandingPageForLocation(window.location);
+// No stored session, or `/auth/me` turns it down: the sign-in page's code too
+// (not on a Public Server page, whose Sign in starts it; a signed-in boot never downloads it).
+// Not waited for: it races the locale and styles the first render waits for;
+// still on its way then, the page draws its frame until it lands (SignInPageFrame.tsx).
+preloadSignInPageEarly(window.location, !!useAuthStore.getState().accessToken);
+// Only the boot's restore: a later /auth/me 401 (a recovery check) is usually refreshed away.
+onStoredSessionRejected(() => {
+  onStoredSessionRejected(() => {});
+  if (!useAuthStore.getState().user) preloadSignInPageEarly(window.location, false);
+});
 // So does an address with a thread open: the thread panel is deferred (features/thread/threadPanelChunk.ts).
 preloadThreadPanelForLocation(window.location);
 // An expired access token held every early request until refresh, /auth/me

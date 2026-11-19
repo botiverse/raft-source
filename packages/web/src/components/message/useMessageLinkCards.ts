@@ -9,6 +9,7 @@ import { useAuthStore } from "../../store/authStore";
 import { useServerStore } from "../../store/serverStore";
 import { useAppLinkPreviews } from "./useAppLinkPreviews";
 import type { AppLinkResult } from "./useAppLinkPreviews";
+import type { MessageCardActing, MessageCardActionsRead } from "./messageCardActions";
 
 /** A first-party object's link (an Artifact): its object reference's answer from core's summaries. */
 export type ObjectLinkCard = { kind: "object"; url: string } & ArtifactLink;
@@ -60,6 +61,8 @@ export interface MessageLinkCards {
    */
   objects: readonly ObjectLinkCard[];
   blocks: MessageAppLinkBlocks;
+  /** A card message's acting buttons as this viewer may use them (RFC 086), from the same read; null: the message has none. */
+  messageCard: MessageCardActionsRead | null;
 }
 
 const NO_LINKS: readonly { href: string; bare: boolean }[] = [];
@@ -173,13 +176,18 @@ function useSeenOnScreen(target: RefObject<Element | null>, key: string, watchin
  * from the same answer. A message reads MESSAGE_OBJECT_LINK_LIMIT first-party
  * references at most; links to more stay plain. Unavailable or failed, a first-party link stays the
  * author's link; a failed read is asked again by the loader, not here.
+ *
+ * A card message with acting buttons (RFC 086; `card`, from readMessageCard)
+ * is read with the App link read too, links or not: the same request, view
+ * and observer, and its answer comes back as `messageCard`.
  */
-export function useMessageLinkCards({ messageId, content, conversationId, enabled, target }: {
+export function useMessageLinkCards({ messageId, content, conversationId, enabled, target, card = null }: {
   messageId: string;
   content: string;
   conversationId: string;
   enabled: boolean;
   target: RefObject<Element | null>;
+  card?: MessageCardActing | null;
 }): MessageLinkCards {
   const viewer = useAuthStore((s) => s.user?.id);
   const server = useServerStore((s) => s.current?.id);
@@ -198,8 +206,9 @@ export function useMessageLinkCards({ messageId, content, conversationId, enable
 
   // One observer for both: the App link read's own scope (viewer, Server,
   // message and content).
-  const seen = useSeenOnScreen(target, `${viewer}:${server}:${messageId}:${content}`, hasLinks);
-  const appResults = useAppLinkPreviews({ messageId, content, conversationId, enabled: enabled && appLinks, target, seen });
+  const acting = enabled ? card : null;
+  const seen = useSeenOnScreen(target, `${viewer}:${server}:${messageId}:${content}`, hasLinks || !!acting);
+  const { results: appResults, card: messageCard } = useAppLinkPreviews({ messageId, content, conversationId, enabled: enabled && (appLinks || !!acting), target, seen, card: acting });
 
   // The references read: each once, in message order, MESSAGE_OBJECT_LINK_LIMIT at most.
   const asked = useMemo(() => {
@@ -253,6 +262,6 @@ export function useMessageLinkCards({ messageId, content, conversationId, enable
       }
       blocks = chosen;
     }
-    return { links, objects, blocks };
-  }, [appResults, objectTargets, asked, summaries, content]);
+    return { links, objects, blocks, messageCard };
+  }, [appResults, objectTargets, asked, summaries, content, messageCard]);
 }

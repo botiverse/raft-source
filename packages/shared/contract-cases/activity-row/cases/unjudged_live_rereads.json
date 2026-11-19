@@ -1,0 +1,40 @@
+{
+  "formatVersion": 1,
+  "id": "unjudged_live_rereads",
+  "rule": "position",
+  "title": "A live message the predicate cannot judge re-reads the row",
+  "why": "A system message without its provenance cannot be judged on the client (the predicate's counts = null).",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/shared/src/activityRowPosition.ts (reduceActivityRow; not wired yet, step 2)"
+    ],
+    "server": [
+      "packages/server/src/services/channelService.ts (latestActivitySeqSameSource; the row's latestActivitySeq)",
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (unread_count and latest_seq from one materialized row)"
+    ]
+  },
+  "given": {
+    "row": {
+      "unreadCount": 0,
+      "hasMention": false,
+      "position": "99",
+      "mentionOnly": false
+    }
+  },
+  "steps": [
+    {
+      "act": "liveMessage",
+      "seq": "100",
+      "counts": null,
+      "mentionsViewer": false
+    }
+  ],
+  "expect": {
+    "row": {
+      "unreadCount": 0,
+      "position": "99"
+    },
+    "reread": true
+  }
+}

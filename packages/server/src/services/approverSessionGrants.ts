@@ -10,7 +10,9 @@
 // SECURITY revoke of the session also revokes what it approved: a password
 // change or reset, an account deletion request and the account's retirement
 // (every family of the person),
-// and a device login's "this wasn't me" link (that one family). A plain
+// a device login's "this wasn't me" link (that one family), and the person
+// revoking their own sign-ins as lost devices from their sign-in list (that
+// one family, or every other one: services/mySessions.ts). A plain
 // logout, an expired session and the push capability revoke never do, so
 // signing out of a browser never knocks a machine offline. (Unlike
 // deviceSessionKeys.ts, where the keys a device session holds go with it for
@@ -49,7 +51,7 @@ import { revokeComputerKeyInTransaction, type ApproverSessionRevokeTrigger } fro
 import { closeDeviceSessionKeys, type DeviceSessionKeyReach } from "./deviceSessionKeys";
 import { newAuditOperationId, recordIntegrationAuditEvent } from "./integrationAuditService";
 import type { SecurityRevokeTally } from "./securityRevokeNotice";
-import { PASSWORD_CHANGED_REVOKED_REASON } from "./sessionService";
+import { PASSWORD_CHANGED_REVOKED_REASON, USER_REVOKED_OTHERS_REVOKED_REASON, USER_REVOKED_REASON } from "./sessionService";
 
 export type { ApproverSessionRevokeTrigger };
 
@@ -76,22 +78,28 @@ const laterRevokeAll = alias(sessionFamilies, "later_revoke_all");
 /**
  * A family whose revoke was a security revoke, read from state (what the
  * triggers write): a device login's revoke link (`device_login_revoked`), the
- * account's retirement (`users.retired_at`), or a password change or reset at
- * or after the family's revoke (it revokes every live family `revoke_all`, the
- * changing session's `password_changed`, all with one timestamp; a family
- * signed out before it counts too, see above). The changing session's own
- * family is exempt from its own change (same timestamp) and taken only by a
- * strictly later one.
+ * person revoking that one sign-in as a lost device from their sign-in list
+ * (`user_revoked`, services/mySessions.ts), the account's retirement
+ * (`users.retired_at`), or a password change or reset at or after the
+ * family's revoke (it revokes every live family `revoke_all`, the changing
+ * session's `password_changed`, all with one timestamp; a family signed out
+ * before it counts too, see above). The changing session's own family is
+ * exempt from its own change (same timestamp) and taken only by a strictly
+ * later one. Revoking every other sign-in as lost devices
+ * (`user_revoked_others`) reaches like a password change: every family of
+ * the person revoked at or before it; the sign-in that asked is not revoked
+ * by it, so only a later revoke of its own (strictly later) could be, and
+ * that is never at or before.
  */
 function securityRevokedFamily(): SQL {
   return or(
-    eq(sessionFamilies.revokedReason, "device_login_revoked"),
+    inArray(sessionFamilies.revokedReason, ["device_login_revoked", USER_REVOKED_REASON]),
     exists(getDb().select({ id: users.id }).from(users)
       .where(and(eq(users.id, sessionFamilies.userId), isNotNull(users.retiredAt)))),
     exists(getDb().select({ id: laterRevokeAll.id }).from(laterRevokeAll)
       .where(and(
         eq(laterRevokeAll.userId, sessionFamilies.userId),
-        inArray(laterRevokeAll.revokedReason, ["revoke_all", PASSWORD_CHANGED_REVOKED_REASON]),
+        inArray(laterRevokeAll.revokedReason, ["revoke_all", PASSWORD_CHANGED_REVOKED_REASON, USER_REVOKED_OTHERS_REVOKED_REASON]),
         or(
           and(gte(laterRevokeAll.revokedAt, sessionFamilies.revokedAt), sql`${sessionFamilies.revokedReason} is distinct from ${PASSWORD_CHANGED_REVOKED_REASON}`),
           gt(laterRevokeAll.revokedAt, sessionFamilies.revokedAt),

@@ -56,10 +56,21 @@ export async function openSelectModeMoreMenu(page: Page) {
   return menu;
 }
 
+/**
+ * Clicks one of the select-mode toolbar's actions (raft-ui SelectionToolbar):
+ * in the row while it fits there, else from More, where it is a menu item
+ * named as the action.
+ */
 export async function clickSelectModeMoreAction(page: Page, testId: string) {
-  await openSelectModeMoreMenu(page);
   const action = page.getByTestId(testId);
-  await expect(action).toBeVisible();
   await expect(action).toBeEnabled();
-  await action.click();
+  if (await action.isVisible()) {
+    await action.click();
+    return;
+  }
+  const name = ((await action.textContent()) ?? "").trim();
+  const menu = await openSelectModeMoreMenu(page);
+  const item = menu.getByRole("menuitem", { name, exact: true });
+  await expect(item).toBeEnabled();
+  await item.click();
 }

@@ -1,4 +1,20 @@
+import { currentTimeMs } from "@botiverse/raft-shared";
 import type { MachineFacts, RunnerMachineFacts } from "./machineFacts";
+
+/**
+ * How long a spawned runner that never connected must have stayed alive
+ * before it counts as `runner-disconnected` rather than `runner-absent`.
+ * The runner attests its version as soon as it holds the machine lock, before
+ * connecting, so a runner that crashes on the handshake (or any time after
+ * the lock) looks attested and alive for a moment, and the service respawns
+ * it after 2 s (service.ts CHILD_RESTART_BACKOFF_MS): a crash loop always
+ * has a fresh spawn alive. 10 s is five backoffs: a runner crashing within
+ * seconds of its spawn never gets that old, while one that is only kept off
+ * an unreachable server keeps reconnecting and passes it well inside the
+ * start wait (15 s default, 30 s under the installer), whose partial-ready
+ * decision is read at the end of the wait.
+ */
+export const SPAWNED_RUNNER_MIN_ALIVE_MS = 10_000;
 
 export type MachineReadinessReasonCode =
   | "runner-not-managed"
@@ -38,9 +54,13 @@ export interface MachineReadinessRequirement {
   readonly expectedVersion: string;
   /**
    * The live service whose lock-conflict records count. Unset: none do (a
-   * record is only current for the service that wrote it).
+   * record is only current for the service that wrote it). Also the service
+   * whose spawn records count; unset, any service's does (its pid is still
+   * bound to the runner's own version evidence, see spawnedRunnerReadiness).
    */
   readonly servicePid?: number;
+  /** When the verdict is read (epoch ms), for the spawned runner's age. Default: now. */
+  readonly nowMs?: number;
 }
 
 export interface MachineReadinessVerdict {
@@ -75,11 +95,51 @@ export interface StartReadinessReport {
 
 type RunnerReadiness = MachineReadinessReason | { readonly pid: number };
 
+/**
+ * A runner with no live `runner.pid` (the service writes it only once the
+ * runner has connected) that the service spawned and that is still alive.
+ * It counts as a runner only when the runner's own version evidence names the
+ * spawned pid: the runner writes that evidence once it holds the machine lock,
+ * right after it starts connecting and before any connection exists, so a
+ * child that lost the lock, has not got that far, or a pid reused by another
+ * program stays `runner-absent`, and so does one younger than
+ * SPAWNED_RUNNER_MIN_ALIVE_MS (a crash loop's latest spawn). Never ready: readiness from a spawn record
+ * stops at `runner-disconnected`, and the service's own `runner.pid` is what
+ * says connected.
+ */
+function spawnedRunnerReadiness(
+  runner: RunnerMachineFacts | undefined,
+  serverId: string,
+  expectedVersion: string,
+  servicePid: number | undefined,
+  nowMs: number,
+): MachineReadinessReason | null {
+  const spawned = runner?.spawned;
+  if (!spawned || !spawned.alive) return null;
+  if (nowMs - spawned.spawnedAt < SPAWNED_RUNNER_MIN_ALIVE_MS) return null;
+  if (servicePid !== undefined && spawned.servicePid !== servicePid) return null;
+  const evidence = runner.versionEvidence;
+  if (!evidence || evidence.pid !== spawned.pid || evidence.version === null || evidence.installRoot.length === 0) {
+    return null;
+  }
+  if (evidence.version !== expectedVersion) {
+    return {
+      code: "runner-version-mismatch",
+      serverId,
+      pid: spawned.pid,
+      expectedVersion,
+      actualVersion: evidence.version,
+    };
+  }
+  return { code: "runner-disconnected", serverId, pid: spawned.pid };
+}
+
 function runnerReadiness(
   runner: RunnerMachineFacts | undefined,
   serverId: string,
   expectedVersion: string,
   servicePid: number | undefined,
+  nowMs: number,
 ): RunnerReadiness {
   const conflict =
     servicePid !== undefined && runner?.lockConflict?.servicePid === servicePid ? runner.lockConflict : null;
@@ -91,7 +151,8 @@ function runnerReadiness(
   });
   if (!runner || runner.pid === null || !runner.alive) {
     // Parked: the service could not name a live lock owner and does not retry.
-    return conflict && conflict.ownerPid === null ? lockConflict() : { code: "runner-absent", serverId };
+    if (conflict && conflict.ownerPid === null) return lockConflict();
+    return spawnedRunnerReadiness(runner, serverId, expectedVersion, servicePid, nowMs) ?? { code: "runner-absent", serverId };
   }
   const evidence = runner.versionEvidence;
   if (
@@ -130,13 +191,14 @@ export function machineReadiness(
   const targetServerIds = [...new Set(requirement.targetServerIds)].sort();
   const runnerPids = new Map<string, number>();
   const reasons: MachineReadinessReason[] = [];
+  const nowMs = requirement.nowMs ?? currentTimeMs();
 
   for (const serverId of targetServerIds) {
     if (!managed.has(serverId)) {
       reasons.push({ code: "runner-not-managed", serverId });
       continue;
     }
-    const readiness = runnerReadiness(runners.get(serverId), serverId, requirement.expectedVersion, requirement.servicePid);
+    const readiness = runnerReadiness(runners.get(serverId), serverId, requirement.expectedVersion, requirement.servicePid, nowMs);
     if ("code" in readiness) {
       reasons.push(readiness);
       continue;

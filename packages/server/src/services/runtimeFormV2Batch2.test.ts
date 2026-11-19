@@ -10,8 +10,7 @@
  * Antigravity (revived on the OAR host) is here too, as it was a batch-2 form:
  * it now has the live-list model form with a reasoning effort (the OAR
  * `listModels` of the Computer's `agy`), and a stored model or effort is kept
- * on edit. CodeBuddy Code (OAR-only) has the same form shape, so it is pinned
- * beside it.
+ * on edit.
  */
 import assert from "node:assert/strict";
 import { parseRuntimeFormV2 } from "@botiverse/raft-runtime-form";
@@ -252,47 +251,6 @@ test("antigravity: a submit checks the effort against the live model", () => {
   });
   // The configured default is not in the live list: unchanged.
   assert.deepEqual(entry.reconcileWithLiveModels!(submitted("antigravity", { model: "default" }) as unknown as RuntimeConfig, null, models), { kind: "unchanged" });
-});
-
-// CodeBuddy lists the thought levels of its current model only (OAR's projection
-// of its ACP `session/new`): the others carry none.
-const CODEBUDDY_LIVE: RuntimeModelSourceOutcome = {
-  kind: "live",
-  value: {
-    models: [
-      { id: "cb-default", label: "CB Default", supportedReasoningEfforts: ["low", "medium", "high"], defaultReasoningEffort: "medium", verified: "launchable" },
-      { id: "cb-other", label: "CB Other", verified: "launchable" },
-    ],
-  },
-};
-
-test("codebuddy: the Computer's CodeBuddy models, a typed id allowed, efforts only where CodeBuddy lists them", async () => {
-  const entry = runtimeFormV2Entry("codebuddy")!;
-  assert.equal(buildRuntimeFormV2("codebuddy").schemaVersion, "codebuddy.create.v1");
-  const live = optionSourceContext(async () => CODEBUDDY_LIVE);
-  const resolution = await entry.resolveOptionSource({ ...live.context, sourceStatus: true } as RuntimeFormOptionSourceContext);
-  assert.deepEqual(live.calls, ["codebuddy"]);
-  const source = (resolution as unknown as { source: Record<string, unknown> }).source;
-  assert.equal(source.status, "live");
-  assert.equal(source.customValueAllowed, true);
-  assert.deepEqual(source.options, [
-    { value: "cb-default", label: "CB Default", supportedReasoningEfforts: ["low", "medium", "high"], defaultReasoningEffort: "medium" },
-    // No levels listed: no effort, never the base set (CodeBuddy could not apply it).
-    { value: "cb-other", label: "CB Other", supportedReasoningEfforts: [] },
-  ]);
-
-  const models = (CODEBUDDY_LIVE as { value: { models: RuntimeModelInfo[] } }).value.models;
-  const picked = submitted("codebuddy", { model: "cb-default", reasoningEffort: "high" }) as unknown as RuntimeConfig;
-  assert.ok(parseRuntimeConfig({ runtimeConfig: picked }).ok, "the shared parser takes a CodeBuddy effort");
-  assert.deepEqual(entry.reconcileWithLiveModels!(picked, "high", models), {
-    kind: "updated",
-    runtimeConfig: { ...picked, model: { kind: "preset", id: "cb-default" }, reasoningEffort: "high" },
-  });
-  const other = submitted("codebuddy", { model: "cb-other", reasoningEffort: "high" }) as unknown as RuntimeConfig;
-  assert.deepEqual(entry.reconcileWithLiveModels!(other, "high", models), {
-    kind: "rejected",
-    issue: { code: "reasoning_effort_not_supported", pointer: "/formValues/reasoningEffort" },
-  });
 });
 
 test("post-assembly issues point back at the field", () => {

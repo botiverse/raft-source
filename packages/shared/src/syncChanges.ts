@@ -30,9 +30,13 @@
 //   - Store the cursor only once the whole pull (every `hasMore` page)
 //     succeeded; a failure on a later page pulls again from the first cursor.
 //
-// Compatibility: an unknown `entity` is skipped; a known entity with an
-// unknown `op` means "resnapshot that entity" (its SyncSnapshotName). New
-// entities and ops are added, never renamed.
+// Compatibility (clients must keep to it; the server relies on it to add
+// entities and ops without a client release first):
+//   - an unknown `entity`: skip the change;
+//   - a known entity with an unknown `op`: re-read that entity (take its
+//     SyncSnapshotName, or for `message` / `task` the list it belongs to);
+//   - an unknown snapshot name in a list: take every snapshot you know.
+// New entities, ops and fields are added, never renamed or removed.
 
 /** Opaque position in the change log. Echo it back unchanged; never parse or compare it. */
 export type SyncChangesCursor = string & { readonly __brand: "SyncChangesCursor" };
@@ -56,13 +60,21 @@ export const SYNC_SNAPSHOT_ENDPOINTS = {
   machines: ["GET /api/servers/:id/machines"],
   sidebar_order: ["GET /api/servers/:id/sidebar-order"],
   server_order: ["GET /api/servers/order"],
+  /** Per channel: each channel's task list (see the `task` entity). */
+  tasks: ["GET /api/tasks/channel/:id"],
 } as const satisfies Record<string, readonly string[]>;
 
 export type SyncSnapshotName = keyof typeof SYNC_SNAPSHOT_ENDPOINTS;
 
 export const SYNC_SNAPSHOT_NAMES = Object.keys(SYNC_SNAPSHOT_ENDPOINTS) as SyncSnapshotName[];
 
-/** What a channel scope added or removed invalidates (that channel's rows). */
+/**
+ * What a channel scope added or removed invalidates (that channel's rows).
+ * `tasks` is left out on purpose: web clients released before it treat an
+ * unknown name here as "take every snapshot", on every channel join. A client
+ * that keeps task lists also (re)reads that channel's tasks on `added`, and
+ * drops them on `removed`.
+ */
 export const SYNC_CHANNEL_SCOPE_SNAPSHOTS = ["channels", "channel_members", "inbox", "unread"] as const satisfies readonly SyncSnapshotName[];
 
 /**
@@ -88,12 +100,23 @@ export const SYNC_CHANNEL_SCOPE_SNAPSHOTS = ["channels", "channel_members", "inb
  *   a message the store does not hold needs nothing. Upserts only, and only
  *   to viewers who can read the message; it has no snapshot (a known op this
  *   client doesn't handle: refresh the open conversation's messages).
+ * - task (#wg-task-v2:7b87bf4a): id = task id; the task as
+ *   GET /api/tasks/channel/:channelId lists it for this viewer, `channelId`
+ *   the viewer's own channel (a joint's local projection). Logged by a
+ *   trigger on every create, delete and change the list shows. A task moved to
+ *   another channel is a delete in the old channel's scope and an upsert in
+ *   the new one. Its `delete` carries `channelId` too (SyncTaskDelete), so a
+ *   client keeping task lists per channel need not search them all. It also
+ *   has op `resnapshot` (SyncTaskResnapshot): id = a channel id, re-read that
+ *   channel's task list (a bulk change logged once per channel, not per task).
+ *   The task conversation's unread state and messages still come as
+ *   `conversation` and `message` changes.
  *
  * server_member, agent and machine are server-wide: a change to a row this
  * viewer's list does not show them is not sent at all (no delete either), and
  * a `delete` only names an entity they could be shown.
  */
-export type SyncRowEntity = "channel" | "channel_member" | "server_member" | "agent" | "machine" | "sidebar_order" | "server_order" | "message";
+export type SyncRowEntity = "channel" | "channel_member" | "server_member" | "agent" | "machine" | "sidebar_order" | "server_order" | "message" | "task";
 
 export type SyncEntity = SyncRowEntity | "conversation" | "scope";
 
@@ -105,10 +128,19 @@ export type SyncEntity = SyncRowEntity | "conversation" | "scope";
 export type SyncRowTypes = Record<SyncRowEntity, object>;
 
 export type SyncRowChange<Rows extends SyncRowTypes = SyncRowTypes> = {
-  [E in SyncRowEntity]:
+  [E in Exclude<SyncRowEntity, "task">]:
     | { seq: number; entity: E; id: string; op: "upsert"; row: Rows[E] }
     | { seq: number; entity: E; id: string; op: "delete" };
-}[SyncRowEntity];
+}[Exclude<SyncRowEntity, "task">]
+  | { seq: number; entity: "task"; id: string; op: "upsert"; row: Rows["task"] }
+  | SyncTaskDelete
+  | SyncTaskResnapshot;
+
+/** A task left this viewer's list of `channelId` (deleted, moved away, no longer visible). */
+export type SyncTaskDelete = { seq: number; entity: "task"; id: string; op: "delete"; channelId: string };
+
+/** Re-read the task list of channel `id` (GET /api/tasks/channel/:id): many of its tasks changed at once. */
+export type SyncTaskResnapshot = { seq: number; entity: "task"; id: string; op: "resnapshot" };
 
 /**
  * The viewer's own state of a conversation (read position, inbox done,

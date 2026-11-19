@@ -4,6 +4,7 @@ import { useIntl } from "react-intl";
 import type { IntlShape } from "react-intl";
 import { Badge, Text } from "@botiverse/raft-ui";
 import { cn } from "@botiverse/raft-ui/cn";
+import { AppLinkCardBadge } from "@botiverse/raft-ui/wip";
 import { clearClockInterval, currentTimeMs, setClockInterval } from "@botiverse/raft-shared";
 import { formatRelativeTime } from "../../utils/relativeTime";
 
@@ -62,12 +63,24 @@ export function CardText({ tone, mono, inRow, clamp, children, ...data }: {
 
 /**
  * A state in the sender's words, in a neutral soft Badge: no status color (DS
- * PreviewCard › Item card); callers keep the element's tone on their data
- * marker. One line, truncated.
+ * PreviewCard › Item card), but an App's own `fill` on its link card, under a
+ * message or on hover; callers keep the element's tone on their data marker.
+ * One line, truncated.
  */
-export function CardBadge({ inRow, children, ...data }: { inRow: boolean; children: ReactNode } & DataAttributes) {
+export function CardBadge({ inRow, fill, surface = "card", children, ...data }: { inRow: boolean; fill?: string | undefined; surface?: "card" | "popover"; children: ReactNode } & DataAttributes) {
+  const className = cn("max-w-full", !inRow && "self-start");
+  // fill: the App's colour for its state on its link card (AppLinkCardBadge: only the fill changes; without one it
+  // is the same soft Badge). surface: the card it is on, which the badge's ring is decided against. Card messages
+  // pass no fill.
+  if (fill !== undefined) {
+    return (
+      <AppLinkCardBadge fill={fill} surface={surface} className={className} data-card-badge-fill="" {...data}>
+        <span className="min-w-0 truncate">{children}</span>
+      </AppLinkCardBadge>
+    );
+  }
   return (
-    <Badge appearance="soft" className={cn("max-w-full", !inRow && "self-start")} {...data}>
+    <Badge appearance="soft" className={className} {...data}>
       <span className="min-w-0 truncate">{children}</span>
     </Badge>
   );

@@ -33,8 +33,8 @@ for (const outcome of ["success", "failure"] as const) {
       const latest = useMessageStore.getState().loadMessages(id);
       await h.loadOlderMessages(id);
       assert.deepEqual(h.getCalls(), [
-        `/messages/channel/${id}?limit=50&before=162`,
-        `/messages/channel/${id}?limit=50`,
+        `/messages/channel/${id}?limit=50&before=162&threadPreviewChars=200`,
+        `/messages/channel/${id}?limit=50&threadPreviewChars=200`,
       ], "latest reload must not admit another older while both responses remain pending");
       latestResponse.resolve(page(id, 162));
       await latest;
@@ -47,7 +47,7 @@ for (const outcome of ["success", "failure"] as const) {
       const nextCursor = outcome === "success" ? 112 : 162;
       h.enqueueChannelPages(page(id, nextCursor - 50));
       await h.loadOlderMessages(id);
-      assert.equal(h.getCalls().at(-1), `/messages/channel/${id}?limit=50&before=${nextCursor}`);
+      assert.equal(h.getCalls().at(-1), `/messages/channel/${id}?limit=50&before=${nextCursor}&threadPreviewChars=200`);
       assert.equal(h.getCalls().length, 3, "settled older allows a legitimate next page (or same-cursor retry)");
       assert.equal(h.messages(id)[0].seq, nextCursor - 50);
     } finally {

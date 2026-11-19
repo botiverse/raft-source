@@ -61,7 +61,7 @@ import { PI_OAUTH_FLOWS, piKeyEntry, piLoginFailureReason, piOAuthFlow, piSigned
 
 /**
  * task #17: web login and logout for this Computer's runtimes (Claude Code,
- * Codex, Kimi, Qoder, Antigravity, Grok Build, CodeBuddy Code), run here through OAR, except Kimi Code's: that runs on
+ * Codex, Kimi, Qoder, Antigravity, Grok Build), run here through OAR, except Kimi Code's: that runs on
  * the Kimi Code SDK the daemon bundles (kimiSdkAuth.ts), the one its agents
  * run on, so it needs no Kimi Code CLI installed. Credentials stay in the
  * runtime's own store. The daemon relays the link or device code and the
@@ -141,7 +141,7 @@ export const RUNTIME_AUTH_LOGOUT_TIMEOUT_MS = 30_000;
 export const RUNTIME_AUTH_PROVIDER_TIMEOUT_MS = 20_000;
 
 /** Runtimes only the OAR host runs, which does not run on Windows (agentHost/oarAgentHost.ts). */
-const OAR_HOST_ONLY_RUNTIMES: ReadonlySet<RuntimeAuthRuntime> = new Set(["qoder", "qwen", "codebuddy"]);
+const OAR_HOST_ONLY_RUNTIMES: ReadonlySet<RuntimeAuthRuntime> = new Set(["qoder", "qwen"]);
 
 /**
  * The environment OAR runs a runtime's status, login and logout in, as its agents run
@@ -524,7 +524,7 @@ export class RuntimeAuthHost {
     await this.deps.opencode?.close().catch(() => undefined);
   }
 
-  /** Qoder, Qwen Code and CodeBuddy Code run on the OAR host only, which does not run on Windows (agentHost/oarAgentHost.ts). */
+  /** Qoder and Qwen Code run on the OAR host only, which does not run on Windows (agentHost/oarAgentHost.ts). */
   private runsHere(runtimeId: RuntimeAuthRuntime): boolean {
     return !(OAR_HOST_ONLY_RUNTIMES.has(runtimeId) && (this.deps.platform ?? process.platform) === "win32");
   }

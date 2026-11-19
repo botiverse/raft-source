@@ -8,6 +8,7 @@ import {
   BOOT_CHUNK_PAGES,
   CATALOG_GATE,
   CATALOG_PARTS,
+  FIRST_PART_PAGES,
   LOCALE_CATALOGS_ELEMENT_ID,
   idsNamedBy,
   partKey,
@@ -21,7 +22,8 @@ import {
 //
 // 1. index.html's catalog map names every part of every display locale, and no
 //    whole catalog is built any more.
-// 2. Every locale's first part has every id the first download's code names,
+// 2. Every locale's first part has every id the first download's code names
+//    (and the FIRST_PART_PAGES' chunks, whose loads go ungated),
 //    the first and boot parts every id a boot-started page's chunks name, and
 //    no id is in two parts.
 // 3. Every `import()` of a later chunk with app code goes through the gate: a
@@ -51,8 +53,10 @@ export function validateCatalogParts(input: {
   html: string;
   parts: Map<string, Record<string, string>>;
   bootPages: readonly string[];
+  /** FIRST_PART_PAGES: their chunks count with the first download. */
+  firstPartPages?: readonly string[];
 }): { firstIds: number; bootIds: number; restIds: number; gated: number; bootGated: number } {
-  const { manifest, files, html, parts, bootPages } = input;
+  const { manifest, files, html, parts, bootPages, firstPartPages = [] } = input;
   const errors: string[] = [];
   const mapJson = new RegExp(`<script type="application/json" id="${LOCALE_CATALOGS_ELEMENT_ID}">([^<]*)</script>`).exec(html)?.[1];
   const map = mapJson ? JSON.parse(mapJson) as Record<string, string> : {};
@@ -71,7 +75,9 @@ export function validateCatalogParts(input: {
     }
     return seen;
   };
-  const initial = closure(Object.entries(manifest).filter(([, chunk]) => chunk.isEntry).map(([key]) => key));
+  // The first download and the FIRST_PART_PAGES' chunks: their words are in the first part, their loads ungated.
+  for (const page of firstPartPages) if (!manifest[page]?.isDynamicEntry) errors.push(`first-part page ${page} has no chunk of its own`);
+  const initial = closure([...Object.entries(manifest).filter(([, chunk]) => chunk.isEntry).map(([key]) => key), ...firstPartPages]);
   const appChunks = new Set<string>();
   for (const [key, chunk] of Object.entries(manifest)) if (chunk.file.endsWith(".js") && !key.includes("node_modules/")) appChunks.add(chunk.file);
   const bootFiles = new Set<string>();
@@ -161,7 +167,7 @@ async function main() {
     bootPages.push(...dynamicImportTargets(loader, await readFile(resolve(webRoot, loader), "utf8"), (path) => statSync(resolve(webRoot, path), { throwIfNoEntry: false })?.isFile() === true));
   }
   try {
-    const result = validateCatalogParts({ manifest, files, html, parts, bootPages: [...new Set(bootPages)] });
+    const result = validateCatalogParts({ manifest, files, html, parts, bootPages: [...new Set(bootPages)], firstPartPages: FIRST_PART_PAGES });
     console.log(`[catalog-parts] ids: first ${result.firstIds}, boot ${result.bootIds}, rest ${result.restIds}; ${result.gated} later-chunk loads gated (${result.bootGated} boot-started pages)`);
   } catch (error) {
     console.error(`[catalog-parts] catalog parts broken:\n${(error as Error).message}`);

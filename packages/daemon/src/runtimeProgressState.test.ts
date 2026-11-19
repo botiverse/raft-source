@@ -51,3 +51,17 @@ test("runtime progress state: stall age anchors on turn start, last-event age do
   assert.equal(state.ageMs(200_100), 100, "a newer runtime event wins over an older turn start");
   assert.equal(state.lastEventAgeMs(200_100), 100);
 });
+
+test("runtime progress state: turn progress lasts until the turn's end or the next turn start", () => {
+  const state = new RuntimeProgressState(100);
+  assert.equal(state.takeTurnProgressAtTurnEnd(), false, "the first turn (riding the spawn) had none");
+
+  state.noteTurnProgress();
+  assert.equal(state.turnProgressObserved, true);
+  assert.equal(state.takeTurnProgressAtTurnEnd(), true);
+  assert.equal(state.takeTurnProgressAtTurnEnd(), false, "a second, bare turn end had none");
+
+  state.noteTurnProgress();
+  state.noteTurnStarted(200);
+  assert.equal(state.turnProgressObserved, false, "a new turn starts without");
+});

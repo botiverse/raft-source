@@ -5,11 +5,13 @@ import Tooltip from "../../../components/ui/Tooltip";
 import { DeclaredScopeToggle } from "../../../components/settings/DeclaredScopeToggle";
 import {
   AGENT_DIRECTORY_OAUTH_SCOPES,
+  APP_DIRECTORY_OAUTH_SCOPES,
   AGENT_INBOUND_OAUTH_SCOPES,
   IDENTITY_OAUTH_SCOPES,
   OPTIONAL_IDENTITY_OAUTH_SCOPES,
   OAUTH_SCOPE_PRESENTATION,
   hasAgentInboundOAuthScope,
+  scopeGroupLabelId,
 } from "../../../lib/oauthScopePresentation";
 import type { RaftOAuthScopeId } from "../../../lib/oauthScopePresentation";
 
@@ -33,6 +35,7 @@ export function DeclaredScopesPicker({
       ...IDENTITY_OAUTH_SCOPES,
       ...OPTIONAL_IDENTITY_OAUTH_SCOPES.filter((item) => next.has(item)),
       ...AGENT_DIRECTORY_OAUTH_SCOPES.filter((item) => next.has(item)),
+      ...APP_DIRECTORY_OAUTH_SCOPES.filter((item) => next.has(item)),
       ...AGENT_INBOUND_OAUTH_SCOPES.filter((item) => next.has(item)),
     ]);
   }, [onChange, value]);
@@ -57,6 +60,23 @@ export function DeclaredScopesPicker({
               );
             })}
             {OPTIONAL_IDENTITY_OAUTH_SCOPES.map((scope) => (
+              <DeclaredScopeToggle
+                key={scope}
+                scope={scope}
+                checked={selected.has(scope)}
+                className="inline-flex min-h-8 items-center gap-2 rounded-control border border-line-hairline bg-layer-card px-2.5 py-1 font-mono text-mono-meta text-foreground"
+                onScopeChange={updateScope}
+              />
+            ))}
+          </div>
+        </div>
+
+        <div className="rounded-control bg-fill-muted p-3">
+          <div className="text-footnote font-semibold text-foreground">
+            {formatMessage({ id: scopeGroupLabelId("app_directory") })}
+          </div>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {APP_DIRECTORY_OAUTH_SCOPES.map((scope) => (
               <DeclaredScopeToggle
                 key={scope}
                 scope={scope}

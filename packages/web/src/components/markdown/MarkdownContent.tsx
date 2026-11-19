@@ -12,13 +12,14 @@ import type {
   ComponentType,
 } from "react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
-import type { Components, Options } from "react-markdown";
+import type { Components, ExtraProps, Options } from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import remarkCjkFriendly from "remark-cjk-friendly";
 import rehypeSanitize from "rehype-sanitize";
-import { InlineCode, Separator, MarkdownLink as RaftMarkdownLink } from "@botiverse/raft-ui";
+import { InlineCode, Separator, TableScroll, MarkdownLink as RaftMarkdownLink } from "@botiverse/raft-ui";
 import { remarkAutolinkBareUrls } from "../../utils/markdownAutolink";
+import { blockDirection } from "../../utils/textDirection";
 import {
   EXTERNAL_TRANSLATION_GUARD_TRANSLATE,
   withExternalTranslationGuardClass,
@@ -36,6 +37,7 @@ import { remarkRaftMath } from "./remarkRaftMath";
 import { InlineMath } from "./InlineMath";
 import { DisplayMath } from "./DisplayMath";
 import { isMathClassName, readMathSource } from "./mathFormula";
+import { webLinkProps } from "../../features/webPreview/webLinkRouting";
 
 interface MarkdownContentErrorBoundaryProps {
   source: string;
@@ -171,7 +173,7 @@ export function extractCodeBlockLanguage(node: ReactNode): string | null {
  *  Centralizing this keeps tuning like #proj-uiux task #299 single-source
  *  — stdrc 2026-05-24 audit follow-up. */
 export const MARKDOWN_BLOCKQUOTE_BASE_CLASS =
-  "border-l-2 border-line-seam pl-2.5 text-foreground-muted";
+  "border-s-2 border-line-seam ps-2.5 text-foreground-muted";
 
 type ExternalTranslationGuardProps = {
   translate: typeof EXTERNAL_TRANSLATION_GUARD_TRANSLATE;
@@ -237,6 +239,7 @@ export function MarkdownLink({
       href={href}
       target="_blank"
       rel="noopener noreferrer"
+      {...webLinkProps}
       {...externalTranslationGuardProps("")}
     >
       {children}
@@ -252,78 +255,82 @@ export const BASE_MARKDOWN_COMPONENTS: Components = {
   },
   code: (props) => <MarkdownCode {...props} />,
   p: ({ children }) => (
-    <p {...externalTranslationGuardProps("mb-1 last:mb-0")}>
+    <p dir={blockDirection(children)} {...externalTranslationGuardProps("mb-1 last:mb-0")}>
       {children}
     </p>
   ),
   ul: ({ node: _node, children, className, ...props }) => (
-    <ul {...props} {...externalTranslationGuardProps(mergeClassName(className, "mb-1 pl-5 list-disc"))}>
+    <ul {...props} dir={blockDirection(children)} {...externalTranslationGuardProps(mergeClassName(className, "mb-1 ps-5 list-disc"))}>
       {children}
     </ul>
   ),
   ol: ({ node: _node, children, className, ...props }) => (
-    <ol {...props} {...externalTranslationGuardProps(mergeClassName(className, "mb-1 pl-5 list-decimal"))}>
+    <ol {...props} dir={blockDirection(children)} {...externalTranslationGuardProps(mergeClassName(className, "mb-1 ps-5 list-decimal"))}>
       {children}
     </ol>
   ),
   li: ({ node: _node, children, className, ...props }) => (
-    <li {...props} {...externalTranslationGuardProps(mergeClassName(className, "mb-0.5"))}>
+    <li {...props} {...externalTranslationGuardProps(mergeClassName(className, "mb-0.5 [unicode-bidi:plaintext]"))}>
       {children}
     </li>
   ),
   blockquote: ({ children }) => (
     // Keep the no-fill blockquote shape restored after PR #1834, but use a
     // lighter left accent per #proj-uiux task #299.
-    <blockquote {...externalTranslationGuardProps(`${MARKDOWN_BLOCKQUOTE_BASE_CLASS} my-1`)}>
+    <blockquote dir={blockDirection(children)} {...externalTranslationGuardProps(`${MARKDOWN_BLOCKQUOTE_BASE_CLASS} my-1`)}>
       {children}
     </blockquote>
   ),
   table: ({ children }) => (
-    <div data-md-table="" {...externalTranslationGuardProps("my-2 overflow-x-auto")}>
-    <table className="border-collapse border border-line-hairline [font-size:inherit]">{children}</table>
-    </div>
+    // A table wider than the text scrolls sideways in raft-ui's TableScroll (a horizontal
+    // ScrollArea), as a block formula does (DisplayMath). It only overflows
+    // sideways, so it never holds back the message list's vertical scroll.
+    <TableScroll data-md-table="" {...externalTranslationGuardProps("my-2")}>
+      <table className="border-collapse border border-line-hairline [font-size:inherit]">{children}</table>
+    </TableScroll>
   ),
   th: ({ children }) => (
     <th
+      dir={blockDirection(children)}
       {...externalTranslationGuardProps(
-        "border border-line-hairline bg-fill-muted px-2 py-1 text-left font-bold whitespace-nowrap text-foreground",
+        "border border-line-hairline bg-fill-muted px-2 py-1 text-start font-bold whitespace-nowrap text-foreground",
       )}
     >
       {children}
     </th>
   ),
   td: ({ children }) => (
-    <td {...externalTranslationGuardProps("border border-line-hairline px-2 py-1")}>
+    <td dir={blockDirection(children)} {...externalTranslationGuardProps("border border-line-hairline px-2 py-1")}>
       {children}
     </td>
   ),
   h1: ({ children }) => (
-    <h1 {...externalTranslationGuardProps("text-[1.286em] font-bold mt-3 mb-1 leading-tight")}>
+    <h1 dir={blockDirection(children)} {...externalTranslationGuardProps("text-[1.286em] font-bold mt-3 mb-1 leading-tight")}>
       {children}
     </h1>
   ),
   h2: ({ children }) => (
-    <h2 {...externalTranslationGuardProps("text-[1.143em] font-bold mt-2 mb-1 leading-tight")}>
+    <h2 dir={blockDirection(children)} {...externalTranslationGuardProps("text-[1.143em] font-bold mt-2 mb-1 leading-tight")}>
       {children}
     </h2>
   ),
   h3: ({ children }) => (
-    <h3 {...externalTranslationGuardProps("text-[1.071em] font-bold mt-2 mb-1 leading-tight")}>
+    <h3 dir={blockDirection(children)} {...externalTranslationGuardProps("text-[1.071em] font-bold mt-2 mb-1 leading-tight")}>
       {children}
     </h3>
   ),
   h4: ({ children }) => (
-    <h4 {...externalTranslationGuardProps("text-[1em] font-bold mt-1 mb-0.5 leading-tight")}>
+    <h4 dir={blockDirection(children)} {...externalTranslationGuardProps("text-[1em] font-bold mt-1 mb-0.5 leading-tight")}>
       {children}
     </h4>
   ),
   h5: ({ children }) => (
-    <h5 {...externalTranslationGuardProps("text-[1em] font-bold mt-1 mb-0.5 leading-tight")}>
+    <h5 dir={blockDirection(children)} {...externalTranslationGuardProps("text-[1em] font-bold mt-1 mb-0.5 leading-tight")}>
       {children}
     </h5>
   ),
   h6: ({ children }) => (
-    <h6 {...externalTranslationGuardProps("text-[1em] font-bold mt-1 mb-0.5 leading-tight text-foreground-muted")}>
+    <h6 dir={blockDirection(children)} {...externalTranslationGuardProps("text-[1em] font-bold mt-1 mb-0.5 leading-tight text-foreground-muted")}>
       {children}
     </h6>
   ),
@@ -341,22 +348,22 @@ export const BASE_MARKDOWN_COMPONENTS: Components = {
 
 const DOCUMENT_MARKDOWN_COMPONENTS: Components = {
   p: ({ children }) => (
-    <p {...externalTranslationGuardProps("mb-3 last:mb-0")}>
+    <p dir={blockDirection(children)} {...externalTranslationGuardProps("mb-3 last:mb-0")}>
       {children}
     </p>
   ),
   ul: ({ node: _node, children, className, ...props }) => (
-    <ul {...props} {...externalTranslationGuardProps(mergeClassName(className, "mb-3 pl-6 list-disc"))}>
+    <ul {...props} dir={blockDirection(children)} {...externalTranslationGuardProps(mergeClassName(className, "mb-3 ps-6 list-disc"))}>
       {children}
     </ul>
   ),
   ol: ({ node: _node, children, className, ...props }) => (
-    <ol {...props} {...externalTranslationGuardProps(mergeClassName(className, "mb-3 pl-6 list-decimal"))}>
+    <ol {...props} dir={blockDirection(children)} {...externalTranslationGuardProps(mergeClassName(className, "mb-3 ps-6 list-decimal"))}>
       {children}
     </ol>
   ),
   li: ({ node: _node, children, className, ...props }) => (
-    <li {...props} {...externalTranslationGuardProps(mergeClassName(className, "mb-1"))}>
+    <li {...props} {...externalTranslationGuardProps(mergeClassName(className, "mb-1 [unicode-bidi:plaintext]"))}>
       {children}
     </li>
   ),
@@ -366,17 +373,17 @@ const DOCUMENT_MARKDOWN_COMPONENTS: Components = {
   // document preview keeps Slock markdown tokens instead of inventing another
   // prose skin.
   h1: ({ children }) => (
-    <h1 {...externalTranslationGuardProps("text-3xl font-bold mt-6 mb-3 leading-tight")}>
+    <h1 dir={blockDirection(children)} {...externalTranslationGuardProps("text-3xl font-bold mt-6 mb-3 leading-tight")}>
       {children}
     </h1>
   ),
   h2: ({ children }) => (
-    <h2 {...externalTranslationGuardProps("text-2xl font-bold mt-5 mb-2.5 leading-tight")}>
+    <h2 dir={blockDirection(children)} {...externalTranslationGuardProps("text-2xl font-bold mt-5 mb-2.5 leading-tight")}>
       {children}
     </h2>
   ),
   h3: ({ children }) => (
-    <h3 {...externalTranslationGuardProps("text-xl font-bold mt-4 mb-2 leading-tight")}>
+    <h3 dir={blockDirection(children)} {...externalTranslationGuardProps("text-xl font-bold mt-4 mb-2 leading-tight")}>
       {children}
     </h3>
   ),
@@ -484,6 +491,29 @@ export interface MarkdownContentProps {
   enableMermaid?: boolean;
 }
 
+type AnchorComponent = ComponentType<ComponentPropsWithoutRef<"a"> & { node?: unknown }>;
+type MarkdownAnchor = (props: ComponentPropsWithoutRef<"a"> & ExtraProps) => ReactNode;
+const guardedAnchors = new WeakMap<AnchorComponent, MarkdownAnchor>();
+
+/** The external-translation guard around a caller's anchor, one per anchor: a new wrapper on every render would remount
+ *  every link (its chip, preview card and tooltip) whenever the caller's component map changes (#proj-frontend:#57). */
+function guardedAnchor(AnchorOverride: AnchorComponent): MarkdownAnchor {
+  let guarded = guardedAnchors.get(AnchorOverride);
+  if (!guarded) {
+    guarded = (props) => (
+      <span
+        translate={EXTERNAL_TRANSLATION_GUARD_TRANSLATE}
+        className={withExternalTranslationGuardClass("contents")}
+        data-immersive-translate-ignore=""
+      >
+        <AnchorOverride {...props} />
+      </span>
+    );
+    guardedAnchors.set(AnchorOverride, guarded);
+  }
+  return guarded;
+}
+
 function MarkdownContentImpl({
   source,
   density = "compact",
@@ -503,23 +533,13 @@ function MarkdownContentImpl({
       if (!components) return baseComponents;
 
       const merged = { ...baseComponents, ...components };
-      const AnchorOverride = components.a as
-        | ComponentType<ComponentPropsWithoutRef<"a"> & { node?: unknown }>
-        | undefined;
+      const AnchorOverride = components.a as AnchorComponent | undefined;
       if (AnchorOverride) {
         // Chat supplies a large custom anchor renderer for mentions, refs, and
         // ordinary URLs. Keep the external-translation guard even when that
         // override replaces BASE_MARKDOWN_COMPONENTS.a: every return path is
         // now enclosed by the closest possible translator-ignore boundary.
-        merged.a = (props) => (
-          <span
-            translate={EXTERNAL_TRANSLATION_GUARD_TRANSLATE}
-            className={withExternalTranslationGuardClass("contents")}
-            data-immersive-translate-ignore=""
-          >
-            <AnchorOverride {...props} />
-          </span>
-        );
+        merged.a = guardedAnchor(AnchorOverride);
       }
       return merged;
     },
@@ -530,7 +550,9 @@ function MarkdownContentImpl({
       <div
         data-raft-markdown-content=""
         translate={EXTERNAL_TRANSLATION_GUARD_TRANSLATE}
-        className={withExternalTranslationGuardClass("contents")}
+        // A link (mention, #ref, URL) takes its direction from its own text, so
+        // `@alice` reads `@alice` inside a right-to-left paragraph (Hands 82e3ca69).
+        className={withExternalTranslationGuardClass("contents [&_a]:[unicode-bidi:plaintext]")}
         data-immersive-translate-ignore=""
       >
         <ReactMarkdown

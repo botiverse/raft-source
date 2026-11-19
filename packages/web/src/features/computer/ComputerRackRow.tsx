@@ -11,7 +11,7 @@ import { useMachineStore } from "../../store/machineStore";
 import type { Machine } from "../../store/machineStore";
 import { useProfileStore } from "../../store/profileStore";
 import { useServerStore } from "../../store/serverStore";
-import { canManageMachine } from "../../utils/canManageMachine";
+import { canControlComputer, canManageMachine } from "../../utils/canManageMachine";
 import { computerOsName } from "../../utils/computerDevice";
 import { getComputerAvailableVersion } from "../../utils/computerVersionFact";
 import { machineDiskLowPresentation } from "../../utils/machineDiskPresentation";
@@ -105,9 +105,10 @@ export const ComputerRackRow = memo(function ComputerRackRow({
   const currentUserId = useAuthStore((s) => s.user?.id ?? null);
   const { capabilities } = useServerPermissions();
   const canManage = canManageMachine(machine, currentUserId, capabilities);
+  const canControl = canControlComputer(machine, currentUserId, capabilities);
   const upgrade = useComputerUpgradeCard(machine);
   // Offered as the row menu offers it (RackRowMenu's canRestart; the hook adds "no restart running").
-  const restart = useComputerRestart(machine.id, canManage && machine.isComputer === true && machine.status === "online" && upgrade.cardState.kind !== "upgrading");
+  const restart = useComputerRestart(machine.id, canControl && machine.isComputer === true && machine.status === "online" && upgrade.cardState.kind !== "upgrading");
   // This device: the local host's answer when Raft Computer is not running
   // here (Stopped, Removed from this device, …), the same as the sidebar row.
   const local = useThisDeviceRowStatus(machine);
@@ -266,11 +267,11 @@ export const ComputerRackRow = memo(function ComputerRackRow({
   // and the menu's Restart's confirmations (portalled, so they add nothing here).
   const action = (
     <>
-      <RackRowAction machine={machine} canManage={canManage} variant={variant} upgrade={upgrade} restart={restart} thisDevice={thisDevice} />
+      <RackRowAction machine={machine} canManage={canManage} canControl={canControl} variant={variant} upgrade={upgrade} restart={restart} thisDevice={thisDevice} onOpen={openComputer} offline={offline} />
       <ComputerActionConfirms name={machine.name} agentCount={agents.length} upgrade={upgrade} restart={restart} />
     </>
   );
-  const menu = <RackRowMenu machine={machine} agents={agents} canManage={canManage} upgrade={upgrade} restartState={restart} />;
+  const menu = <RackRowMenu machine={machine} agents={agents} canManage={canManage} canControl={canControl} upgrade={upgrade} restartState={restart} />;
   const surface = hovered && droppable
     ? "bg-info-soft"
     : selected

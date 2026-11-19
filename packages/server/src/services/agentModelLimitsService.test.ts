@@ -60,7 +60,7 @@ test("mixed instances: one catalog, one default for the same scope -> shown, wha
   assert.equal(shown([b, a]), true);
 });
 
-test("only a Built-in custom model reached through a gateway gets a signal", () => {
+test("only a Built-in custom model reached through a gateway or on a preset that takes a typed id gets a signal", () => {
   const gateway = {
     version: RUNTIME_CONFIG_VERSION,
     runtime: "builtin",
@@ -74,7 +74,7 @@ test("only a Built-in custom model reached through a gateway gets a signal", () 
   assert.equal(isBuiltInGatewayCustomModelConfig(connection, { providerId: "anthropic-compatible", endpointUrl: "https://gw.example.test" }), true);
   assert.equal(isBuiltInGatewayCustomModelConfig(connection, { providerId: "anthropic-compatible", endpointUrl: null }), false, "no endpoint: the daemon does not resolve it to a gateway");
   assert.equal(isBuiltInGatewayCustomModelConfig(connection, { providerId: "anthropic-compatible", endpointUrl: "" }), false);
-  assert.equal(isBuiltInGatewayCustomModelConfig(connection, { providerId: "deepseek", endpointUrl: "https://api.deepseek.com" }), false, "a preset provider connection");
+  assert.equal(isBuiltInGatewayCustomModelConfig(connection, { providerId: "deepseek", endpointUrl: null }), true, "a typed id through a preset connection, as on the preset");
   assert.equal(isBuiltInGatewayCustomModelConfig(connection, null), false);
   assert.equal(isBuiltInGatewayCustomModelConfig({ ...gateway, model: { kind: "preset", id: "x/y" } } as unknown as RuntimeConfig, null), false);
   assert.equal(isBuiltInGatewayCustomModelConfig({ ...gateway, runtime: "pi" } as unknown as RuntimeConfig, null), false);

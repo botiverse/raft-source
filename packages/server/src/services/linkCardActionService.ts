@@ -1,6 +1,11 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { inspect } from "node:util";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
-import { currentDate } from "@botiverse/raft-shared";
+import {
+  currentDate, MESSAGE_CARD_FORM_FIELD_ID, MESSAGE_CARD_FORM_LIMITS, MESSAGE_CARD_SEALED_INPUTS_MAX_BYTES, MESSAGE_CARD_SEALED_INPUTS_PATTERN,
+  messageCardFormSubmissionFits, type MessageCardFormSubmission,
+} from "@botiverse/raft-shared";
+import { linkCardExecuteToastForCapabilities, linkCardToastSchema } from "@botiverse/raft-shared/src/appLinkPreview";
 import { getDb, type DatabaseExecutor } from "../db";
 import {
   linkCardAttempts, linkCardClientRequests, linkCardHandleUses, linkCardOperations, linkCardPreparedActions, linkCardUpdateTokens, linkCardViews,
@@ -9,6 +14,7 @@ import {
 import { canonicalJsonSha256 } from "../lib/canonicalJson";
 import { parseStrictJson, type StrictJsonValue } from "../lib/strictJson";
 import { linkCardOpenOperations } from "../metrics";
+import { recordTraceEvent } from "../tracing/semanticTrace";
 import { PreviewNotSentError } from "./appLinkPreviewHttp";
 import { linkPreviewAudienceKey, previewTransport } from "./appLinkPreviewService";
 import { admitLinkCardAction, admitLinkCardAppExecute } from "./linkCardActionLimits";
@@ -36,6 +42,14 @@ import { CardActionPastDeadlineError, signCardActionAssertion } from "./oidcServ
 // runs under a database lock: prepare calls the App after its one short write,
 // and execute sends only after its admission transaction and its dispatch
 // transaction have both committed.
+//
+// A card form's values (RFC 086 §5.4: `sealed_inputs`, the SecretInput values
+// sealed to the App, and `inputs`, the TextInput values) ride the execute
+// request only: held in memory (LinkCardFormValues) from the parse to the one
+// App call and forwarded inline in its body, never written to any table
+// (the operation records only that there were some), never part of
+// `request_sha256`, never in a log line, trace attribute or answer. Refusals
+// are fixed sentences. Recovery, status and reconciliation never send them.
 
 /** The synchronous budget of a prepare or execute call to an App (protocol §5.1, Q-A2). */
 export const LINK_CARD_ACTION_BUDGET_MS = 2500;
@@ -60,6 +74,8 @@ const fail = (status: number, code: string, error: string, extra: Record<string,
 const INVALID_REQUEST = fail(400, "INVALID_REQUEST", "Invalid link card request");
 const PREPARE_REQUIRED = fail(400, "PREPARE_REQUIRED", "This action needs a confirmation first");
 const PREPARED_NOT_ALLOWED = fail(400, "PREPARED_NOT_ALLOWED", "This action takes no confirmation");
+/** RFC 086 §5.4: the form's values don't fit the button's form (or it has none). Fixed: never says which value or what of it. */
+const FORM_INVALID = fail(400, "FORM_INVALID", "This button's form wasn't sent as it asks. Fill it in again.");
 const NOT_FOUND = fail(404, "NOT_FOUND", "Not found");
 const HANDLE_INVALID = fail(410, "HANDLE_INVALID", "This card is out of date. Refresh it and try again.");
 const PREPARED_INVALID = fail(410, "PREPARED_INVALID", "This confirmation is out of date. Try again.");
@@ -78,10 +94,12 @@ export type LinkCardHint = { tone: "info" | "success" | "warning"; text: string 
 /**
  * The only toast Raft's own records answer with (rule 6; protocol §5.3.2 step
  * 7, §8.2 (3)): one fixed, object-free hint per state. An App's toast, code or
- * attribution is never relayed from a synchronous answer or from Raft's
- * records; it is shown only through a forwarded status that passed the App's
- * current object-read check (linkCardReceiptService.ts). Copy owner:
- * product/design; clients may localize by `state`.
+ * attribution is never relayed from Raft's records or from prepare; it reaches
+ * the viewer only in the answer to the request that asked the App: a
+ * forwarded status that passed the App's current object-read check
+ * (linkCardReceiptService.ts), or, as `app_result: { toast }` and only the
+ * toast, the execute that the App's answer finished (dispatchAndAnswer). Copy
+ * owner: product/design; clients may localize by `state`.
  */
 const hint = (tone: LinkCardHint["tone"], text: string): Readonly<LinkCardHint> => Object.freeze({ tone, text });
 export const LINK_CARD_STATE_HINTS: Readonly<Record<Exclude<LinkCardOperationState, "requested">, Readonly<LinkCardHint>>> = Object.freeze({
@@ -94,9 +112,9 @@ export const LINK_CARD_STATE_HINTS: Readonly<Record<Exclude<LinkCardOperationSta
   needs_reconciliation: hint("warning", "The result isn't confirmed yet."),
   resolved_manually: hint("info", "The result could not be confirmed."),
 });
-const answered = (operationId: string, state: LinkCardOperationState): LinkCardActionResponse => {
+const answered = (operationId: string, state: LinkCardOperationState, appToast: LinkCardHint | null = null): LinkCardActionResponse => {
   const shown = state === "requested" ? "sent" : state;
-  return { status: 200, body: { operation_id: operationId, state: shown, toast: LINK_CARD_STATE_HINTS[shown] } };
+  return { status: 200, body: { operation_id: operationId, state: shown, toast: LINK_CARD_STATE_HINTS[shown], ...(appToast ? { app_result: { toast: appToast } } : {}) } };
 };
 
 // ---------------------------------------------------------------------------
@@ -119,32 +137,72 @@ export function parseLinkCardPrepareBody(body: unknown): LinkCardPrepareRequest 
   return boundedString(businessRevision, 512) ? { handle, claimedBusinessRevision: businessRevision } : null;
 }
 
+/**
+ * A card form's values for one execute (RFC 086 §5.4), held in memory for the
+ * one App call. Serializing or inspecting it (a log line, an error report, a
+ * JSON dump of the request) shows only whether there were any: the values are
+ * readable through the getters alone, by the code that forwards them.
+ */
+export class LinkCardFormValues {
+  readonly #submission: MessageCardFormSubmission;
+  constructor(submission: MessageCardFormSubmission) { this.#submission = submission; }
+  get submission(): MessageCardFormSubmission { return this.#submission; }
+  get sealed(): boolean { return this.#submission.sealedInputs !== null; }
+  get text(): boolean { return this.#submission.inputs !== null; }
+  toJSON() { return { sealed: this.sealed, inputs: this.text }; }
+  [inspect.custom]() { return `LinkCardFormValues ${JSON.stringify(this.toJSON())}`; }
+}
+
 export type LinkCardExecuteRequest = {
   clientRequestId: string;
   handle: string;
   /** Both or neither (a pair with one half is a schema error). */
   prepared: { actionId: string; digest: string } | null;
+  /** RFC 086 §5.4: the card form's values, checked against the button's form once the handle is (FORM_INVALID). */
+  form: LinkCardFormValues;
 };
-const EXECUTE_FIELDS = new Set(["client_request_id", "handle", "prepared_action_id", "prepared_digest", "prepared_description"]);
+const EXECUTE_FIELDS = new Set(["client_request_id", "handle", "prepared_action_id", "prepared_digest", "prepared_description", "sealed_inputs", "inputs"]);
+
+/** Why an execute body is refused: 400, or 413 for `sealed_inputs` over its cap. Neither answer carries anything of the body. */
+export type LinkCardExecuteBodyRefusal = { refused: 400 | 413 };
 
 /**
- * `{ client_request_id, handle, prepared_action_id?, prepared_digest?, prepared_description? }`.
+ * `{ client_request_id, handle, prepared_action_id?, prepared_digest?, prepared_description?, sealed_inputs?, inputs? }`.
  * `prepared_description` belongs to native providers (RFC 076 §7), and none is
  * registered yet, so it is refused for now; the request digest already has
- * its slot (linkCardRequestSha256).
+ * its slot (linkCardRequestSha256). `sealed_inputs` (RFC 086 §5.4) is read
+ * first, as an opaque string: the type, then the cap (413), then the JWE
+ * compact shape, before any other member; `inputs` is an object of at most
+ * MESSAGE_CARD_FORM_LIMITS.maxFields strings by field id, each within a
+ * TextInput's longest. Whether they fit the button's form is execute's to
+ * decide, once the handle is checked.
  */
-export function parseLinkCardExecuteBody(body: unknown): LinkCardExecuteRequest | null {
-  if (!isPlainObject(body) || Object.keys(body).some((key) => !EXECUTE_FIELDS.has(key))) return null;
-  if (own(body, "prepared_description") !== undefined) return null;
+export function parseLinkCardExecuteBody(body: unknown): LinkCardExecuteRequest | LinkCardExecuteBodyRefusal {
+  const invalid = { refused: 400 } as const;
+  if (!isPlainObject(body)) return invalid;
+  const sealedInputs = own(body, "sealed_inputs");
+  if (sealedInputs !== undefined) {
+    if (typeof sealedInputs !== "string") return invalid;
+    if (sealedInputs.length > MESSAGE_CARD_SEALED_INPUTS_MAX_BYTES) return { refused: 413 };
+    if (!MESSAGE_CARD_SEALED_INPUTS_PATTERN.test(sealedInputs)) return invalid;
+  }
+  if (Object.keys(body).some((key) => !EXECUTE_FIELDS.has(key))) return invalid;
+  if (own(body, "prepared_description") !== undefined) return invalid;
+  const inputs = own(body, "inputs");
+  if (inputs !== undefined && !(isPlainObject(inputs) && Object.keys(inputs).length <= MESSAGE_CARD_FORM_LIMITS.maxFields
+    && Object.entries(inputs).every(([id, value]) => MESSAGE_CARD_FORM_FIELD_ID.test(id) && typeof value === "string" && codePoints(value) <= MESSAGE_CARD_FORM_LIMITS.textInputMaxLength))) {
+    return invalid;
+  }
+  const form = new LinkCardFormValues({ sealedInputs: sealedInputs ?? null, inputs: (inputs as Record<string, string> | undefined) ?? null });
   const clientRequestId = own(body, "client_request_id");
   const handle = own(body, "handle");
   const preparedActionId = own(body, "prepared_action_id");
   const preparedDigest = own(body, "prepared_digest");
-  if (typeof clientRequestId !== "string" || !CLIENT_REQUEST_ID.test(clientRequestId) || !boundedString(handle, MAX_HANDLE_LENGTH)) return null;
-  if ((preparedActionId === undefined) !== (preparedDigest === undefined)) return null;
-  if (preparedActionId === undefined) return { clientRequestId, handle, prepared: null };
-  if (typeof preparedActionId !== "string" || !UUID.test(preparedActionId) || typeof preparedDigest !== "string" || !SHA256.test(preparedDigest)) return null;
-  return { clientRequestId, handle, prepared: { actionId: preparedActionId, digest: preparedDigest } };
+  if (typeof clientRequestId !== "string" || !CLIENT_REQUEST_ID.test(clientRequestId) || !boundedString(handle, MAX_HANDLE_LENGTH)) return invalid;
+  if ((preparedActionId === undefined) !== (preparedDigest === undefined)) return invalid;
+  if (preparedActionId === undefined) return { clientRequestId, handle, prepared: null, form };
+  if (typeof preparedActionId !== "string" || !UUID.test(preparedActionId) || typeof preparedDigest !== "string" || !SHA256.test(preparedDigest)) return invalid;
+  return { clientRequestId, handle, prepared: { actionId: preparedActionId, digest: preparedDigest }, form };
 }
 
 /**
@@ -209,6 +267,47 @@ export async function callLinkCardActionEndpoint(endpoint: string, body: string,
     .then((text): CallResult => (typeof text === "string" ? { kind: "answered", text } : { kind: "failed" }))
     .catch((error: unknown): CallResult => (error instanceof PreviewNotSentError ? { kind: "not_sent" } : { kind: "failed" }));
   try { return await Promise.race([call, timeout]); } finally { clearTimeout(timer); }
+}
+
+/** The private part of an App's execute or status answer: shown only where rule 6 lets it through. */
+export type LinkCardAppResult = { toast?: LinkCardHint; code?: string; attribution?: string };
+const APP_ANSWER_FIELDS = new Set(["status", "code", "attribution", "toast"]);
+const codePoints = (value: string) => [...value].length;
+const boundedText = (value: unknown, max: number): value is string => typeof value === "string" && codePoints(value) >= 1 && codePoints(value) <= max;
+
+export type LinkCardAppResultField = keyof LinkCardAppResult;
+
+/**
+ * The App's answer to execute or to status, one parser for both (protocol
+ * §5.3, §5.4): strict from the raw text (protocol §10.1; C0-control keys,
+ * duplicate keys and broken Unicode refuse it), then
+ * `{ status, code?, attribution?, toast? }` with `status` one of the phase's
+ * `statuses`. null for anything else. The bounds of the private fields: a
+ * toast as protocol §4.4, `code` 1-64 and `attribution` 1-200 code points.
+ * `invalidFields` names each one present outside them; `appResult` is then
+ * null, so nothing out of bounds is ever shown. Status refuses such an answer
+ * whole; execute keeps its status and drops the three (each caller decides).
+ */
+export function parseLinkCardAppAnswer<S extends string>(text: string, statuses: ReadonlySet<S>): {
+  status: S; appResult: LinkCardAppResult | null; invalidFields: LinkCardAppResultField[];
+} | null {
+  let answer: Record<string, unknown>;
+  try { answer = parseStrictJson(text); } catch { return null; }
+  const status = answer.status;
+  if (typeof status !== "string" || !statuses.has(status as S) || Object.keys(answer).some((key) => !APP_ANSWER_FIELDS.has(key))) return null;
+  const toast = Object.hasOwn(answer, "toast") ? linkCardToastSchema.safeParse(answer.toast) : null;
+  const invalidFields: LinkCardAppResultField[] = [
+    ...(Object.hasOwn(answer, "code") && !boundedText(answer.code, 64) ? ["code" as const] : []),
+    ...(Object.hasOwn(answer, "attribution") && !boundedText(answer.attribution, 200) ? ["attribution" as const] : []),
+    ...(toast && !toast.success ? ["toast" as const] : []),
+  ];
+  if (invalidFields.length) return { status: status as S, appResult: null, invalidFields };
+  const appResult: LinkCardAppResult = {
+    ...(toast?.success ? { toast: toast.data } : {}),
+    ...(Object.hasOwn(answer, "code") ? { code: answer.code as string } : {}),
+    ...(Object.hasOwn(answer, "attribution") ? { attribution: answer.attribution as string } : {}),
+  };
+  return { status: status as S, appResult: Object.keys(appResult).length ? appResult : null, invalidFields };
 }
 
 const sha256Hex = (value: string) => createHash("sha256").update(value, "utf8").digest("hex");
@@ -377,7 +476,7 @@ export async function executeLinkCardAction(input: {
   if (existing) return recovered(existing, requestSha256, input.readMessage);
   await hooks.afterRecoveryMiss?.();
   const admission = await admitNewIntent(input, selector, key, requestSha256);
-  if (admission.kind === "admitted") return dispatchAndAnswer(admission.op, input.locale, input.hints ?? noLinkCardReceiptHints);
+  if (admission.kind === "admitted") return dispatchAndAnswer(admission.op, input.locale, input.hints ?? noLinkCardReceiptHints, input.readMessage);
   if (admission.kind === "recover") return recovered(admission.hit, requestSha256, input.readMessage);
   // 5. Any error on the new-intent path looks the mapping up once more: a
   // concurrent request with this id may have won (rule 5; protocol §5.3.3).
@@ -392,6 +491,12 @@ type AdmittedOperation = {
   claims: LinkCardHandleClaims;
   live: LinkCardLiveState;
   prepared: LinkCardExecuteRequest["prepared"];
+  /** RFC 086 §5.4: forwarded inline in the one execute request; never stored. */
+  form: LinkCardFormValues;
+  /** The request id the viewer sent: a claim of the execute JWT (RFC 086 §5.3), and the operation's key. */
+  clientRequestId: string;
+  /** The SHA-256 of the handle used: a claim of the execute JWT (RFC 086 §5.3). */
+  handleSha256: string;
   registrationRevision: string;
 };
 type Admission = { kind: "admitted"; op: AdmittedOperation } | { kind: "recover"; hit: ClientRequestHit } | { kind: "refused"; response: LinkCardActionResponse };
@@ -425,11 +530,15 @@ async function admitNewIntent(
   });
   if (!checked.ok) return refused(checked.reason === "eligibility" ? NOT_ELIGIBLE : HANDLE_INVALID);
   const { live } = checked;
-  // 3.5 an App acting under its own-Server confirmation (RFC 076 §17), not
-  // reviewed by the platform, also spends the viewer's budget for that App
-  // (429). Only the live check knows which way the App is eligible, so this
-  // limit comes after it.
-  if (live.basis === "own_server") {
+  // 3.4b RFC 086 §5.4: the form's values fit the button's form, now that the
+  // handle names it (its card revision fixes the form); a link card's button,
+  // and an acting button without a form, take none (400, a fixed sentence).
+  if (!messageCardFormSubmissionFits(live.messageCard?.action.form, input.request.form.submission)) return refused(FORM_INVALID);
+  // 3.5 an App that is not official (RFC 076 §17: its own Server's default or
+  // this Server's allow), not reviewed by the platform, also spends the
+  // viewer's budget for that App (429). Only the live check knows which way
+  // the App is eligible, so this limit comes after it.
+  if (live.basis !== "official") {
     const appBudget = await admitLinkCardAppExecute(input.viewerId, input.serverId, live.entry.app.key);
     if (!appBudget.admitted) return refused(rateLimited(appBudget.retryAfterSeconds));
   }
@@ -439,7 +548,7 @@ async function admitNewIntent(
     return await getDb().transaction(async (tx) => ({
       kind: "admitted" as const,
       op: await admitInTransaction(tx, {
-        key, requestSha256, claims, handleSha256: verified.handleSha256, live, prepared: input.request.prepared, readMessage: input.readMessage,
+        key, requestSha256, claims, handleSha256: verified.handleSha256, live, prepared: input.request.prepared, form: input.request.form, readMessage: input.readMessage,
       }),
     }));
   } catch (error) {
@@ -489,14 +598,19 @@ function reportInstallationLoad(installationKey: string, open: number) {
  */
 async function admitInTransaction(tx: DatabaseExecutor, input: {
   key: ClientRequestKey; requestSha256: string; claims: LinkCardHandleClaims; handleSha256: string; live: LinkCardLiveState; prepared: LinkCardExecuteRequest["prepared"];
-  readMessage: LinkCardMessageReader;
+  form: LinkCardFormValues; readMessage: LinkCardMessageReader;
 }): Promise<AdmittedOperation> {
   const { key, claims, live } = input;
   const installationKey = live.entry.installationId;
   // A bound on each lock wait, not on the whole transaction.
   await tx.execute(sql`SET LOCAL lock_timeout = '2s'`);
-  // (a) Eligibility, FOR SHARE on the registry, install and registration rows.
-  if (!await lockLinkCardActionEligibility(tx, { live, claims, serverId: key.serverId })) throw stop(NOT_ELIGIBLE);
+  // (a) Eligibility, FOR SHARE on the registry, install and registration rows;
+  // for a card message's acting button also its card encryption key (RFC 086
+  // §5.2): a SecretInput still from an official App with a key, and the kid
+  // the handle bound still the App's. A refusal rolls back and drops the
+  // form's values: no App call, no part of them in the answer.
+  const eligibility = await lockLinkCardActionEligibility(tx, { live, claims, serverId: key.serverId });
+  if (eligibility !== null) throw stop(eligibility === "eligibility" ? NOT_ELIGIBLE : HANDLE_INVALID);
   // (b) Admission locks, the same order for every writer: viewer, then installation.
   await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${`link_card:viewer:${key.viewerId}:${key.serverId}`}, 0))`);
   await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${`link_card:installation:${installationKey}`}, 0))`);
@@ -533,11 +647,12 @@ async function admitInTransaction(tx: DatabaseExecutor, input: {
   const operationId = randomUUID();
   const registrationRevision = claims.binding.registrationRevision;
   await tx.execute(sql`INSERT INTO ${linkCardOperations} (operation_id, viewer_id, server_id, provider_kind, provider_key, installation_key,
-      registration_revision, view_nonce, message_id, url_sha256, action_endpoint_sha256, action_origin, action_id, request_sha256, state,
-      created_at, first_send_deadline)
+      registration_revision, view_nonce, message_id, url_sha256, action_endpoint_sha256, action_origin, action_id, request_sha256,
+      sealed_inputs_submitted, text_inputs_submitted, state, created_at, first_send_deadline)
     SELECT ${operationId}::uuid, ${key.viewerId}::uuid, ${key.serverId}::uuid, 'app', ${live.entry.app.key}, ${installationKey},
       ${registrationRevision}, ${claims.viewNonce}, ${claims.binding.messageId}::uuid, ${claims.binding.urlSha256}, ${live.actionEndpointSha256},
-      ${live.entry.config.origin}, ${claims.actionId}, ${input.requestSha256}, 'requested', t.created_at, t.created_at + interval '10 minutes'
+      ${live.entry.config.origin}, ${claims.actionId}, ${input.requestSha256}, ${input.form.sealed}, ${input.form.text},
+      'requested', t.created_at, t.created_at + interval '10 minutes'
     FROM (SELECT date_trunc('second', clock_timestamp()) AS created_at) AS t`);
   // (d) The request mapping.
   await tx.insert(linkCardClientRequests).values({
@@ -581,17 +696,22 @@ async function admitInTransaction(tx: DatabaseExecutor, input: {
   // (h) requested -> sent, in the same transaction.
   await tx.update(linkCardOperations).set({ state: "sent", updatedAt: sql`now()` })
     .where(and(eq(linkCardOperations.operationId, operationId), eq(linkCardOperations.state, "requested")));
-  return { operationId, viewerId: key.viewerId, serverId: key.serverId, claims, live, prepared: input.prepared, registrationRevision };
+  return {
+    operationId, viewerId: key.viewerId, serverId: key.serverId, claims, live, prepared: input.prepared, form: input.form,
+    clientRequestId: key.clientRequestId, handleSha256: input.handleSha256, registrationRevision,
+  };
 }
 
 // ---------------------------------------------------------------------------
 // After commit: dispatch, send, apply the synchronous answer.
 
-async function dispatchAndAnswer(op: AdmittedOperation, locale: string, hints: LinkCardReceiptHints): Promise<LinkCardActionResponse> {
+async function dispatchAndAnswer(op: AdmittedOperation, locale: string, hints: LinkCardReceiptHints, readMessage: LinkCardMessageReader): Promise<LinkCardActionResponse> {
   let state: LinkCardOperationState;
+  let appToast: LinkCardHint | null = null;
   try {
     const settled = await dispatchExecute(op, locale);
     state = settled.state;
+    appToast = settled.appToast;
     // After the commit: the viewer's other sessions learn the receipt moved.
     if (settled.receiptRevision !== null) hints({ viewerId: op.viewerId, serverId: op.serverId, operationId: op.operationId, receiptRevision: settled.receiptRevision });
   } catch {
@@ -600,11 +720,34 @@ async function dispatchAndAnswer(op: AdmittedOperation, locale: string, hints: L
     const [row] = await getDb().select({ state: linkCardOperations.state }).from(linkCardOperations).where(eq(linkCardOperations.operationId, op.operationId));
     state = row?.state ?? "sent";
   }
-  return answered(op.operationId, state);
+  return answered(op.operationId, state, await shownAppToast(op, appToast, readMessage));
+}
+
+/**
+ * The App's toast from the answer that finished this execute, under status's
+ * gates (rule 6): the App's answer to execute is its own decision for `sub`
+ * in this request, so it stands for status's object-read check, and the
+ * viewer must still be able to read the receipt, asked again after the App
+ * answered (access lost meanwhile shows nothing private). Only to a client
+ * that declared `execute.toast.v1` (bound into its handle); only the toast,
+ * never the code or attribution. Raft stores none of it, so a recovered
+ * answer never has it.
+ */
+async function shownAppToast(op: AdmittedOperation, appToast: LinkCardHint | null, readMessage: LinkCardMessageReader): Promise<LinkCardHint | null> {
+  const toast = linkCardExecuteToastForCapabilities(appToast, op.claims.binding.capabilities);
+  if (!toast) return null;
+  const receipt = {
+    viewerId: op.viewerId, serverId: op.serverId, providerKind: "app" as const, providerKey: op.live.entry.app.key,
+    installationKey: op.live.entry.installationId, messageId: op.claims.binding.messageId,
+  };
+  return await linkCardReceiptReadable(receipt, readMessage).catch(() => false) ? toast : null;
 }
 
 /** The state after a settle, and the new receipt revision when it moved (null when it did not). */
 type Settled = { state: LinkCardOperationState; receiptRevision: number | null };
+/** A settled execute, with the App's toast when the App's final answer is what the operation now records. */
+type Dispatched = Settled & { appToast: LinkCardHint | null };
+const byRaft = (settled: Settled): Dispatched => ({ ...settled, appToast: null });
 
 /**
  * One conditional transition (state machine: protocol §8.1; the 0387 trigger
@@ -642,23 +785,49 @@ async function settle(
   return { state: row?.state ?? next, receiptRevision: null };
 }
 
+const EXECUTE_ANSWER_STATUSES = new Set(["accepted", "executing", "done", "refused", "failed_not_sent", "unknown"] as const);
+
+type ExecuteAnswer = {
+  next: LinkCardOperationState; outcome: string; by: "raft" | "app_answer";
+  /** The App's, only on a final answer whose private fields are all within bounds. */
+  toast: LinkCardHint | null;
+  /** Private fields outside status's bounds, dropped (the status still applies). */
+  droppedFields: LinkCardAppResultField[];
+};
+
 /**
  * The synchronous answer as a transition (RFC 076 §6.3 step 7): never a
  * made-up accepted. `by` says whether the App answered (a valid status) or
  * Raft concluded it (no answer, a failure, an invalid answer, never sent).
+ * Parsed by status's parser (parseLinkCardAppAnswer), so `code`,
+ * `attribution` and `toast` have status's bounds. Unlike status, one outside
+ * them doesn't refuse the answer: its `status` is still the transition (Apps
+ * answered execute before these bounds applied to it, and a `done` must stay
+ * `done`), and all three are dropped, so no `app_result`.
  */
-function readExecuteAnswer(result: CallResult): { next: LinkCardOperationState; outcome: string; by: "raft" | "app_answer" } {
-  if (result.kind === "not_sent") return { next: "failed_not_sent", outcome: "not_sent", by: "raft" };
-  if (result.kind !== "answered") return { next: "unknown", outcome: result.kind === "timeout" ? "timeout" : "transport_error", by: "raft" };
-  let answer: Record<string, unknown>;
-  try { answer = parseStrictJson(result.text); } catch { return { next: "unknown", outcome: "invalid_answer", by: "raft" }; }
-  if (Object.keys(answer).some((key) => !["status", "code", "attribution", "toast"].includes(key))) return { next: "unknown", outcome: "invalid_answer", by: "raft" };
+function readExecuteAnswer(result: CallResult): ExecuteAnswer {
+  const raft = (next: LinkCardOperationState, outcome: string): ExecuteAnswer => ({ next, outcome, by: "raft", toast: null, droppedFields: [] });
+  if (result.kind === "not_sent") return raft("failed_not_sent", "not_sent");
+  if (result.kind !== "answered") return raft("unknown", result.kind === "timeout" ? "timeout" : "transport_error");
+  const answer = parseLinkCardAppAnswer(result.text, EXECUTE_ANSWER_STATUSES);
+  if (!answer) return raft("unknown", "invalid_answer");
+  const app = (next: LinkCardOperationState, toast: LinkCardHint | null = null): ExecuteAnswer =>
+    ({ next, outcome: `answered:${answer.status}`, by: "app_answer", toast, droppedFields: answer.invalidFields });
   switch (answer.status) {
-    case "accepted": case "executing": return { next: "accepted", outcome: `answered:${answer.status}`, by: "app_answer" };
-    case "done": case "refused": case "failed_not_sent": return { next: answer.status, outcome: `answered:${answer.status}`, by: "app_answer" };
-    case "unknown": return { next: "unknown", outcome: "answered:unknown", by: "app_answer" };
-    default: return { next: "unknown", outcome: "invalid_answer", by: "raft" };
+    case "accepted": case "executing": return app("accepted");
+    case "unknown": return app("unknown");
+    default: return app(answer.status, answer.appResult?.toast ?? null);
   }
+}
+
+/**
+ * One trace event per execute answer whose private fields were dropped for
+ * being outside status's bounds: the App and which fields. Never their values,
+ * the link or the viewer.
+ */
+export const LINK_CARD_EXECUTE_ANSWER_FIELDS_DROPPED_EVENT = "server.link_card.execute_answer_fields_dropped";
+function recordExecuteAnswerFieldsDropped(appId: string, fields: readonly LinkCardAppResultField[]) {
+  recordTraceEvent(LINK_CARD_EXECUTE_ANSWER_FIELDS_DROPPED_EVENT, { app_id: appId, fields: fields.join(",") });
 }
 
 /**
@@ -669,7 +838,7 @@ function readExecuteAnswer(result: CallResult): { next: LinkCardOperationState; 
  * Only after that commits is the JWT signed (exp capped at the deadline) and
  * the request sent, once. Retries and recovery never send.
  */
-async function dispatchExecute(op: AdmittedOperation, locale: string): Promise<Settled> {
+async function dispatchExecute(op: AdmittedOperation, locale: string): Promise<Dispatched> {
   await hooks.beforeDispatch?.(op.operationId);
   const { claims, live } = op;
   const jti = linkCardExecuteJti(op.operationId);
@@ -698,13 +867,18 @@ async function dispatchExecute(op: AdmittedOperation, locale: string): Promise<S
     });
     return { send: true, deadline: new Date(row.first_send_deadline) };
   });
-  if (!gate.send) return gate.settled ?? { state: "sent", receiptRevision: null };
-  // The JWT and body_sha256 cover these exact bytes.
+  if (!gate.send) return byRaft(gate.settled ?? { state: "sent", receiptRevision: null });
+  // The JWT and body_sha256 cover these exact bytes. A card form's values
+  // (RFC 086 §5.4) go here, inline, and nowhere else: this request is sent
+  // once and never queued or retried; nothing below logs the body.
+  const { sealedInputs, inputs } = op.form.submission;
   const body = JSON.stringify({
     version: 2, phase: "execute", url: live.url, action_id: claims.actionId, card_revision: claims.cardRevision,
     claimed: { business_revision: claims.businessRevision },
     ...(op.prepared ? { prepared_action_id: op.prepared.actionId, prepared_digest: op.prepared.digest } : {}),
     operation_id: op.operationId, locale, update_token: updateToken,
+    ...(sealedInputs !== null ? { sealed_inputs: sealedInputs } : {}),
+    ...(inputs !== null ? { inputs } : {}),
   });
   let assertion: string;
   try {
@@ -712,15 +886,24 @@ async function dispatchExecute(op: AdmittedOperation, locale: string): Promise<S
       phase: "execute", notAfter: gate.deadline, clientKey: linkPreviewAudienceKey(live.entry), userId: op.viewerId, serverId: op.serverId,
       serverRole: live.entry.serverRole, installationId: identity.installationKey, messageId: claims.binding.messageId,
       urlSha256: claims.binding.urlSha256, body, jti, now: hooks.signingNow?.() ?? currentDate(),
+      // RFC 086 §5.3: what a sealed value's JWE protected header is compared with, by the App, from the signed claims (never the body).
+      request: {
+        handleSha256: op.handleSha256, actionId: claims.actionId, clientRequestId: op.clientRequestId, handleExp: claims.exp,
+        prepared: op.prepared ? { actionId: op.prepared.actionId, digest: op.prepared.digest } : null,
+      },
     });
   } catch (error) {
     if (!(error instanceof CardActionPastDeadlineError)) throw error;
     // Dispatched but past the deadline: never signed, never sent; the record
     // says "may have been sent", so the operation converges to unknown.
-    return getDb().transaction((tx) => settle(tx, op, "unknown", "past_deadline"));
+    return byRaft(await getDb().transaction((tx) => settle(tx, op, "unknown", "past_deadline")));
   }
   const result = await callLinkCardActionEndpoint(live.actionEndpoint, body, assertion, locale);
-  const { next, outcome, by } = readExecuteAnswer(result);
-  return getDb().transaction((tx) => settle(tx, op, next, outcome, by));
+  const { next, outcome, by, toast, droppedFields } = readExecuteAnswer(result);
+  if (droppedFields.length) recordExecuteAnswerFieldsDropped(live.entry.app.id, droppedFields);
+  const settled = await getDb().transaction((tx) => settle(tx, op, next, outcome, by));
+  // The App's toast only for the outcome it answered: a terminal update that
+  // landed first with another one keeps its state, and Raft's hint for it.
+  return { ...settled, appToast: settled.state === next ? toast : null };
 }
 

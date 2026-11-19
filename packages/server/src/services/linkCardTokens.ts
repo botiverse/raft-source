@@ -1,4 +1,5 @@
 import { createHash, createHmac, hkdfSync, randomBytes, timingSafeEqual } from "node:crypto";
+import { APP_CARD_ENCRYPTION_KID_PATTERN } from "@botiverse/raft-shared/src/appLinkPreview";
 import { canonicalJson } from "../lib/canonicalJson";
 
 // Interactive link cards (RFC 076 §5.1). Rendering a card must not write to
@@ -77,6 +78,17 @@ export type LinkCardHandleClaims = LinkCardReadTicketClaims & {
    * called. The App decides again from its own policy; the stricter side wins.
    */
   requiresPrepare: boolean;
+  /**
+   * RFC 086: a card message's acting button, not a link's card: the Button
+   * element of the message (`messageId`) the handle presses. The binding's
+   * `urlSha256` is then the button's fallback page; absent on every link
+   * card handle. `encryptionKid` (RFC 086 §5.2): for a button whose form
+   * holds a SecretInput, the `kid` of the App's card encryption key the
+   * handle was issued under (the read's `app.encryption_key`); a value sealed
+   * under another `kid`, or a handle whose `kid` is no longer the App's,
+   * fails closed.
+   */
+  messageCard?: { elementId: string; encryptionKid?: string };
 };
 
 export type VerifiedLinkCardHandle = {
@@ -241,9 +253,19 @@ function parseHandleClaims(v: Record<string, unknown>): LinkCardHandleClaims | n
   const ticket = parseTicketClaims(v);
   const names = ["actionId", "cardRevision", "businessRevision", "descriptorSha256", "messageContentSha256"] as const;
   if (!ticket || !names.every((name) => field(v[name])) || typeof v.requiresPrepare !== "boolean") return null;
+  let messageCard: LinkCardHandleClaims["messageCard"];
+  if (v.messageCard !== undefined) {
+    const card = v.messageCard;
+    if (!card || typeof card !== "object" || Array.isArray(card) || Object.keys(card).some((key) => key !== "elementId" && key !== "encryptionKid")
+      || !field((card as Record<string, unknown>).elementId)) return null;
+    const { elementId, encryptionKid } = card as Record<string, unknown>;
+    if (encryptionKid !== undefined && (typeof encryptionKid !== "string" || !APP_CARD_ENCRYPTION_KID_PATTERN.test(encryptionKid))) return null;
+    messageCard = { elementId: elementId as string, ...(encryptionKid !== undefined ? { encryptionKid } : {}) };
+  }
   return {
     ...ticket, actionId: v.actionId as string, cardRevision: v.cardRevision as string, businessRevision: v.businessRevision as string,
     descriptorSha256: v.descriptorSha256 as string, messageContentSha256: v.messageContentSha256 as string, requiresPrepare: v.requiresPrepare,
+    ...(messageCard ? { messageCard } : {}),
   };
 }
 
@@ -260,7 +282,10 @@ function payloadOf(kind: TokenKind, claims: LinkCardReadTicketClaims | LinkCardH
   if (kind === "ticket") return base;
   const h = claims as LinkCardHandleClaims;
   return { ...base, actionId: h.actionId, cardRevision: h.cardRevision, businessRevision: h.businessRevision,
-    descriptorSha256: h.descriptorSha256, messageContentSha256: h.messageContentSha256, requiresPrepare: h.requiresPrepare };
+    descriptorSha256: h.descriptorSha256, messageContentSha256: h.messageContentSha256, requiresPrepare: h.requiresPrepare,
+    ...(h.messageCard ? { messageCard: {
+      elementId: h.messageCard.elementId, ...(h.messageCard.encryptionKid !== undefined ? { encryptionKid: h.messageCard.encryptionKid } : {}),
+    } } : {}) };
 }
 
 function sign(kind: "ticket" | "handle", claims: LinkCardReadTicketClaims | LinkCardHandleClaims): string {

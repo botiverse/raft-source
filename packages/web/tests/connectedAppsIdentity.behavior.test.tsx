@@ -2530,7 +2530,7 @@ test("registration persists setup URL and instructions through the real form sub
   await chooseRegisterAppMenuItem("own-service");
   fireEvent.change(screen.getByRole("textbox", { name: "App name" }), { target: { value: "Setup App" } });
   fireEvent.click(screen.getByRole("checkbox", { name: "Requires configuration after installation" }));
-  fireEvent.change(screen.getByRole("textbox", { name: "Setup page URL*" }), { target: { value: "https://setup.example.test/configure" } });
+  fireEvent.change(screen.getByRole("textbox", { name: "Setup page URL" }), { target: { value: "https://setup.example.test/configure" } });
   fireEvent.change(screen.getByRole("textbox", { name: /Configuration instructions/ }), { target: { value: "Choose a repository" } });
   const form = screen.getByRole("textbox", { name: "App name" }).closest("form");
   assert.ok(form);

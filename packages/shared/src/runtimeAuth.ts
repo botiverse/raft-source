@@ -21,9 +21,8 @@ import { lazySchema } from "./lazySchema";
  * (`RUNTIME_AUTH_PER_PROVIDER_RUNTIMES`). Grok Build signs in with its own
  * device code (OAR 0.99 `grok login --device-auth`). OpenCode 2 signs in per
  * provider too, through its own server (OAR 0.100 `createOpencodeProviderAuth`).
- * CodeBuddy Code signs in with its own link (OAR's stream-json `authenticate`).
  */
-export const RUNTIME_AUTH_RUNTIMES = ["claude", "codex", "kimi", "qoder", "qwen", "antigravity", "pi", "grok", "opencode", "codebuddy"] as const;
+export const RUNTIME_AUTH_RUNTIMES = ["claude", "codex", "kimi", "qoder", "qwen", "antigravity", "pi", "grok", "opencode"] as const;
 export type RuntimeAuthRuntime = (typeof RUNTIME_AUTH_RUNTIMES)[number];
 
 export function isRuntimeAuthRuntime(value: unknown): value is RuntimeAuthRuntime {
@@ -75,8 +74,7 @@ export type RuntimeAuthAction = "login" | "logout" | "connect_provider";
  * `runtimeAuthLogoutRuntimesOfComputer`). Grok Build's login and logout
  * (OAR 0.99) came together, on one capability
  * (`DAEMON_CAPABILITY_RUNTIME_AUTH_GROK`); so did OpenCode's per-provider
- * sign-in, sign-out and keys (OAR 0.100, `DAEMON_CAPABILITY_RUNTIME_AUTH_OPENCODE`),
- * and CodeBuddy Code's login and logout (`DAEMON_CAPABILITY_RUNTIME_AUTH_CODEBUDDY`).
+ * sign-in, sign-out and keys (OAR 0.100, `DAEMON_CAPABILITY_RUNTIME_AUTH_OPENCODE`).
  */
 export const RUNTIME_AUTH_ACTIONS: Readonly<Record<RuntimeAuthRuntime, readonly RuntimeAuthAction[]>> = {
   claude: ["login", "logout"],
@@ -88,7 +86,6 @@ export const RUNTIME_AUTH_ACTIONS: Readonly<Record<RuntimeAuthRuntime, readonly 
   pi: ["login", "logout", "connect_provider"],
   grok: ["login", "logout"],
   opencode: ["login", "logout", "connect_provider"],
-  codebuddy: ["login", "logout"],
 };
 
 export function runtimeAuthSupports(runtime: RuntimeAuthRuntime, action: RuntimeAuthAction): boolean {
@@ -115,7 +112,6 @@ export const RUNTIME_AUTH_LOGIN_REGION_CHOICES: Readonly<Record<RuntimeAuthRunti
   pi: [],
   grok: [],
   opencode: [],
-  codebuddy: [],
 };
 
 /**
@@ -156,9 +152,6 @@ const AUTH_RUNTIME_BY_RAFT_RUNTIME = new Map<string, RuntimeAuthRuntime>([
   // through `opencode serve` in the daemon's environment), which its agents
   // read unless their env moves OpenCode's data dir (XDG_DATA_HOME).
   ["opencode", "opencode"],
-  // CodeBuddy Code, OAR-only: its agents start the same `codebuddy` CLI in the
-  // daemon's environment, on the sign-in the web login writes.
-  ["codebuddy", "codebuddy"],
 ]);
 
 export function runtimeAuthRuntimeFor(raftRuntimeId: string): RuntimeAuthRuntime | null {
@@ -252,7 +245,7 @@ export function asRuntimeAuthLoginId(value: string): RuntimeAuthLoginId | null {
 
 /**
  * How long the server keeps a login it relays. Each login is bounded on the
- * Computer (OAR: Claude 15 min, Codex 16, Qoder 5, Antigravity 15, Grok 15, OpenCode 10, CodeBuddy 5; the Kimi Code SDK 15);
+ * Computer (OAR: Claude 15 min, Codex 16, Qoder 5, Antigravity 15, Grok 15, OpenCode 10; the Kimi Code SDK 15);
  * this is the outer bound for a Computer that never answers.
  */
 export const RUNTIME_AUTH_LOGIN_TTL_MS = 20 * 60_000;
@@ -366,7 +359,6 @@ export const runtimeAuthStatusReportSchema = lazySchema("runtimeAuthStatusReport
     pi: runtimeAuthStatusSchema.optional(),
     grok: runtimeAuthStatusSchema.optional(),
     opencode: runtimeAuthStatusSchema.optional(),
-    codebuddy: runtimeAuthStatusSchema.optional(),
   } satisfies Record<RuntimeAuthRuntime, z.ZodType>),
 }));
 export type RuntimeAuthStatusReport = z.infer<typeof runtimeAuthStatusReportSchema>;

@@ -381,9 +381,6 @@ export function formatRuntimeLoginRequiredMessage(runtimeId: string): string {
   if (runtimeId === "qoder") {
     return "Qoder is not logged in on this machine. Run `qodercli login` there, then retry starting this agent.";
   }
-  if (runtimeId === "codebuddy") {
-    return "CodeBuddy Code is not signed in on this machine. Sign in from its card on the Computer page (or run `codebuddy` there and sign in), then retry starting this agent.";
-  }
   const runtimeLabel = runtimeDisplayName(runtimeId);
   return `${runtimeLabel} is not logged in on this machine. Please log in to ${runtimeLabel} locally, then retry starting this agent.`;
 }

@@ -31,6 +31,18 @@ export function sortInboxGroupsByRecentActivity(groups: readonly InboxGroupCount
   return [...dms, ...channels];
 }
 
+/** #244 step 3b: does the channel facet list `row`'s channel? If not, a re-read would add it. */
+export function hasInboxGroup(groups: readonly InboxGroupCount[], row: ActivityPersistedItem): boolean {
+  const groupId = inboxItemGroupChannelId(row);
+  return groups.some((group) => group.channelId === groupId);
+}
+
+/** #244 step 3b: a live message on `row` (its facet listed) with its re-read skipped moves the facet's activity time, as the re-read would. */
+export function touchInboxGroupActivity(groups: InboxGroupCount[], row: ActivityPersistedItem, at: string): InboxGroupCount[] {
+  const groupId = inboxItemGroupChannelId(row);
+  return sortInboxGroupsByRecentActivity(groups.map((group) => group.channelId === groupId ? { ...group, lastActivityAt: at } : group));
+}
+
 export function preserveSelectedInboxGroup(
   incomingGroups: readonly InboxGroupCount[],
   previousGroups: readonly InboxGroupCount[],

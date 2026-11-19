@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { currentDate } from "@botiverse/raft-shared";
+import { currentDate, MESSAGE_CARD_CAPABILITIES, type MessageCardCapability } from "@botiverse/raft-shared";
 import {
   appLinkPreviewResponseSchema, appLinkReadUrls, dropInvalidLinkCardBadgeColors, LINK_CARD_CAPABILITIES, UNREVIEWED_APP_CAPABILITY, linkCardBadgeColorsForCapabilities, linkCardExecuteActions,
   matchesAppPreview, parseAppLinkPreviewV2, parseAppLinkPreviewV3,
@@ -22,7 +22,7 @@ import {
 } from "./linkCardTokens";
 import { oidcIssuer, signAppLinkPreviewAssertion } from "./oidcService";
 import { isApprovedOfficialAppClient } from "./officialAppAutoInstallService";
-import { ownServerActionsInForce } from "./linkCardExecuteEligibility";
+import { unreviewedActionsBasis } from "./linkCardExecuteEligibility";
 import { recordTraceEvent } from "../tracing/semanticTrace";
 
 // The batched link-card read (RFC 076 §6.1; protocol v3.2.3 §4, addenda 1, 2
@@ -63,6 +63,14 @@ export type LinkCardReadRequest = {
   urls: ReadonlySet<string> | null;
   /** The client's current ticket per link (the item `url` it was issued for). */
   tickets: ReadonlyMap<string, string>;
+  /**
+   * RFC 086 §4.4, §5.1: the card message capabilities the client declared
+   * (`card.execute.v1`: it draws a card message's acting buttons;
+   * `card.form.v1` and `card.form.secret.v1`: their forms), sorted. Read only
+   * for card messages; never forwarded to an App or bound into a link's
+   * ticket.
+   */
+  messageCardCapabilities: MessageCardCapability[];
 };
 
 const BODY_FIELDS = new Set(["view_instance_id", "capabilities", "locale", "urls", "tickets"]);
@@ -108,6 +116,7 @@ export function parseLinkCardReadBody(body: unknown): LinkCardReadRequest | null
   return {
     viewInstanceId, locale, urls, tickets,
     capabilities: LINK_CARD_CAPABILITIES.filter((known) => capabilities.includes(known)).sort(),
+    messageCardCapabilities: MESSAGE_CARD_CAPABILITIES.filter((known) => capabilities.includes(known)).sort(),
   };
 }
 
@@ -166,13 +175,13 @@ export function __resetLinkCardReadBudgetForTests() {
  * The most this provider's buttons may do (addendum 4 §2; RFC 076 §17): an
  * approved official App without an approved action endpoint in force, or
  * suspended -> navigate and read, otherwise every button; any other App ->
- * every button only where its own-Server actions are in force for this
- * viewer's Server (linkCardExecuteEligibility), else navigate only. Display
+ * every button only where its installation on this viewer's Server lets them
+ * act (`unreviewed`: unreviewedActionsBasis), else navigate only. Display
  * only: the action endpoints check again before calling the App (C2b).
  */
-export function linkCardActionTier(input: { official: boolean; ownServer: boolean; actionEndpoint: string | null; suspended: boolean }): LinkCardActionTier {
+export function linkCardActionTier(input: { official: boolean; unreviewed: boolean; actionEndpoint: string | null; suspended: boolean }): LinkCardActionTier {
   if (input.official) return input.actionEndpoint !== null && !input.suspended ? "execute" : "read";
-  return input.ownServer ? "execute" : "navigate";
+  return input.unreviewed ? "execute" : "navigate";
 }
 
 type Plan = { url: string; entry: RegisteredApp };
@@ -310,17 +319,7 @@ const sameBinding = (a: LinkCardViewBinding, b: LinkCardViewBinding) =>
 function signCardTokens(input: { url: string; request: LinkCardReadRequest; binding: LinkCardViewBinding; card: ItemOf<"card">; messageContentSha256: string }): LinkCardActionHandles {
   const actions = linkCardExecuteActions(input.card.card);
   if (!actions.length) return { ticket: null, actions: [] };
-  const now = currentDate();
-  const iat = Math.floor(now.getTime() / 1000);
-  const presented = input.request.tickets.get(input.url);
-  const earlier = presented === undefined ? null : verifyLinkCardReadTicket(presented, now);
-  const continues = !!earlier && earlier.viewInstanceId === input.request.viewInstanceId && sameBinding(earlier.binding, input.binding);
-  const claims: LinkCardReadTicketClaims = {
-    viewInstanceId: input.request.viewInstanceId,
-    viewNonce: continues ? earlier.viewNonce : newLinkCardViewNonce(),
-    epoch: continues ? earlier.epoch + 1 : 1,
-    binding: input.binding, iat, exp: iat + LINK_CARD_TOKEN_MAX_TTL_SECONDS,
-  };
+  const claims = linkCardTicketClaims(input);
   return {
     ticket: signLinkCardReadTicket(claims),
     actions: actions.map((action) => ({
@@ -332,6 +331,27 @@ function signCardTokens(input: { url: string; request: LinkCardReadRequest; bind
         descriptorSha256: canonicalJsonSha256(action.descriptor), messageContentSha256: input.messageContentSha256, requiresPrepare: action.requiresPrepare,
       }),
     })),
+  };
+}
+
+/**
+ * The claims of the ticket a read signs for one view of `url`: the client's
+ * earlier ticket for it continues its chain (same nonce, epoch + 1) only if it
+ * verifies and was issued for this view and this exact binding; otherwise a
+ * new nonce at epoch 1. A card message's acting buttons (RFC 086) chain the
+ * same way, one ticket per fallback page.
+ */
+export function linkCardTicketClaims(input: { url: string; request: Pick<LinkCardReadRequest, "tickets" | "viewInstanceId">; binding: LinkCardViewBinding }): LinkCardReadTicketClaims {
+  const now = currentDate();
+  const iat = Math.floor(now.getTime() / 1000);
+  const presented = input.request.tickets.get(input.url);
+  const earlier = presented === undefined ? null : verifyLinkCardReadTicket(presented, now);
+  const continues = !!earlier && earlier.viewInstanceId === input.request.viewInstanceId && sameBinding(earlier.binding, input.binding);
+  return {
+    viewInstanceId: input.request.viewInstanceId,
+    viewNonce: continues ? earlier.viewNonce : newLinkCardViewNonce(),
+    epoch: continues ? earlier.epoch + 1 : 1,
+    binding: input.binding, iat, exp: iat + LINK_CARD_TOKEN_MAX_TTL_SECONDS,
   };
 }
 
@@ -391,9 +411,9 @@ export async function readLinkCards(input: {
   const stillValid = (entry: RegisteredApp) => current.some((row) => row.app.id === entry.app.id && row.installationId === entry.installationId
     && row.config.revision === entry.config.revision && provenWithin(row.config.verifiedAt, LINK_PREVIEW_PROOF_HARD_TTL_MS, currentDate()));
 
-  // Decided on the registration as it is after the callbacks (a withdrawn
-  // own-Server confirmation is not covered by the revision stillValid checks).
-  // An App acting under its own-Server confirmation (RFC 076 §17) keeps its
+  // Decided on the registration and installation as they are after the
+  // callbacks (a switch-off or withdrawal is not covered by the revision
+  // stillValid checks). An App that is not official (RFC 076 §17) keeps its
   // acting buttons only for a client that declared unreviewed_app.v1, and
   // only that client is told it is not reviewed (`app.reviewed: false`).
   const tiers = new Map<string, LinkCardActionTier>();
@@ -404,9 +424,9 @@ export async function readLinkCards(input: {
     const now = current.find((row) => row.app.id === app.id);
     if (!now) continue;
     const official = await isApprovedOfficialAppClient(app.id);
-    const ownServer = !official && ownServerActionsInForce(now, input.serverId) && input.request.capabilities.includes(UNREVIEWED_APP_CAPABILITY);
-    if (ownServer) unreviewed.add(app.id);
-    tiers.set(app.id, linkCardActionTier({ official, ownServer, actionEndpoint: now.config.actionEndpoint, suspended: now.config.suspendedAt !== null }));
+    const acts = !official && unreviewedActionsBasis(now, input.serverId) !== null && input.request.capabilities.includes(UNREVIEWED_APP_CAPABILITY);
+    if (acts) unreviewed.add(app.id);
+    tiers.set(app.id, linkCardActionTier({ official, unreviewed: acts, actionEndpoint: now.config.actionEndpoint, suspended: now.config.suspendedAt !== null }));
   }
   const messageContentSha256 = linkCardMessageContentSha256(input.content);
   const items = outcomes.flatMap((outcome): LinkCardReadItem[] => {

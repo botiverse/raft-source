@@ -254,9 +254,19 @@ type CardActionAssertionBase = {
   installationId: string; messageId: string; urlSha256: string; body: string | Uint8Array;
   jti: string; now: Date;
 };
-/** Execute always carries the first-send deadline; prepare and status may. */
+/**
+ * What an execute assertion also names of the person's request (RFC 086 §5.3):
+ * the handle used (its SHA-256, lowercase hex), the action, the request id
+ * the person's client sent, the handle's expiry (seconds) and, after a
+ * confirmation, the prepared action's id and digest. An App compares a sealed
+ * value's JWE protected header with these signed claims, never with the body.
+ */
+export type CardActionExecuteRequestClaims = {
+  handleSha256: string; actionId: string; clientRequestId: string; handleExp: number; prepared: { actionId: string; digest: string } | null;
+};
+/** Execute always carries the first-send deadline and the request's claims; prepare and status may carry the deadline. */
 export type CardActionAssertionInput =
-  | CardActionAssertionBase & { phase: "execute"; notAfter: Date }
+  | CardActionAssertionBase & { phase: "execute"; notAfter: Date; request: CardActionExecuteRequestClaims }
   | CardActionAssertionBase & { phase: Exclude<CardActionPhase, "execute">; notAfter?: Date };
 
 /** The operation's first-send deadline has passed: do not sign, do not send. */
@@ -277,6 +287,12 @@ export class CardActionPastDeadlineError extends Error {
  * Execute must pass it, as the operation's first-send deadline, so no execute
  * credential outlives that deadline (protocol v3.2.3 §5.3.4); for prepare and
  * status it is optional.
+ * An execute assertion also carries `handle_sha256`, `action_id`,
+ * `client_request_id`, `handle_exp` and, after a confirmation,
+ * `prepared_action_id` and `prepared_digest` (RFC 086 §5.3): the claims a
+ * sealed card form value's JWE header (`hnd`, `act`, `crq`, `exp`, `pid`,
+ * `pdg`; with `sub`, `server_id` for `srv` and the audience's client id for
+ * `aud`) must equal.
  * `iss` is always `<origin>/oidc/<server_id>`, derived here from `serverId`
  * (addendum 1 §5): a slug can be renamed, and Apps require `iss` to equal the
  * `server_id` claim's issuer, so no caller can sign it any other way.
@@ -285,6 +301,7 @@ export class CardActionPastDeadlineError extends Error {
 export function signCardActionAssertion(input: CardActionAssertionInput): string {
   if (!/^[0-9a-f]{64}$/.test(input.urlSha256)) throw new Error("urlSha256 must be a hex SHA-256");
   if (input.phase === "execute" && !(input.notAfter instanceof Date)) throw new Error("an execute assertion needs notAfter (the first-send deadline)");
+  if (input.phase === "execute" && !/^[0-9a-f]{64}$/.test(input.request.handleSha256)) throw new Error("handleSha256 must be a hex SHA-256");
   const now = Math.floor(input.now.getTime() / 1000);
   const notAfter = input.notAfter ? Math.floor(input.notAfter.getTime() / 1000) : Number.POSITIVE_INFINITY;
   if (!(now < notAfter)) throw new CardActionPastDeadlineError();
@@ -299,6 +316,11 @@ export function signCardActionAssertion(input: CardActionAssertionInput): string
     message_id: input.messageId,
     url_sha256: input.urlSha256,
     body_sha256: createHash("sha256").update(input.body).digest("hex"),
+    ...(input.phase === "execute" ? {
+      handle_sha256: input.request.handleSha256, action_id: input.request.actionId, client_request_id: input.request.clientRequestId,
+      handle_exp: input.request.handleExp,
+      ...(input.request.prepared ? { prepared_action_id: input.request.prepared.actionId, prepared_digest: input.request.prepared.digest } : {}),
+    } : {}),
   }));
   const signingInput = `${header}.${payload}`;
   const signature = sign("sha256", Buffer.from(signingInput, "ascii"), { key: privateKey, dsaEncoding: "ieee-p1363" });

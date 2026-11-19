@@ -16,6 +16,7 @@ const CASES = [
   ["03-consent-warning", "consent", null, "dialog"],
   ["04a-list-below-limit", "list-below", null, "radio"],
   ["04b-list-at-5-hour-limit", "list-wall", "Continue", "radio"],
+  ["04c-list-read-only", "list-read-only", null, "listitem"],
   ["05-confirm", "confirm", null, "dialog"],
   ["06a-result-success", "result-success", null, "scene"],
   ["06b-result-refused-nothing-used", "result-refused", "Use weekly reset", "No reset was used"],
@@ -39,6 +40,7 @@ try {
     if (waitFor === "scene") await page.locator("[data-shot='scene']").first().waitFor({ state: "visible", timeout: 20_000 });
     else if (waitFor === "dialog") await page.getByRole("dialog").last().waitFor({ state: "visible", timeout: 20_000 });
     else if (waitFor === "radio") await page.getByRole("radio").first().waitFor({ state: "visible", timeout: 20_000 });
+    else if (waitFor === "listitem") await page.getByRole("listitem").first().waitFor({ state: "visible", timeout: 20_000 });
     else await page.getByText(waitFor, { exact: false }).first().waitFor({ state: "visible", timeout: 20_000 });
     await page.evaluate(() => document.fonts.ready);
     await page.waitForTimeout(600);

@@ -693,12 +693,13 @@ test("visibility follow-ups: any role change resets, an archived guest channel l
   await db.update(channels).set({ description: "after delete" }).where(eq(channels.id, room.id));
   assert.equal(await count(), before);
 
-  // The guest feature flag changing resets guest viewers only.
+  // The retired guest flag (server_guest_v0) decides nothing: changing its
+  // row resets nobody (its guest_access trigger is dropped).
   const ownerMid = await sync(ownerClient, ownerStart.cursor);
   const guestMid = await sync(guestClient, guestRound.cursor);
   const flipped = await db.execute(sql`UPDATE feature_flags SET kill_switch = NOT kill_switch WHERE key = 'server_guest_v0'`);
-  assert.equal(flipped.rowCount ?? (flipped as { affectedRows?: number }).affectedRows, 1, "the guest flag is in the migrated baseline");
-  assert.equal((await sync(guestClient, guestMid.cursor)).reset?.reason, "forced");
+  assert.equal(flipped.rowCount ?? (flipped as { affectedRows?: number }).affectedRows, 1, "the flag row is still in the migrated baseline");
+  assert.equal((await sync(guestClient, guestMid.cursor)).reset, null);
   assert.equal((await sync(ownerClient, ownerMid.cursor)).reset, null);
 });
 
@@ -720,7 +721,9 @@ test("an inactive joint revokes it from the joint's members on every projection"
   );
 });
 
-test("a guest_access reset that commits after the guest's cursor passed its seq still reaches the guest", async ({ seed, db, http }) => {
+// No trigger writes guest_access resets any more; rows written before it was
+// dropped stay in change_log until retention, and still reach guest viewers.
+test("a historical guest_access reset that commits after the guest's cursor passed its seq still reaches the guest", async ({ seed, db, http }) => {
   const owner = await seed.human();
   const guest = await seed.human();
   const server = await seed.server({ owner, members: [guest] });

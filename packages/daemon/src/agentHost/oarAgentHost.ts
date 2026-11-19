@@ -16,7 +16,7 @@
 // (`RuntimeDriver.oarOnly`: Qwen Code, Qoder) is never handed back: the router
 // fails what this host cannot run (agentHostRouter.ts).
 //
-// Scope today: antigravity, codex, cursor, grok, qwen, qoder, codebuddy (`OAR_LAUNCHES`). See README.md in this directory.
+// Scope today: antigravity, codex, cursor, grok, opencode, qwen, qoder (`OAR_LAUNCHES`). See README.md in this directory.
 
 import { randomUUID } from "node:crypto";
 import path from "node:path";
@@ -25,6 +25,7 @@ import { activityTurnTokensFrom } from "../runtimeTurnTokens";
 import { resolveRaftHome } from "../raftHome";
 import { SessionSummaryRecorder, SessionSummaryStore, sessionSummaryDir } from "./oarSessionSummary";
 import {
+  AGENT_INBOX_DROPPED_APP_EVENTS_MAX_IDS,
   AGENT_TURN_ENDED_MAX_SHOWN_TARGETS,
   type AgentActivityDetailKind,
   type AgentActivityKind,
@@ -88,7 +89,7 @@ import { messagesTraceAttrs } from "../runtimeTurnTrace";
 import { appInboxTurnTriggerAttrs, messageTurnTriggerAttrs } from "../turnTriggerTrace";
 import { runtimeTelemetryVersionAttrs, sanitizeRuntimeTelemetryPayloadAttrs } from "../runtimeTelemetrySanitization";
 import { spawnCliTransportDir } from "../drivers/cliTransport";
-import { AGENT_STOP_KILL_CONFIRM_MS, AGENT_STOP_KILL_GRACE_MS } from "../drivers/processStop";
+import { AGENT_STOP_KILL_CONFIRM_MS, AGENT_STOP_KILL_GRACE_MS, agentStopTraceAttrs, type AgentStopReason } from "../drivers/processStop";
 import { planSpawnContextGeneration } from "../contextGeneration";
 import { cleanupLaunchProxies, cleanupLaunchProxiesForLaunch } from "../launchProxyCleanup";
 import { logger } from "../logger";
@@ -183,7 +184,7 @@ import {
 import { startFailureActivity } from "../spawnFailureClassification";
 import { reportedStickyFailureReason, type SessionResetCause } from "../stickyFailureRecords";
 import { TURN_END_COMPACTION_EVENT, TURN_END_COMPACTION_OAR_RUNTIMES, TurnEndCompactionArming, turnEndCompactionLogLine, decideTurnEndCompaction, resolveTurnEndCompactionConfig, turnEndCompactionTraceAttrs, type TurnEndContextFacts } from "../turnEndCompaction";
-import { COLD_IDLE_SWEEP_MS, WAKE_RECYCLE_SUMMARY_FACTS_RUNTIMES, applyWakeRecycleBriefing, coldIdleGate, decideColdIdle, describeAppliedWakeRecycle, describeRecycledWakeLogLine, recycleThresholdTraceAttrs, planWakeSessionRecycle, resolveWakeRecycleConfig, sessionSummaryResumeFacts, wakeRecycleKindTraceAttrs } from "../wakeSessionRecycle";
+import { COLD_IDLE_SWEEP_MS, IDLE_PROCESS_STOP_RUNTIMES, idleProcessStopMs, WAKE_RECYCLE_SUMMARY_FACTS_RUNTIMES, applyWakeRecycleBriefing, coldIdleGate, decideColdIdle, describeAppliedWakeRecycle, describeRecycledWakeLogLine, recycleThresholdTraceAttrs, planWakeSessionRecycle, resolveWakeRecycleConfig, sessionSummaryResumeFacts, wakeRecycleKindTraceAttrs } from "../wakeSessionRecycle";
 import { WARM_RECYCLE_CANCELLED_EVENT, WARM_RECYCLE_MARKED_EVENT, WARM_RECYCLE_STOPPED_EVENT, WarmRecycleMarks, decideWarmRecycleMark, describeWarmRecycleCancelled, describeWarmRecycleMarked, describeWarmRecycleStopped, resolveWarmRecycleConfig, warmRecycleCoversRuntime, warmRecycleSenderKind, type WarmRecycleCancelReason, type WarmRecycleConfig, type WarmRecycleMark, type WarmRecycleSenderKind, type WarmRecycleTimers } from "../wakeRecycleWarm";
 import type { AgentDeliveryContext, AgentIdleNoticeDelivery, AgentIdleNoticeFacts, AgentStartRequest, AgentTurnInterruptReport, HostedAgentSession } from "./agentLifecycleHost";
 import { OarActivityProjector, type OarToolClassifier } from "./oarActivity";
@@ -195,7 +196,8 @@ import { prepareCodexOarLaunch } from "./oarCodexLaunch";
 import { cursorAuthEnv, cursorSdkCredentialPresent, cursorSdkSignIn, prepareCursorOarLaunch } from "./oarCursorLaunch";
 import { prepareGrokOarLaunch } from "./oarGrokLaunch";
 import { prepareOarOnlyLaunch } from "./oarOnlyLaunch";
-import type { OarLaunch, PrepareOarLaunch } from "./oarLaunch";
+import { isOarOpencodeVersion, prepareOpencodeOarLaunch } from "./oarOpencodeLaunch";
+import { OarLaunchDeclined, type OarLaunch, type PrepareOarLaunch } from "./oarLaunch";
 
 /** How each runtime this host runs turns a Raft launch into an OAR launch. */
 const OAR_LAUNCHES: Readonly<Record<string, PrepareOarLaunch>> = {
@@ -204,9 +206,10 @@ const OAR_LAUNCHES: Readonly<Record<string, PrepareOarLaunch>> = {
   // #oar-raft:#10, behind `agent_runtime_oar_cursor` (oarCursorLaunch.ts).
   cursor: (ctx) => prepareCursorOarLaunch(ctx),
   grok: (ctx) => prepareGrokOarLaunch(ctx),
+  // Behind `agent_runtime_oar_opencode` and `runtime-host:oar:opencode` (oarOpencodeLaunch.ts).
+  opencode: (ctx) => prepareOpencodeOarLaunch(ctx),
   qwen: (ctx) => prepareOarOnlyLaunch("qwen", ctx),
   qoder: (ctx) => prepareOarOnlyLaunch("qoder", ctx),
-  codebuddy: (ctx) => prepareOarOnlyLaunch("codebuddy", ctx),
 };
 
 /**
@@ -239,6 +242,12 @@ const CURSOR_MIGRATIONS_NOTED_MAX = 1_000;
  * what happened and what to do, in the owner's words.
  */
 export const CURSOR_SIGN_IN_UNREADABLE_TEXT = "The agent didn't start because Raft couldn't check this Computer's Cursor sign-in (the check failed or took too long). Its Cursor session is kept. Start the agent again; if this keeps happening, restart the Computer.";
+/**
+ * The Activity Log row when an OpenCode 2.x session OAR will not resume in the
+ * agent's workspace (made before #14872 under the daemon's directory) is left
+ * for a new session.
+ */
+export const OPENCODE_SESSION_ELSEWHERE_TEXT = "Raft now keeps OpenCode sessions in the agent's workspace, and this agent's earlier OpenCode session was kept elsewhere, so it started a new OpenCode session. Its memory and Raft history are unchanged.";
 /** #oar-raft:#10: the Activity Log row when a Cursor CLI session is left for a new SDK session. */
 export const CURSOR_SESSION_MIGRATED_TEXT = "Raft now runs Cursor through the Cursor SDK, which can't continue sessions from the Cursor CLI, so this agent started a new Cursor session. Its memory and Raft history are unchanged.";
 /** Steers the runtime may refuse in one turn before held deliveries wait for its end. */
@@ -248,6 +257,8 @@ const TAKEN_ID_LIMIT = 4096;
 const TAKEN_ID_MAX_AGE_MS = 60 * 60_000;
 /** Ends whose dropped deliveries the server carries by design (a stop); others are logged as warnings. */
 const OAR_STOP_REASONS: ReadonlySet<string> = new Set(["explicit_stop", "silent_stop", "stopped_start", "spec_restart", "stalled_recovery"]);
+/** Idle hand-overs: their dropped app events are not reported (the legacy host's IDLE_HANDOVER_EXIT_PATHS); they run with nothing held. */
+const IDLE_HANDOVER_REASONS: ReadonlySet<string> = new Set(["cold_idle_recycle", "idle_process_stop", "warm_recycle"]);
 const TEXT_COALESCE_MS = 1_000;
 const DELIVERY_ORIGIN = { kind: "notification", source: "raft" } as const;
 
@@ -278,13 +289,14 @@ export interface OarLaunchLedger {
 export const OAR_GROK_MIN_CLI_VERSION = [1, 0, 70] as const;
 
 /**
- * Grok Build itself (`grok 1.0.77`, optionally `[stable]`) at or above
+ * Grok Build itself (`grok 1.0.77`, optionally its build hash and channel:
+ * `grok 1.0.77 (50ca579fa996) [stable]`) at or above
  * OAR_GROK_MIN_CLI_VERSION. Another program in the slot (`raft-devin-adapter
  * 0.2.0`, `grok 0.9.0 (raft-acp-bridge 0.3.0)`, `aiderdesk 0.1.0`) or no
  * version at all is not.
  */
 export function isVerifiedGrokCli(version: string | undefined): boolean {
-  const match = /^grok (\d+)\.(\d+)\.(\d+)(?: \[[a-z]+\])?$/i.exec(version?.trim() ?? "");
+  const match = /^grok (\d+)\.(\d+)\.(\d+)(?: \([0-9a-f]{7,40}\))?(?: \[[a-z]+\])?$/i.exec(version?.trim() ?? "");
   if (!match) return false;
   const parts = [Number(match[1]), Number(match[2]), Number(match[3])];
   for (let i = 0; i < 3; i++) {
@@ -443,6 +455,13 @@ interface Delivery {
   rawInput?: string;
   /** A start's own first input, held at its commit (a credential hold): it belongs to that launch. */
   firstInput?: true;
+  /**
+   * A start's own input (its held first input, or a message deferred from
+   * it): the app events it carries (the wake of a refused push the server
+   * converted into this start, `converted_to_wake`). The server re-sends none
+   * of them, so dropped they are reported as custody deliveries are.
+   */
+  startEventIds?: readonly string[];
   /** When this host took it (the turn span's `local_wait_ms`). */
   receivedAtMs: number;
   /** A pre-rendered input's turn span start (its reason and trigger); ordinary messages carry theirs. */
@@ -456,6 +475,8 @@ interface Delivery {
 export interface HeldDelivery {
   message: AgentMessage;
   context: AgentDeliveryContext;
+  /** Its app events the server re-sends none of (`droppedAppEventIds`): dropped, they go in `reportDroppedAppEvents`. */
+  droppedAppEventIds?: readonly string[];
   settle(accepted: boolean | Promise<boolean>): void;
 }
 
@@ -636,6 +657,14 @@ interface HostedAgent {
    * was opened (OAR's clock; null before), for the uptime.
    */
   openedAtMs: number | null;
+  /**
+   * #proj-runtime:#63: when this host last saw an event from the session (its
+   * own clock; null before any). The idle process stop counts idle time from
+   * the later of this and the session summary's last activity, so a summary
+   * whose clock is behind (or a record with no time) never makes a live
+   * session look an hour idle.
+   */
+  lastEventAtMs: number | null;
   /** The session produced model output (text, reasoning, a tool start). */
   modelOutput: boolean;
   /** A turn runs (`turn_started` .. `turn_ended`). */
@@ -1017,6 +1046,10 @@ export class OarAgentHost {
     // the OAR Grok adapter was checked against, runs here; anything else keeps
     // the driver until it is verified.
     if (runtime === "grok" && !isVerifiedGrokCli(this.deps.detectedRuntimeCliVersion?.("grok"))) return { ok: false, reason: "grok_cli_not_verified" };
+    // OpenCode 1.x from 1.18.30, 2.x from 2.0.27, below 3 (what OAR's adapter
+    // was checked against), as the last ready reported it; the launch reads
+    // the version again (`opencode_version_unsupported` hands it back then).
+    if (runtime === "opencode" && !isOarOpencodeVersion(this.deps.detectedRuntimeCliVersion?.("opencode"))) return { ok: false, reason: "opencode_version_unsupported" };
     if (config.runtimeProfileControl) return { ok: false, reason: "runtime_profile_control" };
     if (request.wakeMessage && runtimeProfileNotificationFromMessage(request.wakeMessage)) return { ok: false, reason: "runtime_profile_message" };
     // RFC 071: an admitted human start's grant is spent at the legacy host's
@@ -1295,6 +1328,7 @@ export class OarAgentHost {
       subagentWake: { resultUnread: false, lastTurnAborted: false },
       stallDeadline: null,
       openedAtMs: null,
+      lastEventAtMs: null,
       modelOutput: false,
       turnOpen: false,
       turnCutByExit: false,
@@ -1358,6 +1392,8 @@ export class OarAgentHost {
       this.revokeLaunchOnlyCredential(agent);
       const cursorResume = this.cursorSdkResumeFailed(agent, error);
       if (cursorResume) return this.startCursorAfterResumeFailure(agent, cursorResume.sessionId, cursorResume.cause);
+      const elsewhere = this.resumeRefusedElsewhere(agent, error);
+      if (elsewhere) return this.startAfterResumeElsewhere(agent, elsewhere);
       this.deps.recordEvent("daemon.agent.oar.fallback", {
         agentId: agent.agentId,
         launchId: agent.launchId ?? undefined,
@@ -1424,6 +1460,46 @@ export class OarAgentHost {
           title: "New Cursor session",
           text: `Stored Cursor session ${sessionId} could not be resumed, so this agent started a new Cursor session. Earlier runtime context may not be restored; its memory and Raft history are unchanged.`,
         },
+      },
+    );
+  }
+
+  /**
+   * OpenCode 2.x (`OarLaunch.newSessionOnResumeElsewhere`): OAR refused the
+   * resume because the session lives in another directory than the agent's
+   * workspace (`UnsupportedOptionError` on `cwd`). Sessions made before
+   * #14872 ran with the daemon's `$PWD`. The driver could reopen such a
+   * session only in that other directory, so it is not handed back: a new
+   * session starts here. Any other open failure is handed back as before.
+   */
+  private resumeRefusedElsewhere(agent: HostedAgent, error: unknown): string | null {
+    if (agent.launch?.newSessionOnResumeElsewhere !== true || !(error instanceof HandBack)) return null;
+    if (error.reason !== "resume_failed:UnsupportedOptionError") return null;
+    const option = (error.cause as { option?: unknown } | undefined)?.option;
+    if (option !== "cwd") return null;
+    return agent.launch.options.resume ?? null;
+  }
+
+  /**
+   * The new session after `resumeRefusedElsewhere`: the same start with no
+   * session (its first input a fresh session's). The server forgets the old
+   * session (`runtime_host_migration`); the new session's Activity Log says
+   * why, as for a Cursor CLI session left behind (not an error).
+   */
+  private startAfterResumeElsewhere(agent: HostedAgent, sessionId: string): Promise<OarStartOutcome> {
+    const { agentId } = agent;
+    const launchId = agent.launchId ?? undefined;
+    logger.warn(`[Agent ${agentId}] ${agent.runtimeId} session ${sessionId} lives outside the agent's workspace; starting a new session`);
+    this.deps.recordEvent("daemon.agent.oar.resume_elsewhere_new_session", { agentId, launchId, runtime: agent.runtimeId });
+    this.deps.sendToServer({ type: "agent:session:invalidate", agentId, sessionId, ...(launchId ? { launchId } : {}), reason: "runtime_host_migration" });
+    const carried = agent.pending.splice(0);
+    this.agents.delete(agentId);
+    return this.startHosted(
+      { ...agent.request, launchId, config: { ...agent.request.config, sessionId: null } },
+      {
+        carried,
+        notBeforeMs: null,
+        sessionNotice: { kind: "system", title: "New OpenCode session", text: OPENCODE_SESSION_ELSEWHERE_TEXT },
       },
     );
   }
@@ -1503,7 +1579,8 @@ export class OarAgentHost {
       onMentionAck: () => { for (const each of contexts) each.onMentionAck?.(); },
       onRejectedNoProcess: () => { for (const each of contexts) each.onRejectedNoProcess?.(); },
     };
-    return { message: delivery.message, context, settle: (accepted) => delivery.settle(accepted) };
+    const droppedAppEventIds = this.droppedAppEventIds(delivery);
+    return { message: delivery.message, context, ...(droppedAppEventIds.length > 0 ? { droppedAppEventIds } : {}), settle: (accepted) => delivery.settle(accepted) };
   }
 
   private async launch(agent: HostedAgent): Promise<void> {
@@ -1750,8 +1827,13 @@ export class OarAgentHost {
     });
     agent.proxyLaunch = { launchId: ctx.launchId ?? null };
     // Bounded whichever way the launch was prepared (a test's deps included).
+    const prepared = await this.prepareLaunch(ctx).catch((error: unknown) => {
+      // The launch decided the driver runs this start (an OpenCode version or session the OAR host does not take).
+      if (error instanceof OarLaunchDeclined) throw new HandBack(error.reason, undefined, { cause: error });
+      throw error;
+    });
     const launch = withOarOomPreference(
-      withOarRecordRetention(await this.prepareLaunch(ctx)),
+      withOarRecordRetention(prepared),
       path.join(this.deps.slockHome ?? resolveRaftHome(), "oar-launch"),
       this.deps.platform,
     );
@@ -1776,7 +1858,9 @@ export class OarAgentHost {
     let session: Session;
     agent.openedAtMs = this.now();
     try {
-      session = await this.openSession(launch);
+      session = launch.openGate
+        ? await launch.openGate(() => { this.checkpoint(agent); return this.openSession(launch); }, agent.abort.signal)
+        : await this.openSession(launch);
     } catch (error) {
       this.checkpoint(agent);
       // Never a fresh session in place of the one this agent had: the legacy
@@ -1802,6 +1886,17 @@ export class OarAgentHost {
     // Reconciler step 5: its runtime is recorded for the orphan sweep (OAR keeps the pid to itself).
     this.deps.runtimeProcesses?.opened(agent.agentId, agent.launchId);
     this.checkpoint(agent);
+    if (launch.sessionOpened) {
+      try {
+        await launch.sessionOpened(session);
+      } catch (error) {
+        // OpenCode: the session's major line could not be recorded, so it would
+        // be resumable without provenance. Disposed with the launch, handed back.
+        this.checkpoint(agent);
+        throw new HandBack(`open_failed:session_record`, undefined, { cause: error });
+      }
+      this.checkpoint(agent);
+    }
     if (launch.firstInputReady) {
       const ready = await launch.firstInputReady(session, agent.abort.signal);
       this.deps.recordEvent("daemon.agent.oar.first_input_ready", {
@@ -1870,7 +1965,7 @@ export class OarAgentHost {
         const wakeContext = { ...(request.wakeMessageTransient ? { transient: true } : {}) };
         const carriedCount = agent.carried.length;
         agent.pending = [
-          ...deferred.map((message) => this.newDelivery(message, [message === wakeMessage ? wakeContext : {}])),
+          ...deferred.map((message) => this.newDelivery(message, [message === wakeMessage ? wakeContext : {}], { startEventIds: thirdPartyEventIdsFromEvents([message]) })),
           ...agent.carried.splice(0),
           ...agent.pending,
         ];
@@ -1947,10 +2042,19 @@ export class OarAgentHost {
         content: "",
         timestamp: new Date(this.now()).toISOString(),
       };
-      const first = this.newDelivery(message, [{}], { rawInput: heldFirstInput, firstInput: true, onAccepted: firstInputTaken, turnStart: firstTurn });
+      // The app events the start itself brought (its wake), not the carried deliveries, which report their own.
+      const carriedMessages = new Set(agent.carried.map((delivery) => delivery.message));
+      const startEventIds = this.startInputEventIds(agent.request, acceptedMessages.filter((each) => !carriedMessages.has(each)));
+      const first = this.newDelivery(message, [{}], { rawInput: heldFirstInput, firstInput: true, onAccepted: firstInputTaken, turnStart: firstTurn, startEventIds });
       // Not taken after all (refused, or the session ended): the deliveries it names go with it.
       void first.settled.then((accepted) => {
-        if (!accepted) for (const delivery of agent.carried.splice(0)) delivery.settle(false);
+        if (accepted) return;
+        const dropped = agent.carried.splice(0);
+        for (const delivery of dropped) delivery.settle(false);
+        // Its own app events, if any, were reported where it was dropped or refused.
+        // The requeued ones wait for the agent's next start: this session
+        // reported its runtime ready at the commit.
+        this.reportDroppedAppEvents(agentId, agent.launchId, "first_input_refused", dropped.flatMap((delivery) => this.droppedAppEventIds(delivery)));
       });
       agent.pending.unshift(first);
       this.reportHeld(agent.carried);
@@ -2119,10 +2223,15 @@ export class OarAgentHost {
   private onEvent(agent: HostedAgent, session: Session, event: Event): void {
     // A stopped or replaced launch never speaks for the agent again.
     if (!this.isCurrent(agent) || agent.session !== session) return;
+    agent.lastEventAtMs = this.now();
     // A task's events come from wherever the runtime reports them: Grok on the parent, Qwen and Qoder on the sub-agent.
     this.publishTaskRow(agent, event);
-    // Sub-agents (and grok's child sessions, which carry their own session id) stay in OAR's stream.
-    if (event.agentPath.length > 0 || event.sessionId !== session.id) return;
+    // Sub-agents (and grok's child sessions, which carry their own session id)
+    // stay in OAR's stream; only a running subagent's tool calls come out, as its steps.
+    if (event.agentPath.length > 0 || event.sessionId !== session.id) {
+      this.publishSubagentStep(agent, event);
+      return;
+    }
     if (!agent.runtimeReadySent && event.kind !== "turn_started" && event.kind !== "turn_active" && event.kind !== "user_message") {
       this.sendRuntimeReady(agent, false);
     }
@@ -3743,7 +3852,7 @@ export class OarAgentHost {
     return custody ? true : delivery.settled;
   }
 
-  private newDelivery(message: AgentMessage, contexts: AgentDeliveryContext[], extra: Partial<Pick<Delivery, "custody" | "rawInput" | "firstInput" | "onAccepted" | "turnStart">> = {}): Delivery {
+  private newDelivery(message: AgentMessage, contexts: AgentDeliveryContext[], extra: Partial<Pick<Delivery, "custody" | "rawInput" | "firstInput" | "onAccepted" | "turnStart" | "startEventIds">> = {}): Delivery {
     let settle!: (accepted: boolean | Promise<boolean>) => void;
     const settled = new Promise<boolean>((resolve) => { settle = resolve; });
     return { message, contexts, custody: false, pendingReported: false, receivedAtMs: this.now(), settled, settle, ...extra };
@@ -3877,6 +3986,11 @@ export class OarAgentHost {
     const text = serverContext ? `${formatServerContextPrefix(serverContext.body)}${input}` : String(input);
     const idle = session.status().value.kind === "idle";
     const steers = agent.launch?.busyDelivery === "now" && session.steer !== undefined;
+    // OpenCode (`OarLaunch.promptFirst`): after background sub-agents OAR's
+    // status never reads idle again (OAR #777) though no turn runs, so the
+    // status decides nothing here: the input goes as a prompt, and only OAR's
+    // `busy` answer (a turn really runs) makes it a busy delivery below.
+    const promptFirst = !idle && agent.launch?.promptFirst === true;
     const trace = (outcome: string, code?: RejectionCode, reason?: string | null, failure?: FailureClass) => this.deps.recordEvent("daemon.agent.oar.delivery", {
       agentId: agent.agentId,
       launchId: agent.launchId ?? undefined,
@@ -3889,7 +4003,7 @@ export class OarAgentHost {
       // OAR's class of a refusal (`input_too_large`), where it gives one.
       ...(failure ? { oar_failure: failure } : {}),
     }, code ? "error" : "ok");
-    if (!idle && !steers) {
+    if (!idle && !steers && !promptFirst) {
       // `after_turn`: held here until the turn end flushes it as a new turn.
       // Never OAR's queue: grok's is held in this process only
       // (`queue.durable: false`), where the host can neither see nor
@@ -3898,7 +4012,7 @@ export class OarAgentHost {
       this.reportHeld(agent.pending);
       return;
     }
-    const steerHeld = !idle && steers ? this.steerHeldReason(agent) : null;
+    const steerHeld = !idle && steers && !promptFirst ? this.steerHeldReason(agent) : null;
     if (steerHeld) {
       // Not into a compacting (or reviewing) turn, nor again after it refused
       // this turn's steers: the next tool start, compaction end or the turn
@@ -3909,25 +4023,58 @@ export class OarAgentHost {
     }
     // The span of the turn this input starts (its `turn_started`): only an
     // idle session's; a steer into the running turn starts none.
-    if (idle) agent.nextTurn = first.turnStart ?? this.turnStartFor("stdin-idle-delivery", messages, new Map(deliveries.map((delivery) => [delivery.message, delivery])));
+    if (idle || promptFirst) agent.nextTurn = first.turnStart ?? this.turnStartFor("stdin-idle-delivery", messages, new Map(deliveries.map((delivery) => [delivery.message, delivery])));
     // Idle: a prompt, rejected `busy` if a turn started meanwhile (then held
     // like a busy delivery), never a steer into it.
     const inputId = randomUUID();
-    let delivered: { landed: "prompted" | "steered" | "queued" } | { landed: "rejected"; code: RejectionCode; reason: string; failure?: FailureClass } = steers
+    // Whether this input went through OAR's `deliver` (a steer, or a prompt it chose), never a plain prompt.
+    let viaDeliver = steers && !promptFirst;
+    let delivered: { landed: "prompted" | "steered" | "queued" } | { landed: "rejected"; code: RejectionCode; reason: string; failure?: FailureClass } = viaDeliver
       ? await session.deliver(text, { when: "now", origin: DELIVERY_ORIGIN, inputId })
       : await session.prompt(text, { origin: DELIVERY_ORIGIN }).then((outcome) => (outcome.kind === "accepted"
         ? { landed: "prompted" as const }
         : { landed: "rejected" as const, code: outcome.code, reason: outcome.reason, ...(outcome.failure ? { failure: outcome.failure } : {}) }));
+    // Ended meanwhile: the release already dropped these deliveries (still
+    // pending while the input was in flight) and reported their app events,
+    // though the runtime may have taken it. Accepted: one duplicate "late"
+    // wake at the next start, never a lost event.
     if (!this.isCurrent(agent) || agent.session !== session) return;
+    if (promptFirst && delivered.landed === "rejected" && delivered.code === "busy") {
+      // A turn runs: a busy delivery, steered where the session can steer
+      // (the same path, the #15041 withdraw of a `queued` landing included),
+      // else held for the turn end.
+      agent.nextTurn = null;
+      const held = steers ? this.steerHeldReason(agent) : "held_until_turn_end";
+      if (held) {
+        trace(held);
+        this.reportHeld(agent.pending);
+        return;
+      }
+      viaDeliver = true;
+      delivered = await session.deliver(text, { when: "now", origin: DELIVERY_ORIGIN, inputId });
+      if (!this.isCurrent(agent) || agent.session !== session) return;
+    }
+    // OAR 0.105+ queues a steer that finds no turn to join while the status
+    // still shows that turn running (a turn whose abort is pending, a reply the
+    // runtime started on its own) instead of refusing it `no_active_turn`. That
+    // queue is in memory and out of this host's sight: the input would run as a
+    // turn Raft never prompted, or be lost with the process after its ack. Take
+    // it back and hold it as before; only an input OAR will not give back stays
+    // with OAR as delivered.
+    if (viaDeliver && delivered.landed === "queued" && session.withdraw) {
+      const withdrawn = await session.withdraw(inputId).catch(() => null);
+      if (withdrawn?.kind === "accepted") delivered = { landed: "rejected", code: "no_active_turn", reason: "queued by OAR; withdrawn and held" };
+      if (!this.isCurrent(agent) || agent.session !== session) return;
+    }
     // An `error` steer (e.g. OAR's 15 s deadline on grok's `_x.ai/interject`)
     // may have landed anyway: grok echoes an accepted interjection at once as
     // `_x.ai/session/interjection` carrying our inputId (Cindy, #oar-raft:#4).
     // With that echo it is delivered; resending would show it to the model twice.
-    if (delivered.landed === "rejected" && delivered.code === "error" && steers && interjectionEchoed(session, inputId)) {
+    if (delivered.landed === "rejected" && delivered.code === "error" && viaDeliver && interjectionEchoed(session, inputId)) {
       delivered = { landed: "steered" };
     }
     // A refusal (or a steer after all) started no turn of its own.
-    if (idle && delivered.landed !== "prompted") agent.nextTurn = null;
+    if ((idle || promptFirst) && delivered.landed !== "prompted") agent.nextTurn = null;
     const code: RejectionCode | null = delivered.landed === "rejected" ? delivered.code : null;
     const refusalReason = delivered.landed === "rejected" ? delivered.reason : null;
     trace(delivered.landed, code ?? undefined, refusalReason, delivered.landed === "rejected" ? delivered.failure : undefined);
@@ -3948,7 +4095,7 @@ export class OarAgentHost {
     // An `error` steer with no echo (above): not delivered as far as the
     // runtime shows, so it is held like a refused steer and tried again, not
     // refused (handed back to be delivered again on the next start).
-    if ((code === "runtime_refused" || code === "error") && steers && (!idle || session.status().value.kind !== "idle")) {
+    if ((code === "runtime_refused" || code === "error") && viaDeliver && (!idle || session.status().value.kind !== "idle")) {
       // A steer the runtime refused (codex: "not steerable", e.g. mid-review)
       // is not a refusal of the message: it waits for the next tool start,
       // then for the turn end (the legacy host's
@@ -3987,6 +4134,13 @@ export class OarAgentHost {
     if (agent.deliverSingly > 0) agent.deliverSingly -= 1;
     if (code) {
       for (const delivery of deliveries) this.refuse(delivery, code);
+      // Their app events have no catch-up. Unless the input itself is one the
+      // runtime can never take (too long, or `unsupported`), the refusal may
+      // be passing (a transport `error`, `aborted`, `session_released`,
+      // `not_queued`): the next start sends them again.
+      if (!tooLong && code !== "unsupported") {
+        this.reportDroppedAppEvents(agent.agentId, agent.launchId, `refused_${code}`, deliveries.flatMap((delivery) => this.droppedAppEventIds(delivery)));
+      }
       if (tooLong) {
         this.publishMessageTooLarge(agent);
         // The messages after it were never offered.
@@ -4083,8 +4237,9 @@ export class OarAgentHost {
 
   /**
    * The runtime refused it for good (not busy), or it goes with the runtime.
-   * A plain server delivery was acked on custody: it stays unread on the
-   * server for the next start, with nothing to send. A tracked mention is
+   * A plain server delivery was acked on custody: as chat it stays unread on
+   * the server for the next start, with nothing to send; its app event is
+   * reported by the caller (`reportDroppedAppEvents`). A tracked mention is
    * answered once (no process, or rejected), unless `answerMention` is false
    * (a stop: as on the legacy host, the server's held cycle settles it); the
    * host's own inputs settle false.
@@ -4560,7 +4715,7 @@ export class OarAgentHost {
       let held = false;
       for (const agent of [...this.agents.values()]) {
         const specHeld = this.reconcile(agent, "sweep");
-        if (this.isCurrent(agent) && (specHeld || (agent.committed && agent.pending.length > 0) || this.coldIdleCandidate(agent))) held = true;
+        if (this.isCurrent(agent) && (specHeld || (agent.committed && agent.pending.length > 0) || this.coldIdleCandidate(agent) || this.idleStopCandidate(agent))) held = true;
       }
       if (!held) this.clearReconcileSweep();
     }, Math.max(1, this.deps.featuresSweepMs ?? COLD_IDLE_SWEEP_MS));
@@ -4604,7 +4759,9 @@ export class OarAgentHost {
    */
   private reconcileColdIdle(agent: HostedAgent, trigger: RuntimeSpecReconcileTrigger): void {
     const session = agent.session;
-    if (!session || !this.coldIdleCandidate(agent)) {
+    const recycle = Boolean(session) && this.coldIdleCandidate(agent);
+    const idleStop = Boolean(session) && this.idleStopCandidate(agent);
+    if (!session || (!recycle && !idleStop)) {
       this.idleHolds.forget(agent.agentId, "cold_idle");
       return;
     }
@@ -4616,33 +4773,79 @@ export class OarAgentHost {
     // Unknown facts (no context reported yet, a turn running) are never cold.
     if (!facts || facts.lastActivityAtMs === null) return;
     const nowMs = this.now();
-    const gate = coldIdleGate({ config, liveSessionId: session.id, lastEventAtMs: facts.lastActivityAtMs, runtimeCliVersion: undefined, nowMs });
-    if (!gate.pass) return;
-    if (this.agentNotIdle(agent, session) !== null) return;
-    // Ending the session kills its sub-agents, so a task with no end holds it
-    // however long it has been silent (the idle reminder presumes a silent hour
-    // ended; this host has no process-tree check to confirm it). A lost end
-    // only costs this session its recycle.
-    if (agent.taskRows.runningCount(Number.POSITIVE_INFINITY) > 0) return;
-    const verdict = decideColdIdle(facts, { config: gate.config, lastEventAtMs: facts.lastActivityAtMs, nowMs });
-    if (!verdict.cold) return;
-    this.deps.recordEvent("daemon.agent.cold_idle_stop", {
+    if (recycle) {
+      const gate = coldIdleGate({ config, liveSessionId: session.id, lastEventAtMs: facts.lastActivityAtMs, runtimeCliVersion: undefined, nowMs });
+      const verdict = gate.pass ? decideColdIdle(facts, { config: gate.config, lastEventAtMs: facts.lastActivityAtMs, nowMs }) : null;
+      if (verdict?.cold && this.mayEndIdleSession(agent, session)) {
+        this.deps.recordEvent("daemon.agent.cold_idle_stop", {
+          agentId: agent.agentId,
+          launchId: agent.launchId ?? undefined,
+          session_id: session.id,
+          idle_ms: verdict.idleMs,
+          prior_context_tokens: verdict.priorContextTokens,
+          ...recycleThresholdTraceAttrs(verdict.thresholds),
+          notified_unread_count: 0,
+          trigger,
+          host: "oar",
+        });
+        logger.info(`[Agent ${agent.agentId}] Ending cold idle OAR session (idle ${Math.round(verdict.idleMs / 60_000)}m, ~${Math.round(verdict.priorContextTokens / 1000)}k context, session ${session.id}, ${trigger}); the next wake decides resume vs fresh briefing`);
+        this.endIdleSession(agent, session, "cold_idle_recycle");
+        return;
+      }
+    }
+    // #proj-runtime:#63: an idle process past IDLE_PROCESS_STOP_MS is stopped
+    // whatever its context; the next wake resumes the same thread (below the
+    // recycle threshold the start's recycle decision resumes).
+    if (!idleStop) return;
+    const idleMs = nowMs - Math.max(facts.lastActivityAtMs, agent.lastEventAtMs ?? agent.openedAtMs ?? nowMs);
+    if (idleMs < idleProcessStopMs(this.agentConfig(agent).envVars) || !this.mayEndIdleSession(agent, session)) return;
+    // Nothing held: a delivery waiting out a usage limit or a sign-in is
+    // handed over when it ends, and a stop now would drop that hand-over
+    // (it would wait for the next message instead).
+    if (agent.pending.length > 0 || agent.carried.length > 0) return;
+    this.deps.recordEvent("daemon.agent.idle_process_stop", {
       agentId: agent.agentId,
       launchId: agent.launchId ?? undefined,
+      runtime: agent.runtimeId,
       session_id: session.id,
-      idle_ms: verdict.idleMs,
-      prior_context_tokens: verdict.priorContextTokens,
-      ...recycleThresholdTraceAttrs(verdict.thresholds),
-      notified_unread_count: 0,
+      idle_ms: idleMs,
+      prior_context_tokens: facts.lastContextTokens ?? undefined,
       trigger,
       host: "oar",
     });
-    logger.info(`[Agent ${agent.agentId}] Ending cold idle OAR session (idle ${Math.round(verdict.idleMs / 60_000)}m, ~${Math.round(verdict.priorContextTokens / 1000)}k context, session ${session.id}, ${trigger}); the next wake decides resume vs fresh briefing`);
-    // Planned as the spec stop is: clean, the session kept, and the next
-    // delivery's start is the Server's (no status, no activity).
+    logger.info(`[Agent ${agent.agentId}] Stopping idle ${agent.runtimeId} process (idle ${Math.round(idleMs / 60_000)}m, session ${session.id}, ${trigger}); the next wake resumes it`);
+    this.endIdleSession(agent, session, "idle_process_stop");
+  }
+
+  /**
+   * Idle as the legacy host reads it (no turn, background task or sub-agent,
+   * delivery held or being written). Ending the session kills its
+   * sub-agents, so a task with no end holds it however long it has been
+   * silent (this host has no process-tree check to confirm it ended).
+   */
+  private mayEndIdleSession(agent: HostedAgent, session: Session): boolean {
+    if (this.agentNotIdle(agent, session) !== null) return false;
+    return agent.taskRows.runningCount(Number.POSITIVE_INFINITY) === 0;
+  }
+
+  /**
+   * Planned as the spec stop is: clean, the session kept, and the next
+   * delivery's start is the Server's (no status, no activity); that start's
+   * recycle decision (planWakeSessionRecycle) resumes or starts fresh. The
+   * handback is parked: that delivery may be hours away, and its refusal
+   * reports the agent waking, not an unavailable runtime (`park`).
+   */
+  private endIdleSession(agent: HostedAgent, session: Session, reason: "cold_idle_recycle" | "idle_process_stop"): void {
     this.planEnd(agent, session, "cold_idle_recycle", null);
-    this.specHandbacks.mark(agent.agentId);
-    void this.endSession(agent, "cold_idle_recycle");
+    this.specHandbacks.park(agent.agentId);
+    void this.endSession(agent, reason);
+  }
+
+  /** Whether the sweep should keep looking at this session for the idle process stop (#63). */
+  private idleStopCandidate(agent: HostedAgent): boolean {
+    if (!this.isCurrent(agent) || !agent.committed || !agent.session || agent.stopping) return false;
+    if (!IDLE_PROCESS_STOP_RUNTIMES.has(agent.runtimeId)) return false;
+    return idleProcessStopMs(this.agentConfig(agent).envVars) > 0;
   }
 
   /** Whether the sweep should keep looking at this session for cold idle (reconcileColdIdle's cheap half). */
@@ -4817,7 +5020,8 @@ export class OarAgentHost {
    * on OAR (its resume was refused, the gate refused it, ...). Nothing runs
    * the agent: it is shown stopped, a held tracked mention is handed back so
    * the server wakes it (the router then picks the host), and the plain
-   * deliveries stay unread on the server for that start, as after an exit.
+   * deliveries stay unread on the server for that start, as after an exit
+   * (chat; their app events are reported, `reportDroppedAppEvents`).
    */
   private restartFailed(agent: HostedAgent, outcome: Extract<OarStartOutcome, { kind: "fallback" }>, cause: OarRestartCause): void {
     const stall = cause === "stalled_recovery";
@@ -4826,6 +5030,14 @@ export class OarAgentHost {
       if (held.context.mentionDelivery) held.context.onRejectedNoProcess?.();
       held.settle(false);
     }
+    // And the start inputs the restart was to rebuild (a wake its ended
+    // session held in its first input, `restartAfterEnd`): no session takes them now.
+    const { request } = outcome;
+    const startInputs = [...(request.wakeMessage ? [request.wakeMessage] : []), ...(request.resumeMessages ?? [])];
+    this.reportDroppedAppEvents(agent.agentId, request.launchId ?? null, "restart_failed", [
+      ...outcome.held.flatMap((held) => held.droppedAppEventIds ?? []),
+      ...this.startInputEventIds(request, startInputs),
+    ]);
     if (this.agents.has(agent.agentId)) return;
     this.sendStatus(agent, "inactive");
     const label = runtimeDisplayName(agent.runtimeId);
@@ -4904,7 +5116,7 @@ export class OarAgentHost {
   }
 
   /** The Sub-agents view's row for a task event: it says nothing about the main turn. */
-  private publishTaskRow(agent: HostedAgent, event: Event): void {
+  private publishTaskRow(agent: HostedAgent, event: Event | { kind: "task_updated"; taskId: string; status: "running" }): void {
     let row: OarTaskRow | null = null;
     // A sub-agent's end was a person's stop only if it ended stopped: a stop
     // refused because it had just finished on its own still leaves a result.
@@ -4936,8 +5148,34 @@ export class OarAgentHost {
       launchId: agent.launchId ?? undefined,
       runtime: agent.runtimeId,
       phase: row.subagent.phase,
+      // #oar-raft:#18: which sub-agent, so one agent's sub-agent timeline can be read (a runtime thread id, no content).
+      ...(row.subagent.taskId ? { task_id: row.subagent.taskId } : {}),
       host: "oar",
     });
+  }
+
+  /**
+   * #oar-raft:#18: a running subagent's tool call, a step of its row in the
+   * Sub-agents view: its `tool_start` row carrying the subagent's lineage (as
+   * the legacy host reports a Codex child thread's calls). Like the subagent's
+   * lifecycle rows (publishTaskRow), it rides a frame that restates the
+   * agent's own status: a subagent's step says nothing about the main turn
+   * (the web reads no status from a row with lineage). Its ends only keep the
+   * projector's call timings tidy.
+   */
+  private publishSubagentStep(agent: HostedAgent, event: Event): void {
+    if (event.kind !== "tool_call_started" && event.kind !== "tool_call_ended") return;
+    // An ended sub-agent at work again: reopened as its late (or lost) task_updated would.
+    const reopened = event.kind === "tool_call_started" ? agent.taskRows.endedTaskAtWork(event) : null;
+    if (reopened) this.publishTaskRow(agent, { kind: "task_updated", taskId: reopened, status: "running" });
+    const lineage = agent.taskRows.childStepLineage(event);
+    if (!lineage || !agent.activity) return;
+    // Read as a root call: the projector reads no attributed (agentPath) event.
+    const entries = agent.activity.facts({ ...event, agentPath: [] }).flatMap((fact) => fact.entries)
+      .filter((entry) => entry.kind === "tool_start")
+      .map((entry) => ({ ...entry, subagent: lineage }));
+    if (entries.length === 0) return;
+    this.sink.publishFact({ agentId: agent.agentId, ...agent.last, entries, launchId: agent.launchId ?? undefined }, this.producer(agent));
   }
 
   /**
@@ -5027,7 +5265,9 @@ export class OarAgentHost {
    * started, credential revoked), as the legacy host waits for the runtime's
    * exit; a migration and the daemon's shutdown rely on it.
    */
-  async stopAgent(agentId: string, { wait = false, silent = false }: { wait?: boolean; silent?: boolean } = {}): Promise<void> {
+  async stopAgent(agentId: string, { wait = false, silent = false, reason }: { wait?: boolean; silent?: boolean; reason?: AgentStopReason } = {}): Promise<void> {
+    const stopStartedAtMs = Date.now();
+    const stopReason: AgentStopReason = reason ?? (silent ? "internal" : "explicit");
     // RFC 070 §6.5: a stop ends a pending warm mark and its timer; an explicit
     // one (also how an agent leaves this computer) forgets everything kept for it.
     if (silent) this.warmRecycle.dropPending(agentId);
@@ -5069,9 +5309,22 @@ export class OarAgentHost {
       this.detachStopped(agent);
       this.deps.recordEvent("daemon.agent.oar.stopped", { agentId, launchId: agent.launchId ?? undefined, silent, committed: false });
       if (wait) await this.unwound(agentId);
+      this.deps.recordEvent("daemon.agent.stop", agentStopTraceAttrs({
+        agentId,
+        launchId: agent.launchId,
+        runtime: agent.runtimeId,
+        host: "oar",
+        reason: stopReason,
+        hadProcess: false,
+        waitMs: Date.now() - stopStartedAtMs,
+        escalated: false,
+        exitConfirmed: true,
+      }));
       return;
     }
     const hosted = this.hostedSession(agentId);
+    const hadProcess = agent.session !== null;
+    const stopOutcome = { escalated: false, exitConfirmed: true };
     await this.endSession(agent, silent ? "silent_stop" : "explicit_stop", () => {
       if (silent) return;
       // As the legacy host: reported once the runtime is gone, unless a later
@@ -5083,8 +5336,19 @@ export class OarAgentHost {
       if (hosted) this.deps.sendRuntimeProfileReport?.(agentId, hosted, "stop");
       this.sendStatus(agent, "inactive");
       this.publish(agent, "offline", "Stopped", "stopped");
-    });
+    }, stopOutcome);
     this.deps.recordEvent("daemon.agent.oar.stopped", { agentId, launchId: agent.launchId ?? undefined, silent, committed: true });
+    this.deps.recordEvent("daemon.agent.stop", agentStopTraceAttrs({
+      agentId,
+      launchId: agent.launchId,
+      runtime: agent.runtimeId,
+      host: "oar",
+      reason: stopReason,
+      hadProcess,
+      waitMs: Date.now() - stopStartedAtMs,
+      escalated: stopOutcome.escalated,
+      exitConfirmed: stopOutcome.exitConfirmed,
+    }));
   }
 
   /**
@@ -5096,7 +5360,7 @@ export class OarAgentHost {
     // Task #17: these stops are silent (no closing frame), so a held empty
     // wake would go with the daemon; published first, as the legacy host does.
     for (const agent of this.agents.values()) if (agent.committed && !agent.stopping) this.publishReleasedTurn(agent);
-    await Promise.all([...this.agents.keys()].map((agentId) => this.stopAgent(agentId, { wait: true, silent: true })));
+    await Promise.all([...this.agents.keys()].map((agentId) => this.stopAgent(agentId, { wait: true, silent: true, reason: "shutdown" })));
     await Promise.all([...this.unwinding.keys()].map((agentId) => this.unwound(agentId)));
     this.clearReconcileSweep();
     this.warmRecycle.clear();
@@ -5117,14 +5381,14 @@ export class OarAgentHost {
    * (RFC 071 `process_exited`), then `ended`. Tracked as an unwind: the next
    * start of the agent, on either host, begins after all of it.
    */
-  private endSession(agent: HostedAgent, reason: string, ended?: () => void): Promise<void> {
+  private endSession(agent: HostedAgent, reason: string, ended?: () => void, stopOutcome?: { escalated: boolean; exitConfirmed: boolean }): Promise<void> {
     agent.stopping = true;
     const session = agent.session;
     // A caller that reports the end itself publishes the turn's end then.
     this.release(agent, reason, { keepTurnSummary: ended !== undefined });
     const done = (async () => {
       if (session) {
-        await this.disposeSession(agent, session, reason);
+        await this.disposeSession(agent, session, reason, stopOutcome);
         this.sendProcessExited(agent, exitCodeOf(session));
       }
       ended?.();
@@ -5144,7 +5408,7 @@ export class OarAgentHost {
    * agent anyway when no exit is confirmed within the confirmation window
    * after it (`kill_unconfirmed`), so a later start is never held forever.
    */
-  private disposeSession(agent: HostedAgent, session: Session, path: string): Promise<void> {
+  private disposeSession(agent: HostedAgent, session: Session, path: string, stopOutcome?: { escalated: boolean; exitConfirmed: boolean }): Promise<void> {
     const graceMs = Math.max(0, this.deps.stopKill?.graceMs ?? AGENT_STOP_KILL_GRACE_MS);
     const confirmMs = Math.max(0, this.deps.stopKill?.confirmMs ?? AGENT_STOP_KILL_CONFIRM_MS);
     const attrs = { agentId: agent.agentId, launchId: agent.launchId ?? undefined, path: `oar_${path}`, grace_ms: graceMs, host: "oar" };
@@ -5159,9 +5423,11 @@ export class OarAgentHost {
       };
       const escalated = setTimeout(() => {
         // OAR's own SIGKILL of the group is due now.
+        if (stopOutcome) stopOutcome.escalated = true;
         this.deps.recordEvent("daemon.agent.stop.escalated", { ...attrs, tree_killed_count: undefined, escalated_by: "oar_dispose" }, "error");
       }, graceMs);
       const unconfirmed = setTimeout(() => {
+        if (stopOutcome) stopOutcome.exitConfirmed = false;
         this.deps.recordEvent("daemon.agent.stop.kill_unconfirmed", { ...attrs, confirm_ms: confirmMs, pid: undefined }, "error");
         logger.warn(`[Agent ${agent.agentId}] OAR session dispose (${path}) did not finish ${graceMs + confirmMs}ms after it began; releasing the agent anyway`);
         finish();
@@ -5213,7 +5479,8 @@ export class OarAgentHost {
   /**
    * Deliveries the runtime never took go with it (the legacy host's
    * `recordInboxDroppedOnExit`, task #353): the plain ones were acked on
-   * custody and stay unread on the server for the next start's catch-up.
+   * custody. Chat stays unread on the server for the next start's catch-up;
+   * app events have none and are reported (`reportDroppedAppEvents`).
    * After a stop that is by design; after an exit planned for the next wake,
    * or a terminal failure, the agent waits for the server's next start (an
    * exit planned to start again took them out first: `restartAfterEnd`).
@@ -5229,10 +5496,62 @@ export class OarAgentHost {
     for (const delivery of held) this.refuse(delivery, "runtime_exited", { answerMention: !serverCarried });
     const unconsumed = held.filter((delivery) => delivery.custody && !this.isTransient(delivery)).length;
     this.deps.recordEvent("daemon.agent.oar.held_dropped", { agentId: agent.agentId, count: held.length, unconsumed_count: unconsumed, reason, expected }, expected ? "ok" : "error");
+    // Before the custody count's return: a held first input is no custody
+    // delivery, but may carry the start's wake app event. At least once: a
+    // delivery whose input was in flight when the session ended (`flush`
+    // awaiting the prompt) is reported too, though the runtime may have taken
+    // it; that costs one "late" re-send at the next start.
+    this.reportDroppedAppEvents(agent.agentId, agent.launchId, reason, held.flatMap((delivery) => this.droppedAppEventIds(delivery)));
     if (unconsumed === 0) return;
-    const line = `[Agent ${agent.agentId}] OAR runtime closed via ${reason} with ${unconsumed} unconsumed queued message(s); not carried by the daemon, they stay unread on the server`;
+    const line = `[Agent ${agent.agentId}] OAR runtime closed via ${reason} with ${unconsumed} unconsumed queued message(s); not carried by the daemon (chat stays unread on the server; app events are reported to be sent again at the next start)`;
     if (expected) logger.info(line);
     else logger.warn(line);
+  }
+
+  /**
+   * The app events of a delivery the server re-sends none of once it is
+   * dropped: its own when it was acked on custody, or those a start's own
+   * input carries (`startEventIds`). Never a transient notice's.
+   */
+  private droppedAppEventIds(delivery: Delivery): readonly string[] {
+    if (this.isTransient(delivery)) return [];
+    if (delivery.custody) return delivery.message.third_party_event?.id ? [delivery.message.third_party_event.id] : [];
+    return delivery.startEventIds ?? [];
+  }
+
+  /** The app events among a start's own input messages (its wake, its catch-up); never a transient wake's. */
+  private startInputEventIds(request: AgentStartRequest, messages: readonly AgentMessage[]): string[] {
+    return thirdPartyEventIdsFromEvents(messages.filter((each) => !(each === request.wakeMessage && request.wakeMessageTransient)));
+  }
+
+  /**
+   * The legacy host's `reportDroppedAppEvents`: unlike chat, an app event
+   * acked on custody and dropped (`droppedAppEventIds`) has no catch-up at the
+   * next start and stays `delivering` on the server until it expires. The
+   * server is told which ones (`agent:inbox:dropped_app_events`, at most
+   * AGENT_INBOX_DROPPED_APP_EVENTS_MAX_IDS) and queues them for the agent's
+   * next runtime start. Also the router's, for the deliveries of a start it
+   * fails. An idle hand-over sends nothing: it runs only with nothing held, so
+   * one that drops app events is a new path, traced (`skipped_idle_handover`)
+   * rather than lost unseen.
+   */
+  reportDroppedAppEvents(agentId: string, launchId: string | null, reason: string, eventIds: readonly string[]): void {
+    const ids = [...new Set(eventIds)];
+    if (ids.length === 0) return;
+    if (IDLE_HANDOVER_REASONS.has(reason)) {
+      this.deps.recordEvent("daemon.agent.oar.dropped_app_events", { agentId, launchId: launchId ?? undefined, reason, count: ids.length, outcome: "skipped_idle_handover" }, "error");
+      return;
+    }
+    const daemonInstanceId = this.deps.daemonInstanceId();
+    if (!daemonInstanceId) return;
+    this.deps.sendToServer({
+      type: "agent:inbox:dropped_app_events",
+      agentId,
+      launchId,
+      daemonInstanceId,
+      exitReason: reason,
+      eventIds: ids.slice(0, AGENT_INBOX_DROPPED_APP_EVENTS_MAX_IDS),
+    });
   }
 
   /**

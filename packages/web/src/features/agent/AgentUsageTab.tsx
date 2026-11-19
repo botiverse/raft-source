@@ -108,7 +108,7 @@ export function AgentUsageTab({ agentId }: { agentId: string }) {
   } else if (!summary) {
     body = <UsageSkeleton />;
   } else if (summary.kind !== "ready") {
-    body = <AgentUsageNoFigures kind={summary.kind} agentId={agentId} range={view.range} />;
+    body = <AgentUsageNoFigures summary={summary} agentId={agentId} range={view.range} />;
   } else {
     const pickedPast = view.day !== null && view.day !== today;
     const heading = (labelId: "agent.usage.tokens" | "agent.usage.tokenTypes" | "agent.usage.context" | "agent.usage.models") => (

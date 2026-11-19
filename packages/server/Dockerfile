@@ -1,4 +1,4 @@
-ARG NODE_VERSION=24.22.1
+ARG NODE_VERSION=24.22.3
 FROM node:${NODE_VERSION}-bookworm-slim AS base
 
 # ECS migration overrides invoke pnpm --filter ... db:migrate:deploy. Keep the
@@ -60,6 +60,9 @@ COPY packages/server/ packages/server/
 COPY manual/ manual/
 # Node/Oxc cannot transpile TypeScript beneath node_modules. Keep workspace
 # sources at their original paths, separate from the production dependency graph.
+# Modes, like mtimes, must not depend on the tarball or the store state: a
+# package directory arrived 777 in one install and 755 in another (staging
+# run 43734952399, image-layer-diff). Normalize to 755 directories and 644 or 755 files.
 RUN mkdir -p /out-app/packages /out-dependencies/packages \
   && mv node_modules /out-dependencies/node_modules \
   && cp package.json pnpm-workspace.yaml pnpm-lock.yaml /out-app/ \
@@ -74,6 +77,7 @@ RUN mkdir -p /out-app/packages /out-dependencies/packages \
   && chmod +x /out-app/packages/server/entrypoint.sh \
   && mkdir -p /out-dependencies/node_modules/@oxc-node \
   && ln -s ../../packages/server/node_modules/@oxc-node/core /out-dependencies/node_modules/@oxc-node/core \
+  && find /out-app /out-dependencies \( -type d -o -type f \) -exec chmod u=rwX,go=rX {} + \
   && find /out-app /out-dependencies -exec touch --no-dereference --date=@0 {} +
 
 FROM base AS runtime

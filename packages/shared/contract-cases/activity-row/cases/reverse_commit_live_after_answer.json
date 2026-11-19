@@ -1,0 +1,76 @@
+{
+  "formatVersion": 1,
+  "id": "reverse_commit_live_after_answer",
+  "rule": "position",
+  "title": "101 commits before 100; the answer at 101 misses 100, and live 100 arrives after it: re-read the row once",
+  "why": "A live seq at or below the row's position that this client has not applied may have committed after a higher seq, so the answer may not count it.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/shared/src/activityRowPosition.ts (reduceActivityRow; not wired yet, step 2)"
+    ],
+    "server": [
+      "packages/server/src/services/channelService.ts (latestActivitySeqSameSource; the row's latestActivitySeq)",
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (unread_count and latest_seq from one materialized row)"
+    ]
+  },
+  "given": {
+    "row": {
+      "unreadCount": 0,
+      "hasMention": false,
+      "position": "99",
+      "mentionOnly": false
+    }
+  },
+  "steps": [
+    {
+      "act": "answer",
+      "row": {
+        "unreadCount": 1,
+        "hasMention": false,
+        "position": "101",
+        "mentionOnly": false
+      }
+    },
+    {
+      "act": "liveMessage",
+      "seq": "100",
+      "counts": true,
+      "mentionsViewer": false
+    },
+    {
+      "act": "answer",
+      "row": {
+        "unreadCount": 2,
+        "hasMention": false,
+        "position": "101",
+        "mentionOnly": false
+      }
+    }
+  ],
+  "checkpoints": [
+    {
+      "afterStep": 1,
+      "row": {
+        "unreadCount": 1,
+        "position": "101"
+      },
+      "reread": false
+    },
+    {
+      "afterStep": 2,
+      "row": {
+        "unreadCount": 1,
+        "position": "101"
+      },
+      "reread": true
+    }
+  ],
+  "expect": {
+    "row": {
+      "unreadCount": 2,
+      "position": "101"
+    },
+    "reread": true
+  }
+}

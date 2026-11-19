@@ -8,6 +8,7 @@ import { useMachineStore } from "../../store/machineStore";
 import type { Machine, MachineUpgradeRequest } from "../../store/machineStore";
 import { useServerStore } from "../../store/serverStore";
 import { getComputerVersionFact } from "../../utils/computerVersionFact";
+import { computerUpgradeHints, upgradeRequestOutcomeStillTrue } from "./computerUpgradeHints";
 import { getLocalComputerBridge, useLocalComputerMachineId } from "./localComputer/localComputerStore";
 
 /**
@@ -114,17 +115,7 @@ export function useComputerUpgradeCard(machine: Machine) {
     ? upgradeRefusalState.refusal
     : null;
   const consentedTargetVersion = machine.computerBroadcastPolicy?.targetVersion ?? null;
-  // The last request's outcome only while the Computer is still below that
-  // request's target: a later manual upgrade makes a failure / no-response
-  // line stale.
-  const requestOutcomeStillTrue = Boolean(
-    upgradeRequest
-    && (upgradeRequest.state === "failed" || upgradeRequest.state === "no_response")
-    && machine.computerVersion
-    && isComputerSemver(machine.computerVersion)
-    && isComputerSemver(upgradeRequest.targetVersion)
-    && compareComputerVersions(machine.computerVersion, upgradeRequest.targetVersion) < 0,
-  );
+  const requestOutcomeStillTrue = upgradeRequestOutcomeStillTrue(upgradeRequest, machine.computerVersion);
   // Below 1.0.54 a no_response has two causes the server cannot tell apart:
   // the Computer is not running as a service (it ignores the request), or,
   // before 1.0.50, the installer stopped before stopping the service and its
@@ -218,15 +209,14 @@ export function useComputerUpgradeCard(machine: Machine) {
     return { kind: "commands", version, sentence: "runCommands" };
   })();
   // The last web upgrade failed in a way only the install command on the
-  // machine gets past (a systemd unit, read by the server from the failure).
-  // Advisory: shown beside an offered Upgrade, which stays, and only while
-  // the Computer still runs the version it failed on.
-  const upgradeFailureHint = cardState.kind === "oneClick"
-    && requestOutcomeStillTrue
-    && upgradeRequest?.state === "failed"
-    && (upgradeRequest.observedVersion === null || upgradeRequest.observedVersion === machine.computerVersion)
-    ? upgradeRequest.failureHint ?? null
-    : null;
+  // machine gets past, or the installer state needs a repair. Advisory:
+  // shown beside an offered Upgrade, which stays.
+  const { upgradeFailureHint, recommendRepair } = computerUpgradeHints({
+    oneClick: cardState.kind === "oneClick",
+    upgradeRequest,
+    computerVersion: machine.computerVersion,
+    installerRepairHint,
+  });
   // Upgrading restarts the Computer, which disconnects every agent on it, and
   // can't be taken back: every route (the card, the version notice, the
   // runtime chips, the overview row) opens one confirmation first (Raft DS ›
@@ -245,7 +235,7 @@ export function useComputerUpgradeCard(machine: Machine) {
   return {
     cardState,
     /** Recommend the install command over the offered one-click Upgrade (which stays). */
-    recommendRepair: installerRepairHint && cardState.kind === "oneClick",
+    recommendRepair,
     computerVersionFact,
     versionTier,
     webUpgradeOn,

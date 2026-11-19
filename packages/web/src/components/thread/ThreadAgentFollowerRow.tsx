@@ -4,7 +4,7 @@ import { useCallback } from "react";
 import { useIntl } from "react-intl";
 import type { ThreadAgentFollower } from "../../store/threadAgentFollowerStore";
 import { useProfileStore } from "../../store/profileStore";
-import { AgentActivityInfo, JointPeerBadge, agentStatusFallbackActivity } from "../agent/channelMemberParts";
+import { AgentActivityInfo, agentStatusFallbackActivity } from "../agent/channelMemberParts";
 import { ChannelMemberRow } from "../channel/ChannelMemberList";
 import type { Agent } from "../../store/agentStore";
 import { setCachedAgentProfile } from "../profile/profileFallbackCache";
@@ -82,11 +82,15 @@ export function ThreadAgentFollowerRow({ agent, canManage, removing, currentServ
         agentAvatarUrl={agent.avatarUrl}
         agentFallbackActivity={agentStatusFallbackActivity(followerAgentStatus(agent.status))}
         name={(
-          <span className="flex min-w-0 items-center gap-1.5">
-            <span className="min-w-0 truncate">{agentLabel}</span>
+          // An agent from another server: its server's name in quiet text after
+          // its own, as a channel's member list writes it (MemberRowName; cindyz,
+          // 2026-11-13, #wg-rbac:38225c7c: it was a blue chip here). The server
+          // name gives way before the agent's.
+          <span className="flex min-w-0 items-baseline gap-1.5">
+            <span className="min-w-0 shrink truncate">{agentLabel}</span>
             {agent.isCurrentServer === false && serverLabel ? (
-              <span className="max-w-1/2 shrink-0">
-                <JointPeerBadge label={serverLabel} />
+              <span data-testid="thread-follower-origin-server" className="min-w-0 shrink-[999] truncate text-caption font-normal text-foreground-hint">
+                {serverLabel}
               </span>
             ) : null}
           </span>

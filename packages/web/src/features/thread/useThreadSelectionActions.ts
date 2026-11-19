@@ -13,6 +13,7 @@ import { isRangeSelectableMessage } from "../../components/message/messageRangeS
 import { forwardToast } from "../../components/message/forwardToast";
 import { buildMessagePermalink } from "../../hooks/useAppNavigate";
 import { useShortcutLayer } from "../../features/shortcuts/useShortcutLayer";
+import { copyTextToClipboard } from "../../utils/selectMarkdown";
 
 const SELECTION_TOAST_OPTIONS = { icon: false, dismissible: false } as const;
 
@@ -205,19 +206,19 @@ export function useThreadSelectionActions({
     setForwardComposer({ messages: forwardable, skippedCount: 0, nestedForwardCount });
   }, []);
 
-  const copySelectedLinks = useCallback(() => {
+  const copySelectedLinks = useCallback((): Promise<boolean> => {
     // Stryker disable next-line ConditionalExpression: this guard is a stale parent-channel resolution no-op; the visible behavior is no clipboard side effect.
-    if (!parentChannel) return;
+    if (!parentChannel) return Promise.resolve(false);
     // Stryker disable next-line ConditionalExpression: the select toolbar is anchored to a concrete parent message; this is a stale-callback guard.
-    if (!parentMessageId) return;
-    if (!serverSlug) return;
+    if (!parentMessageId) return Promise.resolve(false);
+    if (!serverSlug) return Promise.resolve(false);
     const { messages: selected, unresolvedCount } = gatherSelectedMessagesWithMeta({
       threadReplyMessages: messages,
       threadParentMessageRef,
     });
     if (unresolvedCount > 0) {
       showUnresolvedSelectionToast(unresolvedCount);
-      return;
+      return Promise.resolve(false);
     }
     const routeKind = parentChannel.type === "dm" ? "dm" : "channel";
     const links = selected.map((selectedMessage) =>
@@ -226,10 +227,12 @@ export function useThreadSelectionActions({
         threadParentMessageId: selectedMessage.channelId === threadChannelId ? parentMessageId : null,
       })
     );
-    void navigator.clipboard.writeText(links.join("\n")).then(() => {
+    return copyTextToClipboard(links.join("\n"), formatMessageRef.current).then(() => {
       toast.success(formatCopyLinksToast(links.length, formatMessageRef.current), SELECTION_TOAST_OPTIONS);
+      return true;
     }).catch(() => {
       toast.error(formatMessageRef.current({ id: "message.chatPanel.clipboardBlocked" }), SELECTION_TOAST_OPTIONS);
+      return false;
     });
   }, [messages, parentChannel, parentMessageId, serverSlug, showUnresolvedSelectionToast, threadChannelId]);
   // Stryker disable next-line StringLiteral: select-mode only renders while scoped to a known thread; this is a defensive child-prop fallback.

@@ -20,11 +20,13 @@ import { cliArgs } from "./args";
 import { vitalsInitScript } from "./vitals";
 import { type LoadMetrics, type PageRunRow, toPageRunRows } from "./pageRuns";
 import { writeFileSync } from "node:fs";
+import { availableParallelism } from "node:os";
 import process from "node:process";
-import { chromium } from "playwright";
 import type { Browser, BrowserContext } from "playwright";
-import { overallVerdict, pairedVerdict } from "./verdict";
+import { type HostSample, busyPairs, hostBenchmark, hostExtra, lopsided, readPressure, stallShares, withoutPairs } from "./hostHealth";
+import { MIN_PAIRS_TO_SETTLE, overallVerdict, pairedVerdict } from "./verdict";
 import type { MetricVerdict, Verdict } from "./verdict";
+import { BrowserError, type OpenedBrowser, leftOutAsBusy, openBrowser, planBrowser } from "./browser";
 import { bootContentMs, isProductionHost, withoutBootPrefetch } from "./page";
 
 const HELP = `raft-perf measure — paired on/off page measurement with a JSON verdict
@@ -43,8 +45,16 @@ Options:
   --net <n>           fast | slow (slow: 150 ms RTT, 200 KB/s down, 4x CPU)
   --ab <name>         boot-prefetch | none (default boot-prefetch)
   --runs <n>          pairs (default 5, minimum 3)
+  --max-runs <n>      keep adding pairs past --runs, up to this many, while the verdict is not settled
+                      (pairs taken while the host was busy are left out of the verdict, so they are made up for)
+  --keep-busy         keep pairs taken while the host was busy in the verdict (they are still reported)
+                      (the report's "confidence"; six pairs is the least that can settle). Default: --runs, no extra pairs
   --settle <ms>       wait after load before reading metrics (default 8000 fast / 15000 slow)
   --chromium-arg <a>  extra Chromium switch (repeatable), e.g. a host's run marker
+  --browser <where>   local | browser-run (default local). browser-run: a Chromium on Cloudflare Browser Run, driven from
+                      here; needs RAFT_PERF_CF_ACCOUNT_ID and RAFT_PERF_CF_API_TOKEN. No pair is left out as busy (this
+                      host says nothing about that machine) and --jsonl is refused: compare such a report only with
+                      another taken there
   --out <file>        also write the JSON here
   --jsonl <file>      also write one row per measured load (ScopeDB perf.page_runs); needs --project
   --project <name>    with --jsonl: the product this web belongs to (e.g. raft-web)
@@ -92,8 +102,11 @@ async function main(): Promise<number> {
       net: { type: "string", default: "fast" },
       ab: { type: "string", default: "boot-prefetch" },
       runs: { type: "string", default: "5" },
+      "max-runs": { type: "string" },
+      "keep-busy": { type: "boolean" },
       settle: { type: "string" },
       "chromium-arg": { type: "string", multiple: true, default: [] },
+      browser: { type: "string" },
       out: { type: "string" },
       jsonl: { type: "string" },
       project: { type: "string" },
@@ -115,12 +128,20 @@ async function main(): Promise<number> {
   const net = args.net as "fast" | "slow";
   const ab = args.ab as "boot-prefetch" | "none";
   const runs = Number(args.runs);
+  // refused before signing in: with --allow-production a sign-in is a production write
+  const plan = planBrowser(args.browser, args["chromium-arg"], process.env);
+  const where = plan.where;
+  /** The browser is on another machine: what this host was doing beside a load says nothing about that load. */
+  const remote = where !== "local";
+  if (remote && args.jsonl) fail("--jsonl is refused with --browser browser-run: stored rows are one series per page, taken on one kind of machine");
   if (!args.server) fail("--server <slug> is required");
   if (!["channel", "root"].includes(entry)) fail(`--entry must be channel or root, not ${entry}`);
   if (!["cold", "release", "repeat"].includes(state)) fail(`--state must be cold, release or repeat, not ${state}`);
   if (!["fast", "slow"].includes(net)) fail(`--net must be fast or slow, not ${net}`);
   if (!["boot-prefetch", "none"].includes(ab)) fail(`--ab must be boot-prefetch or none, not ${ab}`);
   if (!Number.isInteger(runs) || runs < 3) fail("--runs must be an integer of at least 3");
+  const maxRuns = args["max-runs"] === undefined ? runs : Number(args["max-runs"]);
+  if (!Number.isInteger(maxRuns) || maxRuns < runs) fail("--max-runs must be an integer, --runs or more");
   if (args.jsonl && !args.project) fail("--jsonl needs --project (which product this web belongs to)");
   let production: boolean;
   try {
@@ -308,11 +329,24 @@ async function main(): Promise<number> {
     }
   }
 
+  /** What was seen of the host beside each load (src/hostHealth.ts). */
+  const host: Record<Arm, HostSample[]> = { on: [], off: [] };
+  /** The pairs to leave out: those with a load taken on a busy host (none with --keep-busy). */
+  const busyNow = (): number[] => leftOutAsBusy(busyPairs(host.on, host.off).dropped, { keepBusy: !!args["keep-busy"], where });
+  type Pick = (r: RunMetrics) => number | null;
+  const picks: Pick[] = [(r) => r.contentMs, (r) => r.lcp];
+  const judge = (taken: Record<Arm, RunMetrics[]>, pick: Pick, dropped: readonly number[]): MetricVerdict => pairedVerdict(withoutPairs(taken.on.map(pick), dropped), withoutPairs(taken.off.map(pick), dropped));
+  /** A metric some load pair has reported, busy or not: one that no load reports (LCP on a page without one) can never settle. */
+  const reported = (taken: Record<Arm, RunMetrics[]>, pick: Pick): boolean => taken.on.some((r, i) => pick(r) != null && taken.off[i] != null && pick(taken.off[i]) != null);
   const arms: Arm[] = ab === "none" ? ["on"] : ["on", "off"];
   const results: Record<Arm, RunMetrics[]> = { on: [], off: [] };
+  /** Adding pairs stopped because the sessions were running out: more pairs would not have fitted. */
+  let outOfTime = false;
   const warnings: string[] = [];
+  let opened: OpenedBrowser | null = null;
   try {
-    browser = await chromium.launch({ args: args["chromium-arg"] });
+    opened = await openBrowser(plan);
+    browser = opened.browser;
     // release and repeat keep one context per arm, each with its own session, warmed by one unmeasured visit.
     const warm: Partial<Record<Arm, BrowserContext>> = {};
     const warmAt = Date.now();
@@ -324,11 +358,26 @@ async function main(): Promise<number> {
       checkEnv();
     }
     let coldSession = first;
-    for (let i = 0; i < runs; i++) {
+    hostBenchmark(); // once unmeasured: the first run of the loop is slower while it is compiled
+    outOfTime = false;
+    for (let i = 0; i < maxRuns; i++) {
+      // Past the pairs asked for, another pair is taken only while one of the judged metrics is not settled.
+      // A metric no pair has reported is left out; one whose pairs were all dropped as busy is not settled, so pairs keep coming.
+      if (i >= runs) {
+        const dropped = busyNow();
+        if (ab === "none" || picks.filter((pick) => reported(results, pick)).every((pick) => judge(results, pick, dropped).confidence === "settled")) break;
+      }
+      // An extra pair is not worth losing the pairs already taken: stop adding while the sessions still have two minutes.
+      if (i >= runs && state !== "cold" && Date.now() - warmAt > TOKEN_REUSE_MS - 2 * 60_000) {
+        warnings.push(`stopped adding pairs at ${i}: the sessions are close to their 10 minutes; the verdict stays as far as it got`);
+        outOfTime = true;
+        break;
+      }
       // Alternate which arm goes first so drift hits both.
       for (const arm of i % 2 ? [...arms].reverse() : arms) {
         if (state !== "cold" && Date.now() - warmAt > TOKEN_REUSE_MS) fail("the run outlived its sessions (10 min); lower --runs or use --net fast");
         if (state === "cold" && Date.now() - coldSession.at > TOKEN_REUSE_MS) coldSession = await signIn();
+        const hostBefore = { benchMs: hostBenchmark(), pressure: readPressure(), at: Date.now() };
         if (state === "cold") {
           const context = await newContext(coldSession);
           try {
@@ -339,11 +388,14 @@ async function main(): Promise<number> {
         } else {
           results[arm].push(await load(warm[arm]!, arm, state === "release"));
         }
+        host[arm].push({ ...stallShares(hostBefore.pressure, readPressure(), Date.now() - hostBefore.at), benchMs: Math.max(hostBefore.benchMs, hostBenchmark()) });
         checkEnv();
       }
     }
   } finally {
-    await browser?.close();
+    // to stderr, not to the report's warnings: it says nothing about the measurement, and a failed run writes no report
+    const notEnded = await opened?.close();
+    if (notEnded) process.stderr.write(`raft-perf measure: ${notEnded}\n`);
   }
 
   if (ab === "boot-prefetch") {
@@ -356,13 +408,25 @@ async function main(): Promise<number> {
   if (commits.size > 1) warnings.push(`the web changed during the run (${[...commits].map((c) => c!.slice(0, 8)).join(", ")}): the comparison is invalid`);
   if (loads.some((r) => r.contentMs == null)) warnings.push("some loads reported no rendered boot timing (content_ms); those pairs are dropped from that metric");
 
+  /** Things a reader needs beside the numbers that are not faults of the run (a warning is one). */
+  const notes: string[] = [];
+  const hostSeen = busyPairs(host.on, host.off);
+  const droppedPairs = leftOutAsBusy(hostSeen.dropped, { keepBusy: !!args["keep-busy"], where });
+  const cpus = availableParallelism();
   const verdictMetrics: Record<string, MetricVerdict> | null =
     ab === "none"
       ? null
       : {
-          contentMs: pairedVerdict(results.on.map((r) => r.contentMs), results.off.map((r) => r.contentMs)),
-          lcp: pairedVerdict(results.on.map((r) => r.lcp), results.off.map((r) => r.lcp)),
+          contentMs: judge(results, picks[0], droppedPairs),
+          lcp: judge(results, picks[1], droppedPairs),
         };
+  if (remote) {
+    notes.push("the browser ran on Browser Run: this host's load says nothing about it, so no pair was left out as busy and `host` describes only the machine that drove it");
+    notes.push("every load hands the page its document through this machine (the pause in which the off arm loses its boot prefetch config; it is there with --ab none too), so its times include two round trips between here and Browser Run: arms are affected alike, the absolute times depend on where this command ran");
+  }
+  else if (ab !== "none" && hostSeen.dropped.length) warnings.push(`${hostSeen.dropped.length} pair(s) ${args["keep-busy"] ? "taken on a busy host (kept: --keep-busy)" : "left out of the verdict: the host was busy during them"} (pair ${hostSeen.dropped.map((i) => i + 1).join(", ")}; ${hostSeen.by === "pressure" ? "tasks on the host were stalled for 10% or more of those loads' time" : `the benchmark beside those loads took over 1.5x its median of ${hostSeen.benchmarkMedianMs} ms`})`);
+  const tilted = ab === "none" || remote ? null : lopsided(hostSeen.busyOn, hostSeen.busyOff);
+  if (tilted) warnings.push(`the busy loads are mostly on the ${tilted} arm (${hostSeen.busyOn.filter(Boolean).length} on, ${hostSeen.busyOff.filter(Boolean).length} off): on a host with few cores (${cpus} here) the heavier arm can raise the pressure by itself, and leaving its pairs out would tilt the verdict; compare with --keep-busy`);
   const info = ab === "none" ? null : { messagesFetched: pairedVerdict(results.on.map((r) => r.messagesFetched), results.off.map((r) => r.messagesFetched)) };
   let verdict: Verdict = verdictMetrics ? overallVerdict(Object.values(verdictMetrics).map((m) => m.verdict)) : "unknown";
   if (warnings.some((w) => /invalid/.test(w))) verdict = "unknown";
@@ -376,9 +440,20 @@ async function main(): Promise<number> {
     net,
     ab,
     requestedPairs: runs,
+    maxPairs: maxRuns,
+    // rounds taken: pairs, or single loads with --ab none
+    pairs: results.on.length,
     verdict,
+    // how far the pairs settle it: the weakest of the judged metrics
+    confidence: verdictMetrics ? (["too-few", "open", "settled"] as const).find((level) => Object.values(verdictMetrics).some((m) => m.confidence === level)) ?? null : null,
     metrics: verdictMetrics,
     informational: info,
+    // where the browser ran and which Chromium it was: two reports compare only when `where` is the same
+    browser: opened?.describe ?? null,
+    // what a reader needs beside the numbers that is not a fault of the run
+    notes,
+    // what was seen of the host beside each load, which signal decided, the pairs with a busy load (1-based) and whether they were left out
+    host: { by: hostSeen.by, cpus, benchmarkMedianMs: hostSeen.benchmarkMedianMs, loads: host, busyPairs: ab === "none" ? [] : hostSeen.dropped.map((i) => i + 1), busyLoads: { on: hostSeen.busyOn.filter(Boolean).length, off: hostSeen.busyOff.filter(Boolean).length }, leftOut: !args["keep-busy"] && !remote },
     warnings,
     totals: {
       preflights: { on: sum("on", "preflights"), off: sum("off", "preflights") },
@@ -405,16 +480,18 @@ async function main(): Promise<number> {
       net,
       ab,
       verdict,
+      host: hostExtra(cpus, hostSeen.benchmarkMedianMs),
     });
     writeFileSync(args.jsonl, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
   }
   const c = verdictMetrics?.contentMs;
   process.stderr.write(
     `raft-perf measure ${entry}/${state}/${net} ab=${ab}: ${verdict}` +
-      (c ? ` (content shown ${c.medianOn} vs ${c.medianOff} ms, delta ${c.medianDelta}, floor ${c.noiseFloor == null ? "-" : Math.round(c.noiseFloor)})` : "") +
+      (c ? ` (content shown ${c.medianOn} vs ${c.medianOff} ms, delta ${c.medianDelta}, floor ${c.noiseFloor == null ? "-" : Math.round(c.noiseFloor)}; ${c.interval ? `shift ${Math.round(c.shift!)} ms, 95% interval ${Math.round(c.interval[0])} to ${Math.round(c.interval[1])}` : `${c.pairs} pair(s), no interval under ${MIN_PAIRS_TO_SETTLE}`}; ${report.confidence})` : "") +
       (warnings.length ? `; ${warnings.length} warning(s)` : "") +
       "\n",
   );
+  if (ab !== "none" && report.confidence !== "settled" && verdict !== "unknown") process.stderr.write(outOfTime ? `the verdict is not settled (${report.confidence}) and the sessions' ten minutes ran out: more pairs do not fit in one run on this network\n` : `next: the verdict is not settled (${report.confidence}); run again with --max-runs ${Math.max(maxRuns * 2, 12)} to let it add pairs until it is\n`);
   if (verdict === "unknown" && ab !== "none") return 2;
   return verdict === "worse" && args["fail-on-worse"] ? 1 : 0;
 }
@@ -424,7 +501,7 @@ main().then(
     process.exitCode = code;
   },
   (error: unknown) => {
-    process.stderr.write(`raft-perf measure: ${error instanceof MeasureError ? error.message : `failed: ${(error as Error)?.stack ?? String(error)}`}\n`);
+    process.stderr.write(`raft-perf measure: ${error instanceof MeasureError || error instanceof BrowserError ? error.message : `failed: ${(error as Error)?.stack ?? String(error)}`}\n`);
     process.exitCode = 2;
   },
 );

@@ -1,4 +1,5 @@
 import {
+  inferClaudeUsageWindowScopes,
   RAFT_CLIENT_CAPABILITIES_HEADER,
   RUNTIME_USAGE_WINDOW_SCOPE_CLIENT_CAPABILITY,
   safeParseRuntimeAccountUsageSnapshot,
@@ -42,6 +43,12 @@ export type RuntimeAccountUsageRefreshResult = {
   snapshot?: RuntimeAccountUsageSnapshot | null;
 };
 
+/** A snapshot from an answer, checked and in the shape every usage view reads (`inferClaudeUsageWindowScopes`); null when malformed. */
+export function usageSnapshotOf(value: unknown): RuntimeAccountUsageSnapshot | null {
+  const parsed = safeParseRuntimeAccountUsageSnapshot(value);
+  return parsed.success ? inferClaudeUsageWindowScopes(parsed.data) : null;
+}
+
 /**
  * A refresh carries the computer's reply inline. Keep it only in the shape
  * the read path guarantees: one malformed snapshot (an account whose
@@ -50,21 +57,22 @@ export type RuntimeAccountUsageRefreshResult = {
  */
 function withValidSnapshot(result: RuntimeAccountUsageRefreshResult): RuntimeAccountUsageRefreshResult {
   if (!result.snapshot) return result;
-  const parsed = safeParseRuntimeAccountUsageSnapshot(result.snapshot);
-  return { ...result, snapshot: parsed.success ? parsed.data : null };
+  return { ...result, snapshot: usageSnapshotOf(result.snapshot) };
 }
 
 /**
  * A read's answer in the shape every usage view relies on: an answer without
  * a snapshot holding its accounts (absent, an unknown state) is `missing`,
  * never a crash where a view reads `snapshot.accounts`. The server's read
- * serves only snapshots its cache validated on the way in.
+ * serves only snapshots its cache validated on the way in; an older
+ * Computer's Claude windows get their model scope (`inferClaudeUsageWindowScopes`).
  */
 function readResultOf(value: unknown): RuntimeAccountUsageReadResult {
   const answer = value as { state?: unknown; snapshot?: { accounts?: unknown } | null } | null | undefined;
   if (answer?.state === "unsupported") return { state: "unsupported", snapshot: null };
   if ((answer?.state === "fresh" || answer?.state === "stale") && Array.isArray(answer.snapshot?.accounts)) {
-    return answer as RuntimeAccountUsageReadResult;
+    const read = answer as Extract<RuntimeAccountUsageReadResult, { snapshot: RuntimeAccountUsageSnapshot }>;
+    return { ...read, snapshot: inferClaudeUsageWindowScopes(read.snapshot) };
   }
   return { state: "missing", snapshot: null };
 }

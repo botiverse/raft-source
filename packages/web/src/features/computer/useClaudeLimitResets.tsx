@@ -8,6 +8,7 @@ import type { RuntimeAccountUsageReadResult } from "../../utils/runtimeAccountUs
 import type { RuntimeAuthClient, RuntimeAuthView } from "../../utils/runtimeAuthClient";
 import { ClaudeLimitResetConfirmDialog, ClaudeLimitResetsDialog } from "./ClaudeLimitResetsDialog";
 import { claudeLimitResetsNotSupportedHere } from "./claudeLimitResetCopy";
+import { claudeLimitResetOffer } from "./claudeLimitResetOffer";
 import { forgetLimitResetAttemptKey, limitResetAttemptKey } from "./limitResetAttemptKey";
 import type { RuntimeLimitResetOutcome } from "./limitResetOutcome";
 
@@ -16,7 +17,8 @@ import type { RuntimeLimitResetOutcome } from "./limitResetOutcome";
  * docs/contracts/runtime-account-usage.md): what the card offers, and the
  * list and confirm dialogs. Shown only to a person who may act on the
  * Computer's runtimes, where the flag is on and the server says what this
- * Computer can do (`RuntimeAuthView.claudeLimitResets`).
+ * Computer can do (`RuntimeAuthView.claudeLimitResets`). What this viewer is
+ * offered (use, the list only, or nothing) is `claudeLimitResetOffer`.
  */
 export function useClaudeLimitResets({
   serverId,
@@ -70,11 +72,6 @@ export function useClaudeLimitResets({
     && claudeFiveHourLimitOf(result.snapshot) === "at_limit";
   const claudeAccountLabel = claudeAccount ? claudeAccount.maskedLabel ?? claudeAccount.displayName ?? null : null;
   const legacySubject = `${limitResetSubject}\0${claudeAccount?.accountKey ?? ""}`;
-  // Only the person who connected the Computer spends its Claude resets; an
-  // owner or admin views them. An older server does not say: allowed, and it
-  // still decides.
-  const claudeCanUse = authView?.claudeLimitResetAccess?.canUse ?? true;
-  const claudeCanConsent = authView?.claudeLimitResetAccess?.canConsent ?? true;
   const openClaudeList = useCallback(() => {
     onAuthDialog?.();
     setClaudeDialog({ subject: limitResetSubject, list: true, confirm: null });
@@ -107,20 +104,25 @@ export function useClaudeLimitResets({
     setLegacyAccount(legacySubject);
     if (spent) void refresh();
   }, [legacySubject, refresh]);
+  // What this viewer is offered: use, the list only, or nothing.
+  const offer = claudeLimitResetOffer({
+    provider,
+    flagOn: claudeFlagOn,
+    canActOnRuntimes,
+    authStatus,
+    authView,
+    atFiveHourLimit: claudeAtFiveHourLimit,
+    notSupportedHere: notSupportedSubject === limitResetSubject,
+  });
   const surfaceClaudeLimitReset = useMemo<SurfaceClaudeLimitReset | null>(() => {
-    if (provider !== "claude" || !claudeFlagOn || !canActOnRuntimes || authStatus?.kind === "logged_out") return null;
-    const state = authView?.claudeLimitResets;
-    if (!state || notSupportedSubject === limitResetSubject) return null;
-    if (state === "computer_upgrade_required") return { state };
+    if (offer === null) return null;
     const legacyAtLimit = claudeAtFiveHourLimit && legacyAccount === legacySubject;
     return {
-      state,
       atFiveHourLimit: claudeAtFiveHourLimit,
       onView: legacyAtLimit ? null : openClaudeList,
-      onUseFiveHour: claudeAtFiveHourLimit && claudeCanUse ? () => openClaudeConfirm("five_hour", false) : null,
-      ownerOnly: !claudeCanUse,
+      onUseFiveHour: claudeAtFiveHourLimit && offer === "ok" ? () => openClaudeConfirm("five_hour", false) : null,
     };
-  }, [authStatus?.kind, authView?.claudeLimitResets, canActOnRuntimes, claudeAtFiveHourLimit, claudeCanUse, claudeFlagOn, legacyAccount, legacySubject, limitResetSubject, notSupportedSubject, openClaudeConfirm, openClaudeList, provider]);
+  }, [claudeAtFiveHourLimit, legacyAccount, legacySubject, offer, openClaudeConfirm, openClaudeList]);
 
   const dialogs = (
     <>
@@ -129,8 +131,7 @@ export function useClaudeLimitResets({
           serverId={serverId}
           machineId={machineId}
           atFiveHourLimit={claudeAtFiveHourLimit}
-          canUse={claudeCanUse}
-          canConsent={claudeCanConsent}
+          canUse={authView?.claudeLimitResetAccess?.canUse ?? true}
           client={authClient}
           onUse={pickClaudeKindFromList}
           onLegacy={handleClaudeLegacy}

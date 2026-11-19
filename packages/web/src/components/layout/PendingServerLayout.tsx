@@ -129,7 +129,7 @@ export function PendingServerLayout({ prerender = false, offline }: {
       )}
       mainHidden={sidebarInline}
       main={(
-        <div className="thread-layout-container flex min-h-0 min-w-0 flex-1" data-testid="pending-server-layout">
+        <div className="thread-layout-container flex min-h-0 min-w-0 flex-1" data-testid="pending-server-layout" data-has-thread={thread ? "" : undefined}>
           <div className="thread-main-column flex min-h-0 min-w-0 flex-1 flex-col overflow-clip" data-main-column="">
             {offline
               ? <OfflineMessagesNotice />

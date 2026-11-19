@@ -118,6 +118,59 @@ test("child-process runtime session emits exit exactly once, including for a fai
   }), [{ code: 0, reason: "runtime_exit" }]);
 });
 
+test("child-process runtime session parses an unterminated last line and emits the driver's end-of-stdout events once, only after a clean exit, before close", async () => {
+  class EndDriver extends Utf8Driver {
+    ends = 0;
+    parseStdoutEnd(): ParsedEvent[] {
+      this.ends += 1;
+      return [{ kind: "turn_end" }];
+    }
+  }
+  const cases: Array<{ name: string; drive: (child: FakeChildProcess) => void; order: string[] }> = [
+    // The usual order: stdout ends, then the exit. turn_end goes out before the exit.
+    { name: "end, exit 0", drive: (c) => { c.stdout.emit("end"); c.emit("exit", 0, null); c.emit("close", 0, null); }, order: ["text", "turn_end", "exit", "close"] },
+    // A descendant held stdout past the exit.
+    { name: "exit 0, end", drive: (c) => { c.emit("exit", 0, null); c.stdout.emit("end"); c.emit("close", 0, null); }, order: ["exit", "text", "turn_end", "close"] },
+    // No `end` seen (the child ended before the session listened): `close` flushes.
+    { name: "exit 0, close", drive: (c) => { c.emit("exit", 0, null); c.emit("close", 0, null); }, order: ["exit", "text", "turn_end", "close"] },
+    // A crash or a kill (OOM) mid-turn is not a finished turn.
+    { name: "end, exit 1", drive: (c) => { c.stdout.emit("end"); c.emit("exit", 1, null); c.emit("close", 1, null); }, order: ["text", "exit", "close"] },
+    { name: "end, SIGKILL", drive: (c) => { c.stdout.emit("end"); c.emit("exit", null, "SIGKILL"); c.emit("close", null, "SIGKILL"); }, order: ["text", "exit", "close"] },
+  ];
+  for (const { name, drive, order: expected } of cases) {
+    const driver = new EndDriver();
+    const session = new ChildProcessRuntimeSession(driver, spawnContext);
+    const order: string[] = [];
+    session.on("runtime_event", (event) => order.push(event.kind));
+    session.on("exit", () => order.push("exit"));
+    session.on("close", () => order.push("close"));
+    await session.start({ text: "start" });
+    // The last line has no trailing newline: it is parsed at the end of stdout.
+    driver.spawned.stdout.emit("data", Buffer.from(JSON.stringify({ text: "done" })));
+    assert.deepEqual(order, []);
+    drive(driver.spawned);
+    assert.deepEqual(order, expected, name);
+    assert.ok(driver.ends <= 1, name);
+  }
+});
+
+test("child-process runtime session emits no end-of-stdout events after a stop the daemon asked for", async () => {
+  class EndDriver extends Utf8Driver {
+    parseStdoutEnd(): ParsedEvent[] {
+      return [{ kind: "turn_end" }];
+    }
+  }
+  const driver = new EndDriver();
+  const session = new ChildProcessRuntimeSession(driver, spawnContext);
+  const order: string[] = [];
+  session.on("runtime_event", (event) => order.push(event.kind));
+  session.on("close", () => order.push("close"));
+  await session.start({ text: "start" });
+  driver.spawned.stdout.emit("data", Buffer.from(`${JSON.stringify({ text: "done" })}\n`));
+  await session.stop({ reason: "stalled_recovery" });
+  assert.deepEqual(order, ["text", "close"]);
+});
+
 // Task #366: real children, worst-case timing. The driver hands the child over
 // only after it has already ended, so every event RuntimeSession must see
 // happened before it listened.

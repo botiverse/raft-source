@@ -43,9 +43,22 @@ from outside it, until each piece finds its home:
   while the Marketplace lists one for this Server and it isn't installed, as its Marketplace card (`MarketplaceListingRow`) with its own
   line; the card opens the same install detail. While it shows, the installed
   list under it has its own "Installed" heading (`AppsSectionHeading`, an
-  `h3` under the page title's `h2`). A Server that uninstalled Stamp sees it
-  recommended again: the record carries no "uninstalled here" signal. Add a
-  recommendation there, with its line in the catalogs.
+  `h3` under the page title's `h2`). A Server where a person uninstalled the
+  App is not recommended it again: the record's `uninstalledHereAt` (when a
+  person on this Server last uninstalled the App, or null; kept after a
+  reinstall, so it is read together with `installedAt`) drops it from the
+  section, and the Marketplace still lists it. Add
+  a recommendation there, with its line in the catalogs.
+- `useOwnServerCardButtons.ts`: the App editor's Card buttons section for an
+  App made on this Server (RFC 076 §17): reads
+  `GET /integrations/clients/:id/action-endpoint` while the editor is open,
+  allows the endpoint in force (`PUT .../own-server-actions`, the URL exactly
+  as shown; a 409 for a changed one reads it again) and revokes it
+  (`DELETE`). `connected-apps/ConnectedAppCardButtonsSection.tsx` draws it.
+  The server now has them on by default there, so Allow switches them on and
+  Revoke off; the same answer's `card_buttons` is the newer view, which also
+  covers allowing an installed App on another Server
+  ([app link previews](../../../../../docs/development/app-link-previews.md#card-buttons-of-an-app-raft-did-not-review-rfc-076-17)).
 - `connected-apps/`: the parts several App surfaces share. Record and view
   types (`oauthClientRecords.ts`, `connectedAppTypes.ts`), pure helpers
   (`connectedAppStatus.ts`, `connectedAppCatalog.ts`, `connectedAppMapping.ts`,

@@ -5,6 +5,7 @@ import api from "../../api/client";
 import { isSecondFactorStepUpCancelled, withSecondFactorStepUp } from "../../components/settings/secondFactorStepUp";
 import { accountLoginRefusalOf, authorizationErrorRedirectUrl, isAppNotAvailableError } from "./loginErrors";
 import type { AccountLoginRefusal } from "./loginErrors";
+import { useLoginSetupHost } from "./loginSetupHost";
 
 export type AccountAuthorizationRequest = {
   returnUrl: string;
@@ -43,6 +44,7 @@ export function useAccountAuthorization({
   onSuspended,
 }: AccountAuthorizationRequest) {
   const { formatMessage } = useIntl();
+  const { deliver, source } = useLoginSetupHost();
   const [submitting, setSubmitting] = useState(false);
   const [status, setStatus] = useState("");
   const [refusal, setRefusal] = useState<AccountLoginRefusal | null>(null);
@@ -62,15 +64,16 @@ export function useAccountAuthorization({
           codeChallenge: oidcCodeChallenge || undefined,
           codeChallengeMethod: oidcCodeChallengeMethod || undefined,
         } : {}),
+        ...(source ? { source } : {}),
       }), "appAccess");
-      window.location.assign(appendOAuthAuthorizationParams(data.returnUrl, data.code, setupState));
+      deliver(appendOAuthAuthorizationParams(data.returnUrl, data.code, setupState));
     } catch (err: unknown) {
       // Closing "Verify it's you" cancels: stay on the page, nothing to report.
       if (isSecondFactorStepUpCancelled(err)) return;
       const body = (err as { response?: { data?: { error?: unknown; error_description?: unknown } } } | null)?.response?.data;
       const appErrorUrl = authorizationErrorRedirectUrl(body, setupState);
       if (appErrorUrl) {
-        window.location.assign(appErrorUrl);
+        deliver(appErrorUrl);
         return;
       }
       if (isAppNotAvailableError(err)) {
@@ -89,6 +92,7 @@ export function useAccountAuthorization({
       setSubmitting(false);
     }
   }, [
+    deliver,
     formatMessage,
     oidcCodeChallenge,
     oidcCodeChallengeMethod,
@@ -99,6 +103,7 @@ export function useAccountAuthorization({
     returnUrl,
     scopes,
     setupState,
+    source,
   ]);
 
   // A fresh lookup of the App replaces the press's refusal (the page calls this).

@@ -45,14 +45,14 @@ test("rack reset: none when it isn't known or has passed", () => {
 });
 
 test("rack reset words: short in the cell, the same count in full for its name", () => {
-  assert.deepEqual(rackResetText(at(45 * MINUTE), intl("zh-cn"), NOW), { short: "45m 后重置", full: "已用完 · 45 分钟后恢复" });
-  assert.deepEqual(rackResetText(at(3 * HOUR + 30 * MINUTE), intl("zh-cn"), NOW), { short: "3h 后重置", full: "已用完 · 3 小时后恢复" });
-  assert.deepEqual(rackResetText(at(2 * DAY + HOUR), intl("zh-cn"), NOW), { short: "2d 后重置", full: "已用完 · 2 天后恢复" });
-  assert.deepEqual(rackResetText(at(45 * MINUTE), intl("en"), NOW), { short: "Back in 45m", full: "Used up · back in 45 minutes" });
-  assert.deepEqual(rackResetText(at(3 * HOUR), intl("en"), NOW), { short: "Back in 3h", full: "Used up · back in 3 hours" });
-  assert.deepEqual(rackResetText(at(DAY + 23 * HOUR), intl("en"), NOW), { short: "Back in 47h", full: "Used up · back in 47 hours" });
-  assert.deepEqual(rackResetText(at(5 * DAY), intl("en"), NOW), { short: "Back in 5d", full: "Used up · back in 5 days" });
-  assert.deepEqual(rackResetText(at(HOUR), intl("en"), NOW), { short: "Back in 1h", full: "Used up · back in 1 hour" });
+  assert.deepEqual(rackResetText(at(45 * MINUTE), intl("zh-cn"), NOW), { short: "45m 后重置", full: "已用完 · 45 分钟后重置" });
+  assert.deepEqual(rackResetText(at(3 * HOUR + 30 * MINUTE), intl("zh-cn"), NOW), { short: "3h 后重置", full: "已用完 · 3 小时后重置" });
+  assert.deepEqual(rackResetText(at(2 * DAY + HOUR), intl("zh-cn"), NOW), { short: "2d 后重置", full: "已用完 · 2 天后重置" });
+  assert.deepEqual(rackResetText(at(45 * MINUTE), intl("en"), NOW), { short: "Back in 45m", full: "Used up · resets in 45 minutes" });
+  assert.deepEqual(rackResetText(at(3 * HOUR), intl("en"), NOW), { short: "Back in 3h", full: "Used up · resets in 3 hours" });
+  assert.deepEqual(rackResetText(at(DAY + 23 * HOUR), intl("en"), NOW), { short: "Back in 47h", full: "Used up · resets in 47 hours" });
+  assert.deepEqual(rackResetText(at(5 * DAY), intl("en"), NOW), { short: "Back in 5d", full: "Used up · resets in 5 days" });
+  assert.deepEqual(rackResetText(at(HOUR), intl("en"), NOW), { short: "Back in 1h", full: "Used up · resets in 1 hour" });
 });
 
 test("the usage-limit notification says when it is back relatively, as the card and cell do: \"Back in 6 days\"", () => {

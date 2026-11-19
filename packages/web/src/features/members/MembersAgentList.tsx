@@ -1,5 +1,5 @@
 import { ListRow, ListRowBody, ListRowGroup, ListRowMeta, ListRowSubtitle, ListRowTitle, Skeleton } from "@botiverse/raft-ui";
-import { memo, useCallback, useId } from "react";
+import { memo, useCallback, useContext, useId } from "react";
 import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
 import StatusDot from "../../components/ui/StatusDot";
@@ -15,6 +15,9 @@ import { MemberMenuTrigger } from "./MemberMenuTrigger";
 import { MEMBER_ROW_MIN_H } from "./memberRowHeights";
 import { CELL, HEADING_LABEL } from "./membersAgentColumns";
 import type { MemberEntry } from "./membersPageModel";
+import { EditAgentButton } from "./EditAgentButton";
+import { MemberActionsContext } from "./memberActionsContext";
+import { useCanEditAgent } from "./memberTileParts";
 
 // The columns' tracks, shared by the heading row and every row so they line
 // up. Status is as wide as its longest short presence word in this locale
@@ -29,6 +32,9 @@ const COL_COMPUTER = "hidden w-[136px] shrink-0 @[760px]/members-list:flex";
 // The usage view (MembersAgentUsage) has more columns: its Model needs 1040px
 // of list, below which it folds under the name with the runtime.
 const COL_USAGE_MODEL = "hidden w-[176px] shrink-0 @[1040px]/members-list:flex";
+// The trailing actions track (Edit agent, EditAgentButton's icon-md), on every
+// row and heading line, so the columns line up whether or not a row has it.
+const COL_ACTIONS = "w-8 shrink-0";
 
 // The name line: the name, then the role word and the app tag on its baseline.
 const NAME_LINE = "flex min-w-0 items-baseline gap-2";
@@ -138,8 +144,9 @@ const AgentRow = memo(function AgentRow({ entry, machine, showComputer, selected
       data-testid={`members-agent-row-${agent.id}`}
       data-member-entry-id={agent.id}
       // Every row the height of one with a description (12 + 22 + 2 + 18 + 12 with a mouse),
-      // the name centred on its cells when there is none, as every cell is.
-      className={MEMBER_ROW_MIN_H}
+      // the name centred on its cells when there is none, as every cell is. Its hover
+      // holds while the pointer is on its Edit agent (a sibling, AgentRowItem).
+      className={`${MEMBER_ROW_MIN_H} not-data-selected:group-hover/edit:overlay-subtle`}
     >
       <MemberEntryAvatar
         entry={entry}
@@ -192,9 +199,29 @@ const AgentRow = memo(function AgentRow({ entry, machine, showComputer, selected
           ) : <ListRowMeta>—</ListRowMeta>}
         </span>
       ) : null}
+      <span aria-hidden className={COL_ACTIONS} />
     </MemberMenuTrigger>
   );
 });
+
+/**
+ * A row in its list item, with Edit agent (EditAgentButton) over the row's
+ * trailing track for an agent the viewer may edit: beside the row's button,
+ * not inside it.
+ */
+function AgentRowItem(props: Parameters<typeof AgentRow>[0]) {
+  const actions = useContext(MemberActionsContext);
+  const { agent } = props.entry;
+  const canEdit = useCanEditAgent(agent) && actions !== null;
+  return (
+    <li className="group/edit relative flex min-w-0 flex-col">
+      <AgentRow {...props} />
+      {canEdit && actions ? (
+        <EditAgentButton agent={agent} onEdit={actions.requestEdit} className="absolute top-1/2 right-4 -translate-y-1/2" />
+      ) : null}
+    </li>
+  );
+}
 
 /**
  * An agent's row while the Agents tab loads: AgentRow's own ListRow at the
@@ -250,13 +277,14 @@ export function MembersAgentGroup({ heading, entries, machinesById, showComputer
               <span className={`${COL_RUNTIME} ${HEADING_LABEL}`}>{formatMessage({ id: "members.page.column.runtime" })}</span>
               <span className={`${COL_MODEL} ${HEADING_LABEL}`}>{formatMessage({ id: "members.page.column.model" })}</span>
               {showComputer ? <span className={`${COL_COMPUTER} ${HEADING_LABEL}`}>{formatMessage({ id: "members.page.column.computer" })}</span> : null}
+              <span aria-hidden className={COL_ACTIONS} />
             </>
           ) : null}
         </div>
       ) : null}
-      <ListRowGroup className="mx-5 mt-2">
+      <ListRowGroup render={<ul />} className="mx-5 mt-2">
         {entries.map((entry) => entry.kind === "agent" ? (
-          <AgentRow
+          <AgentRowItem
             key={entry.id}
             entry={entry}
             machine={entry.agent.machineId ? machinesById.get(entry.agent.machineId) : undefined}
@@ -294,6 +322,7 @@ export function MembersAgentUsageHeadings({ label, name, headings }: {
         <StatusColumn role="columnheader"><span className={HEADING_LABEL}>{formatMessage({ id: "members.page.column.status" })}</span></StatusColumn>
         <span role="columnheader" className={`${COL_USAGE_MODEL} ${HEADING_LABEL}`}>{formatMessage({ id: "members.page.column.model" })}</span>
         {headings}
+        <span aria-hidden className={COL_ACTIONS} />
       </div>
     </div>
   );

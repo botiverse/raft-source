@@ -1,5 +1,5 @@
 import type { MessageId } from "../../i18n/messages";
-import { Button, InlineCode, SegmentedControl, SegmentedControlItem, SegmentedControlLabel, Separator, Spinner, MarkdownLink, ScrollArea } from "@botiverse/raft-ui";
+import { Button, InlineCode, SegmentedControl, SegmentedControlItem, SegmentedControlLabel, Separator, Spinner, MarkdownLink, ScrollArea, TableScroll } from "@botiverse/raft-ui";
 import { useEffect, useState, useCallback, useRef } from "react";
 import {
   ChevronRight,
@@ -135,13 +135,13 @@ const WORKSPACE_MARKDOWN_COMPONENTS: Components = {
       {children}
     </blockquote>
   ),
-  // A wide table scrolls sideways in a horizontal raft-ui ScrollArea, as raft-ui's Markdown tables do.
+  // A wide table scrolls sideways in raft-ui's TableScroll, as raft-ui's Markdown tables do.
   table: ({ children }) => (
-    <ScrollArea orientation="horizontal" className="my-2">
+    <TableScroll className="my-2">
       <table className="border-collapse border border-line-hairline text-callout">
         {children}
       </table>
-    </ScrollArea>
+    </TableScroll>
   ),
   th: ({ children }) => (
     <th className="border border-line-hairline bg-fill-muted px-2 py-1 text-left font-bold whitespace-nowrap text-foreground">

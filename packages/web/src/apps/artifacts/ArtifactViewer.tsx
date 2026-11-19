@@ -31,6 +31,9 @@ import type { ArtifactCommentsOpening } from "./artifactViewerStore";
 import { ArtifactVersionBadge } from "./ArtifactMessageCard";
 import { ArtifactMetaRow } from "./ArtifactMetaRow";
 import { useHeadReadersWidth } from "./headReadersWidth";
+import { ArtifactRecentTitle } from "./ArtifactRecentTitle";
+import { useRecentTitleExtraWidth } from "./artifactRecentConversation";
+import { ArtifactShownFilePath } from "./ArtifactShownFilePath";
 import ArtifactScopeLabel from "./ArtifactScopeLabel";
 import type { ArtifactCommentsReview } from "./ArtifactCommentsContext";
 import { ArtifactShownFileProvider } from "./ArtifactShownFileProvider";
@@ -275,7 +278,7 @@ function LoadedViewer({ chrome, switching, failedVersion, onRetry, phone, onOpen
       onOpenInNewPage={openInNewPage}
       fork={offersForkInRaft(card)}
       actions={<ViewerActions />}
-      title={<ViewerTitle card={card} title={<ArtifactSurfaceTitle testId="artifact-viewer-title" />} version={<ArtifactSurfaceVersionTag />} />}
+      title={<ViewerTitle card={card} record title={<ArtifactSurfaceTitle testId="artifact-viewer-title" />} after={<ArtifactShownFilePath data={data} />} version={<ArtifactSurfaceVersionTag />} />}
       // On a phone the viewer is a page with its own history entry: the message takes its place.
       meta={<ViewerMeta replace={phone} onOpened={onOpenedMessage} />}
     >
@@ -286,13 +289,15 @@ function LoadedViewer({ chrome, switching, failedVersion, onRetry, phone, onOpen
 
 /**
  * The header's title and version, from the viewer data or, while it loads, the opener's card
- * (`title`: the surface's, which a reader who may publish edits in place; `version`: the
- * surface's tag, which switches versions; else the plain title and tag).
+ * (`title`: the surface's own title; `version`: the
+ * surface's tag, which switches versions; else the plain title and tag). Beside a conversation
+ * the title may be the menu of the Artifacts recently opened there (ArtifactRecentTitle; `record`:
+ * loaded, so this one joins them; `after`: what follows that trigger, the file shown).
  */
-function ViewerTitle({ card, title, version }: { card: Pick<ArtifactCard, "title" | "version">; title?: ReactNode; version?: ReactNode }) {
+function ViewerTitle({ card, title, version, record = false, after }: { card: Pick<ArtifactCard, "id" | "title" | "version">; title?: ReactNode; version?: ReactNode; record?: boolean; after?: ReactNode }) {
   return (
     <>
-      {title ?? <PanelTitle data-testid="artifact-viewer-title">{card.title}</PanelTitle>}
+      <ArtifactRecentTitle card={card} record={record} after={after} plain={title ?? <PanelTitle data-testid="artifact-viewer-title">{card.title}</PanelTitle>} />
       <PanelStatus>{version ?? <ArtifactVersionBadge version={card.version} />}</PanelStatus>
     </>
   );
@@ -458,7 +463,8 @@ function ViewerFrame({
   // The head always fits its column (#189 rule 6, as headFit): past the title's room its own actions fold into ⋯, the
   // last first (comment mode's controls, then Open in New Page); ⋯, Expand and Close never fold.
   const [measureHead, headWidth, headElement] = useHeadWidth();
-  const readersWidth = useHeadReadersWidth(headElement);
+  // The readers beside the title, and the title as the recent Artifacts' trigger (its chevron), are room it needs.
+  const readersWidth = useHeadReadersWidth(headElement) + useRecentTitleExtraWidth();
   const headOwn = useViewerHeadOwn(!!onOpenInNewPage, fork);
   const rowExpand = useRowExpand("artifact");
   const ownShown = shownOwnActions({

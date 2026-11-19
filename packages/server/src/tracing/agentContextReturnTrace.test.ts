@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import type { Tracer } from "@botiverse/raft-shared";
 
 import { AGENT_CONTEXT_RETURNED_EVENT, agentRequestContextFromHeaders, recordAgentContextReturned } from "./agentContextReturnTrace";
+import { launchIdHashAttrs, traceAgentIdHash, traceIdentityHash } from "./traceIdentity";
 
 function capture(): { tracer: Tracer; events: Array<{ name: string; attrs: Record<string, unknown> }> } {
   const events: Array<{ name: string; attrs: Record<string, unknown> }> = [];
@@ -54,6 +55,8 @@ test("nothing returned, nothing recorded; a missing launch or context is marked,
   assert.equal("launch_id" in events[0]!.attrs, false);
   assert.equal(events[0]!.attrs.context_id_present, false);
   assert.equal("context_id" in events[0]!.attrs, false);
+  assert.equal("launch_id_hash" in events[0]!.attrs, false);
+  assert.equal("context_id_hash" in events[0]!.attrs, false);
 });
 
 test("the launch and context headers are taken only when well formed", () => {
@@ -63,4 +66,33 @@ test("the launch and context headers are taken only when well formed", () => {
     assert.deepEqual(agentRequestContextFromHeaders({ "x-agent-launch-id": bad, "x-agent-context-id": bad }), { launchId: null, contextId: null });
   }
   assert.deepEqual(agentRequestContextFromHeaders({}), { launchId: null, contextId: null }, "an old daemon sends neither");
+});
+
+test("launch and context carry keyed hashes: 16 hex, stable, not the agent hash of the same id", () => {
+  const { tracer, events } = capture();
+  const launchId = "33333333-3333-4333-8333-333333333333";
+  const contextId = "44444444-4444-4444-8444-444444444444";
+  const input = { source: "history" as const, agentId: "a", channelId: "c", launchId, contextId, seqs: [1] };
+  recordAgentContextReturned(input, tracer);
+  recordAgentContextReturned(input, tracer);
+  const [first, second] = events.map((event) => event.attrs);
+  assert.match(String(first!.launch_id_hash), /^[0-9a-f]{16}$/);
+  assert.match(String(first!.context_id_hash), /^[0-9a-f]{16}$/);
+  assert.equal(second!.launch_id_hash, first!.launch_id_hash, "stable across events, so they join on one launch");
+  assert.equal(second!.context_id_hash, first!.context_id_hash);
+  assert.equal(first!.launch_id_hash, traceIdentityHash("launch_id_hash", launchId));
+  assert.deepEqual(launchIdHashAttrs(launchId), { launch_id_hash: first!.launch_id_hash }, "the wake events' helper gives the same hash");
+  assert.notEqual(first!.launch_id_hash, traceAgentIdHash(launchId), "its own key, not the agent key");
+  assert.notEqual(traceIdentityHash("context_id_hash", launchId), first!.launch_id_hash, "launch and context keys differ");
+  assert.equal(first!.launch_id_present, true);
+  assert.equal(first!.context_id_present, true);
+});
+
+test("without a trace identity key the launch and context hashes are absent, not invented", () => {
+  delete process.env.JWT_SECRET;
+  const { tracer, events } = capture();
+  recordAgentContextReturned({ source: "history", agentId: "a", channelId: "c", launchId: "launch-1", contextId: "context-1", seqs: [1] }, tracer);
+  assert.equal("launch_id_hash" in events[0]!.attrs, false);
+  assert.equal("context_id_hash" in events[0]!.attrs, false);
+  assert.deepEqual(launchIdHashAttrs("launch-1"), {});
 });

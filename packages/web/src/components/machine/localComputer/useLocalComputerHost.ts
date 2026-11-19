@@ -17,7 +17,7 @@ import { RUNTIME_API_ORIGIN } from "../../../runtimeEndpoints";
 import { getDesktopBridge } from "../../../utils/desktopBridge";
 import { attachedHereByOtherAccount, classifyHostError, deriveControls } from "./localComputerLogic";
 import type { HostErrorCode } from "./localComputerLogic";
-import { getLocalComputerBridge, refreshLocalComputerHost, setLocalComputerEnabling, setLocalComputerLastError, useLocalComputerMachineId, useLocalComputerSnapshot } from "./localComputerStore";
+import { getLocalComputerBridge, refreshLocalComputerHost, rereadLocalComputer, setLocalComputerEnabling, setLocalComputerLastError, useLocalComputerMachineId, useLocalComputerSnapshot } from "./localComputerStore";
 import { deriveThisDeviceState } from "./thisDeviceLogic";
 import type { ThisDeviceState } from "./thisDeviceLogic";
 import { useMachineStore } from "../../../store/machineStore";
@@ -82,6 +82,8 @@ export interface LocalComputerHost {
   updateComputer: (() => Promise<void>) | null;
   /** Retry a failed move from an older Desktop's embedded Computer. */
   retryMigration: (() => Promise<void>) | null;
+  /** Try again: read the host state and the status again (a failed or unanswered read). */
+  retryRead: (() => Promise<void>) | null;
   openComputerLogs: (() => void) | null;
   openDesktopLogs: (() => void) | null;
 }
@@ -129,7 +131,7 @@ function run(action: () => Promise<unknown>): Promise<void> {
 export function useLocalComputerHost(): LocalComputerHost | null {
   const computer = getLocalComputerBridge();
   const bridge = computer?.hostCapable ? computer : null;
-  const { status, host, enabling, lastError, ready } = useLocalComputerSnapshot();
+  const { status, host, hostReadFailed, enabling, lastError, ready } = useLocalComputerSnapshot();
   const machineId = useLocalComputerMachineId();
   const latestComputerVersion = useMachineStore((s) => s.latestComputerVersion);
   const serverSlug = useServerStore((s) => s.current?.slug ?? null);
@@ -165,7 +167,8 @@ export function useLocalComputerHost(): LocalComputerHost | null {
     awaitingListing,
     updateAvailable,
     lastErrorCode: lastError?.code ?? null,
-  }), [ready, host, status, enabling, running, attachedHere, awaitingListing, updateAvailable, lastError]);
+    hostReadFailed,
+  }), [ready, host, status, enabling, running, attachedHere, awaitingListing, updateAvailable, lastError, hostReadFailed]);
 
   return useMemo<LocalComputerHost | null>(() => {
     if (!bridge) return null;
@@ -207,6 +210,7 @@ export function useLocalComputerHost(): LocalComputerHost | null {
       runDiagnostics: typeof bridge.runDiagnostics === "function" ? (options) => bridge.runDiagnostics!(options) : null,
       updateComputer: optional(bridge.updateComputer),
       retryMigration: optional(bridge.retryMigration),
+      retryRead: () => rereadLocalComputer(),
       openComputerLogs: opener(bridge.openComputerLogs),
       openDesktopLogs: opener(bridge.openDesktopLogs),
     };

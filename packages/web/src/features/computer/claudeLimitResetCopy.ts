@@ -61,6 +61,18 @@ export function claudeLimitResetsNotSupportedHere(result: RuntimeLimitResetResul
   }
 }
 
+/**
+ * The "cannot run here" sentence for an answer claudeLimitResetsNotSupportedHere
+ * accepts. `endpoint_unavailable` is Claude Code answering "Unknown command:
+ * /limit-reset": the command is not on for this account in the terminal yet,
+ * while claude.ai, Desktop and mobile have "Reset for free" (#otter-lounge:#1).
+ */
+export function claudeLimitResetsNotSupportedMessageId(result: RuntimeLimitResetResult | RuntimeLimitResetsReadResult): MessageId {
+  return result.kind === "unsupported" && result.reason === "endpoint_unavailable"
+    ? "machine.runtimeUsage.claudeReset.notEnabledForAccount"
+    : "machine.runtimeUsage.claudeReset.notSupportedHere";
+}
+
 /** Why nothing was used, for an answer the confirm stays open on. */
 export function claudeLimitResetRefusal(
   formatMessage: IntlShape["formatMessage"],
@@ -80,7 +92,7 @@ export function claudeLimitResetRefusal(
       case "not_installed": return formatMessage({ id: "machine.runtimeAuth.error.notInstalled" }, { runtime: "Claude Code" });
       // The Computer typed nothing: Claude Code does not show this account the newer reset program yet.
       case "capability_unavailable": return formatMessage({ id: "machine.runtimeUsage.claudeReset.notAvailableYet" }, { kind: name });
-      default: return formatMessage({ id: "machine.runtimeUsage.claudeReset.notSupportedHere" });
+      default: return formatMessage({ id: claudeLimitResetsNotSupportedMessageId(result) });
     }
   }
   return formatMessage({ id: "machine.runtimeUsage.claudeReset.unknown" });

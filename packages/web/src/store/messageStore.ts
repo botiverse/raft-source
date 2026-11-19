@@ -40,6 +40,7 @@ import type {
 } from "./receiverPrivateIngress";
 import { hydrateThreadRepliesSnapshotWithSyncCore } from "./threadRepliesSyncDomain";
 import { latestPageRequest, messageWindowRequest, takeInFlightMessagePage, takeMessagePage, withLiveRowsAfter } from "./messagePagePrefetch";
+import { LATEST_PAGE_LIMIT, latestPagePath, olderPagePath } from "./channelPageQuery";
 import type { ThreadRepliesScope } from "./threadRepliesReadModel";
 import { registerServerReset } from "./serverResetRegistry";
 import { reactionReadModelStore } from "./reactionReadModels";
@@ -51,7 +52,7 @@ import {
   getReadStateLedgerGeneration,
   hasAcceptedReadStateChangedAfter,
   notifyChannelReadLocally,
-  rememberAcceptedReadStateProjection,
+  rememberAcceptedReadStateProjection, projectionThroughSeq,
 } from "./readStateSync";
 import type {
   ReadStateProjection,
@@ -622,6 +623,24 @@ function claimMessageWindowRequest(): number {
   return messageWindowRequestGeneration;
 }
 
+/**
+ * The window request now owning the conversation view: every window load
+ * (latest, context, remembered, a channel switch, a server reset) claims a
+ * new one. channelWindowOpen compares it to tell whether its kept page is
+ * still the window shown.
+ */
+export function currentMessageWindowRequestGeneration(): number {
+  return messageWindowRequestGeneration;
+}
+
+/** Per conversation, the window request generation whose latest page (loadMessages) last landed. */
+const latestPageLandedGeneration = new Map<string, number>();
+
+/** Whether loadMessages' latest page for this window request landed (a failed or dropped read settles too). */
+export function latestPageLanded(channelId: string, requestGeneration: number): boolean {
+  return latestPageLandedGeneration.get(channelId) === requestGeneration;
+}
+
 function ownsMessageWindowRequest(
   requestGeneration: number,
   channelId: string,
@@ -1183,7 +1202,7 @@ function projectReadStateFromMessages(
     hasMention,
     firstUnreadMessageId,
     firstMentionMessageId,
-    complete: true,
+    complete: true, throughSeq: projectionThroughSeq(messages ?? [], maxReadSeq),
   };
 }
 
@@ -1994,7 +2013,7 @@ export const useMessageStore = create<MessageState>((set, get) => ({
     const prefetched = (canReuseCachedTail ? takeInFlightMessagePage : takeMessagePage)(latestPageRequest(channelId), get().currentUserId);
     const ingressContext = prefetched?.ingressContext ?? captureReceiverPrivateIngressContext(get().currentUserId);
     try {
-      const limit = 50;
+      const limit = LATEST_PAGE_LIMIT;
       // The page's own sync horizon (taken before its read) can start the
       // first sync:resume only if it was the page's only history read: none
       // went out before it, and none while it was in flight (the server may
@@ -2002,7 +2021,7 @@ export const useMessageStore = create<MessageState>((set, get) => ({
       // starting horizon follows the same rule (socketBridge).
       const firstHistoryRead = messageHistoryRequestsSent() === 0;
       noteMessageHistoryRequest();
-      const { data, headers } = await (prefetched?.request ?? api.get(`/messages/channel/${channelId}?limit=${limit}`));
+      const { data, headers } = await (prefetched?.request ?? api.get(latestPagePath(channelId)));
       // A read sent at the click went out before this count: its horizon is not known to be the first.
       const onlyHistoryRead = !prefetched && firstHistoryRead && messageHistoryRequestsSent() === 1;
       const pageHorizon = onlyHistoryRead ? readSyncHorizonHeader(headers) : null;
@@ -2053,6 +2072,7 @@ export const useMessageStore = create<MessageState>((set, get) => ({
           contextLoadError: null,
         } : {}),
       }, [channelId]));
+      latestPageLandedGeneration.set(channelId, requestGeneration);
       // Mark as read server-side (fire and forget)
       const autoReadQueued = maxSeq > 0 && !skipInitialAutoRead
         ? queueAutoReadSync(channelId, maxSeq)
@@ -2116,9 +2136,7 @@ export const useMessageStore = create<MessageState>((set, get) => ({
     }));
     try {
       const limit = 50;
-      const { data } = await api.get(
-        `/messages/channel/${targetChannelId}?limit=${limit}&before=${minSeq}`
-      );
+      const { data } = await api.get(olderPagePath(targetChannelId, limit, minSeq));
       const older = coerceCurrentReceiverPrivateMessages(
         data.messages ?? data,
         ingressContext,

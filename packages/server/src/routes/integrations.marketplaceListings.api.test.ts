@@ -16,7 +16,7 @@ const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 /** The active rows of mcp_app_templates in a migrated database. */
-const SEEDED_TEMPLATE_COUNT = 19;
+const SEEDED_TEMPLATE_COUNT = 20;
 
 type AppRecord = { id: string } & Record<string, unknown>;
 type ListingsBody = MarketplaceListingsResponse<AppRecord>;
@@ -206,9 +206,10 @@ test("GET /api/integrations/marketplace keeps its App array; listings carry the 
     "botGrant", "publisherName", "publisherServerName", "privateShared", "appNotificationGroups", "appNotificationEvents",
     "appNotificationReviewPending", "appNotificationPendingRevisionId", "appNotificationPendingGroups",
     "appNotificationPendingEvents", "official", "purpose", "permissionApprovalRequired", "promptTextConfirmationRequired",
-    "marketplaceInstallBadge", "needsAdminReview",
+    "marketplaceInstallBadge", "uninstalledHereAt", "needsAdminReview",
   ]);
   assert.equal(array.some((client) => "kind" in client || "installCount" in client), false, "no listing fields leak into the array");
+  assert.equal(alpha.uninstalledHereAt, null, "no one here ever uninstalled Alpha");
   assert.ok(array.some((client) => client.id === f.privateShare.id), "the array still lists a private share installed here");
   // The old route ignores the listing's parameters: still the same array.
   assert.deepEqual(await readArray("?type=mcp&sort=name&limit=1"), array);

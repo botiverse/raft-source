@@ -1,0 +1,38 @@
+{
+  "formatVersion": 1,
+  "id": "partial_read_rereads",
+  "rule": "position",
+  "title": "A read below the row's position re-reads the row",
+  "why": "The row's count cannot be split at a seq.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/shared/src/activityRowPosition.ts (reduceActivityRow; not wired yet, step 2)"
+    ],
+    "server": [
+      "packages/server/src/services/channelService.ts (latestActivitySeqSameSource; the row's latestActivitySeq)",
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (unread_count and latest_seq from one materialized row)"
+    ]
+  },
+  "given": {
+    "row": {
+      "unreadCount": 3,
+      "hasMention": false,
+      "position": "101",
+      "mentionOnly": false
+    }
+  },
+  "steps": [
+    {
+      "act": "read",
+      "seq": "100"
+    }
+  ],
+  "expect": {
+    "row": {
+      "unreadCount": 3,
+      "position": "101"
+    },
+    "reread": true
+  }
+}

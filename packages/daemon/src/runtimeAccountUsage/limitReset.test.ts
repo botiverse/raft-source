@@ -180,6 +180,30 @@ test("a Claude read inspects through OAR with consent and the 5-hour kind as ask
   assert.deepEqual(seen, [{ oarOutcome: "inspected", claudeVersion: "2.1.330" }]);
 });
 
+test("a failed Claude Code start reaches telemetry as OAR's word for the screen and the banner's version, never screen text", async () => {
+  const startupFailed = (startup?: unknown) => ({ kind: "not_attempted", reason: "startup_failed", ...(startup ? { startup } : {}) }) as LimitResetInspection & LimitResetResult;
+  const cases: Array<[LimitResetInspection & LimitResetResult, unknown]> = [
+    [startupFailed({ screen: "prompt_with_text", version: "2.1.323" }), { oarOutcome: "not_attempted:startup_failed", startupScreen: "prompt_with_text", claudeVersion: "2.1.323" }],
+    [startupFailed({ screen: "blank" }), { oarOutcome: "not_attempted:startup_failed", startupScreen: "blank" }],
+    // A word a newer OAR adds reads as unknown; a version that is not a short label is left out.
+    [startupFailed({ screen: "upsell_banner", version: "line one\nline two" }), { oarOutcome: "not_attempted:startup_failed", startupScreen: "unknown" }],
+    [startupFailed(), { oarOutcome: "not_attempted:startup_failed" }],
+  ];
+  for (const [given, expected] of cases) {
+    const { runtime } = runtimeWith({ inspect: async () => given, redeem: async () => given });
+    const seen: unknown[] = [];
+    assert.deepEqual(
+      await readOarLimitResets({ provider: "claude", read: { atFiveHourLimit: false, atFiveHourLimitConsent: false, includeFiveHour: false }, deps: { runtime }, observe: (report) => seen.push(report) }),
+      { kind: "unsupported", reason: "not_attempted" },
+    );
+    assert.deepEqual(
+      await redeemOarLimitReset({ provider: "claude", idempotencyKey: KEY, kind: "weekly", deps: { runtime }, observe: (report) => seen.push(report) }),
+      { kind: "unsupported", reason: "not_attempted" },
+    );
+    assert.deepEqual(seen, [expected, expected], JSON.stringify(given));
+  }
+});
+
 test("a read at the 5-hour limit without consent is refused before Claude Code starts; clear of it, OAR checks again itself", async () => {
   const { runtime, inspections } = runtimeWith({ inspect: async () => ({ kind: "unsupported", reason: "consent_required" }) });
   assert.deepEqual(

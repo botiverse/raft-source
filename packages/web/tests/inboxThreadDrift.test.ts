@@ -21,6 +21,7 @@ Object.defineProperty(globalThis, "sessionStorage", { value: new MemoryStorage()
 const { useInboxStore } = await import("../src/store/inboxStore");
 const { liveActivityUnread, resetInPlaceDriftForTests } = await import("../src/store/inboxInPlaceUnread");
 const { applyReadStateUpdate } = await import("../src/store/applyReadStateUpdate");
+const { getAcceptedReadState } = await import("../src/store/readStateSync");
 const { triggerServerReset } = await import("../src/store/serverResetRegistry");
 const { useServerStore } = await import("../src/store/serverStore");
 const { selectChannelWindowMeta, useMessageStore } = await import("../src/store/messageStore");
@@ -68,9 +69,18 @@ function message(overrides: Partial<Message> & Record<string, unknown> = {}): Me
 }
 
 let served: InboxItem[] = [];
+/** A served row's read frontier, by row id, when not the default: the read this tab accepted (else version 1, nothing read). */
+let servedReadState: Record<string, { readStateVersion: number; maxReadSeq: string }> = {};
+/** The answer's unread totals (0 unless a test says). */
+let servedUnreadTotal = 0;
 let triggers: unknown[] = [];
-type Trace = { outcome: string; detail: string; result: unknown };
+type Trace = { outcome: string; detail: string; result: unknown; sampleRate?: unknown };
 let traces: Trace[] = [];
+
+function servedFrontier(scopeId: string): { readStateVersion: number; maxReadSeq: string } {
+  const accepted = getAcceptedReadState(SERVER, scopeId);
+  return servedReadState[scopeId] ?? (accepted ? { readStateVersion: accepted.readStateVersion, maxReadSeq: String(accepted.maxReadSeq) } : { readStateVersion: 1, maxReadSeq: "0" });
+}
 
 function serve() {
   api.get = (async (url: string, config?: { headers?: Record<string, string> }) => {
@@ -84,12 +94,12 @@ function serve() {
           const messageId = item.kind === "thread" ? row.latestActivityMessageId : row.lastMessageId;
           return {
             ...item,
-            readState: { kind: "present", readStateVersion: 1, maxReadSeq: "0", latestActivity: { messageId, seq: row.latestActivitySeq } },
+            readState: { kind: "present", ...servedFrontier(item.kind === "thread" ? row.threadChannelId : row.channelId), latestActivity: { messageId, seq: row.latestActivitySeq } },
           };
         }),
         totalCount: served.length,
-        totalUnreadCount: 0,
-        activeUnreadCount: 0,
+        totalUnreadCount: servedUnreadTotal,
+        activeUnreadCount: servedUnreadTotal,
         hasMore: false,
       },
     };
@@ -107,12 +117,14 @@ function reset(items: InboxItem[]) {
     totalUnreadCount: 0, activeUnreadCount: 0,
   });
   served = [];
+  servedReadState = {};
+  servedUnreadTotal = 0;
   traces = [];
   triggers = [];
   __setStateTransitionEmitterForTest((name, attrs) => {
     if (name !== "slock.state.transition") return;
     const a = attrs as { key: { event: string; outcome: string }; meta: { outcomeDetail: string } } & Record<string, unknown>;
-    if (a.key.event === "activity:inplace_check") traces.push({ outcome: a.key.outcome, detail: a.meta.outcomeDetail, result: a["inbox.inplace.result"] });
+    if (a.key.event === "activity:inplace_check") traces.push({ outcome: a.key.outcome, detail: a.meta.outcomeDetail, result: a["inbox.inplace.result"], sampleRate: a["inbox.inplace.sample_rate"] });
   });
 }
 
@@ -267,14 +279,17 @@ test("the check's detail says what the event was and whether a read came since",
     await reread();
     assert.equal(traces.length, 1);
     assert.equal(traces[0].outcome, "conflict");
-    assert.match(traces[0].detail, /;ahead=0;own=0;sender_type=user;message_type=chat;following=1;age_ms=\d+;read_state=1;loaded=0;counts=1;late=0;via=live$/);
+    assert.match(traces[0].detail, /;ahead=0;own=0;sender_type=user;message_type=chat;following=1;age_ms=\d+;read_state=1;loaded=0;counts=1;late=0;via=live;open=0;event=message:new$/);
 
+    // On screen when it came (the current channel): open=1, and the socket event it came on.
+    useMessageStore.setState({ currentChannelId: "channel-a" });
     deliver(message({ id: "a-2", channelId: "channel-a", seq: 101, senderId: ME, createdAt: "2026-11-09T10:06:00.000Z" }));
+    useMessageStore.setState({ currentChannelId: null });
     served = [channel({ lastMessageId: "a-2", latestActivitySeq: "101", lastMessageAt: "2026-11-09T10:06:00.000Z", unreadCount: 3 }), served[0]];
     await reread();
     assert.equal(traces.length, 2);
-    assert.match(traces[1].detail, /;own=1;sender_type=user;message_type=chat;age_ms=\d+;read_state=0;loaded=0;counts=0;late=0;via=live$/, "no following on a channel row");
-  } finally { restore(); }
+    assert.match(traces[1].detail, /;own=1;sender_type=user;message_type=chat;age_ms=\d+;read_state=0;loaded=0;counts=0;late=0;via=live;open=1;event=message:new$/, "no following on a channel row");
+  } finally { useMessageStore.setState({ currentChannelId: null }); restore(); }
 });
 
 test("a read made elsewhere clears a thread row it covers, not one with a newer reply", async () => {
@@ -296,6 +311,124 @@ test("a read made elsewhere clears a thread row it covers, not one with a newer 
     served = [{ ...before, unreadCount: 3 }];
     await reread();
     assert.equal(threadRow().unreadCount, 0, "an answer from before the read does not bring the count back");
+  } finally { restore(); }
+});
+
+// #triage:#244 under-count: Activity's answer (RisingWave) can have a reply
+// before it has the read cursor the person moved just before it (the read's ack
+// reached this tab first). Its count is then from the older cursor: the
+// replies the person already read count again. The row's in-place count, from
+// the newer read, is the right one; the answer judges it only once it has the read.
+test("an answer whose read cursor is behind the accepted read keeps the in-place count", async () => {
+  serve();
+  reset([thread({ latestActivityMessageId: "t-x", latestActivitySeq: "51", unreadCount: 2, isFollowing: true } as Partial<ThreadItem>)]);
+  useInboxStore.setState({ totalUnreadCount: 2, activeUnreadCount: 2 });
+  try {
+    applyReadStateUpdate({ serverId: SERVER, scopeId: "thread-t", maxReadSeq: 51, readStateVersion: 10, unreadCount: 0 });
+    assert.equal(threadRow().unreadCount, 0, "read up to its latest reply");
+    deliver(message({ id: "t-2", seq: 52, senderType: "agent", senderId: "agent-1" }));
+    assert.equal(threadRow().unreadCount, 1);
+    const atReply = thread({ latestActivityMessageId: "t-2", latestActivitySeq: "52", lastActivityAt: "2026-11-09T10:05:00.000Z", isFollowing: true } as Partial<ThreadItem>);
+    served = [{ ...atReply, unreadCount: 3 }];
+    servedUnreadTotal = 3;
+    servedReadState = { "thread-t": { readStateVersion: 9, maxReadSeq: "49" } };
+    await reread();
+    assert.equal(threadRow().unreadCount, 1, "not the count from before the read");
+    assert.equal(useInboxStore.getState().totalUnreadCount, 1);
+    assert.equal(useInboxStore.getState().activeUnreadCount, 1);
+    assert.equal(traces.length, 0, "not judged on an answer behind the read");
+
+    // The answer that has the read judges the row.
+    served = [{ ...atReply, unreadCount: 1 }];
+    servedUnreadTotal = 1;
+    servedReadState = { "thread-t": { readStateVersion: 10, maxReadSeq: "51" } };
+    await reread();
+    assert.equal(threadRow().unreadCount, 1);
+    assert.equal(traces.length, 1);
+    assert.equal(traces[0].result, "match", traces[0].detail);
+    assert.match(traces[0].detail, /;read_state=0;read_behind=1;loaded=0;counts=1;/, "the answer it waited out");
+  } finally { restore(); }
+});
+
+// A check no answer judged within the stale-list bound says so (`result=expired`),
+// so fewer conflicts are not just fewer checks.
+test("a check that only saw answers behind the read expires with an outcome that counts them", async () => {
+  serve();
+  reset([thread({ latestActivityMessageId: "t-x", latestActivitySeq: "51", unreadCount: 2, isFollowing: true } as Partial<ThreadItem>)]);
+  try {
+    applyReadStateUpdate({ serverId: SERVER, scopeId: "thread-t", maxReadSeq: 51, readStateVersion: 10, unreadCount: 0 });
+    deliver(message({ id: "t-2", seq: 52, senderType: "agent", senderId: "agent-1" }));
+    const atReply = thread({ latestActivityMessageId: "t-2", latestActivitySeq: "52", lastActivityAt: "2026-11-09T10:05:00.000Z", isFollowing: true } as Partial<ThreadItem>);
+    served = [{ ...atReply, unreadCount: 3 }];
+    servedReadState = { "thread-t": { readStateVersion: 9, maxReadSeq: "49" } };
+    await reread();
+    await reread();
+    assert.equal(traces.length, 0, "not judged on answers behind the read");
+    const later = originalNow() + 91_000;
+    Date.now = () => later;
+    await reread();
+    assert.equal(traces.length, 1);
+    assert.equal(traces[0].outcome, "noop");
+    assert.equal(traces[0].result, "expired");
+    assert.equal(traces[0].sampleRate, "1", "every expired patched row is sent");
+    assert.match(traces[0].detail, /^trigger=message_new;existed=1;result=expired;own=0;sender_type=agent;message_type=chat;following=1;age_ms=\d+;read_state=0;read_behind=2;loaded=0;counts=1;/);
+    await reread();
+    assert.equal(traces.length, 1, "said once");
+  } finally { restore(); }
+});
+
+test("a check no answer reached within the bound expires with read_behind=0", async () => {
+  serve();
+  const before = [channel(), thread()];
+  reset(before);
+  try {
+    reply(message());
+    const later = originalNow() + 91_000;
+    Date.now = () => later;
+    served = before;
+    await reread();
+    assert.equal(traces.length, 1);
+    assert.equal(traces[0].result, "expired");
+    assert.match(traces[0].detail, /^trigger=thread_reply;existed=1;result=expired;.*;read_state=0;read_behind=0;/);
+  } finally { restore(); }
+});
+
+test("a judged check, or one whose row moved on, says nothing at the bound", async () => {
+  serve();
+  const before = [channel(), thread()];
+  reset(before);
+  try {
+    reply(message());
+    served = [channel(), thread({ latestActivityMessageId: "t-2", latestActivitySeq: "51", lastActivityAt: "2026-11-09T10:05:00.000Z", unreadCount: 1 })];
+    await reread();
+    assert.equal(traces.length, 1, traces.map((trace) => trace.detail).join("\n"));
+    assert.notEqual(traces[0].result, "expired");
+    deliver(message({ id: "a-2", channelId: "channel-a", seq: 101, createdAt: "2026-11-09T10:06:00.000Z" }));
+    useInboxStore.setState({ items: useInboxStore.getState().items.filter((item) => item.kind === "thread") });
+    const later = originalNow() + 91_000;
+    Date.now = () => later;
+    await reread();
+    assert.equal(traces.length, 1, "no expired for the judged row, nor for the row no longer listed");
+  } finally { restore(); }
+});
+
+test("a DM answer behind the accepted read keeps its in-place count; one past the row's activity is served", async () => {
+  serve();
+  const dm = (overrides: Partial<ChannelItem> = {}) => channel({ channelId: "dm-a", channelName: "bot", channelType: "dm", kind: "dm", ...overrides } as Partial<ChannelItem>);
+  reset([dm({ unreadCount: 2 })]);
+  try {
+    applyReadStateUpdate({ serverId: SERVER, scopeId: "dm-a", maxReadSeq: 100, readStateVersion: 10, unreadCount: 0 });
+    deliver(message({ id: "a-2", channelId: "dm-a", seq: 101, senderType: "agent", senderId: "agent-1" }));
+    assert.equal(useInboxStore.getState().items[0]?.unreadCount, 1);
+    servedReadState = { "dm-a": { readStateVersion: 9, maxReadSeq: "98" } };
+    served = [dm({ lastMessageId: "a-2", latestActivitySeq: "101", lastMessageAt: "2026-11-09T10:05:00.000Z", unreadCount: 3 })];
+    await reread();
+    assert.equal(useInboxStore.getState().items[0]?.unreadCount, 1, "kept at the same activity");
+    assert.equal(traces.length, 0);
+    // An answer at a newer message than the row shows: nothing here to keep.
+    served = [dm({ lastMessageId: "a-3", latestActivitySeq: "102", lastMessageAt: "2026-11-09T10:06:00.000Z", unreadCount: 4 })];
+    await reread();
+    assert.equal(useInboxStore.getState().items[0]?.unreadCount, 4);
   } finally { restore(); }
 });
 
@@ -345,7 +478,7 @@ test("a reply in a loaded thread with a complete projection is counted once", as
     await reread();
     assert.equal(traces.length, 1);
     assert.equal(traces[0].result, "match", traces[0].detail);
-    assert.match(traces[0].detail, /;read_state=0;loaded=1;counts=1;late=0;via=live$/);
+    assert.match(traces[0].detail, /;read_state=0;loaded=1;counts=1;late=0;via=live;open=0;event=message:new$/);
   } finally {
     useMessageStore.setState({ channelMessages: {} });
     restore();
@@ -362,7 +495,7 @@ test("a reply in a thread whose messages are not loaded still counts in place", 
     await reread();
     assert.equal(traces.length, 1);
     assert.equal(traces[0].result, "match", traces[0].detail);
-    assert.match(traces[0].detail, /;read_state=0;loaded=0;counts=1;late=0;via=live$/);
+    assert.match(traces[0].detail, /;read_state=0;loaded=0;counts=1;late=0;via=live;open=0;event=message:new$/);
   } finally {
     useMessageStore.setState({ channelMessages: {} });
     restore();
@@ -387,7 +520,7 @@ test("a message in a loaded channel with a complete projection is counted once",
     assert.equal(traces.length, 1);
     assert.equal(traces[0].result, "match", traces[0].detail);
     assert.match(traces[0].detail, /^trigger=message_new;/);
-    assert.match(traces[0].detail, /;read_state=0;loaded=1;counts=1;late=0;via=live$/);
+    assert.match(traces[0].detail, /;read_state=0;loaded=1;counts=1;late=0;via=live;open=0;event=message:new$/);
   } finally {
     useMessageStore.setState({ channelMessages: {} });
     restore();
@@ -418,7 +551,7 @@ test("thread:updated before message:new: a reply not yet in the loaded thread co
     served = [thread({ latestActivityMessageId: "t-2", latestActivitySeq: "52", lastActivityAt: "2026-11-09T10:05:00.000Z", unreadCount: 2, isFollowing: true } as Partial<ThreadItem>)];
     await reread();
     assert.equal(traces.length, 1);
-    assert.match(traces[0].detail, /^trigger=thread_reply;.*;loaded=0;counts=1;late=0;via=live$/);
+    assert.match(traces[0].detail, /^trigger=thread_reply;.*;loaded=0;counts=1;late=0;via=live;open=0;event=thread:updated$/);
     assert.equal(traces[0].result, "match", traces[0].detail);
   } finally {
     useMessageStore.setState({ channelMessages: {} });
@@ -450,7 +583,7 @@ test("an accepted read state over an incomplete window does not stop the in-plac
       served = [thread({ latestActivityMessageId: "t-2", latestActivitySeq: "52", lastActivityAt: "2026-11-09T10:05:00.000Z", unreadCount: 2, isFollowing: true } as Partial<ThreadItem>)];
       await reread();
       assert.equal(traces.length, 1, name);
-      assert.match(traces[0].detail, /;loaded=0;counts=1;late=0;via=live$/, name);
+      assert.match(traces[0].detail, /;loaded=0;counts=1;late=0;via=live;open=0;event=message:new$/, name);
     } finally {
       useMessageStore.setState({ channelMessages: {}, channelWindowMeta: {} });
       restore();
@@ -509,7 +642,7 @@ test("a late older reply after a newer one counts once; the row's preview, seq a
     await reread();
     assert.equal(traces.length, 1);
     assert.equal(traces[0].result, "match", traces[0].detail);
-    assert.match(traces[0].detail, /;loaded=0;counts=1;late=1;via=live$/);
+    assert.match(traces[0].detail, /;loaded=0;counts=1;late=1;via=live;open=0;event=thread:updated$/);
   } finally { restore(); }
 });
 

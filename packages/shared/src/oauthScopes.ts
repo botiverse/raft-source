@@ -34,6 +34,23 @@ export const RAFT_OAUTH_SCOPE_CATALOG = {
     requiresResource: false,
     label: "Read the Server agent directory",
   },
+  "app:read": {
+    phase: "app_directory",
+    defaultAllowed: false,
+    publicDiscovery: true,
+    requiresResource: false,
+    label: "See which Apps the Server has installed",
+  },
+  // Raft voice (#wg-runtime-form:#22): ask an agent what it is doing now, or
+  // ask it one question, as the signed-in person and only where that person
+  // may (oauth.ts `/agents/:agentId/voice/*`). People only; flag agent_voice_v1.
+  "agent:voice": {
+    phase: "agent_voice",
+    defaultAllowed: false,
+    publicDiscovery: false,
+    requiresResource: false,
+    label: "Ask agents what they are doing and ask them questions",
+  },
   "agent:event:write": {
     phase: "agent_inbound",
     defaultAllowed: false,

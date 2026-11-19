@@ -1,4 +1,3 @@
-import { AppSetupRequirement } from "../components/integrations/AppSetup";
 import { appendOAuthAuthorizationParams, effectiveAllowedOAuthScopes } from "@botiverse/raft-shared";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ChangeEvent } from "react";
@@ -7,20 +6,13 @@ import {
   Select,
   SelectContent,
   SelectIcon,
-  SelectItem,
-  SelectItemIndicator,
-  SelectItemText,
   SelectList,
   SelectTrigger,
   SelectValue, Button, Card, Input, ScrollArea
 } from "@botiverse/raft-ui";
 import api from "../api/client";
 import { isSecondFactorStepUpCancelled, withSecondFactorStepUp } from "../components/settings/secondFactorStepUp";
-import {
-  APP_BOT_HANDLE_CONFLICT,
-  ConnectedAppBotHandleConflictNotice,
-  ConnectedAppBotInstallOption,
-} from "../components/settings/ConnectedAppBot";
+import { APP_BOT_HANDLE_CONFLICT, ConnectedAppBotHandleConflictNotice } from "../components/settings/ConnectedAppBot";
 import { useAuthStore } from "../store/authStore";
 import { useServerStore } from "../store/serverStore";
 import type { Server } from "../store/serverStore";
@@ -33,12 +25,12 @@ import {
   isAppPermissionsChangedError,
   isExpectedPermissionsRequiredError,
 } from "../lib/appPermissionExpectation";
-import { AppPermissionSetList } from "../components/integrations/AppPermissionSetList";
-import { AppPromptTextSection } from "../components/integrations/AppPromptText";
 import { appTextChangedCurrent, expectedTextRevisionBody, installEntryPromptText, readPromptTextRevisionId } from "../lib/appPromptText";
 import { APP_PROMPT_TEXT_CONSENT_FEATURE_FLAG_KEY, readServerFeatureFlag, useServerFeatureFlag } from "../store/serverFeatureFlags";
 import { MarketplaceServerRow } from "./MarketplaceServerRow";
 import { AccountLoginPanel } from "../features/login-with-raft/AccountLoginPanel";
+import { EmbeddedLoginSetup } from "../features/login-with-raft/EmbeddedLoginSetup";
+import { LoginMarketplaceCommitBody } from "../features/login-with-raft/LoginMarketplaceCommitBody";
 import { LoginAppDetailsCard } from "../features/login-with-raft/LoginAppDetailsCard";
 import { LoginFaqCard } from "../features/login-with-raft/LoginFaqCard";
 import { LoginLookupLoadingCard } from "../features/login-with-raft/LoginLookupLoadingCard";
@@ -56,6 +48,9 @@ import { authorizationErrorRedirectUrl, isAppNotAvailableError, isLoginModeChang
 import { AccountLoginRefusalBanner } from "../features/login-with-raft/AccountLoginRefusalBanner";
 import { APP_DETAILS_CARD_CLASS, FIELD_HELP_CLASS, FIELD_LABEL_CLASS, LOGIN_STATUS_CLASS, TITLE_CLASS } from "../features/login-with-raft/loginSetupClassNames";
 import { useAccountAuthorization } from "../features/login-with-raft/useAccountAuthorization";
+import { useLoginSetupHost } from "../features/login-with-raft/loginSetupHost";
+import { renderSelectItems } from "../features/login-with-raft/loginServerSelectItems";
+import { useApproveLock } from "../features/login-with-raft/useApproveLock";
 import { useLoginInstallBotOffer } from "../features/login-with-raft/useLoginInstallBotOffer";
 import { useTitleFocusRequest } from "../features/login-with-raft/useTitleFocusRequest";
 
@@ -64,20 +59,6 @@ type ServerLookup =
   | ({ status: "ok" } & AvailableServerClient)
   | { status: "notAvailable"; server: Server }
   | { status: "failed"; server: Server };
-
-type SelectOption = {
-  value: string;
-  label: string;
-};
-
-function renderSelectItems(options: readonly SelectOption[]) {
-  return options.map((option) => (
-    <SelectItem key={option.value} value={option.value}>
-      <SelectItemText>{option.label}</SelectItemText>
-      <SelectItemIndicator />
-    </SelectItem>
-  ));
-}
 
 // A read-only stand-in where the server picker would be (none available).
 const FIELD_PLACEHOLDER_CLASS = "flex min-h-control items-center rounded-(--control-radius) border border-line-hairline bg-fill-muted px-3 text-callout text-foreground-muted";
@@ -89,7 +70,9 @@ export default function HumanLoginSetupPage() {
   const user = useAuthStore((s) => s.user);
   const servers = useServerStore((s) => s.servers);
   const serversLoading = useServerStore((s) => s.loading);
-  const params = useMemo(() => new URLSearchParams(window.location.search), []);
+  // The address bar on the page; the shell's request in Raft Desktop's sheet (loginSetupHost.ts).
+  const { search: hostSearch, deliver, source, embedded, notice, preferredServerId, registeredReturnOnly = false, approveAfterMs } = useLoginSetupHost();
+  const params = useMemo(() => new URLSearchParams(hostSearch), [hostSearch]);
   const configuredReturnUrl = params.get("return_to") || params.get("redirect_uri") || "";
   const setupState = params.get("state") || "";
   const oidcFlow = params.get("flow") === "oidc";
@@ -214,8 +197,14 @@ export default function HumanLoginSetupPage() {
         status: isAppNotAvailableError(err) ? "notAvailable" : "failed",
         server,
       }))
-    )).then((results) => {
+    )).then((lookups) => {
       if (cancelled) return;
+      // In the desktop sheet, the App registered with another return address than the request's is not this App.
+      const results = lookups.map((result): ServerLookup => (
+        result.status === "ok" && registeredReturnOnly && result.client.returnUrl !== configuredReturnUrl
+          ? { status: "notAvailable", server: result.server }
+          : result
+      ));
       const found = results.flatMap((result) => (
         result.status === "ok" ? [{ server: result.server, client: result.client }] : []
       ));
@@ -225,8 +214,12 @@ export default function HumanLoginSetupPage() {
       // suspended, before an admin restored it) gives way to what it found.
       clearAccountRefusal();
       setSomeLookupFailed(results.some((result) => result.status === "failed"));
+      // The host's Server (the conversation the built-in browser sits beside) is picked first when
+      // the App can be used or installed there; never over a choice the person already made.
+      const preferred = found.find((entry) => entry.server.id === preferredServerId
+        && (isLoginAvailable(entry.client) || entry.client.availability === "install_required"));
       setSelectedServerId((current) => (
-        found.some((entry) => entry.server.id === current) ? current : firstServerByRank(found)
+        found.some((entry) => entry.server.id === current) ? current : preferred?.server.id ?? firstServerByRank(found)
       ));
     }).finally(() => {
       if (!cancelled) {
@@ -237,7 +230,7 @@ export default function HumanLoginSetupPage() {
     return () => {
       cancelled = true;
     };
-  }, [candidateServers, clientId, scopes, serversLoading, lookupRound, clearAccountRefusal]);
+  }, [candidateServers, clientId, scopes, serversLoading, lookupRound, clearAccountRefusal, preferredServerId, registeredReturnOnly, configuredReturnUrl]);
 
   const selectedServerClient = availableServerClients.find((entry) => entry.server.id === selectedServerId);
   const client = selectedServerClient?.client ?? null;
@@ -324,6 +317,8 @@ export default function HumanLoginSetupPage() {
   // Signing in shows `loading`, which blocks a second press and keeps focus (not `disabled`).
   const canLoginWithAccount = !!accountReady && !installingServerId && !clientLoading && !clientError
     && !!configuredReturnUrl.trim() && !hasAgentInboundRequest && !accountReady.client.scopeValidation?.disallowedScopes.length && !accountRefusal;
+  // Raft Desktop's sheet: the one approving button shown takes no press for a moment after it can first be pressed.
+  const approveLocked = useApproveLock(approveAfterMs, accountView ? canLoginWithAccount : selectedMarketplaceCanInstall ? canInstallAndContinue : canContinue);
   const handleAccountLogin = useCallback(() => {
     if (accountReady) void authorizeAccount(accountReady.client.clientId);
   }, [accountReady, authorizeAccount]);
@@ -344,8 +339,9 @@ export default function HumanLoginSetupPage() {
           codeChallengeMethod: oidcCodeChallengeMethod || undefined,
           server: requestedServerHint || undefined,
         } : {}),
+        ...(source ? { source } : {}),
       }), "appAccess");
-      window.location.assign(appendOAuthAuthorizationParams(data.returnUrl, data.code, setupState));
+      deliver(appendOAuthAuthorizationParams(data.returnUrl, data.code, setupState));
     } catch (err: any) {
       // Closing "Verify it's you" cancels: stay on the page, nothing to report.
       if (isSecondFactorStepUpCancelled(err)) return;
@@ -360,7 +356,7 @@ export default function HumanLoginSetupPage() {
       }
       const appErrorUrl = authorizationErrorRedirectUrl(err.response?.data, setupState);
       if (appErrorUrl) {
-        window.location.assign(appErrorUrl);
+        deliver(appErrorUrl);
         return;
       }
       if (isAppNotAvailableError(err)) {
@@ -373,6 +369,7 @@ export default function HumanLoginSetupPage() {
     }
   }, [
     configuredReturnUrl,
+    deliver,
     formatMessage,
     oidcCodeChallenge,
     oidcCodeChallengeMethod,
@@ -382,6 +379,7 @@ export default function HumanLoginSetupPage() {
     requestedServerHint,
     scopes,
     setupState,
+    source,
   ]);
 
   /** `bot`: the "Also add @bot" choice, when it was offered; undefined sends none. */
@@ -489,7 +487,6 @@ export default function HumanLoginSetupPage() {
   }, [continueToApp, installBot.bot, installBot.checked, installMarketplaceApp, selectedMarketplaceCanInstall, selectedMarketplaceEntry]);
   const botConflictNotice = installBot.conflictHandle ? <ConnectedAppBotHandleConflictNotice handle={installBot.conflictHandle} /> : null;
 
-
   const handleSelectServerRow = useCallback((serverId: string) => {
     if (installingServerId) return;
     setSelectedServerId(serverId);
@@ -500,6 +497,141 @@ export default function HumanLoginSetupPage() {
     setSelectedServerId(value);
   }, []);
 
+  const accountPanel = {
+    serviceName: accountClient?.name || serviceName,
+    client: accountClient,
+    scopes,
+    refusal: accountRefusal,
+    refusalAfterLogin: !!account.refusal,
+    error: clientError,
+    loginModeChanged: lookupRound > 0,
+    titleRef,
+    canLogin: canLoginWithAccount && !approveLocked,
+    submitting: account.submitting,
+    status: account.status,
+    notice: botConflictNotice,
+    onLogin: handleAccountLogin,
+  };
+  // The Server choice: the Marketplace rows, the picker, or a stand-in where there is none.
+  const serverChoice = isMarketplaceApp ? (
+    <div role="group" aria-labelledby="slock-login-server-label">
+      <Card>
+        {marketplaceServerRows.length > 5 && (
+          <div className="border-b border-line-hairline p-2">
+            <Input
+              type="search"
+              value={serverQuery}
+              onChange={handleServerQueryChange}
+              disabled={!!installingServerId}
+              placeholder={formatMessage({ id: "pages.humanLogin.searchServers" })}
+              aria-label={formatMessage({ id: "pages.humanLogin.searchServers" })}
+              className="w-full"
+            />
+          </div>
+        )}
+        {/* The rows (buttons, no tab stop here) scroll in a ScrollArea and hand a scroll past its end to the page. */}
+        <ScrollArea tabIndex={-1} overscroll="auto" className="max-h-72">
+      {/* raft-ui ListRows: the hairline between two rows is theirs. */}
+      {filteredMarketplaceServerRows.map(({ server, entry }) => (
+        <MarketplaceServerRow
+          key={server.id}
+          server={server}
+          entry={entry}
+          selected={selectedServerId === server.id}
+          installPending={installingServerId === server.id}
+          installInFlight={!!installingServerId}
+          onSelect={handleSelectServerRow}
+        />
+      ))}
+        {filteredMarketplaceServerRows.length === 0 && (
+          <div className="px-3 py-6 text-center text-callout text-foreground-hint">
+            {formatMessage({ id: "pages.humanLogin.noServerSearchResults" })}
+          </div>
+        )}
+        </ScrollArea>
+      </Card>
+    </div>
+  ) : availableServerClients.length > 0 ? (
+    <Select
+      value={selectedServerId}
+      onValueChange={handleServerChange}
+      items={availableServerOptions}
+    >
+      <SelectTrigger className="w-full">
+        <SelectValue placeholder={formatMessage({ id: "pages.humanLogin.raftServerLabel" })} />
+        <SelectIcon />
+      </SelectTrigger>
+      <SelectContent>
+        <SelectList>{renderSelectItems(availableServerOptions)}</SelectList>
+      </SelectContent>
+    </Select>
+  ) : (
+    <div className={FIELD_PLACEHOLDER_CLASS}>
+      {formatMessage({ id: "pages.humanLogin.noAvailableServers" })}
+    </div>
+  );
+  const serverHelp = accountMode ? formatMessage({ id: "pages.humanLogin.account.installHelp" }, { serviceName }) : null;
+  const scopeAlert = hasDisallowedScopes ? <LoginScopeConfigurationAlert reason={scopeValidationReason} appName={serviceName} scopeList={disallowedScopes.join(", ")} /> : null;
+  // What the Marketplace commit says about the Server picked, above its button.
+  const commitBody = isMarketplaceApp ? (
+    <LoginMarketplaceCommitBody
+      server={selectedMarketplaceRow?.server ?? null}
+      entry={selectedMarketplaceEntry}
+      installed={selectedMarketplaceInstalled}
+      canInstall={selectedMarketplaceCanInstall}
+      suspended={selectedMarketplaceSuspended}
+      needsAdmin={selectedMarketplaceNeedsAdmin}
+      text={selectedMarketplaceText}
+      installBot={installBot}
+      installing={!!installingServerId}
+      setupClient={detailsClient}
+      notice={botConflictNotice}
+    />
+  ) : null;
+  // The one approving button (raft-ui Button `loading` for every wait: the spinner in place of the label, which
+  // loadingLabel says); none where only a Server admin can install.
+  const commitDisabled = approveLocked || (isMarketplaceApp && selectedMarketplaceCanInstall ? !canInstallAndContinue : !canContinue);
+  const installing = !!installingServerId;
+  const commit = useMemo(() => (isMarketplaceApp ? (selectedMarketplaceNeedsAdmin ? null : {
+    disabled: commitDisabled,
+    loading: installing || submitting,
+    loadingLabel: formatMessage({ id: installing ? "pages.humanLogin.installingAndContinuing" : "pages.humanLogin.continuing" }),
+    onClick: handleCommit,
+    children: formatMessage({ id: selectedMarketplaceCanInstall ? "pages.humanLogin.installAndContinue" : "pages.humanLogin.continueLogin" }),
+    "data-testid": "marketplace-login-commit",
+  }) : {
+    disabled: commitDisabled,
+    loading: submitting,
+    loadingLabel: formatMessage({ id: "pages.humanLogin.continuing" }),
+    onClick: continueToApp,
+    children: formatMessage({ id: "pages.humanLogin.loginWithRaft" }),
+  }), [commitDisabled, continueToApp, formatMessage, handleCommit, installing, isMarketplaceApp, selectedMarketplaceCanInstall, selectedMarketplaceNeedsAdmin, submitting]);
+
+  // In a sheet (loginSetupHost.ts `embedded`) the same facts and the same button are laid out as a dialog's parts.
+  if (embedded) {
+    return (
+      <EmbeddedLoginSetup
+        notice={notice}
+        loading={clientLoading}
+        notAvailable={appNotAvailable}
+        serviceName={detailsClient?.name ?? null}
+        account={accountView ? accountPanel : null}
+        accountRefusal={accountMode ? account.refusal : null}
+        client={detailsClient}
+        clientError={clientError}
+        serverChoice={serverChoice}
+        onlyServer={!isMarketplaceApp && availableServerOptions.length === 1 ? availableServerOptions[0]!.label : null}
+        serverHelp={serverHelp}
+        scopes={scopes}
+        scopeAlert={scopeAlert}
+        commitBody={commitBody}
+        commitBusy={!!installingServerId}
+        commit={commit}
+        status={status}
+        titleRef={titleRef}
+      />
+    );
+  }
   return (
     // raft-ui ScrollArea: the page's scroller (scrollbar while pointed at or scrolling).
     <ScrollArea className="h-full min-h-0 bg-layer-sidebar font-display text-foreground" data-testid="human-login-setup-scroller">
@@ -525,21 +657,7 @@ export default function HumanLoginSetupPage() {
         {clientLoading ? (
           <LoginLookupLoadingCard />
         ) : accountView ? (
-          <AccountLoginPanel
-            serviceName={accountClient?.name || serviceName}
-            client={accountClient}
-            scopes={scopes}
-            refusal={accountRefusal}
-            refusalAfterLogin={!!account.refusal}
-            error={clientError}
-            loginModeChanged={lookupRound > 0}
-            titleRef={titleRef}
-            canLogin={canLoginWithAccount}
-            submitting={account.submitting}
-            status={account.status}
-            notice={botConflictNotice}
-            onLogin={handleAccountLogin}
-          />
+          <AccountLoginPanel {...accountPanel} />
         ) : (
         <Card render={<section />} className="p-4 sm:p-6">
           <h1 ref={titleRef} tabIndex={-1} className={TITLE_CLASS}>
@@ -577,78 +695,16 @@ export default function HumanLoginSetupPage() {
               {formatMessage({ id: "pages.humanLogin.raftServerLabel" })}
             </div>
             <div id="slock-login-server" className="mt-1.5">
-              {isMarketplaceApp ? (
-                <div role="group" aria-labelledby="slock-login-server-label">
-                  <Card>
-                    {marketplaceServerRows.length > 5 && (
-                      <div className="border-b border-line-hairline p-2">
-                        <Input
-                          type="search"
-                          value={serverQuery}
-                          onChange={handleServerQueryChange}
-                          disabled={!!installingServerId}
-                          placeholder={formatMessage({ id: "pages.humanLogin.searchServers" })}
-                          aria-label={formatMessage({ id: "pages.humanLogin.searchServers" })}
-                          className="w-full"
-                        />
-                      </div>
-                    )}
-                    {/* The rows (buttons, no tab stop here) scroll in a ScrollArea and hand a scroll past its end to the page. */}
-                    <ScrollArea tabIndex={-1} overscroll="auto" className="max-h-72">
-                  {/* raft-ui ListRows: the hairline between two rows is theirs. */}
-                  {filteredMarketplaceServerRows.map(({ server, entry }) => (
-                    <MarketplaceServerRow
-                      key={server.id}
-                      server={server}
-                      entry={entry}
-                      selected={selectedServerId === server.id}
-                      installPending={installingServerId === server.id}
-                      installInFlight={!!installingServerId}
-                      onSelect={handleSelectServerRow}
-                    />
-                  ))}
-                    {filteredMarketplaceServerRows.length === 0 && (
-                      <div className="px-3 py-6 text-center text-callout text-foreground-hint">
-                        {formatMessage({ id: "pages.humanLogin.noServerSearchResults" })}
-                      </div>
-                    )}
-                    </ScrollArea>
-                  </Card>
-                </div>
-              ) : availableServerClients.length > 0 ? (
-                <Select
-                  value={selectedServerId}
-                  onValueChange={handleServerChange}
-                  items={availableServerOptions}
-                >
-                  <SelectTrigger className="w-full">
-                    <SelectValue placeholder={formatMessage({ id: "pages.humanLogin.raftServerLabel" })} />
-                    <SelectIcon />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectList>{renderSelectItems(availableServerOptions)}</SelectList>
-                  </SelectContent>
-                </Select>
-              ) : (
-                <div className={FIELD_PLACEHOLDER_CLASS}>
-                  {formatMessage({ id: "pages.humanLogin.noAvailableServers" })}
-                </div>
-              )}
+              {serverChoice}
             </div>
             <p className={FIELD_HELP_CLASS}>
-              {accountMode
-                ? formatMessage({ id: "pages.humanLogin.account.installHelp" }, { serviceName })
-                : formatMessage({ id: isMarketplaceApp
-                  ? "pages.humanLogin.marketplaceServerHelp"
-                  : "pages.humanLogin.serverHelp" })}
+              {serverHelp ?? formatMessage({ id: isMarketplaceApp ? "pages.humanLogin.marketplaceServerHelp" : "pages.humanLogin.serverHelp" })}
             </p>
           </div>
 
           <RequestedScopeConsent scopes={scopes} />
 
-          {hasDisallowedScopes ? (
-            <LoginScopeConfigurationAlert reason={scopeValidationReason} appName={serviceName} scopeList={disallowedScopes.join(", ")} />
-          ) : null}
+          {scopeAlert}
 
           {isMarketplaceApp ? (
             <div
@@ -656,101 +712,11 @@ export default function HumanLoginSetupPage() {
               data-testid="marketplace-login-commit-zone"
               aria-busy={!!installingServerId}
             >
-              {selectedMarketplaceInstalled && selectedMarketplaceRow ? (
-                <p className="text-callout text-foreground">
-                  {formatMessage(
-                    { id: "pages.humanLogin.selectedServerCommit" },
-                    { serverName: selectedMarketplaceRow.server.name, b: (chunks) => <strong key="server">{chunks}</strong> },
-                  )}
-                </p>
-              ) : selectedMarketplaceCanInstall && selectedMarketplaceEntry && selectedMarketplaceRow ? (
-                <>
-                  <p className="text-callout text-foreground">
-                    {formatMessage(
-                      { id: "pages.humanLogin.installCommitBody" },
-                      {
-                        serverName: selectedMarketplaceRow.server.name,
-                        appName: selectedMarketplaceEntry.client.name,
-                        b: (chunks) => <strong key="server">{chunks}</strong>,
-                      },
-                    )}
-                  </p>
-                  {/* Exactly what the install sends as expected_scopes /
-                      expected_groups: the app's whole set, not just this
-                      login's scopes. */}
-                  <p className="mt-3 text-footnote font-semibold text-foreground">
-                    {formatMessage({ id: "pages.humanLogin.installCommitPermissions" })}
-                  </p>
-                  <AppPermissionSetList
-                    className="mt-2"
-                    scopes={effectiveAllowedOAuthScopes(selectedMarketplaceEntry.client.allowedScopes)}
-                    groups={selectedMarketplaceEntry.client.appNotificationGroups}
-                  />
-                  {selectedMarketplaceText ? (
-                    <AppPromptTextSection
-                      className="mt-3"
-                      fields={selectedMarketplaceText}
-                      service={selectedMarketplaceEntry.client.clientId}
-                    />
-                  ) : null}
-                  {/* Under what the install approves, above Install and Continue, as the install dialog has it. */}
-                  {installBot.bot ? (
-                    <ConnectedAppBotInstallOption
-                      appName={selectedMarketplaceEntry.client.name}
-                      bot={installBot.bot}
-                      serverName={selectedMarketplaceRow.server.name}
-                      checked={installBot.checked}
-                      disabled={!!installingServerId}
-                      onCheckedChange={installBot.onCheckedChange}
-                    />
-                  ) : null}
-                </>
-              ) : selectedMarketplaceSuspended ? (
-                <p className="text-callout text-foreground">
-                  {formatMessage({ id: "pages.humanLogin.installationSuspended" })}
-                </p>
-              ) : selectedMarketplaceNeedsAdmin && selectedMarketplaceEntry && selectedMarketplaceRow ? (
-                <p className="text-callout text-foreground">
-                  {formatMessage(
-                    { id: "pages.humanLogin.adminCommitBody" },
-                    {
-                      serverName: selectedMarketplaceRow.server.name,
-                      appName: selectedMarketplaceEntry.client.name,
-                      b: (chunks) => <strong key="server">{chunks}</strong>,
-                    },
-                  )}
-                </p>
-              ) : (
-                <p className="text-callout text-foreground">
-                  {formatMessage({ id: "pages.humanLogin.serverStatusUnavailable" })}
-                </p>
-              )}
+              {commitBody}
 
-              {selectedMarketplaceCanInstall && detailsClient?.setupUrl ? <AppSetupRequirement url={detailsClient.setupUrl} description={detailsClient.setupDescription} /> : null}
+              {commit ? <Button {...commit} size="xl" variant="accent" className="mt-4 w-full" /> : null}
 
-              {botConflictNotice ? <div className="mt-3">{botConflictNotice}</div> : null}
-
-              {/* raft-ui Button `loading` for every wait on this page: the
-                  spinner in place of the label, which loadingLabel says. */}
-              {!selectedMarketplaceNeedsAdmin ? (
-                <Button
-                  disabled={selectedMarketplaceCanInstall ? !canInstallAndContinue : !canContinue}
-                  loading={!!installingServerId || submitting}
-                  loadingLabel={formatMessage({ id: installingServerId
-                    ? "pages.humanLogin.installingAndContinuing"
-                    : "pages.humanLogin.continuing" })}
-                  onClick={handleCommit}
-                  size="xl"
-                  variant="accent"
-                  className="mt-4 w-full"
-                  data-testid="marketplace-login-commit"
-                >
-                  {formatMessage({ id: selectedMarketplaceCanInstall
-                    ? "pages.humanLogin.installAndContinue"
-                    : "pages.humanLogin.continueLogin" })}
-                </Button>
-              ) : null}
-
+              {/* A link into the app: in a sheet it would reload the app's own page under it, so the page only. */}
               {selectedMarketplaceNeedsAdmin && selectedMarketplaceRow ? (
                 <a
                   href={`/s/${encodeURIComponent(selectedMarketplaceRow.server.slug)}/members`}
@@ -762,17 +728,7 @@ export default function HumanLoginSetupPage() {
             </div>
           ) : (
             <div className="mt-6 flex flex-wrap items-center justify-end gap-3">
-              <Button
-                disabled={!canContinue}
-                loading={submitting}
-                loadingLabel={formatMessage({ id: "pages.humanLogin.continuing" })}
-                onClick={continueToApp}
-                size="lg"
-                variant="accent"
-                className="w-full sm:w-auto"
-              >
-                {formatMessage({ id: "pages.humanLogin.loginWithRaft" })}
-              </Button>
+              {commit ? <Button {...commit} size="lg" variant="accent" className="w-full sm:w-auto" /> : null}
             </div>
           )}
 

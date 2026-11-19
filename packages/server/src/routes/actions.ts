@@ -32,6 +32,7 @@ import {
   ACTION_CARD_ALREADY_EXECUTED_ERROR_CODE,
   ACTION_CARD_FORM_INVALID_ERROR_CODE,
   AGENT_UPGRADE_CARD_GATES,
+  PREPARED_REQUEST_ACTION_TYPE,
   SEAT_REQUEST_REASON_MAX_LENGTH,
   asServerId,
   seatsAddPurposeSchema,
@@ -103,8 +104,12 @@ function handleError(req: Request, res: Response, err: unknown): void {
     return;
   }
   if (err && typeof err === "object" && "status" in err && "code" in err && "message" in err) {
-    const typed = err as { status: number; code: string; message: string };
-    res.status(typed.status).json({ error: typed.message, errorCode: typed.code });
+    const typed = err as { status: number; code: string; message: string; details?: Record<string, unknown> };
+    // `details`: more of the refusal beside it (a request card's route refusal: routeStatus, routeCode, the card as served).
+    const details = typed.details && typeof typed.details === "object"
+      ? { ...typed.details, ...(typed.details.metadata ? { metadata: withStoredActionCardSpec(typed.details.metadata) } : {}) }
+      : {};
+    res.status(typed.status).json({ ...details, error: typed.message, errorCode: typed.code });
     return;
   }
   sendJsonServerError(req, res, { error: "Internal error", logPrefix: "[actions] unexpected error:", err });
@@ -198,12 +203,39 @@ actionsRouter.post("/:messageId/execute", async (req, res) => {
     // Only a feedback card's form: other cards, and an execute without a form, are not feedback sends.
     if (carriesForm(body) && card.actionType === "feedback:submit" && !await withinLimit(req, res, PRODUCT_FEEDBACK_LIMITER)) return;
     if (carriesForm(body) && card.actionType === "question:ask" && !await withinLimit(req, res, QUESTION_ANSWER_LIMITER)) return;
-    // A request an owner-action Confirm dispatched never confirms one itself (no dispatch inside a dispatch).
-    if (card.actionType === "assistant:owner_action" && isOwnerDispatch(req)) {
+    // A request an owner-action or request-card Confirm dispatched never confirms one itself (no dispatch inside a dispatch).
+    const runsOwnRoute = card.actionType === "assistant:owner_action" || card.actionType === PREPARED_REQUEST_ACTION_TYPE;
+    if (runsOwnRoute && isOwnerDispatch(req)) {
       res.status(403).json({ error: "An action an assistant asked for can't confirm another one", errorCode: "OWNER_ACTION_NESTED_DISPATCH" });
       return;
     }
     const form = parseExecuteForm(body);
+    if (card.actionType === PREPARED_REQUEST_ACTION_TYPE && form) {
+      // RFC 085: a request card is decided by its own paths: Decline ends it without running anything
+      // (preparedRequestCards.ts), Confirm runs its request as this person (preparedRequestCommit.ts).
+      const requestCards = await import("../services/preparedRequestCards");
+      const decision = requestCards.preparedRequestDecisionOf(form);
+      const decided = decision === "decline"
+        ? await requestCards.declinePreparedRequestCard({
+          messageId: req.params.messageId, serverId: req.serverId!, userId: req.userId!, form, io: getIo(req), orchestrator: getOrchestrator(req),
+        })
+        : decision === "confirm"
+          ? await (await import("../services/preparedRequestCommit")).confirmPreparedRequestCard({
+            messageId: req.params.messageId, serverId: req.serverId!, userId: req.userId!, webSessionFamilyId: webSessionFamilyOf(req), form,
+            ...(typeof body.expectedConfirmationVersion === "number" ? { expectedConfirmationVersion: body.expectedConfirmationVersion } : {}),
+            ownerRequest: ownerConfirmRequestOf(req), io: getIo(req), orchestrator: getOrchestrator(req),
+          })
+          : null;
+      if (decided) {
+        res.json({ messageId: decided.messageId, metadata: withStoredActionCardSpec(decided.metadata) });
+        return;
+      }
+    }
+    if (card.actionType === PREPARED_REQUEST_ACTION_TYPE) {
+      // Without a decision (no form, or another value): execute's own answer (a form card's FORM_REQUIRED or
+      // FORM_INVALID), unless the card waits to be confirmed again after its summary changed.
+      await (await import("../services/preparedRequestCards")).assertPreparedRequestCardConfirmable(req.params.messageId);
+    }
     const expectedState =
       body.expectedState === "prepared" || body.expectedState === "executed"
         ? body.expectedState
@@ -219,9 +251,9 @@ actionsRouter.post("/:messageId/execute", async (req, res) => {
       // A form handler's client facts (a feedback form files them): the
       // request's headers only, never the body.
       client: requestClient(req.get("x-raft-client-platform"), req.get("user-agent")),
-      // An assistant owner-action card's Confirm runs the stored route as this very person
-      // (their Authorization header, through the app): assistantOwnerActionCards.ts.
-      ...(card.actionType === "assistant:owner_action" && form ? { ownerRequest: ownerConfirmRequestOf(req) } : {}),
+      // An assistant owner-action or request card's Confirm runs the stored route as this very person
+      // (their Authorization header, through the app): assistantOwnerActionCards.ts, preparedRequestCards.ts.
+      ...(runsOwnRoute && form ? { ownerRequest: ownerConfirmRequestOf(req) } : {}),
       io: getIo(req),
       orchestrator: getOrchestrator(req),
     });
@@ -315,29 +347,17 @@ actionsRouter.post("/:messageId/event", async (req, res) => {
       return;
     }
 
-    // Authority: the message must (a) exist, (b) be an action card, (c) be
-    // in this server, (d) be in a channel the user has read access to.
+    // Visibility first, as execute/reconfirm (cardInHistoryWindow): an
+    // unknown id, a message in a channel this person can't read, and a card
+    // behind the history window all get the visibility check's own refusal,
+    // so an outsider holding a message id never learns whether it exists or
+    // is a card. Only a message they can see is then said not to be a card.
+    if (!await cardInHistoryWindow(req, res)) return;
     const db = getDb();
-    const [row] = await db.select().from(messages).where(eq(messages.id, req.params.messageId));
-    if (!row) {
-      res.status(404).json({ error: "Card message not found" });
-      return;
-    }
-    const meta = row.actionMetadata as { kind?: string; action?: ActionCardAction } | null;
+    const [row] = await db.select({ actionMetadata: messages.actionMetadata }).from(messages).where(eq(messages.id, req.params.messageId));
+    const meta = (row?.actionMetadata ?? null) as { kind?: string; action?: ActionCardAction } | null;
     if (!meta || meta.kind !== "action-card") {
-      res.status(400).json({ error: "Message is not an action card" });
-      return;
-    }
-    // Joint carriers live in canonical storage; resolve access through the
-    // viewer's own projection like every other card read path.
-    const allowed = await actionCardsService.assertActionCardVisibleToUser({
-      messageId: req.params.messageId,
-      serverId: asServerId(req.serverId!),
-      userId: req.userId!,
-    }).then(() => true, () => false);
-    if (!allowed) {
-      res.status(403).json({ error: "Not allowed to emit events for this card" });
-      return;
+      throw new actionCardsService.ActionCardError(400, "NOT_ACTION_CARD", "Message is not an action card");
     }
 
     // Resolve carrier message id → canonical action_cards.id. This is the
@@ -568,7 +588,18 @@ actionsRouter.post("/:messageId/send-create-agent-card", async (req, res) => {
 // revived by a stale click or a telemetry /event call.
 actionsRouter.post("/:messageId/reconfirm", async (req, res) => {
   try {
-    if (!await cardInHistoryWindow(req, res)) return;
+    const card = await cardInHistoryWindow(req, res);
+    if (!card) return;
+    // RFC 085: a request card whose summary changed is confirmed again by its person (preparedRequestCards.ts).
+    // One a channel conversion asks to be confirmed again goes down the conversion's path below, with its checks.
+    if (card.actionType === PREPARED_REQUEST_ACTION_TYPE) {
+      const requestCards = await import("../services/preparedRequestCards");
+      if (await requestCards.isPreparedRequestChangePending(req.params.messageId)) {
+        const out = await requestCards.reconfirmPreparedRequestCard({ messageId: req.params.messageId, serverId: req.serverId!, userId: req.userId!, io: getIo(req), orchestrator: getOrchestrator(req) });
+        res.json({ messageId: out.messageId, metadata: withStoredActionCardSpec(out.metadata), confirmationVersion: out.confirmationVersion });
+        return;
+      }
+    }
     const db = getDb();
     const out = await db.transaction(async (tx) => {
       const [message] = await tx.select({ channelId: messages.channelId }).from(messages).where(eq(messages.id, req.params.messageId));

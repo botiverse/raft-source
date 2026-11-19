@@ -725,23 +725,21 @@ test("symbolic links: pull won't write through a linked folder; push leaves link
   }
 });
 
-test("push: an upload refused because the server's file storage isn't set up says nothing was pushed and not to retry", async () => {
+test("push: an upload refused because the server's file storage isn't set up says so in the Server's words (retrying won't help); nothing recorded", async () => {
   const root = mkdtempSync(join(tmpdir(), "raft-artifact-pub-"));
   try {
     const dir = join(root, "notes");
     mkdirSync(dir);
     writeFileSync(join(dir, "README.md"), "# notes");
+    const unset = "This server's file storage for Artifacts isn't set up, so artifact files can't be stored or read here: tell an admin of this server, since retrying won't help.";
     const r = await run(["artifact", "push", dir, "--target", "#ops", "--title", "Notes"], (method, path) => {
       if (path === `${BASE}/push`) return { data: { missing: [sha("# notes")] } };
-      if (method === "PUT") return { status: 503, errorBody: { error: "artifact storage (r2) is not configured", code: "ARTIFACTS_STORAGE_UNAVAILABLE" } };
+      if (method === "PUT") return { status: 503, errorBody: { error: unset, code: "ARTIFACTS_STORAGE_UNAVAILABLE" } };
       throw new Error(`unexpected ${method} ${path}`);
     });
     assert.ok(r.error !== null, "exits nonzero");
-    assert.ok(r.stderr.startsWith([
-      "Error: The files couldn't be stored: this server's file storage for Artifacts isn't set up. Nothing was pushed.",
-      "Code: ARTIFACTS_STORAGE_UNAVAILABLE",
-    ].join("\n")), r.stderr);
-    assert.ok(r.stderr.includes("Next action: Tell a human admin of this server; retrying won't help."), r.stderr);
+    // A deliberate 503: the Server's sentence (apiCommon STORAGE_UNAVAILABLE_ERROR), not "Retry in a moment".
+    assert.equal(r.stderr, `Error: ${unset}\nCode: ARTIFACTS_STORAGE_UNAVAILABLE\nNext action: Do what the error says.\n`);
     assert.ok(!existsSync(join(dir, ".raft-artifact.json")), "nothing pushed, nothing recorded");
   } finally {
     rmSync(root, { recursive: true, force: true });

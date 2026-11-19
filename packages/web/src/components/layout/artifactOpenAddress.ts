@@ -6,6 +6,7 @@ import type { ArtifactId, ArtifactReviewId } from "@botiverse/raft-shared";
 import {
   ARTIFACT_OPEN_FROM_PARAM,
   artifactOpenTarget,
+  backPastArtifactFrame,
   withArtifactOpenParams,
   withArtifactOpenVersion,
   withoutArtifactOpenFrom,
@@ -267,7 +268,8 @@ export function writeArtifactAddress(navigate: Navigate, write: ArtifactAddressW
     const from = key ?? historyKey();
     if (from !== null && backFrom === from) return;
     backFrom = from;
-    void navigate(-1);
+    // The viewer's frame may have added entries of its own (its page's #sections): back past them.
+    backPastArtifactFrame(() => void navigate(-1));
     return;
   }
   const options: NavigateOptions = write.replace ? { replace: true, state: write.state } : { state: write.state, ...(flushSync ? { flushSync: true } : {}) };

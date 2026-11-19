@@ -700,7 +700,7 @@ test("Built-in gateway provider rejects illegal URL and preset model combination
   assert.equal(preset.trace.base_url_host_class, "localhost");
 });
 
-test("Built-in runtime rejects model/provider mismatches and custom direct-provider models", () => {
+test("Built-in runtime rejects model/provider mismatches; a typed direct-provider model is a custom model", () => {
   const mismatch = parseRuntimeConfig({
     runtimeConfig: {
       version: 1 as const,
@@ -726,11 +726,8 @@ test("Built-in runtime rejects model/provider mismatches and custom direct-provi
       mode: { kind: "default" },
     },
   });
-  assert.equal(custom.ok, false);
-  assert.equal(custom.trace.reason, "invalid_model");
-  assert.equal(custom.trace.provider_id, "openai");
-  assert.equal(custom.trace.model_kind, "custom");
-  assert.equal(custom.trace.model_id, undefined);
+  // OpenAI's catalog is one transport, so it takes a typed id (task #10).
+  assert.deepEqual(custom.ok && custom.config.model, { kind: "custom", name: "gpt-custom" });
 });
 
 test("Built-in runtime rejects local Pi/default provider shapes before launch materialization", () => {
@@ -1268,7 +1265,7 @@ test("a Built-in custom model takes optional declared limits: bounded positive i
   assert.deepEqual(hydrated.model, { kind: "custom", name: "devin/swe-2-flash", contextWindow: 128_000 }, "a valid stored limit is kept, an invalid one dropped");
 });
 
-test("Built-in OpenRouter accepts a typed model id with optional limits; other presets still refuse one (task #10)", () => {
+test("Built-in OpenRouter accepts a typed model id with optional limits, and so does every single-transport preset (task #10)", () => {
   const openrouter = parseRuntimeConfig({
     runtimeConfig: {
       version: 1 as const,
@@ -1289,6 +1286,7 @@ test("Built-in OpenRouter accepts a typed model id with optional limits; other p
   });
   assert.equal(openrouter.ok && runtimeConfigToLaunchFields(openrouter.config).model, "vendor/new-model-2027");
 
+  // Every preset provider on one transport takes one too (DeepSeek's catalog is all one endpoint).
   const deepseek = parseRuntimeConfig({
     runtimeConfig: {
       version: 1 as const,
@@ -1300,8 +1298,7 @@ test("Built-in OpenRouter accepts a typed model id with optional limits; other p
       envVars: null,
     },
   });
-  assert.equal(deepseek.ok, false);
-  assert.match(deepseek.ok ? "" : deepseek.error, /custom is not supported for runtime: builtin/);
+  assert.deepEqual(deepseek.ok && deepseek.config.model, { kind: "custom", name: "deepseek-v9" });
 
   // A preset model on OpenRouter is still checked against the catalog.
   const unlistedPreset = parseRuntimeConfig({
@@ -1408,6 +1405,83 @@ test("an OpenRouter custom name keeps its model identity with and without limits
   // Unlisted names are kept as typed (the name IS the API id), prefix and all.
   assert.deepEqual(parse({ kind: "custom", name: "openrouter/vendor/unlisted-2099" }), { kind: "custom", name: "openrouter/vendor/unlisted-2099" });
   assert.deepEqual(parse({ kind: "custom", name: "vendor/unlisted-2099", contextWindow: 4096 }), { kind: "custom", name: "vendor/unlisted-2099", contextWindow: 4096 });
+});
+
+test("the preset providers that take a typed id: OpenRouter plus every provider whose catalog is one transport (task #10)", async () => {
+  const { BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS } = await import("./index");
+  const { PI_BUILTIN_UNIFORM_TRANSPORT_PROVIDER_IDS_GENERATED } = await import("./piBuiltinModels.generated");
+  assert.deepEqual(
+    [...BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS].sort(),
+    [...new Set(["openrouter", ...PI_BUILTIN_UNIFORM_TRANSPORT_PROVIDER_IDS_GENERATED])].sort(),
+  );
+});
+
+// A floor, not a snapshot: a provider may join after a Pi bump, but one that
+// leaves would make every stored typed model on it fail to parse.
+test("no preset provider stops taking a typed id (task #10)", async () => {
+  const { BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS } = await import("./index");
+  const floor = [
+    "openrouter",
+    "deepseek", "minimax", "minimax-cn", "zai", "zai-coding-cn", "moonshotai", "moonshotai-cn", "kimi-coding",
+    "qwen-token-plan", "qwen-token-plan-cn", "openai", "anthropic", "google", "xai", "xiaomi",
+  ];
+  for (const providerId of floor) {
+    assert.ok(
+      (BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS as readonly string[]).includes(providerId),
+      `${providerId} no longer takes a typed model id (its Pi catalog stopped sharing one transport?): agents already `
+        + "storing one would fail to parse. Add an explicit allowance for it (and decide its transport) or a migration of "
+        + "those configs before removing it from this floor.",
+    );
+  }
+});
+
+test("a typed Qwen Token Plan name stores the provider's own API id, bare or in Raft's form (task #10)", () => {
+  const parse = (providerId: string, model: Record<string, unknown>) => {
+    const parsed = parseRuntimeConfig({
+      runtimeConfig: {
+        version: 1 as const,
+        runtime: "builtin",
+        provider: { kind: "preset", providerId, apiKey: "sk-qwen-test" },
+        model,
+        mode: { kind: "default" },
+        reasoningEffort: null,
+        envVars: null,
+      },
+    });
+    assert.ok(parsed.ok, parsed.ok ? "" : parsed.error);
+    return parsed.config.model;
+  };
+  for (const providerId of ["qwen-token-plan", "qwen-token-plan-cn"]) {
+    // Unlisted: Qwen's ids never start with `qwen-token-plan/`, so Raft's prefix comes off.
+    for (const name of ["qwen4-preview", `${providerId}/qwen4-preview`]) {
+      assert.deepEqual(parse(providerId, { kind: "custom", name }), { kind: "custom", name: "qwen4-preview" }, name);
+      assert.deepEqual(parse(providerId, { kind: "custom", name, contextWindow: 256_000 }), { kind: "custom", name: "qwen4-preview", contextWindow: 256_000 }, `${name} + limit`);
+    }
+    // Saved and read again: the same config.
+    assert.deepEqual(parse(providerId, { kind: "custom", name: "qwen4-preview" }), { kind: "custom", name: "qwen4-preview" });
+    // Listed: the preset without a limit, the bare API id with one.
+    for (const name of ["qwen3.8-max", `${providerId}/qwen3.8-max`]) {
+      assert.deepEqual(parse(providerId, { kind: "custom", name }), { kind: "preset", id: `${providerId}/qwen3.8-max` }, name);
+      assert.deepEqual(parse(providerId, { kind: "custom", name, maxOutputTokens: 4096 }), { kind: "custom", name: "qwen3.8-max", maxOutputTokens: 4096 }, `${name} + limit`);
+    }
+    // A bare prefix is not an id: kept as typed rather than emptied.
+    assert.deepEqual(parse(providerId, { kind: "custom", name: `${providerId}/` }), { kind: "custom", name: `${providerId}/` });
+    // Every Raft prefix comes off at once, so a stored config parses to itself.
+    for (const [name, expected] of [
+      [`${providerId}/${providerId}/qwen3.8-max`, { kind: "preset", id: `${providerId}/qwen3.8-max` }],
+      [`${providerId}/${providerId}/qwen4-preview`, { kind: "custom", name: "qwen4-preview" }],
+      [`${providerId}/${providerId}/${providerId}/qwen4-preview`, { kind: "custom", name: "qwen4-preview" }],
+    ] as const) {
+      const once = parse(providerId, { kind: "custom", name });
+      assert.deepEqual(once, expected, name);
+      assert.deepEqual(parse(providerId, once as Record<string, unknown>), once, `${name}: parse(parse(x)) == parse(x)`);
+    }
+    const limited = parse(providerId, { kind: "custom", name: `${providerId}/${providerId}/qwen3.8-max`, contextWindow: 1000 });
+    assert.deepEqual(limited, { kind: "custom", name: "qwen3.8-max", contextWindow: 1000 });
+    assert.deepEqual(parse(providerId, limited as Record<string, unknown>), limited);
+  }
+  // The other region's prefix is not this provider's namespace.
+  assert.deepEqual(parse("qwen-token-plan", { kind: "custom", name: "qwen-token-plan-cn/qwen4-preview" }), { kind: "custom", name: "qwen-token-plan-cn/qwen4-preview" });
 });
 
 test("runtimeSessionHomeEnvVars keeps only the env vars a runtime's session directory depends on", async () => {

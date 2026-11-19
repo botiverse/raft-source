@@ -560,7 +560,7 @@ async function agentResolution(
       const name = await namer([thread.threadAuthor, thread.author]);
       return fail(403, {
         code: "FORBIDDEN",
-        error: `Only the thread's author, the artifact's author (or whoever manages it, when it's an agent), and the server's owners and admins can ${opts.resolve ? "resolve" : "reopen"} a thread: if you addressed it, say so in a reply and let them resolve it.`,
+        error: `Only the thread's author, the artifact's author (or whoever manages it, when it's an agent), and the server's owners and admins can ${opts.resolve ? "resolve a thread: if you addressed it, say so in a reply and let them resolve it" : "reopen a thread: to say it isn't done, reply in it instead (a reply reopens it)"}.`,
         next: RAFT_HINTS.artifactComment({ artifact: item.id, replyTo: params.comment }),
         details: { reason: "not_resolver", title: item.title, threadAuthor: name(thread.threadAuthor), author: name(thread.author) },
       });

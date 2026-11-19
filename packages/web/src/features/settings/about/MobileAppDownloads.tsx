@@ -3,6 +3,8 @@ import { Button, TextLink, TextLinkDownloadIcon, TextLinkExternalIcon } from "@b
 import LeavingRaftMark, { opensInNewTabAriaLabel } from "../../../components/ui/LeavingRaftMark";
 import MobileDownloadQr from "../../../components/settings/MobileDownloadQr";
 import type { MessageId } from "../../../i18n/messages";
+import { trackMobileDownloadClicked } from "../../../analytics/appDownload";
+import type { AppDownloadMobileTarget } from "../../../analytics/appDownload";
 import {
   GOOGLE_PLAY_URL,
   detectPhoneDevice,
@@ -10,11 +12,17 @@ import {
   mobileDownloadUrl,
 } from "../../../utils/mobileDownloadUrl";
 
-type MobileLink = { key: "ios" | "googlePlay" | "apk"; href: string; labelId: MessageId; store: boolean; testId: string };
+type MobileLink = { key: "ios" | "googlePlay" | "apk"; href: string; labelId: MessageId; store: boolean; testId: string; target: AppDownloadMobileTarget };
 
-const IOS: MobileLink = { key: "ios", href: mobileDownloadUrl("ios"), labelId: "settings.mobileApp.ios", store: true, testId: "mobile-download-ios" };
-const GOOGLE_PLAY: MobileLink = { key: "googlePlay", href: GOOGLE_PLAY_URL, labelId: "settings.mobileApp.googlePlay", store: true, testId: "mobile-download-google-play" };
-const APK: MobileLink = { key: "apk", href: mobileDownloadUrl("android"), labelId: "settings.mobileApp.android", store: false, testId: "mobile-download-android" };
+const IOS: MobileLink = { key: "ios", href: mobileDownloadUrl("ios"), labelId: "settings.mobileApp.ios", store: true, testId: "mobile-download-ios", target: "ios" };
+const GOOGLE_PLAY: MobileLink = { key: "googlePlay", href: GOOGLE_PLAY_URL, labelId: "settings.mobileApp.googlePlay", store: true, testId: "mobile-download-google-play", target: "google_play" };
+const APK: MobileLink = { key: "apk", href: mobileDownloadUrl("android"), labelId: "settings.mobileApp.android", store: false, testId: "mobile-download-android", target: "apk" };
+
+/** The link was clicked (app_download_clicked); the link itself goes on untouched. */
+function reportClick(link: MobileLink): void {
+  // A store opens in a new tab; the APK is a download in this one (MobileTextLink).
+  trackMobileDownloadClicked("settings_about", link.target, link.store ? "new_tab" : "same_tab");
+}
 
 /** A store leaves Raft (new tab, ↗); the APK is a download and stays in this tab. */
 function MobileTextLink({ link }: { link: MobileLink }) {
@@ -22,13 +30,13 @@ function MobileTextLink({ link }: { link: MobileLink }) {
   const label = formatMessage({ id: link.labelId });
   return link.store ? (
     <TextLink
-      render={<a href={link.href} target="_blank" rel="noopener noreferrer" aria-label={opensInNewTabAriaLabel(formatMessage, label)} data-testid={link.testId} />}
+      render={<a href={link.href} target="_blank" rel="noopener noreferrer" aria-label={opensInNewTabAriaLabel(formatMessage, label)} data-testid={link.testId} onClick={() => reportClick(link)} />}
     >
       {label}
       <TextLinkExternalIcon label={formatMessage({ id: "common.opensInNewTab" })} />
     </TextLink>
   ) : (
-    <TextLink render={<a href={link.href} aria-label={label} data-testid={link.testId} />}>
+    <TextLink render={<a href={link.href} aria-label={label} data-testid={link.testId} onClick={() => reportClick(link)} />}>
       {label}
       <TextLinkDownloadIcon />
     </TextLink>
@@ -64,6 +72,7 @@ export function MobileAppDownloads() {
                 rel="noopener noreferrer"
                 aria-label={opensInNewTabAriaLabel(formatMessage, label)}
                 data-testid={store.testId}
+                onClick={() => reportClick(store)}
               />
             )}
             nativeButton={false}

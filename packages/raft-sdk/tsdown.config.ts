@@ -14,7 +14,11 @@ import { defineConfig } from "tsdown";
 // (autoExternal: false), so keep it inlined to preserve the artifact contract.
 // Regexes, not bare names: tsdown matches alwaysBundle against the full
 // specifier, so a bare "zod" would leave `zod/v4/...` subpath imports external.
-const alwaysBundle = [/^zod(\/|$)/, /^@botiverse\/raft-shared(\/|$)/];
+// `jose` (shared's dependency, through shared's sealedInputs.ts: `./app`'s
+// sealed-inputs check, RFC 086 §5.3) is ESM-only, so it is inlined too: the
+// CJS build can't require it on every Node the package supports. Its types
+// never reach the published d.ts.
+const alwaysBundle = [/^zod(\/|$)/, /^@botiverse\/raft-shared(\/|$)/, /^jose(\/|$)/];
 
 // Three public entries, `.` (program layer), `./agent` (agent layer) and
 // `./continuations` (experimental), built

@@ -52,9 +52,14 @@ const FLAG_REVIVED_RUNTIME_IDS = RUNTIMES
 /** Fail closed: every flag-gated runtime off (a caller that did not resolve the policy). */
 export const DEFAULT_RUNTIME_ADMISSION_POLICY: RuntimeAdmissionPolicy = { disabledRuntimeIds: new Set(FLAG_GATED_RUNTIME_IDS) };
 
-/** A flag evaluation that fails leaves every gated runtime off, never a 500. */
+/**
+ * A flag evaluation that fails leaves every gated runtime off, never a 500.
+ * `userId: null` asks for the server's answer alone (an agent preparing a
+ * Create Agent card, before any person picks): a rule that targets users does
+ * not match.
+ */
 export async function resolveRuntimeAdmissionPolicy(
-  input: { serverId: string; userId: string },
+  input: { serverId: string; userId: string | null },
   evaluate: typeof evaluateFeatureFlags = evaluateFeatureFlags,
 ): Promise<RuntimeAdmissionPolicy> {
   const runtimes = [...FLAG_GATED_RUNTIME_IDS, ...FLAG_REVIVED_RUNTIME_IDS];
@@ -178,6 +183,15 @@ export function projectNewAgentRuntimeOptions(
   const candidates = RUNTIMES.filter((runtime) =>
     isRuntimeSelectableForNewAgent(runtime) || (runtime.supported && isRuntimeRevived(runtime.id, policy)));
   return projectNewUseOptions(candidates, installedRuntimeIds, projection, policy);
+}
+
+/**
+ * The runtime ids this server offers for a new agent now, in catalog order:
+ * the ids of projectNewAgentRuntimeOptions' rows (what Create Agent offers and
+ * the create route admits), whatever a Computer reports.
+ */
+export function newAgentAdmittedRuntimeIds(policy: RuntimeAdmissionPolicy = DEFAULT_RUNTIME_ADMISSION_POLICY): string[] {
+  return projectNewAgentRuntimeOptions([], NO_RUNTIME_FORM_V2_MARKER, policy).map((option) => option.runtimeId);
 }
 
 /** Server setup state never carries the marker: no client opens a v2 form from it. */

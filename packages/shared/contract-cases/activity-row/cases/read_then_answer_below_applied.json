@@ -1,0 +1,24 @@
+{
+  "formatVersion": 1,
+  "id": "read_then_answer_below_applied",
+  "rule": "position",
+  "title": "A read covers the live seqs applied before it: an answer below them does not count them again",
+  "why": "The client keeps the seqs it applied above the delivered position and applies them again on an answer below them. A read here of those seqs (a persisted read, a read change's refSeq) makes them read, so they must not come back as unread when an answer still behind them arrives (Tenny, #14993 review).",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/shared/src/activityRowPosition.ts (reduceActivityRow, applyRead)",
+      "packages/web/src/store/inboxRowPosition.ts (with inbox_row_position_v1 on)"
+    ]
+  },
+  "given": { "row": { "unreadCount": 0, "hasMention": false, "position": "100", "mentionOnly": false } },
+  "steps": [
+    { "act": "liveMessage", "seq": "101", "counts": true, "mentionsViewer": true },
+    { "act": "read", "seq": "101" },
+    { "act": "answer", "row": { "unreadCount": 0, "hasMention": false, "position": "100", "mentionOnly": false } }
+  ],
+  "checkpoints": [
+    { "afterStep": 2, "row": { "unreadCount": 0, "hasMention": false, "position": "101" }, "reread": false }
+  ],
+  "expect": { "row": { "unreadCount": 0, "hasMention": false, "position": "101" }, "reread": false }
+}

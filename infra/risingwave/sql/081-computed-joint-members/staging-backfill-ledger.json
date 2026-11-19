@@ -1,0 +1,2494 @@
+{
+  "scope": "Dated planning receipt, not a runtime gate or live-data performance proof. All new counts unknown; old scale proxies are not bounds. Plan aliases use local CDC source name only.",
+  "measuredAt": "2026-11-14T18:05:46.780Z",
+  "risingwaveVersion": "PostgreSQL 13.14.0-RisingWave-3.0.3 (ec07f2eb759bd2d8a12a55b030bf581b82adb4b9)",
+  "image": "risingwavelabs/risingwave@sha256:4697d18f2fb5626f1607dfe6db099bd00643dcd734ea68e82d9fb2f6ad620ccf",
+  "localAccounting": {
+    "sumWorkerActorCount": 642,
+    "countActors": 642,
+    "sumJobActors": 642,
+    "workerParallelism": 12,
+    "newJobParallelism": 1,
+    "plannedDelta": 276
+  },
+  "stagePlanConfirmation": {
+    "receipt": "#wg-rbac:#73 msg=ea1b70ae",
+    "version": "3.0.3",
+    "streaming_use_snapshot_backfill": true,
+    "enable_index_selection": true,
+    "scope": "helper exact; seq join shape probe only, exact 19 not available until 18 exists",
+    "shape": "preview StreamTableScan / SnapshotBackfill under StreamHashJoin; no bounded lookup"
+  },
+  "rows": [
+    {
+      "step": "00",
+      "file": "staging-helper/00-rw_inbox_preview_parent_v1.sql",
+      "name": "rw_inbox_preview_parent_v1",
+      "actors": 4,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 2,
+      "inputs": [
+        {
+          "relation": "rw_conversation_parent_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_conversation_parent_v1",
+          "rowBasis": "actual count",
+          "rows": 511789,
+          "provenance": {
+            "object": "rw_conversation_parent_v1",
+            "rows": 511789,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14T17:47:47.528368+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        },
+        {
+          "relation": "rw_message_preview_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_message_preview_v1",
+          "rowBasis": "actual count",
+          "rows": 10741988,
+          "provenance": {
+            "object": "rw_message_preview_v1",
+            "rows": 10741988,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14T17:47:47.528368+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        }
+      ],
+      "newPredecessorSteps": [],
+      "classification": "large",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 179.033,
+      "explainSha256": "7432667e61fe54d880f1b5bf789f75ad3270e9588a212421f4ccbe599e6df4d4",
+      "distsqlSha256": "e872e1bcb4511ecd8f87791974a50071100e4cccd8d160f32bec8bf21e8e0ff7",
+      "sqlSha256": "32b895c83db6ba6d6c83c8a5ed890ecb69e36ef878c6c677732c5f6c4a5878aa",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "01",
+      "file": "01-rw_joint_channel_members_v1.sql",
+      "name": "rw_joint_channel_members_v1",
+      "actors": 4,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 1,
+      "inputs": [
+        {
+          "relation": "public.joint_channel_members",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamCdcTableScan",
+          "rowCountRelation": "public.joint_channel_members",
+          "rowBasis": "actual count",
+          "rows": 502,
+          "provenance": {
+            "object": "public.joint_channel_members",
+            "rows": 502,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14 17:43:33.846611+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        }
+      ],
+      "newPredecessorSteps": [],
+      "classification": "small",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 0.008,
+      "explainSha256": "2e47c17d0bfc8b8f556e6fcc159f33559a2a8350036c2a323eddc9febc205023",
+      "distsqlSha256": "e425c1ef327a336f46350fefb718702654a40e1b71e427e8e7b3bd0a1048bb50",
+      "sqlSha256": "02624940d0612305f8b120ccf7f944a0c33f00cdf4cf927ad50e941464e8d193",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "02",
+      "file": "02-rw_joint_channel_admissions_v1.sql",
+      "name": "rw_joint_channel_admissions_v1",
+      "actors": 4,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 1,
+      "inputs": [
+        {
+          "relation": "public.joint_channel_admissions",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamCdcTableScan",
+          "rowCountRelation": "public.joint_channel_admissions",
+          "rowBasis": "actual count",
+          "rows": 24,
+          "provenance": {
+            "object": "public.joint_channel_admissions",
+            "rows": 24,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14 17:43:33.846611+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        }
+      ],
+      "newPredecessorSteps": [],
+      "classification": "small",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 0.0,
+      "explainSha256": "f2f19ada5c6dac632bf2dd5b615b386d969b186dfa616dd922837bab5dd0edc5",
+      "distsqlSha256": "a0fe8fdb1ee7ecfa6d3668f3ae4087002d675e9d8bd93c1812e4d9ba090f4e63",
+      "sqlSha256": "43f097ccd18a703204989a11b2ee3d257741f2deaa590ea292697afb545b3588",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "03",
+      "file": "03-rw_joint_membership_departures_v1.sql",
+      "name": "rw_joint_membership_departures_v1",
+      "actors": 4,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 1,
+      "inputs": [
+        {
+          "relation": "public.joint_membership_departures",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamCdcTableScan",
+          "rowCountRelation": "public.joint_membership_departures",
+          "rowBasis": "actual count",
+          "rows": 6,
+          "provenance": {
+            "object": "public.joint_membership_departures",
+            "rows": 6,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14 17:43:33.846611+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        }
+      ],
+      "newPredecessorSteps": [],
+      "classification": "small",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 0.0,
+      "explainSha256": "2c048f383d3742397651a53aae845704339dacc9abd064be0c10c3257757e523",
+      "distsqlSha256": "0c4f07c631e10ef17fa3f7b5420a43795798c9d237467572e85ae633bda6b5b0",
+      "sqlSha256": "be524f60a2754ffcb85b654cc3519ef19f0427034e3eba78c1acdadf97698cec",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "04",
+      "file": "04-rw_joint_membership_removals_v1.sql",
+      "name": "rw_joint_membership_removals_v1",
+      "actors": 4,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 1,
+      "inputs": [
+        {
+          "relation": "public.joint_membership_removals",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamCdcTableScan",
+          "rowCountRelation": "public.joint_membership_removals",
+          "rowBasis": "actual count",
+          "rows": 6,
+          "provenance": {
+            "object": "public.joint_membership_removals",
+            "rows": 6,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14 17:43:33.846611+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        }
+      ],
+      "newPredecessorSteps": [],
+      "classification": "small",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 0.0,
+      "explainSha256": "1b5a0c2b136949484ed1b3403ff7ad8ab8def6aa8a8e187a8039bb14bac4c294",
+      "distsqlSha256": "57b4d3e160033eaf4a52ab5542b61b505202b049005b3f930c47e9d971384420",
+      "sqlSha256": "4dba7944877b8f97127b4ab29b55ff840d9f930246c196a913e0b56911414876",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "05",
+      "file": "05-rw_joint_entry_server_members_v1.sql",
+      "name": "rw_joint_entry_server_members_v1",
+      "actors": 4,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 1,
+      "inputs": [
+        {
+          "relation": "public.server_members",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamCdcTableScan",
+          "rowCountRelation": "public.server_members",
+          "rowBasis": "actual count",
+          "rows": 33810,
+          "provenance": {
+            "object": "public.server_members",
+            "rows": 33810,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14 17:43:33.846611+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        }
+      ],
+      "newPredecessorSteps": [],
+      "classification": "small",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 0.564,
+      "explainSha256": "5880d3a9568cd14318e711bfd133a20c82dc01acf616776f4a8c14fe9ec8d71e",
+      "distsqlSha256": "a57c919b711001dd31e5ae4fd95960366eeafc1bd9ee5060ae45f5df9618fe26",
+      "sqlSha256": "92f6fa4323841093b3ec2651fc3717444c39c0143e6396f8b19f493801576175",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "06",
+      "file": "06-rw_joint_entry_projections_v1.sql",
+      "name": "rw_joint_entry_projections_v1",
+      "actors": 4,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 1,
+      "inputs": [
+        {
+          "relation": "public.joint_channel_servers",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamCdcTableScan",
+          "rowCountRelation": "public.joint_channel_servers",
+          "rowBasis": "actual count",
+          "rows": 4043,
+          "provenance": {
+            "object": "public.joint_channel_servers",
+            "rows": 4043,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14 17:43:33.846611+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        }
+      ],
+      "newPredecessorSteps": [],
+      "classification": "small",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 0.067,
+      "explainSha256": "3f39f9fdd8aa59a810f0779edcf7767005d88d16d0622fa4479cf0aba14df353",
+      "distsqlSha256": "c6e18ebb3b2cef3626f5def3e888bf9097ea5b8b91cdc4e2a8b24317b894cc62",
+      "sqlSha256": "84c611cf773eccd256b5a99c2567c1ef1e59030db5332fc2e707b8e6b679a476",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "07",
+      "file": "07-rw_joint_human_entries_v1.sql",
+      "name": "rw_joint_human_entries_v1",
+      "actors": 28,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 15,
+      "inputs": [
+        {
+          "relation": "idx_rw_channels_server_active_type",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channels",
+          "rowBasis": "actual count; index uses full base cardinality",
+          "rows": 634880,
+          "provenance": {
+            "object": "rw_channels",
+            "startedAt": "2026-11-14T17:59:42.011660+00:00",
+            "rows": 634880,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:43.185126+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_servers",
+          "scanMultiplicity": 2,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_servers",
+          "rowBasis": "actual count",
+          "rows": 24585,
+          "provenance": {
+            "object": "rw_servers",
+            "startedAt": "2026-11-14T18:00:27.936089+00:00",
+            "rows": 24585,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:28.153025+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_joint_entry_server_members_v1",
+          "scanMultiplicity": 2,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "public.server_members",
+          "rowBasis": "new CDC table not built; PG snapshot scale, parity required",
+          "rows": 33810,
+          "provenance": {
+            "object": "public.server_members",
+            "rows": 33810,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14 17:43:33.846611+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        },
+        {
+          "relation": "rw_joint_channels",
+          "scanMultiplicity": 2,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_joint_channels",
+          "rowBasis": "actual count",
+          "rows": 1685,
+          "provenance": {
+            "object": "rw_joint_channels",
+            "startedAt": "2026-11-14T18:00:10.279042+00:00",
+            "rows": 1685,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:10.481743+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_joint_entry_projections_v1",
+          "scanMultiplicity": 2,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "public.joint_channel_servers",
+          "rowBasis": "new CDC table not built; PG snapshot scale, parity required",
+          "rows": 4043,
+          "provenance": {
+            "object": "public.joint_channel_servers",
+            "rows": 4043,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14 17:43:33.846611+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        },
+        {
+          "relation": "rw_joint_channel_members_v1",
+          "scanMultiplicity": 2,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "public.joint_channel_members",
+          "rowBasis": "new CDC table not built; PG snapshot scale, parity required",
+          "rows": 502,
+          "provenance": {
+            "object": "public.joint_channel_members",
+            "rows": 502,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14 17:43:33.846611+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        },
+        {
+          "relation": "rw_joint_channel_admissions_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "public.joint_channel_admissions",
+          "rowBasis": "new CDC table not built; PG snapshot scale, parity required",
+          "rows": 24,
+          "provenance": {
+            "object": "public.joint_channel_admissions",
+            "rows": 24,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14 17:43:33.846611+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        },
+        {
+          "relation": "rw_channels",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channels",
+          "rowBasis": "actual count",
+          "rows": 634880,
+          "provenance": {
+            "object": "rw_channels",
+            "startedAt": "2026-11-14T17:59:42.011660+00:00",
+            "rows": 634880,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:43.185126+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_joint_membership_removals_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "public.joint_membership_removals",
+          "rowBasis": "new CDC table not built; PG snapshot scale, parity required",
+          "rows": 6,
+          "provenance": {
+            "object": "public.joint_membership_removals",
+            "rows": 6,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14 17:43:33.846611+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        },
+        {
+          "relation": "rw_joint_membership_departures_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "public.joint_membership_departures",
+          "rowBasis": "new CDC table not built; PG snapshot scale, parity required",
+          "rows": 6,
+          "provenance": {
+            "object": "public.joint_membership_departures",
+            "rows": 6,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14 17:43:33.846611+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        }
+      ],
+      "newPredecessorSteps": [
+        "01",
+        "02",
+        "03",
+        "04",
+        "05",
+        "06"
+      ],
+      "classification": "medium",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 10.581,
+      "explainSha256": "f11a236e46bab4e05c9131806635564e2ea9a0943638b3e1362b32b6eab844c7",
+      "distsqlSha256": "7b7551813f83affca26eecf906a3a215ab55efd41d801b578cc5e0a0e3ba6836",
+      "sqlSha256": "e5c08aaec5958bc679ceb9e6a867c58cd11682c7cfa2cec86af0873fe7715bb3",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "08",
+      "file": "08-rw_human_channel_members_v1.sql",
+      "name": "rw_human_channel_members_v1",
+      "actors": 10,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 6,
+      "inputs": [
+        {
+          "relation": "rw_channel_humans",
+          "scanMultiplicity": 2,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channel_humans",
+          "rowBasis": "actual count",
+          "rows": 148466,
+          "provenance": {
+            "object": "rw_channel_humans",
+            "startedAt": "2026-11-14T17:59:41.550941+00:00",
+            "rows": 148466,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:42.011417+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_channels",
+          "scanMultiplicity": 2,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channels",
+          "rowBasis": "actual count",
+          "rows": 634880,
+          "provenance": {
+            "object": "rw_channels",
+            "startedAt": "2026-11-14T17:59:42.011660+00:00",
+            "rows": 634880,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:43.185126+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_joint_human_entries_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_joint_human_entries_v1",
+          "rowBasis": "new intermediate not built; no actual count or same-generation bound",
+          "rows": null
+        },
+        {
+          "relation": "rw_joint_entry_server_members_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "public.server_members",
+          "rowBasis": "new CDC table not built; PG snapshot scale, parity required",
+          "rows": 33810,
+          "provenance": {
+            "object": "public.server_members",
+            "rows": 33810,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14 17:43:33.846611+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        }
+      ],
+      "newPredecessorSteps": [
+        "05",
+        "07"
+      ],
+      "classification": "medium; unknown new input",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 10.581,
+      "explainSha256": "4a40537a60633f7173b71539d14169d8782a5f11389056d8e33a7703e8ae30cf",
+      "distsqlSha256": "4ddd74fecd59fea531f840b847f65f062ce18338d711b1784fe73559951d77c3",
+      "sqlSha256": "fc2b9dabc3cbbfb174fa363174bbb1eeaea45254226ca3f25d085605b776605c",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "09",
+      "file": "09-rw_subs_jcm_v1.sql",
+      "name": "rw_subs_jcm_v1",
+      "actors": 17,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 9,
+      "inputs": [
+        {
+          "relation": "rw_human_channel_members_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channel_humans",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 148466,
+          "provenance": {
+            "object": "rw_channel_humans",
+            "startedAt": "2026-11-14T17:59:41.550941+00:00",
+            "rows": 148466,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:42.011417+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_channels",
+          "scanMultiplicity": 3,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channels",
+          "rowBasis": "actual count",
+          "rows": 634880,
+          "provenance": {
+            "object": "rw_channels",
+            "startedAt": "2026-11-14T17:59:42.011660+00:00",
+            "rows": 634880,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:43.185126+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_inbox_target_mute_states_v2",
+          "scanMultiplicity": 2,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_inbox_target_mute_states_v2",
+          "rowBasis": "actual count",
+          "rows": 2600,
+          "provenance": {
+            "object": "rw_inbox_target_mute_states_v2",
+            "startedAt": "2026-11-14T18:00:09.847220+00:00",
+            "rows": 2600,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:10.064286+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_user_channel_inbox_states",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_user_channel_inbox_states",
+          "rowBasis": "actual count",
+          "rows": 7819,
+          "provenance": {
+            "object": "rw_user_channel_inbox_states",
+            "startedAt": "2026-11-14T18:00:34.122454+00:00",
+            "rows": 7819,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:34.323670+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_channel_agents",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channel_agents",
+          "rowBasis": "actual count",
+          "rows": 266111,
+          "provenance": {
+            "object": "rw_channel_agents",
+            "startedAt": "2026-11-14T17:59:40.907341+00:00",
+            "rows": 266111,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:41.550608+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_thread_follows",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_thread_follows",
+          "rowBasis": "actual count",
+          "rows": 1324407,
+          "provenance": {
+            "object": "rw_thread_follows",
+            "startedAt": "2026-11-14T18:00:31.858146+00:00",
+            "rows": 1324407,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:34.122084+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        }
+      ],
+      "newPredecessorSteps": [
+        "08"
+      ],
+      "classification": "large",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 22.073,
+      "explainSha256": "7268487a58b16b2c595938d7f3b7dcce36f7c145d928189cd0fb47fee3af0125",
+      "distsqlSha256": "68aca3a2bad919d39f57c89365c06931cc60e5859ea3cb74ecbe90eaf607c742",
+      "sqlSha256": "7ef408f952520bf1e8be5dd16003945879f898297922caeed7f4ec18cfc99c04",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "10",
+      "file": "10-rw_muted_subs_jcm_v1.sql",
+      "name": "rw_muted_subs_jcm_v1",
+      "actors": 12,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 7,
+      "inputs": [
+        {
+          "relation": "rw_human_channel_members_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channel_humans",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 148466,
+          "provenance": {
+            "object": "rw_channel_humans",
+            "startedAt": "2026-11-14T17:59:41.550941+00:00",
+            "rows": 148466,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:42.011417+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_channels",
+          "scanMultiplicity": 2,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channels",
+          "rowBasis": "actual count",
+          "rows": 634880,
+          "provenance": {
+            "object": "rw_channels",
+            "startedAt": "2026-11-14T17:59:42.011660+00:00",
+            "rows": 634880,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:43.185126+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_inbox_target_mute_states_v2",
+          "scanMultiplicity": 2,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_inbox_target_mute_states_v2",
+          "rowBasis": "actual count",
+          "rows": 2600,
+          "provenance": {
+            "object": "rw_inbox_target_mute_states_v2",
+            "startedAt": "2026-11-14T18:00:09.847220+00:00",
+            "rows": 2600,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:10.064286+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_user_channel_inbox_states",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_user_channel_inbox_states",
+          "rowBasis": "actual count",
+          "rows": 7819,
+          "provenance": {
+            "object": "rw_user_channel_inbox_states",
+            "startedAt": "2026-11-14T18:00:34.122454+00:00",
+            "rows": 7819,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:34.323670+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_channel_agents",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channel_agents",
+          "rowBasis": "actual count",
+          "rows": 266111,
+          "provenance": {
+            "object": "rw_channel_agents",
+            "startedAt": "2026-11-14T17:59:40.907341+00:00",
+            "rows": 266111,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:41.550608+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        }
+      ],
+      "newPredecessorSteps": [
+        "08"
+      ],
+      "classification": "medium",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 10.581,
+      "explainSha256": "85495c27dd03278b590ad008fb5a1f756ee4d029756083ec8e2ecc7722921b10",
+      "distsqlSha256": "30695070db561599ce660776b48c11b1d548db213bf091998a60846d8a67230e",
+      "sqlSha256": "528881f989c4d2cd6bc6a840fd3f81731c886dc34143a925cac3cd750678fe49",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "11",
+      "file": "11-rw_inbox_normal_jcm_v1.sql",
+      "name": "rw_inbox_normal_jcm_v1",
+      "actors": 8,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 5,
+      "inputs": [
+        {
+          "relation": "rw_subs_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_subs_v2",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 1562059,
+          "provenance": {
+            "object": "rw_subs_v2",
+            "rows": 1562059,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14T17:47:47.528368+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        },
+        {
+          "relation": "idx_rw_target_eligible_v1_target",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_target_eligible_v1",
+          "rowBasis": "actual count; index uses full base cardinality",
+          "rows": 182044,
+          "provenance": {
+            "object": "rw_target_eligible_v1",
+            "startedAt": "2026-11-14T18:00:28.153338+00:00",
+            "rows": 182044,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:28.572870+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_receiver_cursors_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_receiver_cursors_v1",
+          "rowBasis": "actual count",
+          "rows": 1827879,
+          "provenance": {
+            "object": "rw_receiver_cursors_v1",
+            "startedAt": "2026-11-14T18:00:24.666169+00:00",
+            "rows": 1827879,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:27.528560+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_message_target_v3",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_message_target_v3",
+          "rowBasis": "actual count",
+          "rows": 9999255,
+          "provenance": {
+            "object": "rw_message_target_v3",
+            "rows": 9999255,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14T17:47:47.528368+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        },
+        {
+          "relation": "rw_target_latest_v4",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_target_latest_v4",
+          "rowBasis": "actual count",
+          "rows": 565519,
+          "provenance": {
+            "object": "rw_target_latest_v4",
+            "startedAt": "2026-11-14T18:00:28.573177+00:00",
+            "rows": 565519,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:29.464321+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        }
+      ],
+      "newPredecessorSteps": [
+        "09"
+      ],
+      "classification": "large",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 166.654,
+      "explainSha256": "ff61f2870dcd14ba6180e1c72f0cb34b9400ce60e0a9ee1be4a02d6cedcccbbc",
+      "distsqlSha256": "c46474bf08821161df008156600863984807a65a2f47b11c85d5374bdee43186",
+      "sqlSha256": "a98dfca5abbb7aa4a1a4178e4b6c66691eaf50eebfce19023d4e097b45181850",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "12",
+      "file": "12-rw_inbox_muted_full_jcm_v1.sql",
+      "name": "rw_inbox_muted_full_jcm_v1",
+      "actors": 8,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 5,
+      "inputs": [
+        {
+          "relation": "rw_muted_subs_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_muted_subs_v1",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 1597,
+          "provenance": {
+            "object": "rw_muted_subs_v1",
+            "rows": 1597,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14T17:47:47.528368+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        },
+        {
+          "relation": "idx_rw_target_eligible_v1_target",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_target_eligible_v1",
+          "rowBasis": "actual count; index uses full base cardinality",
+          "rows": 182044,
+          "provenance": {
+            "object": "rw_target_eligible_v1",
+            "startedAt": "2026-11-14T18:00:28.153338+00:00",
+            "rows": 182044,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:28.572870+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_receiver_cursors_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_receiver_cursors_v1",
+          "rowBasis": "actual count",
+          "rows": 1827879,
+          "provenance": {
+            "object": "rw_receiver_cursors_v1",
+            "startedAt": "2026-11-14T18:00:24.666169+00:00",
+            "rows": 1827879,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:27.528560+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_message_target_v3",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_message_target_v3",
+          "rowBasis": "actual count",
+          "rows": 9999255,
+          "provenance": {
+            "object": "rw_message_target_v3",
+            "rows": 9999255,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14T17:47:47.528368+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        },
+        {
+          "relation": "rw_target_latest_v4",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_target_latest_v4",
+          "rowBasis": "actual count",
+          "rows": 565519,
+          "provenance": {
+            "object": "rw_target_latest_v4",
+            "startedAt": "2026-11-14T18:00:28.573177+00:00",
+            "rows": 565519,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:29.464321+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        }
+      ],
+      "newPredecessorSteps": [
+        "10"
+      ],
+      "classification": "large",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 166.654,
+      "explainSha256": "dbc15aae017329747f4d2ab3fbee17db98126c0bf295e0f7febc55de6dfa40af",
+      "distsqlSha256": "fddb0c64e3a0e7982e5cea67c48769950caec7343aa27e747765fd46b9780253",
+      "sqlSha256": "eb273df2ed75c8792a0b2de63d5a917b38010e8c14a400c8747ac2b92497f5ba",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "13",
+      "file": "13-rw_inbox_muted_prefix_jcm_v1.sql",
+      "name": "rw_inbox_muted_prefix_jcm_v1",
+      "actors": 8,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 6,
+      "inputs": [
+        {
+          "relation": "rw_muted_subs_jcm_v1",
+          "scanMultiplicity": 2,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_muted_subs_v1",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 1597,
+          "provenance": {
+            "object": "rw_muted_subs_v1",
+            "rows": 1597,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14T17:47:47.528368+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        },
+        {
+          "relation": "idx_rw_target_eligible_v1_target",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_target_eligible_v1",
+          "rowBasis": "actual count; index uses full base cardinality",
+          "rows": 182044,
+          "provenance": {
+            "object": "rw_target_eligible_v1",
+            "startedAt": "2026-11-14T18:00:28.153338+00:00",
+            "rows": 182044,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:28.572870+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_message_target_v3",
+          "scanMultiplicity": 2,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_message_target_v3",
+          "rowBasis": "actual count",
+          "rows": 9999255,
+          "provenance": {
+            "object": "rw_message_target_v3",
+            "rows": 9999255,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14T17:47:47.528368+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        },
+        {
+          "relation": "rw_receiver_cursors_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_receiver_cursors_v1",
+          "rowBasis": "actual count",
+          "rows": 1827879,
+          "provenance": {
+            "object": "rw_receiver_cursors_v1",
+            "startedAt": "2026-11-14T18:00:24.666169+00:00",
+            "rows": 1827879,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:27.528560+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        }
+      ],
+      "newPredecessorSteps": [
+        "10"
+      ],
+      "classification": "large",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 166.654,
+      "explainSha256": "caabd6eca7c77c91212647116fc6679ee68f2a3a64cea1710ce06099ee230e88",
+      "distsqlSha256": "fdd3275d30fa86f62da15d13a99202e2a636729d0db81998e70f8cdf16c06beb",
+      "sqlSha256": "983718e2dc54946590052dffbf72735edcec13b459d94730f355b84637dff79b",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "14",
+      "file": "14-rw_task_conversation_unread_jcm_v1.sql",
+      "name": "rw_task_conversation_unread_jcm_v1",
+      "actors": 7,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 4,
+      "inputs": [
+        {
+          "relation": "rw_subs_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_subs_v2",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 1562059,
+          "provenance": {
+            "object": "rw_subs_v2",
+            "rows": 1562059,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14T17:47:47.528368+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        },
+        {
+          "relation": "rw_channels",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channels",
+          "rowBasis": "actual count",
+          "rows": 634880,
+          "provenance": {
+            "object": "rw_channels",
+            "startedAt": "2026-11-14T17:59:42.011660+00:00",
+            "rows": 634880,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:43.185126+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_receiver_cursors_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_receiver_cursors_v1",
+          "rowBasis": "actual count",
+          "rows": 1827879,
+          "provenance": {
+            "object": "rw_receiver_cursors_v1",
+            "startedAt": "2026-11-14T18:00:24.666169+00:00",
+            "rows": 1827879,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:27.528560+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_message_target_v3",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_message_target_v3",
+          "rowBasis": "actual count",
+          "rows": 9999255,
+          "provenance": {
+            "object": "rw_message_target_v3",
+            "rows": 9999255,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14T17:47:47.528368+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        }
+      ],
+      "newPredecessorSteps": [
+        "09"
+      ],
+      "classification": "large",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 166.654,
+      "explainSha256": "c990fff5bb36364e90ad6ddff413123ec7e07ad1e68f823f2aefd2008f300c23",
+      "distsqlSha256": "8fa0859e7b86c0decc1a4ee65180307b1e700cf3ffa86fef5454fb66de423710",
+      "sqlSha256": "ccef44eac29ddb9078dd1daafc7974980fd353c2bfdf8621f485af78ef707b0a",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "15",
+      "file": "15-rw_inbox_mention_jcm_v1.sql",
+      "name": "rw_inbox_mention_jcm_v1",
+      "actors": 26,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 13,
+      "inputs": [
+        {
+          "relation": "rw_message_mentions_v2",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_message_mentions_v2",
+          "rowBasis": "actual count",
+          "rows": 6956928,
+          "provenance": {
+            "object": "rw_message_mentions_v2",
+            "startedAt": "2026-11-14T18:00:10.482030+00:00",
+            "rows": 6956928,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:24.665889+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_joint_channel_servers",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_joint_channel_servers",
+          "rowBasis": "actual count",
+          "rows": 4043,
+          "provenance": {
+            "object": "rw_joint_channel_servers",
+            "startedAt": "2026-11-14T18:00:10.064589+00:00",
+            "rows": 4043,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:10.278796+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_joint_channels",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_joint_channels",
+          "rowBasis": "actual count",
+          "rows": 1685,
+          "provenance": {
+            "object": "rw_joint_channels",
+            "startedAt": "2026-11-14T18:00:10.279042+00:00",
+            "rows": 1685,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:10.481743+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_channels",
+          "scanMultiplicity": 2,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channels",
+          "rowBasis": "actual count",
+          "rows": 634880,
+          "provenance": {
+            "object": "rw_channels",
+            "startedAt": "2026-11-14T17:59:42.011660+00:00",
+            "rows": 634880,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:43.185126+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "idx_rw_target_eligible_v1_target",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_target_eligible_v1",
+          "rowBasis": "actual count; index uses full base cardinality",
+          "rows": 182044,
+          "provenance": {
+            "object": "rw_target_eligible_v1",
+            "startedAt": "2026-11-14T18:00:28.153338+00:00",
+            "rows": 182044,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:28.572870+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_human_channel_members_v1",
+          "scanMultiplicity": 2,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channel_humans",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 148466,
+          "provenance": {
+            "object": "rw_channel_humans",
+            "startedAt": "2026-11-14T17:59:41.550941+00:00",
+            "rows": 148466,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:42.011417+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_channel_agents",
+          "scanMultiplicity": 2,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channel_agents",
+          "rowBasis": "actual count",
+          "rows": 266111,
+          "provenance": {
+            "object": "rw_channel_agents",
+            "startedAt": "2026-11-14T17:59:40.907341+00:00",
+            "rows": 266111,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:41.550608+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_conversation_parent_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_conversation_parent_v1",
+          "rowBasis": "actual count",
+          "rows": 511789,
+          "provenance": {
+            "object": "rw_conversation_parent_v1",
+            "rows": 511789,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14T17:47:47.528368+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        },
+        {
+          "relation": "rw_thread_follows",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_thread_follows",
+          "rowBasis": "actual count",
+          "rows": 1324407,
+          "provenance": {
+            "object": "rw_thread_follows",
+            "startedAt": "2026-11-14T18:00:31.858146+00:00",
+            "rows": 1324407,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:34.122084+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_receiver_cursors_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_receiver_cursors_v1",
+          "rowBasis": "actual count",
+          "rows": 1827879,
+          "provenance": {
+            "object": "rw_receiver_cursors_v1",
+            "startedAt": "2026-11-14T18:00:24.666169+00:00",
+            "rows": 1827879,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:27.528560+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        }
+      ],
+      "newPredecessorSteps": [
+        "08"
+      ],
+      "classification": "large",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 115.949,
+      "explainSha256": "fd07b66579e650feadd1e1c35d6ba2b56469c4dda2b3490a95f5200514698aec",
+      "distsqlSha256": "ba2ff69df7510ea9183711b8c2828a6fc379fe6aa622aee305fd71308e5bf2d4",
+      "sqlSha256": "38e6d4b9e031a3ba6f6ed993ebf44b60af05e07d7b9763768709d2a926fa131e",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "16",
+      "file": "16-rw_activity_watermark_jcm_v1.sql",
+      "name": "rw_activity_watermark_jcm_v1",
+      "actors": 19,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 11,
+      "inputs": [
+        {
+          "relation": "rw_human_channel_members_v1",
+          "scanMultiplicity": 2,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channel_humans",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 148466,
+          "provenance": {
+            "object": "rw_channel_humans",
+            "startedAt": "2026-11-14T17:59:41.550941+00:00",
+            "rows": 148466,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:42.011417+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_channels",
+          "scanMultiplicity": 4,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channels",
+          "rowBasis": "actual count",
+          "rows": 634880,
+          "provenance": {
+            "object": "rw_channels",
+            "startedAt": "2026-11-14T17:59:42.011660+00:00",
+            "rows": 634880,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:43.185126+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_channel_agents",
+          "scanMultiplicity": 2,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channel_agents",
+          "rowBasis": "actual count",
+          "rows": 266111,
+          "provenance": {
+            "object": "rw_channel_agents",
+            "startedAt": "2026-11-14T17:59:40.907341+00:00",
+            "rows": 266111,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:41.550608+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_thread_follows",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_thread_follows",
+          "rowBasis": "actual count",
+          "rows": 1324407,
+          "provenance": {
+            "object": "rw_thread_follows",
+            "startedAt": "2026-11-14T18:00:31.858146+00:00",
+            "rows": 1324407,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:34.122084+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_conversation_parent_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_conversation_parent_v1",
+          "rowBasis": "actual count",
+          "rows": 511789,
+          "provenance": {
+            "object": "rw_conversation_parent_v1",
+            "rows": 511789,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14T17:47:47.528368+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        },
+        {
+          "relation": "rw_target_latest_v4",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_target_latest_v4",
+          "rowBasis": "actual count",
+          "rows": 565519,
+          "provenance": {
+            "object": "rw_target_latest_v4",
+            "startedAt": "2026-11-14T18:00:28.573177+00:00",
+            "rows": 565519,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:29.464321+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        }
+      ],
+      "newPredecessorSteps": [
+        "08"
+      ],
+      "classification": "large",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 22.073,
+      "explainSha256": "dc5cfb770811b5d74c574ad206ba99f6a3cf508e48b570d8c02e3ed531e4152d",
+      "distsqlSha256": "3302c9f3a221d1b182b644cb7b57741233fdddb2cc3d96ee3c59ed7e220ea20f",
+      "sqlSha256": "2cf4ddff83ba5a125efcbd6a02f876b3b571ea4dda53783a4d3d26c2324d00df",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "17",
+      "file": "17-rw_inbox_items_jcm_v1.sql",
+      "name": "rw_inbox_items_jcm_v1",
+      "actors": 17,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 8,
+      "inputs": [
+        {
+          "relation": "rw_inbox_normal_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_inbox_normal_v5",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 314704,
+          "provenance": {
+            "object": "rw_inbox_normal_v5",
+            "startedAt": "2026-11-14T17:59:52.022916+00:00",
+            "rows": 314704,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:53.324933+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_inbox_muted_prefix_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_inbox_muted_prefix_v2",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 950,
+          "provenance": {
+            "object": "rw_inbox_muted_prefix_v2",
+            "startedAt": "2026-11-14T17:59:51.562739+00:00",
+            "rows": 950,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:52.022651+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_inbox_mention_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_inbox_mention_v7",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 142060,
+          "provenance": {
+            "object": "rw_inbox_mention_v7",
+            "startedAt": "2026-11-14T17:59:50.437106+00:00",
+            "rows": 142060,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:51.117660+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_inbox_suppression_states",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_inbox_suppression_states",
+          "rowBasis": "actual count",
+          "rows": 104264,
+          "provenance": {
+            "object": "rw_inbox_suppression_states",
+            "startedAt": "2026-11-14T18:00:09.129249+00:00",
+            "rows": 104264,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:09.846959+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_conversation_parent_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_conversation_parent_v1",
+          "rowBasis": "actual count",
+          "rows": 511789,
+          "provenance": {
+            "object": "rw_conversation_parent_v1",
+            "rows": 511789,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14T17:47:47.528368+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        },
+        {
+          "relation": "rw_channels",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channels",
+          "rowBasis": "actual count",
+          "rows": 634880,
+          "provenance": {
+            "object": "rw_channels",
+            "startedAt": "2026-11-14T17:59:42.011660+00:00",
+            "rows": 634880,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:43.185126+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_human_channel_members_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channel_humans",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 148466,
+          "provenance": {
+            "object": "rw_channel_humans",
+            "startedAt": "2026-11-14T17:59:41.550941+00:00",
+            "rows": 148466,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:42.011417+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_channel_agents",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channel_agents",
+          "rowBasis": "actual count",
+          "rows": 266111,
+          "provenance": {
+            "object": "rw_channel_agents",
+            "startedAt": "2026-11-14T17:59:40.907341+00:00",
+            "rows": 266111,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:41.550608+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        }
+      ],
+      "newPredecessorSteps": [
+        "08",
+        "11",
+        "13",
+        "15"
+      ],
+      "classification": "medium",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 10.581,
+      "explainSha256": "b74936aa2cefc47cf364348551aaea9480bc37bac39a0f7b013b22e00911db2f",
+      "distsqlSha256": "15cdf645f24a9f3ab65ba8e15a76f731770eaa5a13eb6632302dba14976bb0a8",
+      "sqlSha256": "897c6b12bf9163bf239a831f9c2933c3871d46b0c7419f76bcb7850ae6a43035",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "18",
+      "file": "18-rw_inbox_preview_need_jcm_v1.sql",
+      "name": "rw_inbox_preview_need_jcm_v1",
+      "actors": 9,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 7,
+      "inputs": [
+        {
+          "relation": "rw_inbox_items_jcm_v1",
+          "scanMultiplicity": 3,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_inbox_items_v13",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 272358,
+          "provenance": {
+            "object": "rw_inbox_items_v13",
+            "startedAt": "2026-11-14T17:59:46.458397+00:00",
+            "rows": 272358,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:50.436854+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_task_conversation_unread_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_task_conversation_unread_v1",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 21,
+          "provenance": {
+            "object": "rw_task_conversation_unread_v1",
+            "startedAt": "2026-11-14T18:00:29.678407+00:00",
+            "rows": 21,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:29.869877+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_target_latest_v4",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_target_latest_v4",
+          "rowBasis": "actual count",
+          "rows": 565519,
+          "provenance": {
+            "object": "rw_target_latest_v4",
+            "startedAt": "2026-11-14T18:00:28.573177+00:00",
+            "rows": 565519,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:29.464321+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_inbox_normal_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_inbox_normal_v5",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 314704,
+          "provenance": {
+            "object": "rw_inbox_normal_v5",
+            "startedAt": "2026-11-14T17:59:52.022916+00:00",
+            "rows": 314704,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:53.324933+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_inbox_muted_full_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_inbox_muted_full_v2",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 969,
+          "provenance": {
+            "object": "rw_inbox_muted_full_v2",
+            "startedAt": "2026-11-14T17:59:51.117890+00:00",
+            "rows": 969,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:51.562448+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        }
+      ],
+      "newPredecessorSteps": [
+        "11",
+        "12",
+        "14",
+        "17"
+      ],
+      "classification": "medium",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 9.425,
+      "explainSha256": "2252ba92635bd390a251e95dc58efe8c2dc6d880d4ffb039c8005f0c565ed659",
+      "distsqlSha256": "1a39c93c33ba052a5d6ee3e01c98182bd610d4fb19039f7c446f9b7f5bbe7923",
+      "sqlSha256": "b9e018b1af6cc8f8fcba683c676d13a85498da2d78e002f4fa87fae6a95ebfd0",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "19",
+      "file": "19-rw_inbox_preview_seq_jcm_v1.sql",
+      "name": "rw_inbox_preview_seq_jcm_v1",
+      "actors": 4,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 2,
+      "inputs": [
+        {
+          "relation": "rw_inbox_preview_need_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_inbox_preview_need_jcm_v1",
+          "rowBasis": "new intermediate not built; no actual count or same-generation bound",
+          "rows": null
+        },
+        {
+          "relation": "rw_message_preview_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_message_preview_v1",
+          "rowBasis": "actual count",
+          "rows": 10741988,
+          "provenance": {
+            "object": "rw_message_preview_v1",
+            "rows": 10741988,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14T17:47:47.528368+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        }
+      ],
+      "newPredecessorSteps": [
+        "18"
+      ],
+      "classification": "large; unknown new input",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 179.033,
+      "explainSha256": "34f7d328444037cefacd9dd5c25ebc282f676afd11f1d2626698afb5451ebe27",
+      "distsqlSha256": "1a081b80f7199406a8041ccfdbf3d4d3abb690402da6992db3e38c4f70ace75a",
+      "sqlSha256": "380300d290fca231806128089fe218575f7a772899da40c251adb0333c9337c4",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "20",
+      "file": "20-rw_inbox_serving_jcm_v1.sql",
+      "name": "rw_inbox_serving_jcm_v1",
+      "actors": 24,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 14,
+      "inputs": [
+        {
+          "relation": "rw_inbox_items_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_inbox_items_v13",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 272358,
+          "provenance": {
+            "object": "rw_inbox_items_v13",
+            "startedAt": "2026-11-14T17:59:46.458397+00:00",
+            "rows": 272358,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:50.436854+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_activity_watermark_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_activity_watermark_v7",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 237,
+          "provenance": {
+            "object": "rw_activity_watermark_v7",
+            "startedAt": "2026-11-14T17:59:37.049048+00:00",
+            "rows": 237,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:37.372648+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_channels",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channels",
+          "rowBasis": "actual count",
+          "rows": 634880,
+          "provenance": {
+            "object": "rw_channels",
+            "startedAt": "2026-11-14T17:59:42.011660+00:00",
+            "rows": 634880,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:43.185126+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_inbox_preview_seq_jcm_v1",
+          "scanMultiplicity": 4,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_inbox_preview_seq_jcm_v1",
+          "rowBasis": "new intermediate not built; no actual count or same-generation bound",
+          "rows": null
+        },
+        {
+          "relation": "rw_conversation_parent_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_conversation_parent_v1",
+          "rowBasis": "actual count",
+          "rows": 511789,
+          "provenance": {
+            "object": "rw_conversation_parent_v1",
+            "rows": 511789,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14T17:47:47.528368+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        },
+        {
+          "relation": "rw_inbox_preview_parent_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_inbox_preview_parent_v1",
+          "rowBasis": "new intermediate not built; no actual count or same-generation bound",
+          "rows": null
+        },
+        {
+          "relation": "rw_tasks",
+          "scanMultiplicity": 2,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_tasks",
+          "rowBasis": "actual count",
+          "rows": 430048,
+          "provenance": {
+            "object": "rw_tasks",
+            "startedAt": "2026-11-14T18:00:29.870190+00:00",
+            "rows": 430048,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:31.857828+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_target_latest_v4",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_target_latest_v4",
+          "rowBasis": "actual count",
+          "rows": 565519,
+          "provenance": {
+            "object": "rw_target_latest_v4",
+            "startedAt": "2026-11-14T18:00:28.573177+00:00",
+            "rows": 565519,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:29.464321+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_task_conversation_replies_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_task_conversation_replies_v1",
+          "rowBasis": "actual count",
+          "rows": 12,
+          "provenance": {
+            "object": "rw_task_conversation_replies_v1",
+            "startedAt": "2026-11-14T18:00:29.464667+00:00",
+            "rows": 12,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:29.678099+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_task_conversation_unread_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_task_conversation_unread_v1",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 21,
+          "provenance": {
+            "object": "rw_task_conversation_unread_v1",
+            "startedAt": "2026-11-14T18:00:29.678407+00:00",
+            "rows": 21,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:29.869877+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        }
+      ],
+      "newPredecessorSteps": [
+        "00",
+        "14",
+        "16",
+        "17",
+        "19"
+      ],
+      "classification": "medium; unknown new input",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 10.581,
+      "explainSha256": "5a347a0bd8154d03b2d237c8c05f6cfe26d5379ba2e01075db443112d8cf828b",
+      "distsqlSha256": "da97c87ab292d405590f1af8f5c59f175e14d36808952a6120e315ecd5e14f95",
+      "sqlSha256": "cb31e229309cef6005e516ae8c02a9a8136535ecf140403c033c1a69eec598a3",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "21",
+      "file": "21-idx_rw_inbox_serving_jcm_v1.sql",
+      "name": "idx_rw_inbox_serving_jcm_v1_receiver",
+      "actors": 2,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 1,
+      "inputs": [
+        {
+          "relation": "rw_inbox_serving_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_inbox_serving_v9",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 189072,
+          "provenance": {
+            "object": "rw_inbox_serving_v9",
+            "startedAt": "2026-11-14T17:59:53.325244+00:00",
+            "rows": 189072,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:09.128964+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        }
+      ],
+      "newPredecessorSteps": [
+        "20"
+      ],
+      "classification": "medium",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 3.151,
+      "explainSha256": "0ec3c8f8c8dbed413a7129815bb87fe1150b1cc2e54b6715704ee0309c9f715e",
+      "distsqlSha256": "3d8a040b04158d740f331a894fa93d4ee57fbd06af32d0be40a18249c2d652a1",
+      "sqlSha256": "c23a0874f0c8512d58fc69940ffb8a77de7ab986901f27388210fc0b0bd69d3c",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "22",
+      "file": "22-rw_activity_totals_jcm_v1.sql",
+      "name": "rw_activity_totals_jcm_v1",
+      "actors": 4,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 2,
+      "inputs": [
+        {
+          "relation": "rw_server_members",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_server_members",
+          "rowBasis": "actual count",
+          "rows": 33810,
+          "provenance": {
+            "object": "rw_server_members",
+            "startedAt": "2026-11-14T18:00:27.528904+00:00",
+            "rows": 33810,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:27.935741+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_inbox_serving_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_inbox_serving_v9",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 189072,
+          "provenance": {
+            "object": "rw_inbox_serving_v9",
+            "startedAt": "2026-11-14T17:59:53.325244+00:00",
+            "rows": 189072,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:09.128964+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        }
+      ],
+      "newPredecessorSteps": [
+        "20"
+      ],
+      "classification": "medium",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 3.151,
+      "explainSha256": "c0a228df4ba4417302c0145a751c83a3d84e604cc0bb5b1321681e2ef9390f02",
+      "distsqlSha256": "928f1af739c2e6c60fa31b6b316cb08c72ba014a805202ec75ccea280d7613e0",
+      "sqlSha256": "7148f9671ba62df3bab0f468162c731f878ed60996a864c0828341ce6e8eb9cf",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "23",
+      "file": "23-rw_agent_inbox_jcm_v1.sql",
+      "name": "rw_agent_inbox_jcm_v1",
+      "actors": 20,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 12,
+      "inputs": [
+        {
+          "relation": "rw_inbox_normal_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_inbox_normal_v5",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 314704,
+          "provenance": {
+            "object": "rw_inbox_normal_v5",
+            "startedAt": "2026-11-14T17:59:52.022916+00:00",
+            "rows": 314704,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:53.324933+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_inbox_muted_prefix_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_inbox_muted_prefix_v2",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 950,
+          "provenance": {
+            "object": "rw_inbox_muted_prefix_v2",
+            "startedAt": "2026-11-14T17:59:51.562739+00:00",
+            "rows": 950,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:52.022651+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_inbox_mention_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_inbox_mention_v7",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 142060,
+          "provenance": {
+            "object": "rw_inbox_mention_v7",
+            "startedAt": "2026-11-14T17:59:50.437106+00:00",
+            "rows": 142060,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:51.117660+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_channels",
+          "scanMultiplicity": 2,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channels",
+          "rowBasis": "actual count",
+          "rows": 634880,
+          "provenance": {
+            "object": "rw_channels",
+            "startedAt": "2026-11-14T17:59:42.011660+00:00",
+            "rows": 634880,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:43.185126+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_joint_channel_servers",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_joint_channel_servers",
+          "rowBasis": "actual count",
+          "rows": 4043,
+          "provenance": {
+            "object": "rw_joint_channel_servers",
+            "startedAt": "2026-11-14T18:00:10.064589+00:00",
+            "rows": 4043,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:10.278796+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_joint_channels",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_joint_channels",
+          "rowBasis": "actual count",
+          "rows": 1685,
+          "provenance": {
+            "object": "rw_joint_channels",
+            "startedAt": "2026-11-14T18:00:10.279042+00:00",
+            "rows": 1685,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:10.481743+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_conversation_parent_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_conversation_parent_v1",
+          "rowBasis": "actual count",
+          "rows": 511789,
+          "provenance": {
+            "object": "rw_conversation_parent_v1",
+            "rows": 511789,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14T17:47:47.528368+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        },
+        {
+          "relation": "rw_channel_agents",
+          "scanMultiplicity": 2,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channel_agents",
+          "rowBasis": "actual count",
+          "rows": 266111,
+          "provenance": {
+            "object": "rw_channel_agents",
+            "startedAt": "2026-11-14T17:59:40.907341+00:00",
+            "rows": 266111,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:41.550608+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_receiver_cursors_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_receiver_cursors_v1",
+          "rowBasis": "actual count",
+          "rows": 1827879,
+          "provenance": {
+            "object": "rw_receiver_cursors_v1",
+            "startedAt": "2026-11-14T18:00:24.666169+00:00",
+            "rows": 1827879,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:27.528560+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_thread_follows",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_thread_follows",
+          "rowBasis": "actual count",
+          "rows": 1324407,
+          "provenance": {
+            "object": "rw_thread_follows",
+            "startedAt": "2026-11-14T18:00:31.858146+00:00",
+            "rows": 1324407,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:34.122084+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        }
+      ],
+      "newPredecessorSteps": [
+        "11",
+        "13",
+        "15"
+      ],
+      "classification": "large",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 30.465,
+      "explainSha256": "c14aec764a6dfea6779886e54a6c481a9dd6319a4d7cdca5369997627b1a31de",
+      "distsqlSha256": "dcb4760cc6d00fff8ac5f79631dc8b2d57aa87af1ca602494ad61191abc5ae54",
+      "sqlSha256": "1a173eddaffaf88aab71b91d7feffad19c2bce5d0c17b7eb2b2c33be4a57704e",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "24",
+      "file": "24-idx_rw_agent_inbox_jcm_v1.sql",
+      "name": "idx_rw_agent_inbox_jcm_v1_agent_activity",
+      "actors": 2,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 1,
+      "inputs": [
+        {
+          "relation": "rw_agent_inbox_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_agent_inbox_v7",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 45216,
+          "provenance": {
+            "object": "rw_agent_inbox_v7",
+            "startedAt": "2026-11-14T17:59:40.428585+00:00",
+            "rows": 45216,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:40.907070+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        }
+      ],
+      "newPredecessorSteps": [
+        "23"
+      ],
+      "classification": "small",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 0.754,
+      "explainSha256": "cd3d9ccafa9e340a6685d8ab3450795317ef63c995b4d0abd45cce14e058b7e7",
+      "distsqlSha256": "76f277ab508c0ea2fe20fc4ce5416d27f480601821aa0a108c0073a2752ffa85",
+      "sqlSha256": "183e4dde919bfa28be9f112d508532d1368d0efc45f3b572a15bc7baa7444683",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "25",
+      "file": "25-rw_conversation_unread_jcm_v1.sql",
+      "name": "rw_conversation_unread_jcm_v1",
+      "actors": 21,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 13,
+      "inputs": [
+        {
+          "relation": "rw_inbox_normal_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_inbox_normal_v5",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 314704,
+          "provenance": {
+            "object": "rw_inbox_normal_v5",
+            "startedAt": "2026-11-14T17:59:52.022916+00:00",
+            "rows": 314704,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:53.324933+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_inbox_muted_full_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_inbox_muted_full_v2",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 969,
+          "provenance": {
+            "object": "rw_inbox_muted_full_v2",
+            "startedAt": "2026-11-14T17:59:51.117890+00:00",
+            "rows": 969,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:51.562448+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_inbox_mention_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_inbox_mention_v7",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 142060,
+          "provenance": {
+            "object": "rw_inbox_mention_v7",
+            "startedAt": "2026-11-14T17:59:50.437106+00:00",
+            "rows": 142060,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:51.117660+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_channels",
+          "scanMultiplicity": 2,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channels",
+          "rowBasis": "actual count",
+          "rows": 634880,
+          "provenance": {
+            "object": "rw_channels",
+            "startedAt": "2026-11-14T17:59:42.011660+00:00",
+            "rows": 634880,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:43.185126+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_target_latest_v4",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_target_latest_v4",
+          "rowBasis": "actual count",
+          "rows": 565519,
+          "provenance": {
+            "object": "rw_target_latest_v4",
+            "startedAt": "2026-11-14T18:00:28.573177+00:00",
+            "rows": 565519,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:29.464321+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_task_conversation_unread_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_task_conversation_unread_v1",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 21,
+          "provenance": {
+            "object": "rw_task_conversation_unread_v1",
+            "startedAt": "2026-11-14T18:00:29.678407+00:00",
+            "rows": 21,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:29.869877+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_inbox_preview_seq_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_inbox_preview_seq_jcm_v1",
+          "rowBasis": "new intermediate not built; no actual count or same-generation bound",
+          "rows": null
+        },
+        {
+          "relation": "rw_user_channel_read_cursors_v2",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_user_channel_read_cursors_v2",
+          "rowBasis": "actual count",
+          "rows": 504615,
+          "provenance": {
+            "object": "rw_user_channel_read_cursors_v2",
+            "startedAt": "2026-11-14T18:00:34.323994+00:00",
+            "rows": 504615,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T18:00:35.108054+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_agent_channel_read_cursors",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_agent_channel_read_cursors",
+          "rowBasis": "actual count",
+          "rows": 1323264,
+          "provenance": {
+            "object": "rw_agent_channel_read_cursors",
+            "startedAt": "2026-11-14T17:59:37.373025+00:00",
+            "rows": 1323264,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:40.428322+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_conversation_parent_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_conversation_parent_v1",
+          "rowBasis": "actual count",
+          "rows": 511789,
+          "provenance": {
+            "object": "rw_conversation_parent_v1",
+            "rows": 511789,
+            "method": "actual COUNT(*)",
+            "at": "2026-11-14T17:47:47.528368+00:00",
+            "receipt": "#wg-rbac:#73 msg=40299422",
+            "timing": "batch start; separate actual counts, not atomic across objects/databases"
+          }
+        },
+        {
+          "relation": "rw_human_channel_members_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channel_humans",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 148466,
+          "provenance": {
+            "object": "rw_channel_humans",
+            "startedAt": "2026-11-14T17:59:41.550941+00:00",
+            "rows": 148466,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:42.011417+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        },
+        {
+          "relation": "rw_channel_agents",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_channel_agents",
+          "rowBasis": "actual count",
+          "rows": 266111,
+          "provenance": {
+            "object": "rw_channel_agents",
+            "startedAt": "2026-11-14T17:59:40.907341+00:00",
+            "rows": 266111,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:41.550608+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        }
+      ],
+      "newPredecessorSteps": [
+        "08",
+        "11",
+        "12",
+        "14",
+        "15",
+        "19"
+      ],
+      "classification": "large; unknown new input",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 22.054,
+      "explainSha256": "ed5d799c236b13da5b476885d7418f2d170c8d10477b67c402e17f497ae21d90",
+      "distsqlSha256": "6e343b8cc5abc24486a1578374d34505a979a933e7c590112ab6b84201f4b988",
+      "sqlSha256": "f3cd5b8d9bbb6b1d343dd38c1a3894e1d02c9df453d3b991b6051d47a8b03ea6",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    },
+    {
+      "step": "26",
+      "file": "26-idx_rw_conversation_unread_jcm_v1.sql",
+      "name": "idx_rw_conversation_unread_jcm_v1_receiver",
+      "actors": 2,
+      "parallelism": "FIXED(1)",
+      "physicalScanNodes": 1,
+      "inputs": [
+        {
+          "relation": "rw_conversation_unread_jcm_v1",
+          "scanMultiplicity": 1,
+          "scanKind": "StreamTableScan",
+          "rowCountRelation": "rw_conversation_unread_v4",
+          "rowBasis": "old-generation scale proxy; new count unknown, not an upper bound",
+          "rows": 253846,
+          "provenance": {
+            "object": "rw_conversation_unread_v4",
+            "startedAt": "2026-11-14T17:59:43.185501+00:00",
+            "rows": 253846,
+            "method": "actual COUNT(*)",
+            "status": "counted",
+            "finishedAt": "2026-11-14T17:59:46.458136+00:00",
+            "receipt": "#wg-rbac:#73 msg=3659ea1e"
+          }
+        }
+      ],
+      "newPredecessorSteps": [
+        "25"
+      ],
+      "classification": "medium",
+      "nominalLargestKnownOrProxyInputMinutesAt1000P1": 4.231,
+      "explainSha256": "6c40d9ce23782e8dfb694fc09b32f66bbcc62554ad00d10bfce59b9ac9fe9b67",
+      "distsqlSha256": "1638ad361bf66338b8541e668e9dfcb6bd25f1a4bcaad205ac48bcc92cd1c4a7",
+      "sqlSha256": "e7891cec977cfaa3c7171f942b58e90c31f0baa1cf05141944af64c40572cf5d",
+      "rateLimitRowsPerSecondPerScanParallelism": 1000
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "formatVersion": 1,
+  "id": "predicate_channel_uncounted_subtype",
+  "rule": "predicate",
+  "title": "On a channel row, task.deleted_summary does not count",
+  "why": "The noise subtypes never count, on any row kind, as RisingWave counts them. Decided (Tenny, #14988 review): follow the server (RisingWave). The canonical Postgres read in getInboxItems follows it too (inboxRowMessageCountsUnreadSql).",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/web/src/store/inboxInPlaceUnread.ts (liveActivityUnread, liveUnreadFields)",
+      "packages/web/src/store/inboxRowPosition.ts (rowPositionVerdict, with inbox_row_position_v1 on)"
+    ],
+    "server": [
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (unread_count FILTER)",
+      "packages/server/src/services/inboxUnreadEligibility.ts (isMessageUnreadEligibleForReceiver)"
+    ]
+  },
+  "given": {
+    "viewer": {
+      "type": "user",
+      "id": "viewer-1"
+    },
+    "scope": {
+      "rowKind": "channel"
+    },
+    "message": {
+      "senderType": "system",
+      "senderId": "system",
+      "messageType": "system",
+      "causalActorType": "user",
+      "causalActorId": "user-2",
+      "systemSubtype": "task.deleted_summary",
+      "mentions": []
+    }
+  },
+  "steps": [],
+  "expect": {
+    "verdict": {
+      "counts": false,
+      "mention": false
+    }
+  }
+}

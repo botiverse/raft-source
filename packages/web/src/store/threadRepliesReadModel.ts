@@ -41,6 +41,13 @@ export interface ThreadReplyPreview {
   updatedAt?: string;
   /** RFC 082: the card revision this preview was taken from, once a card update reached it. */
   cardRevision?: number;
+  /**
+   * The server cut `preview` short (a page read with `threadPreviewChars`,
+   * channelPageQuery.ts): it is only the inline row's text, never the reply's
+   * body. A full copy of the same content version always replaces it, and it
+   * never replaces a full copy (`replacesReplyContent`).
+   */
+  truncated?: true;
 }
 
 export interface ThreadRepliesSnapshotOptions {
@@ -212,6 +219,20 @@ export function threadReplyContentVersion(reply: Pick<ThreadReplyPreview, "updat
   return Number.isFinite(version) ? version : 0;
 }
 
+type ReplyContent = Pick<ThreadReplyPreview, "updatedAt" | "createdAt" | "truncated">;
+
+/**
+ * Whether `incoming` carries content that should replace `existing`'s: a newer
+ * content version, or the same version where only `existing` was cut short.
+ * A cut copy never replaces a full one of the same version.
+ */
+export function replacesReplyContent(incoming: ReplyContent, existing: ReplyContent): boolean {
+  const incomingVersion = threadReplyContentVersion(incoming);
+  const existingVersion = threadReplyContentVersion(existing);
+  if (incomingVersion !== existingVersion) return incomingVersion > existingVersion;
+  return existing.truncated === true && incoming.truncated !== true;
+}
+
 /** Edit an already retained reply; never insert, reorder or change counts. */
 export function applyThreadReplyUpdate(
   scope: ThreadRepliesScope,
@@ -223,22 +244,29 @@ export function applyThreadReplyUpdate(
   const existing = scope.replies[index];
   // RFC 082: an older card revision never replaces a newer one, whatever its updatedAt (the conversation's rows' rule).
   if (!existing || isOlderCardRevision(existing.cardRevision, update.cardRevision)) return scope;
-  if (version <= threadReplyContentVersion(existing)) return scope;
+  // The update is the message's own content: full, so it also completes a cut preview of the same version.
+  if (!replacesReplyContent({ updatedAt: update.updatedAt, createdAt: existing.createdAt }, existing)) return scope;
+  const { truncated: _cut, ...full } = existing;
   const replies = [...scope.replies];
-  replies[index] = { ...existing, preview: update.preview, updatedAt: update.updatedAt,
+  replies[index] = { ...full, preview: update.preview, updatedAt: update.updatedAt,
     ...(update.cardRevision === undefined ? {} : { cardRevision: update.cardRevision }) };
   return { ...scope, replies };
 }
 
-/** A delayed HTTP snapshot must not roll back an accepted socket edit. */
+/**
+ * A delayed HTTP snapshot must not roll back an accepted socket edit, and a
+ * snapshot's cut preview must not replace a full copy of the same version.
+ */
 export function retainNewerThreadReplyContent(next: ThreadRepliesScope, current: ThreadRepliesScope | null): ThreadRepliesScope {
   if (!current) return next;
   let changed = false;
   const replies = next.replies.map((reply) => {
     const existing = current.replies.find((old) => old.messageId === reply.messageId && old.seq === reply.seq);
-    if (!existing || threadReplyContentVersion(existing) <= threadReplyContentVersion(reply)) return reply;
+    if (!existing || !replacesReplyContent(existing, reply)) return reply;
     changed = true;
-    return { ...reply, preview: existing.preview, updatedAt: existing.updatedAt,
+    const { truncated: _cut, ...rest } = reply;
+    return { ...rest, preview: existing.preview, updatedAt: existing.updatedAt,
+      ...(existing.truncated ? { truncated: true as const } : {}),
       ...(existing.cardRevision === undefined ? {} : { cardRevision: existing.cardRevision }) };
   });
   return changed ? { ...next, replies } : next;

@@ -74,6 +74,14 @@ function brandLogoUrl(): string {
   return `${appUrl()}/brand/raft-logo.png`;
 }
 
+type ResendEmailsForTests = Pick<Resend["emails"], "cancel" | "get">;
+let resendEmailsForTests: ResendEmailsForTests | null = null;
+
+/** Tests only: stand in for Resend's `emails.cancel` / `emails.get` (cancelScheduledEmail). */
+export function __setResendEmailsForTests(emails: ResendEmailsForTests | null): void {
+  resendEmailsForTests = emails;
+}
+
 function getResend(): Resend | null {
   if (!RESEND_API_KEY) return null;
   if (!resend) {
@@ -779,8 +787,38 @@ export async function sendMobileAppDownloadEmail(
   });
 }
 
-export async function cancelScheduledEmail(emailId: string): Promise<void> {
-  const client = getResend();
+type ResendErrorShape = { name?: string | null; statusCode?: number | null };
+
+/** Resend's error for a cancel or get: its name and status only (never the email id or any user data). */
+function logResendCancelError(call: "cancel" | "get", error: ResendErrorShape): void {
+  console.warn(`[email] resend emails.${call} failed name=${error.name ?? "unknown"} statusCode=${error.statusCode ?? "none"}`);
+}
+
+/**
+ * After Resend refuses a cancel: whether nothing is left to cancel ("done") or
+ * the caller should try again later ("retry"). Done when Resend's own get
+ * shows the email is past "scheduled", when Resend has no such email
+ * (not_found: never in this account, e.g. scheduled under an older key, so
+ * nothing will be sent from here), or when the caller knows its send time and
+ * that time passed more than an hour ago (it has gone out or never will; the
+ * margin covers a Resend queue delay just after the time). Any other answer
+ * retries.
+ */
+const SCHEDULED_EMAIL_SEND_MARGIN_MS = 60 * 60_000;
+
+export function scheduledEmailCancelOutcome(input: {
+  get: { error: ResendErrorShape | null; data: { last_event?: string | null } | null };
+  scheduledAt?: Date | null;
+  now?: Date;
+}): "done" | "retry" {
+  if (!input.get.error && input.get.data?.last_event && input.get.data.last_event !== "scheduled") return "done";
+  if (input.get.error?.name === "not_found") return "done";
+  if (input.scheduledAt && input.scheduledAt.getTime() + SCHEDULED_EMAIL_SEND_MARGIN_MS <= (input.now ?? new Date()).getTime()) return "done";
+  return "retry";
+}
+
+export async function cancelScheduledEmail(emailId: string, options: { scheduledAt?: Date | null } = {}): Promise<void> {
+  const client = resendEmailsForTests ? { emails: resendEmailsForTests } : getResend();
   if (!client) {
     console.log(`\n📧 [DEV EMAIL CANCELED] ID: ${emailId}\n`);
     return;
@@ -788,14 +826,14 @@ export async function cancelScheduledEmail(emailId: string): Promise<void> {
 
   const { error } = await client.emails.cancel(emailId);
   if (error) {
-    // Bounce/complaint events can arrive after delivery. In that case there is
-    // no remaining schedule to cancel, and retrying the webhook forever would
-    // hide the durable local suppression state. Only suppress a cancellation
-    // error when Resend itself confirms the email is no longer scheduled.
+    logResendCancelError("cancel", error);
+    // Bounce/complaint events can arrive after delivery, and an account
+    // deletion can meet an email Resend no longer holds. Retrying either
+    // forever would block the webhook or the deletion, so a cancel error is
+    // only swallowed when there is provably nothing left to cancel.
     const current = await client.emails.get(emailId);
-    if (!current.error && current.data?.last_event && current.data.last_event !== "scheduled") {
-      return;
-    }
+    if (current.error) logResendCancelError("get", current.error);
+    if (scheduledEmailCancelOutcome({ get: current, scheduledAt: options.scheduledAt }) === "done") return;
     throw new Error("Failed to cancel scheduled email");
   }
 }
@@ -1020,7 +1058,7 @@ export async function sendDeviceGrantEmail(
  * ApproverSessionRevokeTrigger but `account_deletion_requested`, whose own
  * email (sendAccountDeletionEmail) already says what was turned off.
  */
-export type SecurityRevokeEmailTrigger = "password_change" | "password_reset" | "account_retired" | "second_factor_recovered" | "device_login_revoked" | "repair";
+export type SecurityRevokeEmailTrigger = "password_change" | "password_reset" | "account_retired" | "second_factor_recovered" | "device_login_revoked" | "user_revoked" | "repair";
 
 export type SecurityRevokeEmailServer = { name: string; slug: string };
 
@@ -1040,7 +1078,8 @@ const SECURITY_REVOKE_LEAD: Record<SecurityRevokeEmailTrigger, string> = {
   account_retired: "Your account was closed, so what its sign-ins had set up was turned off.",
   second_factor_recovered: "Two-step verification on your account was just reset, so every other sign-in was signed out, and what they had set up was turned off.",
   device_login_revoked: "You revoked a device login, so what it had set up was turned off.",
-  repair: "After a recent password change or reset, a two-step verification reset, or a revoked device login, what your signed-out sessions had set up was turned off.",
+  user_revoked: "You signed out a lost or stolen device, so what it had set up was turned off.",
+  repair: "After a recent password change or reset, a two-step verification reset, a revoked device login, or a lost device you signed out, what your signed-out sessions had set up was turned off.",
 };
 
 const plural = (count: number, one: string, many: string) => `${count} ${count === 1 ? one : many}`;

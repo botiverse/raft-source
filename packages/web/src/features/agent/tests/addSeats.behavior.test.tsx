@@ -3,7 +3,7 @@ import "../../../../tests/helpers/domSetup";
 import assert from "node:assert/strict";
 import { act, cleanup, configure, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { PRO_SEAT_ADD_FEATURE_FLAG_KEY, SERVER_GUEST_FEATURE_FLAG_KEY, getCreatableRuntimeOptions } from "@botiverse/raft-shared";
+import { PRO_SEAT_ADD_FEATURE_FLAG_KEY, getCreatableRuntimeOptions } from "@botiverse/raft-shared";
 import api from "../../../api/client";
 import AddSeatsDialog from "../../../components/billing/AddSeatsDialog";
 import type { AddSeatsNeed } from "../../../components/billing/AddSeatsDialog";
@@ -363,7 +363,6 @@ test("Guest → member with the seats full: an owner adds the seat, then the pic
   seedServer("owner", null);
   useAuthStore.setState({ user: { id: "owner-1", name: "ada" }, loading: false, initialized: true } as never);
   setServerFeatureFlagForTests("server-1", PRO_SEAT_ADD_FEATURE_FLAG_KEY, true);
-  setServerFeatureFlagForTests("server-1", SERVER_GUEST_FEATURE_FLAG_KEY, true);
   stubBilling();
   const saves: string[] = [];
   useServerStore.setState({
@@ -484,7 +483,6 @@ test("Invite counts each person once, and every invite takes a seat (no Guest in
   // 3.6 seats used of 2: over, after the seats were reduced.
   seedServer("owner", proBilling(2, 3, 6));
   setServerFeatureFlagForTests("server-1", PRO_SEAT_ADD_FEATURE_FLAG_KEY, true);
-  setServerFeatureFlagForTests("server-1", SERVER_GUEST_FEATURE_FLAG_KEY, true);
   const posts = stubBilling({ status: "pending_webhook" }, () => ({ id: "invite-1" }));
   renderInvite();
 
@@ -505,7 +503,6 @@ test("Guest → member with room left but not a whole seat says what's left", as
   seedServer("owner", null);
   useAuthStore.setState({ user: { id: "owner-1", name: "ada" }, loading: false, initialized: true } as never);
   setServerFeatureFlagForTests("server-1", PRO_SEAT_ADD_FEATURE_FLAG_KEY, true);
-  setServerFeatureFlagForTests("server-1", SERVER_GUEST_FEATURE_FLAG_KEY, true);
   stubBilling();
   useServerStore.setState({
     loadBilling: async () => { useServerStore.setState({ billing: proBilling(4, 3, 6) }); },
@@ -542,7 +539,9 @@ test("the dialog is a raft-ui dialog over the page: Esc closes it, a scrim press
       </TestIntlProvider>,
     );
     const dialog = screen.getByRole("dialog", { name: AGENT_NEED.title });
-    assert.match(dialog.className, /\bz-dialog-layer\b/, "layer 1, as before");
+    // raft-ui 0.96.0: a layer-1 dialog lifts its portal (data-layer="1"), not the card, so its popups stay over it.
+    const portal = dialog.closest('[data-layer="1"]');
+    assert.match(portal?.className ?? "", /\bz-dialog-layer\b/, "layer 1, as before");
     fireEvent.keyDown(dialog, { key: "k", code: "KeyK", ctrlKey: true });
     fireEvent.keyDown(document.body, { key: "k", code: "KeyK", ctrlKey: true });
     assert.deepEqual(searches, [], "global search is hidden under the dialog");

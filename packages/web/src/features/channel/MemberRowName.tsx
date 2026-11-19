@@ -7,8 +7,9 @@ import type { MemberOrigin } from "../../utils/memberOrigin";
  * server: the name, then every server they are from in quiet text ("Acme
  * Corp, Lumen Labs"), the same wording as the @ list; the row's avatar carries
  * the server's tile. When the line runs out of room the server names give way
- * first and the name stays whole. Anyone else: the name and `localTags` (a
- * member of the viewed server who is also in another keeps those tags).
+ * first and the name stays whole. Anyone else: the name and `localTags` (for a
+ * member of the viewed server who is also in another, "Also in …" in the same
+ * quiet text).
  */
 export function MemberRowName({ name, origin, localTags }: { name: string; origin: MemberOrigin; localTags?: ReactNode }) {
   const serverNames = origin.external ? originServerNames(origin) : "";
@@ -26,8 +27,8 @@ export function MemberRowName({ name, origin, localTags }: { name: string; origi
     );
   }
   return (
-    <span className="flex min-w-0 items-center gap-1.5">
-      <span className="min-w-0 truncate">{name}</span>
+    <span className="flex min-w-0 items-baseline gap-1.5">
+      <span className="min-w-0 shrink truncate">{name}</span>
       {origin.external ? null : localTags}
     </span>
   );

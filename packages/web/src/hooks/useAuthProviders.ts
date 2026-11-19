@@ -20,7 +20,7 @@ const DEFAULT_PROVIDERS: AuthProvider[] = [];
 export const SIGN_IN_PROVIDER_COUNT_STORAGE = "raft:auth-provider-count:v1";
 const ALL_PROVIDER_COUNT = 3;
 
-function rememberedProviderCount(): number {
+export function rememberedProviderCount(): number {
   try {
     const raw = localStorage.getItem(SIGN_IN_PROVIDER_COUNT_STORAGE);
     const stored = raw === null || raw === "" ? Number.NaN : Number(raw);

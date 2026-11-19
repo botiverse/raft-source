@@ -22,6 +22,7 @@ import {
   isSupportedRecurrence,
   type Recurrence,
 } from "../../services/recurrence";
+import { UUID_RE } from "../../lib/messageId";
 
 const ONBOARDING_OWNER_CHANNEL_NAME = "onboarding-owner";
 
@@ -355,10 +356,17 @@ export async function listReminders(
   return rows as ReminderRow[];
 }
 
+// What Postgres reads as a uuid here: hyphenated, or the 32 hex digits without
+// them (the CLI passes any id of 32+ characters through unresolved).
+const DASHLESS_UUID_RE = /^[0-9a-f]{32}$/i;
+
 export async function getReminderById(
   reminderId: string,
   opts: ReminderServiceOptions = {},
 ): Promise<ReminderRow | null> {
+  // Anything else (an inbox item id such as `reminder:<id>:<rev>`, a typo) is
+  // no reminder: answer not-found instead of letting the uuid cast throw a 500.
+  if (!UUID_RE.test(reminderId) && !DASHLESS_UUID_RE.test(reminderId)) return null;
   const db = getExecutor(opts);
   const [row] = await db.select().from(reminders).where(eq(reminders.id, reminderId));
   return (row as ReminderRow | undefined) ?? null;

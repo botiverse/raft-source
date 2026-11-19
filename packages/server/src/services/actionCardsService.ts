@@ -4,14 +4,17 @@ import { getAppInstallationSetup } from "./appSetupService";
 import { APP_PERMISSIONS_CHANGED, AppPermissionsChangedError, currentAppPermissionSet } from "./appPermissionExpectation";
 import { ensureCurrentTextRevision } from "./appPromptTextService";
 import { normalizeAppSetupUrl, normalizeAppSetupDescription, AppSetupValidationError } from "@botiverse/raft-shared";
+import { APP_NAME_RESERVED_CODE } from "@botiverse/raft-shared";
+import { RefusalError } from "../lib/refusal";
 import type { DatabaseExecutor } from "../db/index";
 import { AgentRuntimeProviderError } from "./agentRuntimeProviderService";
 import { approvalEndedSentence } from "./agentRuntimeApprovalItem";
 import { assertProviderProvisioningAvailable } from "./agentRuntimeProvisionService";
 import { getHostedRuntimeModels, isHostedModelPickerEnabled } from "./hostedAgentModelService";
+import { isRuntimeAdmittedForNewUse, isRuntimeDeprecatedForServer, newAgentAdmittedRuntimeIds, resolveRuntimeAdmissionPolicy } from "./runtimeAdmissionService";
 import { jointChannels, jointChannelServers } from "../db/schema";
 import { recordTraceEvent } from "../tracing/semanticTrace";
-import { HOSTED_DEFAULT_MODEL, isActionCardReadOnlyInServer } from "@botiverse/raft-shared";
+import { getRuntimeInfo, HOSTED_DEFAULT_MODEL, isActionCardReadOnlyInServer } from "@botiverse/raft-shared";
 import { isMcpConnectionAuthorized } from "./managedMcpService";
 import { publishChannelUpdate } from "./channelRealtimeEvents";
 import { socketUserServerRoom } from "../socket/platformScope";
@@ -84,6 +87,8 @@ import {
   type QuestionAskAgentAction,
   type QuestionRateLimitedDetails,
   type AgentMigrateAction,
+  isPreparedRequestAgentAction,
+  type PreparedRequestAction,
 } from "@botiverse/raft-shared";
 import { isProductFeedbackEnabled } from "./productFeedbackSendService";
 import { QuestionCardExpiredError } from "./questionAskForm";
@@ -197,6 +202,16 @@ export class ActionCardError extends Error {
 }
 
 /** 422 FORM_INVALID: the submitted form failed its checks; the body carries the issues (never a value). */
+/** An App name that reads as Raft (oauthService.assertAppNameAllowed), as a card refusal. */
+function appNameAllowedOrCardError(serverId: string, name: string): void {
+  try {
+    oauthService.assertAppNameAllowed({ serverId, name: name.trim() });
+  } catch (err) {
+    if (err instanceof RefusalError) throw new ActionCardError(err.status, err.refusal.code, err.refusal.error);
+    throw err;
+  }
+}
+
 function clientKeyTakenCardError(): ActionCardError {
   return new ActionCardError(409, "CLIENT_KEY_TAKEN", "Client key is already taken; re-prepare with a different client key");
 }
@@ -307,7 +322,24 @@ export interface PreparedActionCard {
   messageId: string;
   metadata: ActionCardMetadata;
   existing?: true;
+  /** A request card's echo to its agent (RFC 085 §4.2 step 5). */
+  preparedRequest?: PreparedRequestEcho;
 }
+
+/**
+ * What the agent that prepared a request card is told back (RFC 085 §4.2
+ * step 5): the summary the person sees, in English with the names this agent
+ * may see; who it is for; the operation; and that its result comes back as a
+ * reply in the card's thread.
+ */
+export type PreparedRequestEcho = {
+  summary: string;
+  /** The card's title alone ("Start @builder"), what prepare's output names. */
+  title: string;
+  for: string;
+  operation: string;
+  result: "reply";
+};
 
 export function bindMarketplaceAppName(rawName: string): {
   clientName: string;
@@ -426,13 +458,18 @@ async function emitActionCardCarrierMessage(
     // change. Use the existing authority-filtered follower audience instead.
     const followerIds = await messageService.getHumanThreadFollowerIds(target.channelId);
     for (const userId of followerIds) {
+      const userServerRoom = socketUserServerRoom(userId, target.serverId);
+      // A joint thread has one projected payload per server: send each only to
+      // that server's sockets of the user. A single-surface thread keeps the
+      // user-wide room.
+      const followerRoom = targets.length > 1 ? userServerRoom : `user:${userId}`;
       if (event === "message:new") {
-        io.in(socketUserServerRoom(userId, target.serverId)).socketsJoin(`channel:${target.channelId}`);
+        io.in(userServerRoom).socketsJoin(`channel:${target.channelId}`);
         // message-realtime-producer: action-card.new.thread-follower
-        io.to(`user:${userId}`).emit("message:new", payload);
+        io.to(followerRoom).emit("message:new", payload);
       } else {
         // message-realtime-producer: action-card.updated.thread-follower
-        io.to(`user:${userId}`).emit("message:updated", payload);
+        io.to(followerRoom).emit("message:updated", payload);
       }
     }
   }
@@ -987,6 +1024,35 @@ async function assertHostedAgentCardPreparable(serverId: string, action: ActionC
 }
 
 /**
+ * `agent:create`'s `suggestedRuntime`: refused at prepare unless this server
+ * offers it for a new agent now, by the admission the create route uses
+ * (runtimeAdmissionService: unknown, deprecated, or behind a flag that is
+ * off). Read for the server, not a person (no one has picked yet). The
+ * refusal names the offered ids. The Computer is the dialog's question: there
+ * the person sees when the computer they chose cannot run it.
+ */
+async function assertSuggestedRuntimePreparable(serverId: string, action: ActionCardAction): Promise<void> {
+  if (action.type !== "agent:create" || action.suggestedRuntime === undefined) return;
+  const runtime = action.suggestedRuntime;
+  const policy = await resolveRuntimeAdmissionPolicy({ serverId, userId: null });
+  const offered = newAgentAdmittedRuntimeIds(policy);
+  if (offered.includes(runtime)) return;
+  const why = !getRuntimeInfo(runtime) ? "is not a runtime Raft knows"
+    : isRuntimeDeprecatedForServer(runtime, policy) ? "is deprecated for new agents"
+      : !isRuntimeAdmittedForNewUse(runtime, policy) ? "is not enabled on this server"
+        : "is not offered for new agents";
+  throw new ActionCardError(422, "RUNTIME_NOT_OFFERED", suggestedRuntimeNotOfferedMessage(runtime, why, offered));
+}
+
+/** RUNTIME_NOT_OFFERED's sentence: the offered ids with their names, or, with none, to leave the field out. */
+export function suggestedRuntimeNotOfferedMessage(runtime: string, why: string, offered: readonly string[]): string {
+  const next = offered.length === 0
+    ? "This server offers no runtime for new agents now; leave suggestedRuntime out."
+    : `Offered: ${offered.map((id) => `${id} (${getRuntimeInfo(id)?.displayName ?? id})`).join(", ")}. Use one of these ids, or leave suggestedRuntime out so the person picks.`;
+  return `suggestedRuntime "${runtime}" ${why}. ${next}`;
+}
+
+/**
  * Card types only `raft integration ...` commands prepare (each builds the
  * card from its own flags); `raft action prepare` refuses them with
  * ACTION_TYPE_NOT_PREPARABLE, on both prepare-action routes.
@@ -1052,7 +1118,7 @@ function questionAskRefusal(message: string, suggestedNextAction = QUESTION_ASK_
  * assertActionCardTypeAuthority refusing a Guest any question card (a Guest
  * otherwise operates cards in its bound channel).
  */
-async function canPersonAnswerQuestionIn(serverId: string, channelId: string, userId: string): Promise<boolean> {
+export async function canPersonAnswerQuestionIn(serverId: string, channelId: string, userId: string): Promise<boolean> {
   const db = getDb();
   if (!await channelService.canUserAccessChannel(channelId, userId, asServerId(serverId))) return false;
   const authorityChannelId = await channelService.getChannelMembershipAuthorityChannelId(channelId, db);
@@ -1215,7 +1281,37 @@ function questionCardContent(action: QuestionAskAction, agentName: string, link:
   return link ? `${line}\nAnswer on the web: ${link}` : line;
 }
 
+/**
+ * What prepare posts: the card as it is stored, with what posting it needs of
+ * its preparer and conversation. An agent's card (resolveAgentActionForPost),
+ * or a request card the server resolved (request:prepare,
+ * preparedRequestPrepare.ts).
+ */
+export interface ActionCardToPost {
+  action: ActionCardAction | PreparedRequestAction;
+  storedAction: StoredActionCardAction;
+  cardPayload: StoredActionCardAction | AgentMigrateCardPayload;
+  cardNames: ActionCardSpecNames;
+  agent: NonNullable<Awaited<ReturnType<typeof agentService.getAgent>>>;
+  target: NonNullable<Awaited<ReturnType<typeof channelService.getChannel>>>;
+  currentComputerId: string | null;
+  /** A request card's echo to the agent that prepared it (RFC 085 §4.2 step 5). */
+  preparedRequest?: PreparedRequestEcho;
+}
+
 export async function prepareActionCard(args: PrepareActionCardArgs): Promise<PreparedActionCard> {
+  // RFC 085: a request card is the server's to resolve, and only on a server
+  // with its flag on. Anywhere else its type goes on to the card check below,
+  // which refuses it exactly as a type it doesn't know (it is not an agent
+  // card type there).
+  if (args.agentAuthored && isPreparedRequestAgentAction(args.action)) {
+    const { isPreparedRequestCardEnabled, resolvePreparedRequestForPost } = await import("./preparedRequestPrepare");
+    if (await isPreparedRequestCardEnabled(args.serverId)) return postActionCard(args, await resolvePreparedRequestForPost(args));
+  }
+  return postActionCard(args, await resolveAgentActionForPost(args));
+}
+
+async function resolveAgentActionForPost(args: PrepareActionCardArgs): Promise<ActionCardToPost> {
   const parsed = actionCardActionSchema.safeParse(args.action);
   if (!parsed.success) {
     if (args.agentAuthored) throw invalidActionCardError(actionCardSchemaIssues(args.action, parsed.error));
@@ -1234,6 +1330,7 @@ export async function prepareActionCard(args: PrepareActionCardArgs): Promise<Pr
     throw new ActionCardError(400, "INVALID_PAYLOAD", crossFieldIssue.message);
   }
   await assertHostedAgentCardPreparable(args.serverId, parsed.data as ActionCardAction);
+  await assertSuggestedRuntimePreparable(args.serverId, parsed.data as ActionCardAction);
   assertFeedbackCardPreparable(parsed.data as ActionCardAction);
   const cardNames: ActionCardSpecNames = {};
   const resolvedAction = await resolveActionHandles(
@@ -1246,6 +1343,10 @@ export async function prepareActionCard(args: PrepareActionCardArgs): Promise<Pr
   if (action.type === "integration:register_app" && action.clientKey
     && await clientKeyRefusedByAliasRow({ key: action.clientKey.trim().toLowerCase(), serverId: args.serverId })) {
     throw clientKeyTakenCardError();
+  }
+  // Refuse a name that reads as Raft now, not when the person confirms the card.
+  if (action.type === "integration:register_app") {
+    appNameAllowedOrCardError(args.serverId, action.name);
   }
 
   // Verify the requesting agent belongs to this server.
@@ -1292,7 +1393,11 @@ export async function prepareActionCard(args: PrepareActionCardArgs): Promise<Pr
       : action;
     cardPayload = storedAction;
   }
+  return { action, storedAction, cardPayload, cardNames, agent, target, currentComputerId };
+}
 
+async function postActionCard(args: PrepareActionCardArgs, toPost: ActionCardToPost): Promise<PreparedActionCard> {
+  const { action, storedAction, cardPayload, cardNames, agent, target, currentComputerId } = toPost;
   // A channel:add_member card may be posted in one carrier while mutating a
   // different channel.  Its conversion authority is the action target, not
   // the carrier.  Other cards are scoped to the carrier (with Thread cards
@@ -1393,6 +1498,10 @@ export async function prepareActionCard(args: PrepareActionCardArgs): Promise<Pr
     if (storedAction.type === "question:ask") {
       await assertQuestionCardBudget(tx, { requesterAgentId: args.requesterAgentId, storageChannelId });
     }
+    if (storedAction.type === "request:prepare") {
+      const { assertPreparedRequestBudget } = await import("./preparedRequestCards");
+      await assertPreparedRequestBudget(tx, { serverId: args.serverId, requesterAgentId: args.requesterAgentId, action: storedAction });
+    }
     // A question card's content links to itself, so its id is chosen first.
     const messageId = randomUUID();
     const [msg] = await tx
@@ -1424,14 +1533,15 @@ export async function prepareActionCard(args: PrepareActionCardArgs): Promise<Pr
         conversionEpoch: activeFence?.conversionEpoch ?? null,
         freezeState: activeFence ? "frozen" : "ready",
       });
-    if (args.beforeCommit) await args.beforeCommit(tx, { messageId: msg.id, metadata });
+    if (args.beforeCommit) await args.beforeCommit(tx, { messageId: msg.id, metadata, ...(toPost.preparedRequest ? { preparedRequest: toPost.preparedRequest } : {}) });
     return { posted: msg };
   });
   if (out.existing) return out.existing;
   const posted = out.posted;
 
-  // The person a question card asks gets a mention, not just channel activity (spec §2.3).
-  const asked = storedAction.type === "question:ask" && storedAction.addressee?.kind === "user" ? storedAction.addressee : null;
+  // The person a question card asks gets a mention, not just channel activity (spec §2.3); so
+  // does the person a request card is for (RFC 085 §4.2), so it lands in their Activity.
+  const asked = (storedAction.type === "question:ask" || storedAction.type === "request:prepare") && storedAction.addressee?.kind === "user" ? storedAction.addressee : null;
   await messageService.recordInboxFactsForPersistedMessages([posted], {
     inboxFactPolicy: {
       mode: "record",
@@ -1446,7 +1556,7 @@ export async function prepareActionCard(args: PrepareActionCardArgs): Promise<Pr
     await emitActionCardCarrierMessage(args.io, posted, "message:new");
   }
 
-  return { messageId: posted.id, metadata };
+  return { messageId: posted.id, metadata, ...(toPost.preparedRequest ? { preparedRequest: toPost.preparedRequest } : {}) };
 }
 
 export interface ExecuteActionCardArgs {
@@ -1474,7 +1584,7 @@ export interface ExecuteActionCardArgs {
    * its body), for a form handler (`ctx.client`). Absent: `unknown`.
    */
   client?: RequestClient;
-  /** The person's own request, for a form whose action runs one of their routes (assistant:owner_action). */
+  /** The person's own request, for a form whose action runs one of their routes (assistant:owner_action, request:prepare). */
   ownerRequest?: OwnerConfirmRequest;
   io?: SocketServer | null;
   /**
@@ -1759,7 +1869,7 @@ interface PerformActionOutput {
  * computer the agent was on when the card was prepared (null: none). Server
  * only: the carrier message's action never has it (Tenny, #14018 review).
  */
-type AgentMigrateCardPayload = AgentMigrateAction & { fromMachineId?: string | null };
+export type AgentMigrateCardPayload = AgentMigrateAction & { fromMachineId?: string | null };
 
 /** An action_cards payload without what only the server keeps: what the carrier's action must equal. */
 function clientVisibleCardPayload(payload: unknown): unknown {
@@ -1884,6 +1994,7 @@ async function deliverActionCardForm(
     client: args.client ?? UNKNOWN_REQUEST_CLIENT,
     ...(args.ownerRequest ? { ownerRequest: args.ownerRequest } : {}),
     io: args.io ?? null,
+    orchestrator: args.orchestrator ?? null,
   };
   const checked = await checkActionCardForm({
     handler,
@@ -2271,6 +2382,7 @@ async function executeActionCardInner(
         client: args.client ?? UNKNOWN_REQUEST_CLIENT,
         ...(args.ownerRequest ? { ownerRequest: args.ownerRequest } : {}),
         io: args.io ?? null,
+        orchestrator: args.orchestrator ?? null,
       };
       if (formHandler?.deliver) {
         // Delivered before this transaction (executeActionCard), for this
@@ -2296,7 +2408,8 @@ async function executeActionCardInner(
       }
     } else {
       // A server-built type has no built-in action: only its form handler completes it.
-      if (finalAction.type === "agent:approve_call" || finalAction.type === "question:ask" || finalAction.type === "assistant:owner_action") throw formRequiredError();
+      if (finalAction.type === "agent:approve_call" || finalAction.type === "question:ask" || finalAction.type === "assistant:owner_action"
+        || finalAction.type === "request:prepare") throw formRequiredError();
       executionOutput = await performAction(
         targetServerId,
         args.userId,
@@ -3034,6 +3147,9 @@ function describeActionCardResult(result: ActionCardResult, action: StoredAction
       const count = Object.keys(result.answers).length;
       return `answered ${count} question${count === 1 ? "" : "s"}`;
     }
+    case "prepared-request":
+      // Never the route's answer: how it ended.
+      return `request ${result.outcome.replaceAll("_", " ")}`;
   }
 }
 
@@ -3065,7 +3181,13 @@ export type ActionCardResultReplyOutcome =
   /** A person's request no owner answered within SEAT_REQUEST_TTL_MS. */
   | { kind: "expired" }
   /** An agent's question card nobody answered by its `expiresAt` (a withdrawn one gets no reply). */
-  | { kind: "question_expired"; action: QuestionAskAction };
+  | { kind: "question_expired"; action: QuestionAskAction }
+  /**
+   * A request:prepare card's one result kind for its agent (RFC 085 §4.2;
+   * preparedRequestCards.ts writes the text). `causalUserId`: the person it
+   * was for, when nobody acted (its expiry).
+   */
+  | { kind: "prepared_request"; text: string; causalUserId: string };
 
 /**
  * Tell whoever asked for a card how it resolved: the agent that prepared it,
@@ -3124,7 +3246,8 @@ export async function postActionCardResultReply(input: {
     // went to), never the requester, who must see it unread.
     const causalUserId = input.confirmerUserId
       ?? (requester.type === "user" ? await otherDmHuman(localCarrierChannelId, requester.id)
-        : input.outcome.kind === "question_expired" ? await questionExpiryCausalUser(input.outcome.action, localCarrierChannelId) : null);
+        : input.outcome.kind === "question_expired" ? await questionExpiryCausalUser(input.outcome.action, localCarrierChannelId)
+          : input.outcome.kind === "prepared_request" ? input.outcome.causalUserId : null);
     if (!causalUserId) return skip("no_causal_user");
     let threadChannelId: string;
     let threadParentMessageId: string;
@@ -3153,7 +3276,9 @@ export async function postActionCardResultReply(input: {
     const movedAgentName = requester.type === "agent" && migrated && migrated.toLowerCase() !== requester.id.toLowerCase()
       ? (await agentService.getAgent(migrated, true))?.name ?? migrated.slice(0, 8)
       : null;
-    const content = requester.type === "agent"
+    const content = requester.type === "agent" && input.outcome.kind === "prepared_request"
+      ? `@${requester.name} ${input.outcome.text}`
+      : requester.type === "agent"
       ? await questionResultReplyContent(requester.name, input.messageId, input.outcome,
         () => agentReadTargetOfCard(card.serverId, requester.id, localCarrierChannelId, carrierChannel))
         ?? agentResultReplyContent(requester.name, confirmer, targetServer?.name ?? null, cardRef, input.outcome, movedAgentName)
@@ -3358,6 +3483,9 @@ export function startQuestionCardExpiryWorker(
   const sweep = () => {
     void sweepExpiredQuestionCards(io, orchestrator)
       .catch((err) => console.error("[question-cards] expiry sweep failed:", err instanceof Error ? err.message : err));
+    // RFC 085 request cards: 30 days unconfirmed, and claims that outlived their run (preparedRequestCards.ts).
+    void import("./preparedRequestCards").then(({ sweepPreparedRequestCards }) => sweepPreparedRequestCards(io, orchestrator))
+      .catch((err) => console.error("[request-cards] sweep failed:", err instanceof Error ? err.message : err));
   };
   const first = setTimeout(sweep, 60_000);
   first.unref?.();
@@ -3388,7 +3516,7 @@ export async function withdrawQuestionCard(args: {
   requesterAgentId: string;
   messageRef: string;
   io?: SocketServer | null;
-}): Promise<{ messageId: string; metadata: ActionCardMetadata; alreadyWithdrawn: boolean }> {
+}): Promise<{ messageId: string; metadata: ActionCardMetadata; alreadyWithdrawn: boolean; preparedRequest?: { outcome: "withdrawn"; summary: string } }> {
   const db = getDb();
   const ref = args.messageRef.trim().toLowerCase();
   const notFound = () => new ActionCardError(404, "NOT_FOUND", "No question card with that message id", { suggestedNextAction: QUESTION_WITHDRAW_NOT_FOUND_NEXT_STEP });
@@ -3404,10 +3532,10 @@ export async function withdrawQuestionCard(args: {
   const candidates = looksLikeUuid(ref)
     ? await db.select(columns).from(actionCards).where(eq(actionCards.messageId, ref)).limit(1)
     : /^[0-9a-f]{8,32}$/.test(prefix) && /^[0-9a-f-]+$/.test(ref)
-      // It names one of this agent's own question cards only.
+      // It names one of this agent's own question or request cards only.
       ? await db.select(columns).from(actionCards).where(and(
         eq(actionCards.requesterAgentId, args.requesterAgentId),
-        eq(actionCards.actionType, "question:ask"),
+        inArray(actionCards.actionType, ["question:ask", "request:prepare"]),
         sql`replace(${actionCards.messageId}::text, '-', '') like ${`${prefix}%`}`,
       )).limit(2)
       : [];
@@ -3421,6 +3549,11 @@ export async function withdrawQuestionCard(args: {
   if (!card || card.serverId !== args.serverId) throw notFound();
   if (card.requesterAgentId !== args.requesterAgentId) {
     throw new ActionCardError(403, "NOT_REQUESTER", "Only the agent that asked can withdraw this question");
+  }
+  if (card.actionType === "request:prepare") {
+    // RFC 085: a request card its agent withdraws (preparedRequestCards.ts).
+    const { withdrawPreparedRequestCard } = await import("./preparedRequestCards");
+    return withdrawPreparedRequestCard({ serverId: args.serverId, requesterAgentId: args.requesterAgentId, messageId: card.messageId, io: args.io ?? null });
   }
   if (card.actionType !== "question:ask") {
     throw new ActionCardError(409, "NOT_WITHDRAWABLE", "Only a question card can be withdrawn", { suggestedNextAction: "A card of this type stays until a person acts on it." });
@@ -3569,6 +3702,8 @@ function agentResultReplyContent(
   if ((outcome.kind === "executed" || outcome.kind === "failed") && outcome.action.type === "agent:approve_call") return null;
   // An owner-action card's assistant hears through its own system.assistant event, never a reply in the DM.
   if ((outcome.kind === "executed" || outcome.kind === "failed") && outcome.action.type === "assistant:owner_action") return null;
+  // A request card's agent hears its one result kind (prepared_request), never the generic executed or failed line.
+  if ((outcome.kind === "executed" || outcome.kind === "failed") && outcome.action.type === "request:prepare") return null;
   switch (outcome.kind) {
     case "executed":
       return [
@@ -3616,6 +3751,9 @@ function personResultReplyContent(
       return `No owner answered within 7 days, ${to}; nothing changed.`;
     case "question_expired":
       // Only an agent asks a question card.
+      return null;
+    case "prepared_request":
+      // Only an agent prepares a request card.
       return null;
   }
 }
@@ -3968,6 +4106,9 @@ async function performAction(
       allowedScopes: action.scopes.length > 0 ? action.scopes : undefined,
     }, dbOrTx).catch((err: unknown) => {
       if (err instanceof OAuthClientKeyTakenError) throw clientKeyTakenCardError();
+      if (err instanceof RefusalError && err.refusal.code === APP_NAME_RESERVED_CODE) {
+        throw new ActionCardError(err.status, err.refusal.code, err.refusal.error);
+      }
       throw err;
     });
     return {
@@ -4293,5 +4434,8 @@ function summarize(action: StoredActionCardAction): string {
     case "question:ask":
       // How a reply names the card; its message's own content is questionCardContent (spec §7 layer 0).
       return action.questions.length === 1 ? "Asked a question" : `Asked ${action.questions.length} questions`;
+    case "request:prepare":
+      // Previews, notifications and replies: who it is for and the operation, never a name the card resolved.
+      return `Request for @${action.addressee.handle} to confirm: ${action.operation}`;
   }
 }

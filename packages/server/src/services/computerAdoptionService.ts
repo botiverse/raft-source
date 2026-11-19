@@ -29,7 +29,7 @@
 // Raw key hygiene (§3.3.1): the raw `sk_machine_*` is read into memory once
 // for argon2.verify and discarded. NEVER persisted, NEVER logged.
 
-import { and, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, isNull, sql } from "drizzle-orm";
 import argon2 from "argon2";
 import { getDb, type DatabaseExecutor, type DatabaseTransaction } from "../db/index";
 import { computers, deviceLoginGrants, machines, servers, sessionFamilies, users } from "../db/schema";
@@ -685,7 +685,8 @@ async function adoptMatchedLegacyMachine(input: {
  * Selection-based adoption by the machine's registrant without `registerMachines`. A machine not yet migrated
  * qualifies only if it never had a Computer (revoked or not): a Computer attached through /api/computer/attach
  * also leaves `legacyKeyMigratedAt` NULL, and once revoked it reconnects only through a new attach. A migrated
- * machine qualifies for resume only when its live Computer (if any) was attached by the caller.
+ * machine qualifies for resume only when its most recent attach record (the live one first) was attached by the
+ * caller, or names no one and is revoked; none at all qualifies too.
  */
 async function registrantMayAdoptBySelection(
   q: DatabaseExecutor,
@@ -700,12 +701,22 @@ async function registrantMayAdoptBySelection(
       .limit(1);
     return !anyComputer;
   }
-  const [live] = await q
-    .select({ attachedByUserId: computers.attachedByUserId })
+  // The live attach record, else the most recent revoked one (computerControllerUserId's order): once someone
+  // else adopted it, their revoke does not hand the machine back to its registrant.
+  // Deliberately not computerControllerUserId itself: they differ in one case. A LIVE attach record that names
+  // no one (attached_by_user_id null) refuses the registrant here, where computerControllerUserId falls back to
+  // machines.userId (the registrant). Resuming hands the live Computer's key to the caller (rotated in place).
+  // Without `registerMachines`, only the Computer's own attacher may take it; with no attacher on record, nobody
+  // qualifies. The row's controller does not reach that far. Keep the two separate.
+  const [latest] = await q
+    .select({ attachedByUserId: computers.attachedByUserId, revokedAt: computers.revokedAt })
     .from(computers)
-    .where(and(eq(computers.machineId, machine.id), isNull(computers.revokedAt)))
+    .where(eq(computers.machineId, machine.id))
+    .orderBy(sql`${computers.revokedAt} IS NULL DESC`, desc(computers.createdAt))
     .limit(1);
-  return !live || live.attachedByUserId === userId;
+  if (!latest) return true;
+  if (!latest.revokedAt) return latest.attachedByUserId === userId;
+  return latest.attachedByUserId === null || latest.attachedByUserId === userId;
 }
 
 /**

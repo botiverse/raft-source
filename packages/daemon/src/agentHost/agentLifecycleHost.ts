@@ -15,8 +15,10 @@ import type {
   TraceContext,
   Tracer,
 } from "@botiverse/raft-shared";
+import type { AgentSideAskOutcome, AgentSideAskRequest } from "@botiverse/raft-shared";
 import type { AgentAppInboxNoticeOptions } from "../agentAppInbox";
 import type { AgentDrainOptions, AgentDrainProgress, AgentDrainSummary } from "../agentDrain";
+import type { AgentStartOutcome } from "../agentStartCoordinator";
 import type { AgentStartAcceptance } from "../agentStartDispatchProjection";
 import type { RecoveryGrant } from "../runtimeOutcomeOutbox";
 
@@ -116,7 +118,7 @@ export interface AgentLifecycleHost {
     catchupBatchId?: string,
     recoveryGrant?: RecoveryGrant | null,
     claimedConnectionEpochId?: string | null,
-  ): Promise<void>;
+  ): Promise<AgentStartOutcome>;
   getAgentStartAcceptance(agentId: string): AgentStartAcceptance;
   stopAgent(agentId: string, options?: { wait?: boolean; silent?: boolean }): Promise<void>;
   stopAll(): Promise<void>;
@@ -194,6 +196,10 @@ export interface AgentLifecycleHost {
   endDrain?(agentId?: string): void;
   /** Reconciler step 13: the drain's progress now (live processes, the ones not quiet); null when no drain holds. `agentId`: that agent's drain. */
   drainProgress?(agentId?: string): AgentDrainProgress | null;
+  /** #wg-runtime-form:#22: status now, or one question to a read-only fork of the agent's Claude session (agentSideAsk.ts). */
+  sideAsk(request: AgentSideAskRequest): Promise<{ outcome: AgentSideAskOutcome; text?: string }>;
+  /** Kill the agent's side-question fork, if any. */
+  stopSideAsk(agentId: string): void;
 }
 
 /** The legacy host as the router needs it: the lifecycle plus what it holds for an agent. */

@@ -59,7 +59,7 @@ import {
   type DiagnosticsPushResult,
 } from "../services/diagnosticsPush";
 import type { ComputerApiEvent } from "./events";
-import { runDoctorChecks, type DoctorCheck, redactSecrets } from "../doctor";
+import { runDoctorChecks, type DoctorCheck, redactSecretLines, redactSecrets } from "../doctor";
 import { runFullCleanup, type CleanupReport } from "../cleanup";
 import { readCrashHistory } from "../health";
 import { clearServerManaged, formatServerSlugDisplay, listAttachedServerIds } from "../serverState";
@@ -607,7 +607,9 @@ export function createComputerApi(slockHome: string, opts?: CreateComputerApiOpt
       const lines = content.split("\n");
       if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
       const tail = lines.slice(-n);
-      return tail.map((line) => redactSecrets(line));
+      // Line for line (`--lines N` stays N lines), but a YAML block secret or
+      // a complete PEM block is read across the lines it spans.
+      return redactSecretLines(tail);
     },
 
     async runnersList(serverId, opts): Promise<RunnersListResult> {

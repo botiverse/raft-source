@@ -7,10 +7,24 @@ import * as externalInstaller from "./externalInstaller";
 import { readLastRemoteUpgradeReceipt } from "./externalInstaller";
 import { collectRemoteUpgradeSteps } from "./remoteUpgradeTrace";
 import { runService } from "./service";
-import { readSupervisorRecord, supervisorRecordPath, writeSupervisorRecord, type ExternalSupervisorRecord, type SystemctlRunner } from "./externalSupervisor";
+import { readSupervisorRecord, supervisorRecordPath, systemdScopeProbeArgs, writeSupervisorRecord, type ExternalSupervisorRecord, type SystemctlRunner, type SystemdScopeProbe } from "./externalSupervisor";
 import { ServiceClientError } from "./lib/types";
 
 const RECORD: ExternalSupervisorRecord = { kind: "systemd", scope: "user", unit: "raft-computer.service", invocationId: "inv", pid: process.pid, recordedAt: "t" };
+const SYSTEM_RECORD: ExternalSupervisorRecord = { ...RECORD, scope: "system" };
+
+/** The probe must not run on this path (an old installer never needs a scope). */
+const noProbe: SystemdScopeProbe = async () => { throw new Error("the scope probe must not run here"); };
+
+/** systemd lets (or refuses) this process a transient scope; records the manager asked. */
+function scopeProbe(answer: { code: number | null; stderr?: string }): { probe: SystemdScopeProbe; scopes: string[] } {
+  const scopes: string[] = [];
+  const probe: SystemdScopeProbe = async (scope) => {
+    scopes.push(scope);
+    return { code: answer.code, stdout: "", stderr: answer.stderr ?? "" };
+  };
+  return { probe, scopes };
+}
 
 function systemctlAnswering(killMode: string): { runner: SystemctlRunner; calls: string[] } {
   const calls: string[] = [];
@@ -65,6 +79,7 @@ test("task #917: under systemd with KillMode=control-group an installer older th
         stopAfterMutationsReady: true,
         detectSystemdSupervisorFn: async () => RECORD,
         systemctl: runner,
+        systemdScopeProbe: noProbe,
         readInstallerVersionFn: async () => "0.3.20",
         onMutationsReady: async (mutations) => {
           await assert.rejects(
@@ -93,26 +108,132 @@ test("task #917: under systemd with KillMode=control-group an installer older th
   });
 });
 
-test("installer 0.3.21: under systemd with KillMode=control-group an installer that leaves the unit itself is launched", async () => {
+test("installer 0.3.21: under systemd with KillMode=control-group an installer that leaves the unit itself is launched once systemd grants this service a scope", async () => {
   await withServiceHome(async (home) => {
     const launch = launchThroughVeto();
+    // A non-default saved channel: the received step must read the file, also for an exact-version request.
+    writeFileSync(join(home, "computer", "channel"), "alpha");
+    const { probe, scopes } = scopeProbe({ code: 0 });
     try {
       await runService({
         stopAfterMutationsReady: true,
         detectSystemdSupervisorFn: async () => RECORD,
         systemctl: systemctlAnswering("control-group").runner,
+        systemdScopeProbe: probe,
         readInstallerVersionFn: async () => "0.3.21",
         onMutationsReady: async (mutations) => {
           assert.deepEqual(await mutations.upgradeStart!(remote("req-3", "1.0.33")), { status: "started", upgradeId: "req-3", targetVersion: "1.0.33" });
         },
       });
       assert.equal(launch.mock.calls.length, 1);
+      assert.deepEqual(scopes, ["user"], "asked the unit's own manager, once, before the spawn");
       const steps = (await collectRemoteUpgradeSteps(home, { serverId: "test-server" })).events;
       assert.deepEqual(steps.map((event) => [event.step, event.outcome, event.killMode]).slice(0, 3), [
         ["received", "ok", "control-group"],
         ["download", "ok", undefined],
         ["installer_spawned", "ok", "control-group"],
       ]);
+      // #67: the channels this machine follows, on the received step: the saved release channel
+      // (also for an exact-version request) and the installer channel (default main).
+      assert.deepEqual([steps[0]!.channel, steps[0]!.installerChannel], ["alpha", "main"]);
+    } finally {
+      launch.mockRestore();
+    }
+  });
+});
+
+test("#67: a system unit run without the right to open a scope refuses the upgrade before spawn, in the installer's held words, instead of a held after the download", async () => {
+  await withServiceHome(async (home) => {
+    const launch = launchThroughVeto();
+    const { probe, scopes } = scopeProbe({
+      code: 1,
+      stderr: "Failed to start transient scope unit: Access denied as the requested operation requires interactive authentication. However, interactive authentication has not been enabled by the calling program.\n",
+    });
+    try {
+      await runService({
+        stopAfterMutationsReady: true,
+        detectSystemdSupervisorFn: async () => SYSTEM_RECORD,
+        systemctl: systemctlAnswering("control-group").runner,
+        systemdScopeProbe: probe,
+        readInstallerVersionFn: async () => "0.4.1",
+        onMutationsReady: async (mutations) => {
+          await assert.rejects(
+            mutations.upgradeStart!(remote("req-scope", "1.22.0")),
+            (err: unknown) => err instanceof ServiceClientError && err.code === "UPGRADE_START_REJECTED"
+              // The installer's own `held` words (the server reads them as installation_held), plus systemd's.
+              && /runs in systemd unit raft-computer\.service, which would stop the upgrade together with the service, and the upgrade could not move out of it \(systemd-run: Failed to start transient scope unit: Access denied/.test(err.message)
+              && /`systemctl stop raft-computer\.service`, run the install command, then `systemctl start raft-computer\.service`/.test(err.message)
+              && !/KillMode=process/.test(err.message),
+          );
+        },
+      });
+      assert.deepEqual(scopes, ["system"], "the system manager, as the installer would use");
+      assert.equal(launch.mock.calls.length, 1, "the installer was resolved (the veto runs right before spawn)");
+      const receipt = await readLastRemoteUpgradeReceipt(home);
+      assert.equal(receipt?.targetVersion, "1.22.0");
+      assert.equal(receipt?.outcome, "failed");
+      assert.match(receipt?.reason ?? "", /could not move out of it \(systemd-run:/);
+      const steps = (await collectRemoteUpgradeSteps(home, { serverId: "test-server" })).events;
+      assert.deepEqual(steps.map((event) => [event.step, event.outcome, event.errorCode]), [
+        ["received", "ok", undefined],
+        ["download", "ok", undefined],
+        ["installer_spawned", "failed", "scope_unavailable"],
+      ]);
+    } finally {
+      launch.mockRestore();
+    }
+  });
+});
+
+test("#67: the scope probe asks systemd the way the installer does: --user only for a user unit", () => {
+  assert.deepEqual(systemdScopeProbeArgs("user"), ["--user", "--scope", "--quiet", "--collect", "--", "true"]);
+  assert.deepEqual(systemdScopeProbeArgs("system"), ["--scope", "--quiet", "--collect", "--", "true"]);
+});
+
+test("#67: a safe KillMode does not spare the new installer the probe (it escapes whatever the KillMode): refused when systemd says no", async () => {
+  await withServiceHome(async (home) => {
+    const launch = launchThroughVeto();
+    const { probe, scopes } = scopeProbe({ code: null, stderr: "systemd-run did not finish within 15 s" });
+    try {
+      await runService({
+        stopAfterMutationsReady: true,
+        detectSystemdSupervisorFn: async () => RECORD,
+        systemctl: systemctlAnswering("process").runner,
+        systemdScopeProbe: probe,
+        readInstallerVersionFn: async () => "0.4.1",
+        onMutationsReady: async (mutations) => {
+          await assert.rejects(
+            mutations.upgradeStart!(remote("req-safe-new", "1.22.0")),
+            (err: unknown) => err instanceof ServiceClientError && err.code === "UPGRADE_START_REJECTED"
+              && /\(systemd-run: systemd-run did not finish within 15 s\)/.test(err.message)
+              && /`systemctl --user stop raft-computer\.service`/.test(err.message),
+          );
+        },
+      });
+      assert.deepEqual(scopes, ["user"]);
+      const receipt = await readLastRemoteUpgradeReceipt(home);
+      assert.equal(receipt?.outcome, "failed");
+    } finally {
+      launch.mockRestore();
+    }
+  });
+});
+
+test("#67: under a safe KillMode an old installer is launched without any probe (it never needs a scope)", async () => {
+  await withServiceHome(async () => {
+    const launch = launchThroughVeto();
+    try {
+      await runService({
+        stopAfterMutationsReady: true,
+        detectSystemdSupervisorFn: async () => RECORD,
+        systemctl: systemctlAnswering("process").runner,
+        systemdScopeProbe: noProbe,
+        readInstallerVersionFn: async () => "0.3.20",
+        onMutationsReady: async (mutations) => {
+          assert.deepEqual(await mutations.upgradeStart!(remote("req-safe-old", "1.0.33")), { status: "started", upgradeId: "req-safe-old", targetVersion: "1.0.33" });
+        },
+      });
+      assert.equal(launch.mock.calls.length, 1);
     } finally {
       launch.mockRestore();
     }
@@ -127,6 +248,7 @@ test("task #917: an installer whose version cannot be read counts as old under a
         stopAfterMutationsReady: true,
         detectSystemdSupervisorFn: async () => RECORD,
         systemctl: systemctlAnswering("control-group").runner,
+        systemdScopeProbe: noProbe,
         readInstallerVersionFn: async () => null,
         onMutationsReady: async (mutations) => {
           await assert.rejects(() => mutations.upgradeStart!(remote("req-4")),
@@ -139,9 +261,11 @@ test("task #917: an installer whose version cannot be read counts as old under a
   });
 });
 
-test("task #917: under systemd with KillMode=process the upgrade proceeds through the installer as before", async () => {
-  await withServiceHome(async () => {
+test("task #917: under systemd with KillMode=process the upgrade proceeds through the installer as before; an alpha installer channel is recorded (#67)", async () => {
+  await withServiceHome(async (home) => {
     const launch = vi.spyOn(externalInstaller, "launchInstallerDetached").mockResolvedValue(4321);
+    const previousInstallerChannel = process.env.RAFT_COMPUTER_INSTALLER_CHANNEL;
+    process.env.RAFT_COMPUTER_INSTALLER_CHANNEL = "alpha";
     try {
       await runService({
         stopAfterMutationsReady: true,
@@ -152,7 +276,10 @@ test("task #917: under systemd with KillMode=process the upgrade proceeds throug
         },
       });
       assert.equal(launch.mock.calls.length, 1);
+      const received = (await collectRemoteUpgradeSteps(home, { serverId: "test-server" })).events.find((event) => event.step === "received");
+      assert.deepEqual([received?.channel, received?.installerChannel], ["latest", "alpha"], "an rc installer after the stable is explained by this field");
     } finally {
+      if (previousInstallerChannel === undefined) delete process.env.RAFT_COMPUTER_INSTALLER_CHANNEL; else process.env.RAFT_COMPUTER_INSTALLER_CHANNEL = previousInstallerChannel;
       launch.mockRestore();
     }
   });

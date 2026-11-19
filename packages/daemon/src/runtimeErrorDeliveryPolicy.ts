@@ -11,7 +11,19 @@ export interface RuntimeErrorDeliveryFailureSummary {
   actionRequired: boolean;
 }
 
-export function runtimeErrorFingerprintFenceResetEvent(eventKind: ParsedEvent["kind"]): boolean {
+/**
+ * Whether a runtime event is progress that resets the same-fingerprint and
+ * error-class fences (task #917): model output, tool use, a finished
+ * compaction or review. A `turn_end` counts only when its turn had such
+ * progress (`turnHadProgress`): a turn that ended without any output did not
+ * get anywhere. Grok's ACP server answers a rejected `session/prompt` (a
+ * provider rate limit, say) by ending the turn bare and sending the error a
+ * few ms after it; when the bare turn end reset the fence, every rejection was
+ * attempt 1 and the 15 s idle redelivery looped forever. Cursor's failed turn
+ * (error, then turn_end) is the same: it no longer resets the count it just
+ * added to, unless the turn produced output before the error.
+ */
+export function runtimeErrorFingerprintFenceResetEvent(eventKind: ParsedEvent["kind"], turnHadProgress: boolean): boolean {
   switch (eventKind) {
     case "thinking":
     case "text":
@@ -19,8 +31,9 @@ export function runtimeErrorFingerprintFenceResetEvent(eventKind: ParsedEvent["k
     case "tool_output":
     case "compaction_finished":
     case "review_finished":
-    case "turn_end":
       return true;
+    case "turn_end":
+      return turnHadProgress;
     default:
       return false;
   }

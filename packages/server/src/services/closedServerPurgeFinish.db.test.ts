@@ -13,7 +13,7 @@ import { afterAll, beforeAll } from "vitest";
 import { and, eq, inArray, ne } from "drizzle-orm";
 import { BasicTracer, MemoryTraceSink, type ServerId } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
-import { agentChannelReadCursors, agentMigrations, appOauthProfiles, channels, raftApps, externalAppCredentials, externalAppInstallServerGrants, externalAppInstalls, externalAppRegistrations, externalAppServerGrants, externalChannelBindings, integrationAuditEvents, managedMcpCredentials, managedMcpServers, oauthClientInstalls, oauthClients, oauthGrants, agentOperatorEvents, agentRuntimeProvisions, agents, featureFlags, reminders, serverFileUploadUsageMonths, serverInvites, servers, wechatBridgeBindings, workflowInstances, workflowTemplates } from "../db/schema";
+import { agentChannelReadCursors, agentMigrations, appOauthProfiles, channels, raftApps, externalAppCredentials, externalAppInstallServerGrants, externalAppInstalls, externalAppRegistrations, externalAppServerGrants, externalChannelBindings, integrationAuditEvents, managedMcpCredentials, managedMcpServers, oauthClientInstalls, oauthClients, oauthClientUninstalls, oauthGrants, agentOperatorEvents, agentRuntimeProvisions, agents, featureFlags, reminders, serverFileUploadUsageMonths, serverInvites, servers, wechatBridgeBindings, workflowInstances, workflowTemplates } from "../db/schema";
 import type { FirstPartyApp } from "../platform/apps";
 import { close, DAY_MS, daysAgo, deleteFor, NOW, run as fixtureRun, seedServer } from "../test/closedServerPurgeFixture";
 import { dbTest as test } from "../test/integration/dbTest";
@@ -115,6 +115,8 @@ async function seedFinish(seed: Seed, options: { rowsDeleted?: boolean; migratin
   const [app] = await db.insert(oauthClients).values({ serverId: base.storage.id, clientId: `purge-app-${suffix}`, clientSecretHash: "hash", appType: "third_party_global", name: "App", createdByUserId: owner.id }).returning();
   await db.insert(oauthClientInstalls).values({ serverId: server.id, clientId: app!.id, installedByUserId: owner.id });
   await db.insert(oauthGrants).values({ serverId: server.id, agentId: live.id, clientId: app!.id, scopes: [], grantedByUserId: owner.id });
+  // A person here once uninstalled it (and it was installed again): goes with the server's app rows.
+  await db.insert(oauthClientUninstalls).values({ serverId: server.id, clientId: app!.id, uninstalledAt: new Date("2026-09-01T00:00:00Z"), actorUserId: owner.id });
   // The Slack bridge: an install this server owns, its credential and grants, and a binding on the kept joint projection.
   const [slackClient] = await db.insert(oauthClients).values({ serverId: base.storage.id, clientId: `purge-slack-${suffix}`, clientSecretHash: "hash", appType: "slock_builtin", name: "Slack", createdByUserId: owner.id }).returning();
   const [registration] = await db.insert(externalAppRegistrations).values({
@@ -170,6 +172,7 @@ async function appRows(serverId: string) {
   return {
     installs: await n(db.select().from(oauthClientInstalls).where(eq(oauthClientInstalls.serverId, serverId))),
     grants: await n(db.select().from(oauthGrants).where(eq(oauthGrants.serverId, serverId))),
+    uninstalls: await n(db.select().from(oauthClientUninstalls).where(eq(oauthClientUninstalls.serverId, serverId))),
     slackInstalls: await n(db.select().from(externalAppInstalls).where(eq(externalAppInstalls.serverId, serverId))),
     slackBindings: await n(db.select().from(externalChannelBindings).where(eq(externalChannelBindings.serverId, serverId))),
     slackServerGrants: await n(db.select().from(externalAppServerGrants).where(eq(externalAppServerGrants.serverId, serverId))),
@@ -177,7 +180,7 @@ async function appRows(serverId: string) {
     mcpServers: await n(db.select().from(managedMcpServers).where(eq(managedMcpServers.serverId, serverId))),
   };
 }
-const NO_APP_ROWS = { installs: 0, grants: 0, slackInstalls: 0, slackBindings: 0, slackServerGrants: 0, mcpCredentials: 0, mcpServers: 0 };
+const NO_APP_ROWS = { installs: 0, grants: 0, uninstalls: 0, slackInstalls: 0, slackBindings: 0, slackServerGrants: 0, mcpCredentials: 0, mcpServers: 0 };
 
 const revokeEvents = async (serverId: string) => getDb().select({ outcome: integrationAuditEvents.outcome, targetId: integrationAuditEvents.targetId, metadata: integrationAuditEvents.metadata })
   .from(integrationAuditEvents).where(and(eq(integrationAuditEvents.serverId, serverId), eq(integrationAuditEvents.eventType, CREDENTIAL_REVOKE_EVENT)));

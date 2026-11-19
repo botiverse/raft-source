@@ -9,7 +9,7 @@
  * in-memory ack-retry record (30 min), nothing sent it again. The row stayed
  * `delivering` until some unrelated wake made the agent check its messages.
  *
- * Two triggers re-send such rows through `deliverMessage`, the path the first
+ * Four triggers re-send such rows through `deliverMessage`, the path the first
  * push takes, so every delivery gate applies again (stopped agent, reset,
  * crash-loop hold, passive scope, RaftBench, the wake plan):
  *
@@ -44,13 +44,82 @@
  *   least 10 minutes old, and then backs off exponentially (it waits at least
  *   as long as it had been pending at its last push): at most about eight
  *   sends in its 24 h.
+ * - `daemon_instance_changed` (the restart pass): the replica that receives a
+ *   `ready` whose daemon instance (`daemonInstanceId`, one per daemon process)
+ *   differs from the one the machine last connected with
+ *   (recordMachineDaemonInstance: a durable per-machine marker, swapped under a
+ *   row lock so one `ready` per new instance wins, on any replica). A
+ *   restarted or upgraded daemon has lost whatever it held in memory: an
+ *   event it was pushed and acked (`agent:deliver:ack`) but never handed to
+ *   the agent (machine ca4239b1, 11-15: a start held through an upgrade drain,
+ *   resolved at shutdown) stays `delivering` with no ack-retry record left to
+ *   send it. A plain socket reconnect of the same daemon re-sends nothing (a
+ *   flaky network wakes no idle agent); neither do the first `ready` a machine
+ *   is recorded with, a `ready` without an instance id, nor the instance the
+ *   marker had just replaced coming back (A, B, A: two daemons taking turns
+ *   on one machine; only their first flip counts as a restart). It looks at the
+ *   agents' `delivering` rows (not `queued` ones: the next-start pass
+ *   below, `runtime_ready`, sends those, a dropped-on-exit requeue or a
+ *   failed push, at the agent's next runtime start; the only `queued` rows
+ *   held on purpose are a system app's guard-withheld ones, and every pass
+ *   runs the guard again, so they stay withheld) not coalesced into an item
+ *   that already woke the agent
+ *   (`wake_coalesced_at`, as selectPendingThirdPartyAgentEvents), created in
+ *   the last 24 h, whose last push or claim came before the new daemon
+ *   connected (a later one went to the new daemon). Unlike the reconnect pass
+ *   it expires nothing and sends no summary: these rows may have reached the
+ *   agent before the restart and sit unread in its inbox, so past the 20
+ *   newest per agent they are left there (`deferred_over_cap`), and the first
+ *   event the agent accepts says how many more wait in its inbox
+ *   (`restartDeferred*`). Its note says the event is sent again after a
+ *   restart and may already have been seen: the daemon's duplicate checks
+ *   (`samePendingDelivery`, `dropped_already_consumed`) live in memory and
+ *   start empty after the restart, so an event the agent saw before it whose
+ *   delivered report was lost reaches it a second time.
+ * - `runtime_ready` (the next-start pass): the replica that receives an
+ *   agent's `agent:runtime:ready` (a runtime process of the agent produced its
+ *   first output: any start, a server one or the daemon's own restart from
+ *   its snapshot, and every turn of a per-turn runtime) sends that agent's
+ *   `queued` rows. A process that ends abnormally (a stop, the fence, a
+ *   crash, a provider-stream failure, a recoverable close with no wake)
+ *   drops the app events it had acked and never handed over; its daemon
+ *   names them (`agent:inbox:dropped_app_events`) and
+ *   requeueDroppedThirdPartyAgentEvents moves them from `delivering` back to
+ *   `queued` (wake_coalesced_at unchanged). Nothing at a start or wake hands
+ *   `queued` app events to a managed agent otherwise (its start catch-up is
+ *   the chat chain), so this pass is what sends them, once its next process
+ *   runs (#raft-antiproton:#14: 16 events lost in a week, acked into a
+ *   runtime-error backoff that ended in the fence or a stop). It also sends a
+ *   row left `queued` by a push that failed (claim released). It only takes
+ *   rows that were claimed or requeued at least once (`updated_at` after
+ *   `created_at`): a row never touched since its insert is either still
+ *   being pushed by the request that wrote it, or queued on purpose and
+ *   never pushed (an Artifact's rename and channel-announcement notices,
+ *   Artifacts task #160: they wake no agent, it reads them when something
+ *   else wakes it). It also skips rows coalesced into an item that already
+ *   woke the agent.
+ *   Its claim makes the rows `delivering` again, so a later start of the
+ *   agent sends nothing new, and a per-turn runtime's normal turns (no
+ *   frame, no `queued` row) send nothing. One agent's requeues and passes
+ *   run in order on the replica that holds its socket
+ *   (AgentOrchestrator.chainThirdPartyEventAgentWork): a ready handled at
+ *   the same time as the frame before it still finds the requeued rows. The
+ *   restart pass takes only
+ *   `delivering` rows and this one only `queued` rows, and each claim moves
+ *   `updated_at` past the restart pass's connection time: of one `ready` and
+ *   one start, a row goes out once. Past the newest 20 the rest stay
+ *   `queued` (`deferred_over_cap`; the agent's next runtime start sends
+ *   them), and the first event sent says how many more wait in the inbox.
  *
- * Both leave rows created in the last 31 minutes alone: a parked ack-retry
- * record for them may still live on the replica that made the first push
- * (it re-sends them when the computer is back), and this replica cannot see
- * it; a later sweep (when the sweep is on) picks them up once that record has expired.
+ * The reconnect pass and the sweep leave rows created in the last 31 minutes
+ * alone: a parked ack-retry record for them may still live on the replica
+ * that made the first push (it re-sends them when the computer is back), and
+ * this replica cannot see it; a later sweep (when the sweep is on) picks them
+ * up once that record has expired. The restart pass does not: the restart
+ * left the acked rows with no record anywhere, and a parked record that still
+ * re-sends one only makes a copy the daemon drops.
  *
- * Both then run the kept rows through their system app's delivery guard
+ * All three then run the kept rows through their system app's delivery guard
  * (`systemAppDeliveryGuards`: vetoed rows are expired, withheld rows left as
  * they are), claim each with a compare-and-set on its row (status pending and
  * `updated_at` still before its wait, set to now: two replicas or two passes
@@ -76,6 +145,7 @@
  */
 import { and, asc, eq, inArray, isNull, ne, not, or, sql, type SQL } from "drizzle-orm";
 import {
+  AGENT_INBOX_DROPPED_APP_EVENTS_MAX_IDS,
   EXTERNAL_AGENT_RUNTIME_ID,
   compareComputerVersions,
   currentDate,
@@ -87,13 +157,13 @@ import {
   type Tracer,
 } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
-import { agents, oauthClients, thirdPartyAgentEvents } from "../db/schema";
+import { agents, machineDaemonInstances, oauthClients, thirdPartyAgentEvents } from "../db/schema";
 import { serializeErrorForLog } from "../tracing/safeErrorLog";
 import type { AgentMessageDeliveryResult, AgentOrchestrator } from "./agentOrchestrator";
 import { THIRD_PARTY_EVENT_APP_COLUMNS, buildThirdPartyAgentMessage } from "./oauthService";
 import { partitionDeliverableSystemAppEvents } from "./systemAppDeliveryGuards";
 
-export type ThirdPartyEventRedeliveryTrigger = "machine_ready" | "sweep";
+export type ThirdPartyEventRedeliveryTrigger = "machine_ready" | "sweep" | "daemon_instance_changed" | "runtime_ready";
 
 /** Only rows created this recently are delivered again. */
 export const THIRD_PARTY_EVENT_REDELIVERY_MAX_AGE_MS = 24 * 60 * 60_000;
@@ -140,7 +210,8 @@ const EXCLUDED_SYSTEM_APP = "system.assistant";
 
 /**
  * Agent-facing copy (English), in one place for review.
- * - `lateNote` prefixes every re-delivered event (both triggers). `{createdAt}`
+ * - `lateNote` prefixes every event the reconnect pass and the sweep send
+ *   again, `restartNote` every one the restart pass sends again. `{createdAt}`
  *   is the event's creation time in the `time=` header format
  *   (formatUtcTimestamp, e.g. 2026-10-22 22:50:00Z).
  * - `notDelivered*` (reconnect pass only) goes ahead of the late note on the
@@ -148,9 +219,22 @@ const EXCLUDED_SYSTEM_APP = "system.assistant";
  *   rows that pass expired for the agent (older than 24 h, or beyond the
  *   newest `{cap}`); `{apps}`: their count per app display name, e.g.
  *   "Reminder 2, Stamp 1".
+ * - `restartDeferred*` (restart pass only) goes ahead of the restart note on
+ *   the first event re-sent to the agent in that pass. `{count}`: its rows
+ *   past the newest `{cap}`, left pending in its inbox, not sent again.
+ * - `runtimeRestartNote` prefixes every event the next-start pass sends;
+ *   `runtimeRestartDeferred*` goes ahead of it on the first one, `{count}`:
+ *   the agent's rows past the newest `{cap}`, left queued in its inbox (its
+ *   next runtime start sends them).
  */
 export const THIRD_PARTY_EVENT_REDELIVERY_COPY = {
   lateNote: "Delivered late: this app notification was created at {createdAt} and did not reach you then. Check that it still applies before you act on it.",
+  restartDeferredOne: "1 more app notification that may not have reached you before your computer restarted is in your inbox; it is not sent again. Check your inbox for it.",
+  restartDeferredMany: "{count} more app notifications that may not have reached you before your computer restarted are in your inbox; they are not sent again. Check your inbox for them.",
+  restartNote: "Sent again after your computer restarted: this app notification was created at {createdAt}, and the restart may have lost it before it reached you. If you already handled it, ignore this copy; otherwise check that it still applies before you act on it.",
+  runtimeRestartNote: "Sent again after the agent restarted: this app notification was created at {createdAt}, and it may not have reached you before your previous run ended. If you already handled it, ignore this copy; otherwise check that it still applies before you act on it.",
+  runtimeRestartDeferredOne: "1 more app notification that may not have reached you before your previous run ended is in your inbox. Check your inbox for it.",
+  runtimeRestartDeferredMany: "{count} more app notifications that may not have reached you before your previous run ended are in your inbox. Check your inbox for them.",
   notDeliveredOne: "1 app notification ({apps}) from while your computer was offline was not delivered: it was older than 24 hours, or beyond the newest {cap}. If you were waiting on it, check the app that sends it.",
   notDeliveredMany: "{count} app notifications ({apps}) from while your computer was offline were not delivered: they were older than 24 hours, or beyond the newest {cap}. If you were waiting on one, check the app that sends it.",
 } as const;
@@ -236,9 +320,14 @@ export type ThirdPartyEventRedeliverer = Pick<AgentOrchestrator, "deliverMessage
 
 type EventRow = typeof thirdPartyAgentEvents.$inferSelect;
 
-/** The note that prefixes a re-delivered event's text. */
-export function formatThirdPartyEventLateNote(createdAt: Date): string {
-  return THIRD_PARTY_EVENT_REDELIVERY_COPY.lateNote.replace("{createdAt}", formatUtcTimestamp(createdAt));
+/** The note that prefixes a re-delivered event's text: the restart and next-start passes' own, else the late note. */
+export function formatThirdPartyEventLateNote(createdAt: Date, trigger: ThirdPartyEventRedeliveryTrigger = "machine_ready"): string {
+  const template = trigger === "daemon_instance_changed"
+    ? THIRD_PARTY_EVENT_REDELIVERY_COPY.restartNote
+    : trigger === "runtime_ready"
+      ? THIRD_PARTY_EVENT_REDELIVERY_COPY.runtimeRestartNote
+      : THIRD_PARTY_EVENT_REDELIVERY_COPY.lateNote;
+  return template.replace("{createdAt}", formatUtcTimestamp(createdAt));
 }
 
 /** An app display name fit for one line of the summary: no control characters, at most 40 characters. */
@@ -277,19 +366,29 @@ export function formatNotDeliveredThirdPartyEventsSummary(countsByApp: ReadonlyM
     .replace("{cap}", String(THIRD_PARTY_EVENT_REDELIVERY_PER_AGENT_CAP));
 }
 
+/** Restart and next-start passes: the line telling the agent how many of its rows past the cap wait in its inbox. Null when none. */
+export function formatRestartDeferredThirdPartyEvents(count: number, trigger: "daemon_instance_changed" | "runtime_ready" = "daemon_instance_changed"): string | null {
+  if (count <= 0) return null;
+  const copy = THIRD_PARTY_EVENT_REDELIVERY_COPY;
+  const [one, many] = trigger === "runtime_ready"
+    ? [copy.runtimeRestartDeferredOne, copy.runtimeRestartDeferredMany]
+    : [copy.restartDeferredOne, copy.restartDeferredMany];
+  return count === 1 ? one : many.replace("{count}", String(count));
+}
+
 /**
  * The message the first push sends (buildThirdPartyAgentMessage: same id,
  * original timestamp, so `time=` stays the creation time), its text prefixed
- * with the late note, and with `summary` ahead of that when given. Only the
- * re-delivery path adds them.
+ * with the trigger's note, and with `summary` ahead of that when given. Only
+ * the re-delivery path adds them.
  */
 export function buildRedeliveredThirdPartyAgentMessage(input: {
   event: EventRow;
   clientKey: string;
   clientName: string;
-}, summary: string | null = null): AgentMessage {
+}, summary: string | null = null, trigger: ThirdPartyEventRedeliveryTrigger = "machine_ready"): AgentMessage {
   const message = buildThirdPartyAgentMessage(input);
-  const prefix = [summary, formatThirdPartyEventLateNote(input.event.createdAt)].filter(Boolean).join("\n\n");
+  const prefix = [summary, formatThirdPartyEventLateNote(input.event.createdAt, trigger)].filter(Boolean).join("\n\n");
   return { ...message, content: `${prefix}\n\n${message.content}` };
 }
 
@@ -307,30 +406,53 @@ function pendingPredicates(now: Date): SQL[] {
 
 type PassScope =
   | { trigger: "sweep" }
-  | { trigger: "machine_ready"; outageStartedAt: Date };
+  | { trigger: "machine_ready"; outageStartedAt: Date }
+  /** `daemonConnectedAt`: when the machine's new daemon instance connected. */
+  | { trigger: "daemon_instance_changed"; daemonConnectedAt: Date }
+  | { trigger: "runtime_ready" };
 
-/** Reconnect pass: only rows created during the outage. */
+/**
+ * Reconnect pass: only rows created during the outage. Restart pass: only
+ * pushed rows (`delivering`), next-start pass: only `queued` rows, neither
+ * coalesced into an item that already woke the agent.
+ */
 function scopePredicates(scope: PassScope): SQL[] {
-  if (scope.trigger === "sweep") return [];
-  return [sql`${t.createdAt} >= ${new Date(scope.outageStartedAt.getTime() - THIRD_PARTY_EVENT_REDELIVERY_OUTAGE_SLACK_MS)}`];
+  switch (scope.trigger) {
+    case "sweep":
+      return [];
+    case "machine_ready":
+      return [sql`${t.createdAt} >= ${new Date(scope.outageStartedAt.getTime() - THIRD_PARTY_EVENT_REDELIVERY_OUTAGE_SLACK_MS)}`];
+    case "daemon_instance_changed":
+      return [eq(t.status, "delivering"), isNull(t.wakeCoalescedAt)];
+    case "runtime_ready":
+      return [eq(t.status, "queued"), isNull(t.wakeCoalescedAt)];
+  }
 }
 
 /**
- * Pending, in scope, recent enough but older than any park, not excluded, and
- * its wait since the last push is over.
+ * Pending, in scope, recent enough, older than any park (not the restart and
+ * next-start passes: see the header), not excluded, and its wait since the
+ * last push is over (restart pass: last pushed or claimed before the new
+ * daemon connected; next-start pass: claimed or requeued at least once).
  */
 function duePredicates(now: Date, scope: PassScope, excludeEventIds: readonly string[], parkedMaxMs: number): SQL[] {
   const staleBefore = new Date(now.getTime() - THIRD_PARTY_EVENT_REDELIVERY_MAX_AGE_MS);
   const parkCutoff = new Date(now.getTime() - parkedMaxMs - THIRD_PARTY_EVENT_REDELIVERY_PARK_MARGIN_MS);
   const wait = scope.trigger === "machine_ready"
     ? sql`${t.updatedAt} <= ${new Date(now.getTime() - THIRD_PARTY_EVENT_REDELIVERY_GRACE_MS)}`
-    // Exponential: wait at least as long as the row had been pending at its last push.
-    : sql`${t.updatedAt} <= ${now}::timestamptz - greatest(${THIRD_PARTY_EVENT_REDELIVERY_SWEEP_GRACE_MS}::double precision * interval '1 millisecond', ${t.updatedAt} - ${t.createdAt})`;
+    : scope.trigger === "daemon_instance_changed"
+      ? sql`${t.updatedAt} <= ${scope.daemonConnectedAt}`
+      : scope.trigger === "runtime_ready"
+        ? sql`${t.updatedAt} > ${t.createdAt}`
+        // Exponential: wait at least as long as the row had been pending at its last push.
+        : sql`${t.updatedAt} <= ${now}::timestamptz - greatest(${THIRD_PARTY_EVENT_REDELIVERY_SWEEP_GRACE_MS}::double precision * interval '1 millisecond', ${t.updatedAt} - ${t.createdAt})`;
+  // The restart and next-start passes' rows have no parked record left (see the header).
+  const parked = scope.trigger === "machine_ready" || scope.trigger === "sweep";
   return [
     ...pendingPredicates(now),
     ...scopePredicates(scope),
     sql`${t.createdAt} > ${staleBefore}`,
-    sql`${t.createdAt} <= ${parkCutoff}`,
+    ...(parked ? [sql`${t.createdAt} <= ${parkCutoff}`] : []),
     wait,
     ...(excludeEventIds.length > 0 ? [not(inArray(t.id, [...excludeEventIds]))] : []),
   ];
@@ -342,7 +464,7 @@ export type ThirdPartyEventRedeliveryResult = {
   expiredStaleBacklog: number;
   /** Reconnect pass: due outage rows past the per-agent cap, expired. */
   expiredOverCap: number;
-  /** Sweep: due rows past the per-agent cap, left pending for a later pass. */
+  /** Sweep, restart and next-start passes: due rows past the per-agent cap, left pending (sweep: for a later pass; restart: in the agent's inbox; next start: queued, for its next start). */
   deferredOverCap: number;
   /** Re-delivered events the summary rode on (accepted by deliverMessage; the daemon may still drop a copy it has). */
   summaryAttached: number;
@@ -368,7 +490,9 @@ function emptyResult(outcome: ThirdPartyEventRedeliveryResult["outcome"]): Third
 /**
  * One pass over these managed agents (see the header). The caller passes only
  * managed agents on computers whose daemon reports delivered events, and, for
- * the reconnect pass, the outage start (planReconnectRedelivery).
+ * the reconnect pass, the outage start (planReconnectRedelivery); for the
+ * restart pass, when the new daemon instance connected; the next-start pass
+ * gets the one agent whose runtime is ready.
  * `excludeEventIds`: events this replica still re-sends itself (ack-retry
  * record, pending start). `machineId` is a trace attribute.
  */
@@ -418,7 +542,11 @@ export async function redeliverPendingThirdPartyAgentEvents(input: PassScope & {
     return result;
   }
   try {
-    const scope: PassScope = input.trigger === "sweep" ? { trigger: "sweep" } : { trigger: "machine_ready", outageStartedAt: input.outageStartedAt };
+    const scope: PassScope = input.trigger === "sweep" || input.trigger === "runtime_ready"
+      ? { trigger: input.trigger }
+      : input.trigger === "machine_ready"
+        ? { trigger: "machine_ready", outageStartedAt: input.outageStartedAt }
+        : { trigger: "daemon_instance_changed", daemonConnectedAt: input.daemonConnectedAt };
     await runPass(agentIds, scope, input, result, (name, attrs) => span.addEvent(name, attrs));
     span.end("ok", { attrs: endAttrs() });
     return result;
@@ -437,6 +565,8 @@ async function runPass(
 ): Promise<void> {
   const db = getDb();
   const now = input.now ?? currentDate();
+  // Only the reconnect pass expires (and summarises) rows: its outage rows
+  // cannot have reached the computer.
   const reconnect = scope.trigger === "machine_ready";
   const excludeEventIds = input.excludeEventIds ?? [];
   const parkedMaxMs = input.parkedMaxMs ?? DEFAULT_PARKED_MAX_MS;
@@ -495,7 +625,7 @@ async function runPass(
   }
 
   // 3. Over the per-agent cap. Reconnect pass (outage rows only): expired and
-  // summarised. Sweep: left pending, the agent is online and may have them unread.
+  // summarised. Sweep and restart pass: left pending, the agent may have them unread.
   const overCapIds = processed.flatMap((agentId) => byAgent.get(agentId)!.overCap);
   if (overCapIds.length > 0) result.capped = true;
   if (overCapIds.length > 0 && !reconnect) {
@@ -535,8 +665,9 @@ async function runPass(
 
   // 5. Per agent, the events oldest first. Reconnect pass: the summary of what
   // it expired for the agent rides on the first event deliverMessage accepts
-  // (summary_attached: the daemon may still drop that copy). No event
-  // accepted, no summary: the known gap in the header.
+  // (summary_attached: the daemon may still drop that copy); restart pass: the
+  // count of its rows left in the inbox past the cap. No event accepted, no
+  // summary: the known gap in the header.
   const toSend = new Map<string, typeof guarded.deliverable>();
   for (const row of guarded.deliverable) {
     if (!claimedIds.has(row.event.id)) continue;
@@ -544,17 +675,31 @@ async function runPass(
     list.push(row);
     toSend.set(row.event.agentId, list);
   }
-  const summaries = await summariesByAgent(expiredByAgent, [...toSend.keys()]);
+  const deferring = scope.trigger === "daemon_instance_changed" || scope.trigger === "runtime_ready" ? scope.trigger : null;
+  const deferredCount = (agentId: string) => deferring ? byAgent.get(agentId)?.overCap.length ?? 0 : 0;
+  const summaries = deferring
+    ? new Map([...toSend.keys()].flatMap((agentId) => {
+      const line = formatRestartDeferredThirdPartyEvents(deferredCount(agentId), deferring);
+      return line ? [[agentId, line] as const] : [];
+    }))
+    : await summariesByAgent(expiredByAgent, [...toSend.keys()]);
+  // One `sent` event per event sent again: ids, the trigger, the event's age.
+  const sentAttrs = (event: EventRow) => ({
+    third_party_event_id: event.id,
+    agent_id: event.agentId,
+    trigger: scope.trigger,
+    age_ms: Math.max(0, now.getTime() - event.createdAt.getTime()),
+  });
   for (const agentId of processed) {
     let summary = summaries.get(agentId) ?? null;
     for (const row of toSend.get(agentId) ?? []) {
       let delivery: AgentMessageDeliveryResult;
       try {
-        delivery = await input.deliverer.deliverMessage(agentId, buildRedeliveredThirdPartyAgentMessage(row, summary));
+        delivery = await input.deliverer.deliverMessage(agentId, buildRedeliveredThirdPartyAgentMessage(row, summary, scope.trigger));
       } catch (err) {
         result.failed += 1;
         console.warn("[ThirdPartyEventRedelivery] delivery failed", serializeErrorForLog(err));
-        addEvent("server.third_party_event.redeliver.sent", { third_party_event_id: row.event.id, agent_id: agentId, outcome: "failed" });
+        addEvent("server.third_party_event.redeliver.sent", { ...sentAttrs(row.event), outcome: "failed" });
         continue;
       }
       if (delivery.status === "queued") {
@@ -565,6 +710,7 @@ async function runPass(
             third_party_event_id: row.event.id,
             agent_id: agentId,
             expired_count: expiredByAgent.get(agentId)?.length ?? 0,
+            deferred_count: deferredCount(agentId),
           });
           summary = null;
         }
@@ -572,8 +718,7 @@ async function runPass(
         result.dropped += 1;
       }
       addEvent("server.third_party_event.redeliver.sent", {
-        third_party_event_id: row.event.id,
-        agent_id: agentId,
+        ...sentAttrs(row.event),
         outcome: delivery.status,
         reason: delivery.reason,
       });
@@ -608,6 +753,138 @@ async function summariesByAgent(
     if (summary) summaries.set(agentId, summary);
   }
   return summaries;
+}
+
+/**
+ * What a `ready`'s daemon instance is to the machine's marker:
+ * - `changed`: another instance connected last (the daemon restarted or was
+ *   upgraded), and this `ready` swapped the marker to the new one;
+ * - `returned_to_previous`: the instance the marker had just replaced came
+ *   back (A, B, then A again). A daemon instance id is a fresh UUID per daemon
+ *   process, so a restart never brings an old one back: two daemons are
+ *   taking turns on the machine (two installs), and the one coming back has
+ *   lost nothing to a restart. Swapped like `changed`, so the flips that
+ *   follow (B again, A again) are all this, never `changed`;
+ * - `first`: the machine had no marker (its first `ready` since the marker
+ *   exists): recorded, nothing known to compare with;
+ * - `same`: the marker already names this instance (a socket reconnect, or
+ *   another `ready` of the same instance swapped it first).
+ */
+export type DaemonInstanceObservation = "changed" | "returned_to_previous" | "first" | "same";
+
+/**
+ * Records a `ready`'s daemon instance as the machine's last one: one
+ * transaction that locks the machine's marker row (FOR UPDATE), so of two
+ * `ready`s of one new instance, on one replica or two, exactly one sees
+ * `changed` and the other, waiting on the lock, `same`. Throws on a database
+ * error; the caller skips the restart pass then.
+ */
+export async function recordMachineDaemonInstance(input: {
+  machineId: string;
+  daemonInstanceId: string;
+  now?: Date;
+}): Promise<DaemonInstanceObservation> {
+  const m = machineDaemonInstances;
+  const now = input.now ?? currentDate();
+  return getDb().transaction(async (tx) => {
+    const [marker] = await tx.select({ current: m.daemonInstanceId, previous: m.previousDaemonInstanceId })
+      .from(m)
+      .where(eq(m.machineId, input.machineId))
+      .for("update");
+    if (!marker) {
+      // Two first `ready`s at once: the other one's insert wins, this one is that same recording.
+      const inserted = await tx.insert(m)
+        .values({ machineId: input.machineId, daemonInstanceId: input.daemonInstanceId, previousDaemonInstanceId: null, updatedAt: now })
+        .onConflictDoNothing({ target: m.machineId })
+        .returning({ machineId: m.machineId });
+      return inserted.length > 0 ? "first" : "same";
+    }
+    if (marker.current === input.daemonInstanceId) return "same";
+    await tx.update(m)
+      .set({ daemonInstanceId: input.daemonInstanceId, previousDaemonInstanceId: marker.current, updatedAt: now })
+      .where(eq(m.machineId, input.machineId));
+    return marker.previous === input.daemonInstanceId ? "returned_to_previous" : "changed";
+  });
+}
+
+/** Why an id of an `agent:inbox:dropped_app_events` frame was not put back in the queue. */
+export type DroppedAppEventIgnoredReason =
+  | "over_cap"
+  | "invalid_id"
+  | "not_found"
+  | "other_agent"
+  | "not_delivering"
+  | "expired"
+  | "excluded_app";
+
+export type DroppedAppEventsRequeueResult = {
+  outcome: "disabled" | "processed";
+  requeued: string[];
+  ignored: Record<DroppedAppEventIgnoredReason, number>;
+};
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * An `agent:inbox:dropped_app_events` frame: the app events a runtime process
+ * of `agentId` acked and dropped when it ended abnormally go back to `queued`
+ * (wake_coalesced_at unchanged), for the next-start pass (see the header).
+ * The frame comes from a user-controlled machine, and the caller has checked
+ * that `agentId` is assigned to the sending one: only that agent's
+ * `delivering`, unexpired rows move (never system.assistant ones), from the
+ * first AGENT_INBOX_DROPPED_APP_EVENTS_MAX_IDS ids. Every other id is counted
+ * by reason, so a machine can never make the server re-send another agent's
+ * events.
+ */
+export async function requeueDroppedThirdPartyAgentEvents(input: {
+  agentId: string;
+  eventIds: readonly unknown[];
+  now?: Date;
+  env?: NodeJS.ProcessEnv;
+}): Promise<DroppedAppEventsRequeueResult> {
+  const ignored: Record<DroppedAppEventIgnoredReason, number> = {
+    over_cap: 0, invalid_id: 0, not_found: 0, other_agent: 0, not_delivering: 0, expired: 0, excluded_app: 0,
+  };
+  const listed = Array.isArray(input.eventIds) ? input.eventIds : [];
+  ignored.over_cap = Math.max(0, listed.length - AGENT_INBOX_DROPPED_APP_EVENTS_MAX_IDS);
+  const ids = new Set<string>();
+  for (const id of listed.slice(0, AGENT_INBOX_DROPPED_APP_EVENTS_MAX_IDS)) {
+    if (typeof id === "string" && UUID_RE.test(id)) ids.add(id.toLowerCase());
+    else ignored.invalid_id += 1;
+  }
+  if (!isThirdPartyEventRedeliveryEnabled(input.env)) return { outcome: "disabled", requeued: [], ignored };
+  if (ids.size === 0) return { outcome: "processed", requeued: [], ignored };
+  const now = input.now ?? currentDate();
+  const db = getDb();
+  const requeued = (await db.update(t)
+    // Always after created_at, even against a lagging clock: the next-start
+    // pass takes only rows touched since their insert.
+    .set({ status: "queued", updatedAt: sql`greatest(${now}::timestamptz, ${t.createdAt} + interval '1 millisecond')` })
+    .where(and(
+      inArray(t.id, [...ids]),
+      eq(t.agentId, input.agentId),
+      eq(t.status, "delivering"),
+      isNull(t.deliveredAt),
+      sql`${t.expiresAt} > ${now}`,
+      or(isNull(t.systemApp), ne(t.systemApp, EXCLUDED_SYSTEM_APP))!,
+    ))
+    .returning({ id: t.id })).map((row) => row.id);
+  const moved = new Set(requeued);
+  const rest = [...ids].filter((id) => !moved.has(id));
+  if (rest.length > 0) {
+    const rows = await db.select({ id: t.id, agentId: t.agentId, status: t.status, expiresAt: t.expiresAt, systemApp: t.systemApp })
+      .from(t)
+      .where(inArray(t.id, rest));
+    ignored.not_found += rest.length - rows.length;
+    for (const row of rows) {
+      const reason: DroppedAppEventIgnoredReason = row.agentId !== input.agentId ? "other_agent"
+        : row.systemApp === EXCLUDED_SYSTEM_APP ? "excluded_app"
+          : row.status === "delivering" && row.expiresAt <= now ? "expired"
+            : "not_delivering";
+      ignored[reason] += 1;
+    }
+  }
+  return { outcome: "processed", requeued, ignored };
 }
 
 /**

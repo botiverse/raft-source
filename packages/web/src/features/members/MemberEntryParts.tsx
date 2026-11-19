@@ -34,20 +34,6 @@ export function MemberEntryAvatar({ entry, context, badge }: {
   );
 }
 
-/**
- * "(you)" after the viewer's own name. zh writes it in full-width brackets, as
- * the rest of the catalog does (「（你）」); `text-spacing-trim` takes off the
- * opening bracket's built-in half-em, so the gap after the name matches en.
- */
-export function YouSuffix() {
-  const { formatMessage } = useIntl();
-  return (
-    <span className="shrink-0 font-normal text-foreground-hint [text-spacing-trim:trim-start]" data-testid="member-entry-you">
-      {formatMessage({ id: "layout.sidebar.youSuffix" })}
-    </span>
-  );
-}
-
 /** The App tag on an App's identity. */
 export function MemberEntryAppTag({ entry, className = "" }: { entry: MemberEntry; className?: string }) {
   if (entry.kind !== "agent" || !entry.agent.managedByAppInstallId) return null;

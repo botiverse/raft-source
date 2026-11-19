@@ -173,3 +173,83 @@ test("#54: the local RAFT_WAKE_RECYCLE=0 still turns the stop off with the flag 
     await h.cleanup();
   }
 });
+
+// #proj-runtime:#63: Codex's app-server re-downloads its model catalog every
+// 270 s while it lives. An idle Codex process is stopped after
+// IDLE_PROCESS_STOP_MS whatever its context and whatever the Server's flags,
+// and the next start resumes the same thread. RED proof: drop
+// `idleStopCandidate` from `reconcileColdIdle` (or from the sweep) and the
+// process stays.
+const idleStops = (h: Harness) => h.events.filter((event) => event.name === "daemon.agent.idle_process_stop").map((event) => event.attrs);
+
+test("#63: an idle Codex process is stopped after an hour, flags off, and the next start resumes the same thread", async () => {
+  const { h, offset } = await coldIdleHarness();
+  try {
+    await startIdle(h, { runtime: "codex", envVars: null });
+    offset.ms = 30 * 60_000;
+    await sleep(60);
+    assert.deepEqual(idleStops(h), [], "idle half an hour: kept for a fast wake");
+
+    offset.ms = 2 * HOUR_MS;
+    await until(() => idleStops(h).length > 0, "the idle process stop from the sweep");
+    const stop = idleStops(h)[0]!;
+    assert.equal(stop.runtime, "codex");
+    assert.equal(stop.session_id, SESSION_ID);
+    assert.equal(stop.trigger, "sweep");
+    assert.ok(Number(stop.idle_ms) > HOUR_MS);
+    assert.deepEqual(coldStops(h), [], "not a recycle");
+    assert.equal(h.host.owns("agent-1"), false, "the next delivery asks the Server for a start");
+    await h.host.unwound("agent-1");
+    assert.deepEqual(h.framesOf("agent:status").map((frame) => frame.status), ["active"], "a stop on purpose: never reported inactive");
+
+    h.waiting.set("agent-1", ["launch-2"]);
+    assert.deepEqual(await h.host.start(request({ launchId: "launch-2", config: config({ runtime: "codex", envVars: null }), wakeMessage: message("m-2") })), { kind: "started" });
+    assert.equal(h.opened[1]!.options.resume, SESSION_ID, "the same thread, resumed");
+    assert.equal(h.events.some((event) => event.name === "daemon.agent.wake_recycle"), false, "no fresh session");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("#63: RAFT_IDLE_PROCESS_STOP_MS=0 keeps an idle Codex process; other runtimes are never stopped for idling", async () => {
+  for (const overrides of [{ runtime: "codex", envVars: { RAFT_IDLE_PROCESS_STOP_MS: "0" } }, { runtime: "grok", envVars: null }] as const) {
+    const { h, offset } = await coldIdleHarness();
+    try {
+      await startIdle(h, overrides);
+      offset.ms = 2 * HOUR_MS;
+      await sleep(60);
+      assert.deepEqual(idleStops(h), [], `${overrides.runtime}: no idle stop`);
+      assert.equal(h.host.owns("agent-1"), true);
+    } finally {
+      await h.cleanup();
+    }
+  }
+});
+
+test("#63: with wake_recycle_oar on and a small context, the idle stop (not a recycle) ends it and the next start resumes", async () => {
+  const { h, offset } = await coldIdleHarness();
+  try {
+    await startIdle(h, { runtime: "codex", envVars: null, wakeRecycleOar: true });
+    offset.ms = 2 * HOUR_MS;
+    await until(() => idleStops(h).length > 0, "the idle process stop");
+    assert.deepEqual(coldStops(h), [], "below the recycle threshold: no recycle stop");
+    await h.host.unwound("agent-1");
+    h.waiting.set("agent-1", ["launch-2"]);
+    assert.deepEqual(await h.host.start(request({ launchId: "launch-2", config: config({ runtime: "codex", envVars: null, wakeRecycleOar: true }), wakeMessage: message("m-2") })), { kind: "started" });
+    assert.equal(h.opened[1]!.options.resume, SESSION_ID, "the start's recycle decision read the summary and resumed");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("#63: a large-context Codex session with wake_recycle_oar on is recycled, not idle-stopped", async () => {
+  const { h, offset } = await coldIdleHarness();
+  try {
+    await startIdle(h, { runtime: "codex", wakeRecycleOar: true });
+    offset.ms = 2 * HOUR_MS;
+    await until(() => coldStops(h).length > 0, "the cold-idle recycle stop");
+    assert.deepEqual(idleStops(h), [], "the recycle wins");
+  } finally {
+    await h.cleanup();
+  }
+});

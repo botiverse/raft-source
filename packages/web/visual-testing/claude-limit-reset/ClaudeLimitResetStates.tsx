@@ -65,8 +65,8 @@ const RATE_LIMITED_CLIENT = client(async () => {
 
 function noop() {}
 
-const WALL_ACTIONS: SurfaceClaudeLimitReset = { state: "ok", atFiveHourLimit: true, onView: noop, onUseFiveHour: noop };
-const BELOW_ACTIONS: SurfaceClaudeLimitReset = { state: "ok", atFiveHourLimit: false, onView: noop, onUseFiveHour: null };
+const WALL_ACTIONS: SurfaceClaudeLimitReset = { atFiveHourLimit: true, onView: noop, onUseFiveHour: noop };
+const BELOW_ACTIONS: SurfaceClaudeLimitReset = { atFiveHourLimit: false, onView: noop, onUseFiveHour: null };
 
 const NOTE_RESULTS: Record<string, RuntimeLimitResetResult> = {
   "result-success": { kind: "reset" },
@@ -108,6 +108,9 @@ export function ClaudeLimitResetStates({ caseId }: { caseId: string }) {
       return page(<ClaudeLimitResetsDialog serverId="s" machineId="m" atFiveHourLimit client={OK_CLIENT} onUse={noop} onLegacy={noop} onClose={noop} />);
     case "list-below":
       return page(<ClaudeLimitResetsDialog serverId="s" machineId="m" atFiveHourLimit={false} client={OK_CLIENT} onUse={noop} onLegacy={noop} onClose={noop} />);
+    case "list-read-only":
+      // An owner or admin who did not connect the Computer: the same read, nothing to use.
+      return page(<ClaudeLimitResetsDialog serverId="s" machineId="m" atFiveHourLimit={false} canUse={false} client={OK_CLIENT} onUse={noop} onLegacy={noop} onClose={noop} />);
     case "confirm":
       return page(<ClaudeLimitResetConfirmDialog serverId="s" machineId="m" kind="weekly" account={EMAIL} atFiveHourLimit={false} idempotencyKey={KEY} client={OK_CLIENT} onOutcome={noop} onClose={noop} />);
     case "result-refused":

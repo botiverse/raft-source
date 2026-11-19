@@ -64,6 +64,10 @@ export const ACTION_CARD_SECOND_FACTOR: { readonly [T in StoredActionCardActionT
     secondFactor: "none",
     reason: "a confirmed card runs the owner's own route on their own web session, with that route's own checks (its step-ups included); Decline runs nothing",
   },
+  "request:prepare": {
+    secondFactor: "none",
+    reason: "a confirmed card runs the person's own route on their own web session through the route's own middleware (its step-ups included), and its list never holds a security-sensitive route (RFC 085); Decline runs nothing",
+  },
   "agent:approve_call": {
     secondFactor: "approver",
     reason: "lets a hosted agent's held call run with the credentials of its mount; Deny runs nothing and is not gated",

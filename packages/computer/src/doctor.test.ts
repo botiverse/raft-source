@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { redactSecrets, runDoctorChecks } from "./doctor";
 import { runDoctor, runDoctorJson, runDoctorMigrationDetails, renderMigrationDetailsBody } from "./doctorCli";
 import type { LocalCandidateEvidence } from "./lib/types";
+import { DIAGNOSTIC_REDACTION_CREDENTIAL_SAMPLES } from "../../shared/src/test/diagnosticRedactionCredentialSamples";
 import {
   serverAttachmentPath,
   serverConnectedMarkerPath,
@@ -143,6 +144,21 @@ test("redactSecrets: masks sk_* / JWT / long hex", () => {
   assert.equal(redactSecrets(`key=${SECRET_KEY} done`), "key=***REDACTED*** done");
   assert.equal(redactSecrets(`tok ${SECRET_JWT}`), "tok ***REDACTED***");
   assert.equal(redactSecrets("nothing secret here"), "nothing secret here");
+});
+
+// `logs` and `doctor` use the shared credential catalogue: every sample the
+// feedback log tail and the runtime error excerpt mask, masked here too, while
+// paths, emails and URLs stay readable on the owner's own terminal.
+test("redactSecrets: masks every shared credential sample, keeps paths and emails", () => {
+  for (const { label, sample, mustNotContain } of DIAGNOSTIC_REDACTION_CREDENTIAL_SAMPLES) {
+    // URLs are left whole here, as before (a URL's password is a URL rule, not a credential rule).
+    if (label === "URL basic auth" || label === "http password with /") continue;
+    assert.ok(!redactSecrets(sample).includes(mustNotContain), `${label} leaked: ${redactSecrets(sample)}`);
+  }
+  assert.equal(
+    redactSecrets('2026-11-14 [ERROR] 401 {"api_key": "Zq81mNw2Lp0x"} in /home/alice/.raft/x.log for alice@example.test'),
+    '2026-11-14 [ERROR] 401 {"api_key": "***REDACTED***"} in /home/alice/.raft/x.log for alice@example.test',
+  );
 });
 
 test("doctor: fresh home → login + attachments checks fail (actionable)", async () => {
@@ -697,7 +713,8 @@ test("doctor: runner log computer_machine_unlinked rejection gives stale-state r
       assert.match(runner.detail, /raft-computer setup \/android/);
       assert.match(runner.detail, /raft-computer status \/android/);
       assert.doesNotMatch(runner.detail, /back up|move the stale|runner\.state\.json aside/i);
-      assert.doesNotMatch(runner.detail, /database|sql|machine_id/i);
+      // The diagnostics path is the random temp home (mkdtemp can spell "sql"); check the rest.
+      assert.doesNotMatch(runner.detail.replaceAll(home, "<home>"), /database|sql|machine_id/i);
       assert.doesNotMatch(runner.detail, /sk_computer/i);
     } finally {
       await stop(ctx.server);

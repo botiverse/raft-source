@@ -138,3 +138,26 @@ test("isRaftAppHostname: the page's and the deployment's hosts and the fixed def
   assert.equal(isRaftAppHostname("example.com", ["raft.example.com"]), false);
   assert.equal(isRaftAppHostname("app.raft.build.evil.test"), false);
 });
+
+test("a Raft host is the same host with the trailing dots of a fully-qualified name, in any case", () => {
+  for (const host of ["app.raft.build.", "APP.RAFT.BUILD.", "app.raft.build..", "App.Raft.Build"]) {
+    assert.equal(isRaftAppHostname(host), true, host);
+  }
+  // The deployment's own hosts too, however either side is written.
+  assert.equal(isRaftAppHostname("raft.example.com.", ["raft.example.com"]), true);
+  assert.equal(isRaftAppHostname("raft.example.com", ["Raft.Example.com."]), true);
+  assert.equal(isRaftAppHostname("raft.example.com", "raft.example.com."), true);
+  // An outside host stays outside, and nothing but dots is no host.
+  assert.equal(isRaftAppHostname("example.com."), false);
+  assert.equal(isRaftAppHostname("app.raft.build.evil.test."), false);
+  assert.equal(isRaftAppHostname("."), false);
+  assert.equal(isRaftAppHostname("", [".", ""]), false);
+
+  const path = "/s/botiverse/channel/89dce17f-1cd3-4db8-b08f-7b4141004b5a?msg=7556f881-a5f8-4b0d-88dc-8b5af28e8f05";
+  const plain = parseRaftPermalink(`https://app.raft.build${path}`);
+  assert.ok(plain);
+  for (const origin of ["https://app.raft.build.", "https://APP.RAFT.BUILD.", "https://app.raft.build.."]) {
+    assert.deepEqual(parseRaftPermalink(`${origin}${path}`), plain, origin);
+  }
+  assert.equal(parseRaftPermalink(`https://example.com.${path}`), null);
+});

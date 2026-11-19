@@ -132,9 +132,10 @@ export const useWebPreviewStore = create<WebPreviewState>((set, get) => ({
   reload: () => set({ reloads: get().reloads + 1 }),
 }));
 
-// The built-in browser closed (its last tab, or Close): focus goes back to what opened it, as the panel's does.
+// The built-in browser closed (its last tab, or Close): focus goes back to what opened it, as the panel's does. Not
+// while the panel stays on the pinned tabs (the conversation's last own tab closed, or pinned): it is still open.
 useBrowserTabsStore.subscribe((state, previous) => {
-  if (Object.keys(previous.browsers).some((conversationId) => !(conversationId in state.browsers))) takeWebPreviewReturnFocus()?.focus();
+  if (state.pinnedOnly === null && Object.keys(previous.browsers).some((conversationId) => !(conversationId in state.browsers))) takeWebPreviewReturnFocus()?.focus();
 });
 
 /** The attribute a channel panel's body carries: the conversation a web preview opened from inside it goes beside. */

@@ -18,6 +18,7 @@ import { LinkCardActions, LinkCardConfirmDialog } from "./LinkCardActions";
 import { LinkCardElements } from "./LinkCardElements";
 import { appLinkBlockLayout, messageLinkKey, useMessageAppLinkBlocks } from "./useMessageLinkCards";
 import type { AppLinkBlockResult, MessageAppLinkBlocks } from "./useMessageLinkCards";
+import { webLinkProps } from "../../features/webPreview/webLinkRouting";
 
 // Version 3 block cards (RFC 076 §14; DS Navigation › Block cards, raft-ui
 // AppLinkCard): an App's card drawn in the message after its link's paragraph,
@@ -53,7 +54,7 @@ export function AppLinkBlockCard({ result }: { result: AppLinkBlockResult }) {
         <AppLinkCardBody>
           <AppLinkBlockTitle id={titleId} title={result.title} href={href} linkRef={titleLink} />
           <LinkCardBoundary key={JSON.stringify(result.cardV2)}>
-            <LinkCardElements card={result.cardV2} />
+            <LinkCardElements card={result.cardV2} surface="card" />
           </LinkCardBoundary>
         </AppLinkCardBody>
         <LinkCardActions result={result} owner={owner} placement="block" />
@@ -76,7 +77,7 @@ function AppLinkBlockTitle({ id, title, href, linkRef }: { id: string; title: st
   return (
     <Tooltip content={title} disabled={!truncated} triggerProps={SELECTABLE_TRIGGER}>
       <AppLinkCardTitle ref={titleRef} id={id} data-slot="app-link-card-title" data-link-card-title="">
-        <a ref={linkRef} href={href} target="_blank" rel="noopener noreferrer">{title}</a>
+        <a ref={linkRef} href={href} target="_blank" rel="noopener noreferrer" {...webLinkProps}>{title}</a>
       </AppLinkCardTitle>
     </Tooltip>
   );

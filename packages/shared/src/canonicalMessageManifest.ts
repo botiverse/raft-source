@@ -235,8 +235,10 @@ export const CANONICAL_MESSAGE_EXCLUSIONS = Object.freeze({
     // RFC 077: delegatedBy / delegatedByAgentId (sent by an assistant for its owner) ride every
     // message row; promote to canonical when the web / mobile label consumes them. deletedAt
     // (retracted) was promoted to an optionalAggregate canonical field in manifest v7.
-    fields: ["updatedAt", "delegatedBy", "delegatedByAgentId"] as readonly string[],
-    migrationStatus: "web canonical zero-consumption; mobile legacy consumption to retire in round-2 (label/event-key/SQL cache -> (epoch,seq,id/revision) adjudication); RFC 077 delegation fields: web/mobile label pending (Kirby / Lagoon)",
+    // voiceCallId: the Raft voice call that posted the message in the agent's name; read by
+    // agents only (`posted_by=voice_call`); people see the call's own 📞 prefix.
+    fields: ["updatedAt", "delegatedBy", "delegatedByAgentId", "voiceCallId"] as readonly string[],
+    migrationStatus: "web canonical zero-consumption; mobile legacy consumption to retire in round-2 (label/event-key/SQL cache -> (epoch,seq,id/revision) adjudication); RFC 077 delegation fields: web/mobile label pending (Kirby / Lagoon); voiceCallId: agent-facing only, no client label planned",
   }),
   /** Viewer-scoped nested metadata: shared broadcasts strip these; truth comes
    *  only from actor-scoped HTTP / receiver-private surfaces. */

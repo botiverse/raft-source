@@ -33,7 +33,7 @@ const major = match ? Number.parseInt(match[1], 10) : 0;
 if (major < 24) {
   process.stderr.write("Error: Node " + (process.version || "<unknown>") + " is unsupported; raft requires Node >=24 before loading CLI runtime dependencies.\\n");
   process.stderr.write("No network requests, credentials, or local state were touched.\\n");
-  process.stderr.write("Next action: Install/activate Node 24.22.1 (the repository pin), then retry.\\n");
+  process.stderr.write("Next action: Install/activate Node 24.22.3 (the repository pin), then retry.\\n");
   process.exit(1);
 }
 `;

@@ -4852,6 +4852,209 @@
       "when": 1794532243551,
       "tag": "0692_user_notification_followed_thread_replies",
       "breakpoints": true
+    },
+    {
+      "idx": 693,
+      "version": "7",
+      "when": 1794542140123,
+      "tag": "0693_server_members_push_muted_drop",
+      "breakpoints": true
+    },
+    {
+      "idx": 694,
+      "version": "7",
+      "when": 1794548232384,
+      "tag": "0694_oauth_client_uninstalls",
+      "breakpoints": true
+    },
+    {
+      "idx": 695,
+      "version": "7",
+      "when": 1794548257291,
+      "tag": "0695_oauth_client_uninstalls_backfill",
+      "breakpoints": true
+    },
+    {
+      "idx": 696,
+      "version": "7",
+      "when": 1794553972777,
+      "tag": "0696_mcp_template_perplexity",
+      "breakpoints": true
+    },
+    {
+      "idx": 697,
+      "version": "7",
+      "when": 1794565553383,
+      "tag": "0697_agent_call_flag",
+      "breakpoints": true
+    },
+    {
+      "idx": 698,
+      "version": "7",
+      "when": 1794567142328,
+      "tag": "0698_retire_agent_call_flag",
+      "breakpoints": true
+    },
+    {
+      "idx": 699,
+      "version": "7",
+      "when": 1794568294078,
+      "tag": "0699_desktop_browser_raft_sign_in_flag",
+      "breakpoints": true
+    },
+    {
+      "idx": 700,
+      "version": "7",
+      "when": 1794579936862,
+      "tag": "0700_inbox_message_inplace_flag",
+      "breakpoints": true
+    },
+    {
+      "idx": 701,
+      "version": "7",
+      "when": 1794588417291,
+      "tag": "0701_agent_voice_flag",
+      "breakpoints": true
+    },
+    {
+      "idx": 702,
+      "version": "7",
+      "when": 1794596694529,
+      "tag": "0702_agent_voice_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 703,
+      "version": "7",
+      "when": 1794596694530,
+      "tag": "0703_announcement_rules_reach_computer_version",
+      "breakpoints": true
+    },
+    {
+      "idx": 704,
+      "version": "7",
+      "when": 1794647721446,
+      "tag": "0704_announcement_versions",
+      "breakpoints": true
+    },
+    {
+      "idx": 705,
+      "version": "7",
+      "when": 1794650459889,
+      "tag": "0705_card_buttons_per_installation",
+      "breakpoints": true
+    },
+    {
+      "idx": 706,
+      "version": "7",
+      "when": 1794653466712,
+      "tag": "0706_official_registry_unpublished",
+      "breakpoints": true
+    },
+    {
+      "idx": 707,
+      "version": "7",
+      "when": 1794674464199,
+      "tag": "0707_servers_task_v2_on_since",
+      "breakpoints": true
+    },
+    {
+      "idx": 708,
+      "version": "7",
+      "when": 1794679497657,
+      "tag": "0708_computer_upgrade_auto_retry",
+      "breakpoints": true
+    },
+    {
+      "idx": 709,
+      "version": "7",
+      "when": 1794680481821,
+      "tag": "0709_card_encryption_key",
+      "breakpoints": true
+    },
+    {
+      "idx": 710,
+      "version": "7",
+      "when": 1794684663018,
+      "tag": "0710_change_log_tasks",
+      "breakpoints": true
+    },
+    {
+      "idx": 711,
+      "version": "7",
+      "when": 1794685466017,
+      "tag": "0711_onboarding_held_wakes",
+      "breakpoints": true
+    },
+    {
+      "idx": 712,
+      "version": "7",
+      "when": 1794686460227,
+      "tag": "0712_card_encryption_kid_history",
+      "breakpoints": true
+    },
+    {
+      "idx": 713,
+      "version": "7",
+      "when": 1794690061996,
+      "tag": "0713_announcement_followups",
+      "breakpoints": true
+    },
+    {
+      "idx": 714,
+      "version": "7",
+      "when": 1794692229590,
+      "tag": "0714_inbox_row_position_flag",
+      "breakpoints": true
+    },
+    {
+      "idx": 715,
+      "version": "7",
+      "when": 1794694559242,
+      "tag": "0715_session_family_client",
+      "breakpoints": true
+    },
+    {
+      "idx": 716,
+      "version": "7",
+      "when": 1794705185047,
+      "tag": "0716_ffa_server_plan_entitlement_inputs",
+      "breakpoints": true
+    },
+    {
+      "idx": 717,
+      "version": "7",
+      "when": 1794721346730,
+      "tag": "0717_agent_voice_calls",
+      "breakpoints": true
+    },
+    {
+      "idx": 718,
+      "version": "7",
+      "when": 1794749330988,
+      "tag": "0718_machine_daemon_instances",
+      "breakpoints": true
+    },
+    {
+      "idx": 719,
+      "version": "7",
+      "when": 1794754694838,
+      "tag": "0719_third_party_agent_events_consumed_via_acted",
+      "breakpoints": true
+    },
+    {
+      "idx": 720,
+      "version": "7",
+      "when": 1794759071523,
+      "tag": "0720_change_log_guest_access_trigger_drop",
+      "breakpoints": true
+    },
+    {
+      "idx": 721,
+      "version": "7",
+      "when": 1794790564523,
+      "tag": "0721_messages_voice_call_id",
+      "breakpoints": true
     }
   ]
 }

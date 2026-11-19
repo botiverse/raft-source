@@ -113,6 +113,8 @@ export type AgentActionRequiredNotice =
   | { kind: "computer_detach_requested"; computerName: string }
   | { kind: "handed_over"; deletedName: string; machineCleared: boolean; hosted: boolean }
   | { kind: "inbox_push_paused"; cause: AgentInboxPushPausedCause }
+  /** #proj-runtime:#62: the repeated-wake guard stopped the agent's process; `messageRef` names the message (a `#channel msg=` ref), null when it can't. */
+  | { kind: "repeated_wake_stopped"; emptyTurns: number; messageRef: string | null; excluded: boolean }
   | {
     kind: "automatic_wake_paused";
     earlyExits: number;
@@ -176,6 +178,8 @@ export async function postAgentActionRequiredNotice(
           ? agentInboxPushPausedNoticeText({ agentName: agent.name, cause: notice.cause, agentUrl })
         : notice.kind === "automatic_wake_paused"
           ? agentAutomaticWakePausedNoticeText({ agentName: agent.name, ...notice, agentUrl })
+        : notice.kind === "repeated_wake_stopped"
+          ? agentRepeatedWakeStoppedNoticeText({ agentName: agent.name, ...notice, agentUrl })
         : notice.kind === "readiness_blocked"
           ? agentReadinessBlockedNoticeText({ ...notice, agentUrl: notice.agentNames.length <= 1 ? agentUrl : null })
         : agentRuntimeUnavailableNoticeText({ agentName: agent.name, runtime: notice.runtime, computerName: machine?.name ?? null, agentUrl }),
@@ -195,6 +199,8 @@ export async function postAgentActionRequiredNotice(
             ? "the agent's inbox push stopped; its runtime is not woken for new messages until push resumes"
           : notice.kind === "automatic_wake_paused"
             ? "the agent exited early several times in a row; automatic wakes are paused"
+          : notice.kind === "repeated_wake_stopped"
+            ? "the agent kept being woken by one message without doing anything; Raft stopped its process and no longer offers it that message"
           : notice.kind === "pause_retry_capped"
             ? "the agent's runtime keeps failing; automatic wakes are paused and Raft keeps trying again by itself"
           : notice.kind === "readiness_blocked"
@@ -392,6 +398,29 @@ export function agentAutomaticWakePausedNoticeText(input: {
     hasTasks
       ? "Restarting it from its page resumes automatic wakes. Its tasks can be reassigned."
       : "Restarting it from its page resumes automatic wakes.",
+    ...(input.agentUrl ? [`Agent page: ${input.agentUrl}`] : []),
+  ].join("\n");
+}
+
+/**
+ * `repeated_wake_stopped` (#proj-runtime:#62, agentRepeatedWakeGuard.ts):
+ * what happened, which message, that nothing is lost, what still wakes it
+ * and how to hand it the message again.
+ */
+export function agentRepeatedWakeStoppedNoticeText(input: {
+  agentName: string;
+  emptyTurns: number;
+  messageRef: string | null;
+  /** Raft no longer offers the message on its own (a delivery or a wake); false for an unread backlog, which keeps flowing. */
+  excluded: boolean;
+  agentUrl: string | null;
+}): string {
+  const that = input.messageRef ? `That message (${input.messageRef}) stays unread` : "That message stays unread";
+  return [
+    `Raft stopped @${input.agentName}: it was woken ${input.emptyTurns} times in a row by the same message and did nothing with it.`,
+    input.excluded
+      ? `${that}, and Raft no longer offers it to the agent until you start the agent from its page. New messages still wake it as usual.`
+      : `${that}. New messages still wake it as usual; if it keeps getting stuck, start it again from its page.`,
     ...(input.agentUrl ? [`Agent page: ${input.agentUrl}`] : []),
   ].join("\n");
 }

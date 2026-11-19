@@ -123,6 +123,12 @@ export function summarizeAgentMigrationTransfer(input: {
    * add `excludedIgnoredBySource`. An older Server's strict schema rejects it.
    */
   reportIgnoredBySource?: boolean;
+  /**
+   * The ignored totals are a lower bound (sizing stopped early) and both ends
+   * accept SERVER_CAPABILITY_MIGRATION_IGNORED_PARTIAL_V1: add
+   * `excludedIgnoredPartial`. An older Server's strict schema rejects it.
+   */
+  ignoredPartial?: boolean;
 }): AgentMigrationTransferSummary {
   const excludedRegenerableByCategory = {
     thirdPartyDependencies: 0,
@@ -154,7 +160,10 @@ export function summarizeAgentMigrationTransfer(input: {
     // Only present when something was ignored, so a summary without ignores
     // stays readable by servers that predate the field.
     ...(input.excludedIgnored && input.excludedIgnored.length > 0
-      ? summarizeExcludedIgnored(input.excludedIgnored, input.reportIgnoredBySource === true)
+      ? {
+        ...summarizeExcludedIgnored(input.excludedIgnored, input.reportIgnoredBySource === true),
+        ...(input.ignoredPartial === true ? { excludedIgnoredPartial: true as const } : {}),
+      }
       : {}),
   });
 }
@@ -277,8 +286,8 @@ export interface AgentMigrationWorkspaceListing {
  * Walks the workspace with the same exclusions as an export (built-in
  * regenerable directories, the ignore files) and hands each file or
  * symlink path to `onEntry` in a fixed order, without reading anything or
- * keeping a per-file list. `measureIgnored: false` skips sizing ignored paths
- * on a repeat walk.
+ * keeping a per-file list. `measureIgnored: false` records ignored paths
+ * without sizing them (startMeasuringAgentMigrationIgnoredEntries does that apart).
  */
 export async function listAgentMigrationWorkspace(input: {
   workspacePath: string;
@@ -299,11 +308,7 @@ export async function listAgentMigrationWorkspace(input: {
     onProgress: input.onProgress,
     onEntry: input.onEntry,
     measureIgnored: input.measureIgnored ?? true,
-    ignoredFilesMeasured: 0,
-    ignoredFileMeasureLimit: Math.min(
-      input.ignoredFileMeasureLimit ?? MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT,
-      MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT,
-    ),
+    ignoredMeasure: { measured: 0, limit: ignoredFileMeasureLimit(input.ignoredFileMeasureLimit) },
   };
   await walkWorkspace(workspace, "", state);
   return {
@@ -322,16 +327,9 @@ interface BuildState {
   progress: { files: number; bytes: number };
   onProgress?: (progress: AgentMigrationExportProgress) => void;
   onEntry: (relativePath: string) => Promise<void> | void;
-  /** Count and size ignored paths (skipped by a repeat walk). */
+  /** Count and size ignored paths during the walk; false records them at zero. */
   measureIgnored?: boolean;
-  /**
-   * Files counted so far across every ignored path. Measuring stops at the
-   * summary's bound (MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT), one total
-   * for all paths: a count equal to the bound reads "at least this many". Only
-   * the measuring stops; the paths stay excluded whole.
-   */
-  ignoredFilesMeasured: number;
-  ignoredFileMeasureLimit: number;
+  ignoredMeasure: IgnoredMeasureBudget;
 }
 
 /** Top-level workspace path an entry is accounted under: `name` or `dir/`. */
@@ -594,8 +592,10 @@ function isAlwaysMovedPath(relativePath: string): boolean {
 }
 
 /**
- * Records an ignored path with its size and file count (lstat only, symlinks
- * are not followed).
+ * Records an ignored path, with its size and file count when this walk
+ * measures them (lstat only, symlinks are not followed). A walk that does not
+ * measure records it at zero; startMeasuringAgentMigrationIgnoredEntries sizes
+ * it later, off the walk.
  */
 async function excludeIgnoredPath(
   relativePath: string,
@@ -603,36 +603,12 @@ async function excludeIgnoredPath(
   match: AgentMigrationIgnoreMatch,
   state: BuildState,
 ): Promise<void> {
-  if (state.measureIgnored === false) return;
-  const totals = { fileCount: 0, sizeBytes: 0 };
-  const visit = async (entryPath: string, directory: boolean): Promise<void> => {
-    // The bound is reached: stop measuring (a huge ignored node_modules would
-    // otherwise be lstat'ed file by file only to overflow the summary).
-    if (state.ignoredFilesMeasured >= state.ignoredFileMeasureLimit) return;
-    if (!directory) {
-      try {
-        const entryStat = await lstat(path.join(state.workspace, entryPath));
-        totals.fileCount += 1;
-        state.ignoredFilesMeasured += 1;
-        totals.sizeBytes += entryStat.isFile() ? entryStat.size : 0;
-      } catch {
-        // Vanished while walking: nothing to move or count.
-      }
-      reportScanProgress(state, 1, 0);
-      return;
-    }
-    let children;
-    try {
-      children = await readdir(path.join(state.workspace, entryPath), { withFileTypes: true });
-    } catch {
-      state.unreachable.push({ path: entryPath, reason: "read_error" });
-      return;
-    }
-    for (const child of children) {
-      await visit(toPosixPath(path.join(entryPath, child.name)), child.isDirectory());
-    }
-  };
-  await visit(relativePath, isDirectory);
+  const totals = state.measureIgnored === false
+    ? { fileCount: 0, sizeBytes: 0 }
+    : await measureIgnoredPath(state.workspace, relativePath, isDirectory, state.ignoredMeasure, {
+      onFile: () => reportScanProgress(state, 1, 0),
+      onUnreachable: (entryPath) => state.unreachable.push({ path: entryPath, reason: "read_error" }),
+    });
   state.excludedIgnored.push({
     path: relativePath,
     reason: "raftmigrateignore",
@@ -640,6 +616,123 @@ async function excludeIgnoredPath(
     wildcard: match.wildcard,
     ...totals,
   });
+}
+
+/**
+ * Files counted so far across every ignored path. Measuring stops at the
+ * summary's bound (MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT), one total
+ * for all paths: a count equal to the bound reads "at least this many". Only
+ * the measuring stops; the paths stay excluded whole.
+ */
+interface IgnoredMeasureBudget {
+  measured: number;
+  limit: number;
+  /** Set when a file went uncounted because the bound was reached. */
+  cut?: boolean;
+  signal?: AbortSignal;
+}
+
+async function measureIgnoredPath(
+  workspace: string,
+  relativePath: string,
+  isDirectory: boolean,
+  budget: IgnoredMeasureBudget,
+  hooks: { onFile?: () => void; onUnreachable?: (entryPath: string) => void } = {},
+  // Updated as it goes, so a caller that stops waiting reads what is counted.
+  totals: { fileCount: number; sizeBytes: number } = { fileCount: 0, sizeBytes: 0 },
+): Promise<{ fileCount: number; sizeBytes: number }> {
+  const visit = async (entryPath: string, directory: boolean): Promise<void> => {
+    // The bound is reached, or the caller stopped waiting: stop measuring (a
+    // huge ignored node_modules would otherwise be lstat'ed file by file only
+    // to overflow the summary).
+    if (budget.measured >= budget.limit) {
+      budget.cut = true;
+      return;
+    }
+    if (budget.signal?.aborted) return;
+    if (!directory) {
+      try {
+        const entryStat = await lstat(path.join(workspace, entryPath));
+        if (budget.signal?.aborted) return;
+        totals.fileCount += 1;
+        budget.measured += 1;
+        totals.sizeBytes += entryStat.isFile() ? entryStat.size : 0;
+      } catch {
+        // Vanished while walking: nothing to move or count.
+      }
+      hooks.onFile?.();
+      return;
+    }
+    let children;
+    try {
+      children = await readdir(path.join(workspace, entryPath), { withFileTypes: true });
+    } catch {
+      hooks.onUnreachable?.(entryPath);
+      return;
+    }
+    for (const child of children) {
+      await visit(toPosixPath(path.join(entryPath, child.name)), child.isDirectory());
+    }
+  };
+  await visit(relativePath, isDirectory);
+  return totals;
+}
+
+/** Ignored paths being sized apart from the walk (startMeasuringAgentMigrationIgnoredEntries). */
+export interface AgentMigrationIgnoredMeasurement {
+  /** What is counted so far: every ignored path, in the walk's order, each a lower bound until `complete`. */
+  snapshot(): { entries: AgentMigrationExcludedIgnoredEntry[]; complete: boolean };
+  /** Settles when measuring ends: every path sized, the bound reached, or stopped. Never rejects. */
+  readonly finished: Promise<void>;
+}
+
+/**
+ * Starts sizing the ignored paths a walk with `measureIgnored: false` recorded
+ * at zero, in the walk's order and under the same one bound. Totals grow in
+ * place, so `snapshot()` can be read at any time without waiting on the file
+ * system; once `signal` aborts, nothing more is counted, even from a call that
+ * was already under way. Nothing under an ignored path is read or moved; this
+ * only counts.
+ */
+export function startMeasuringAgentMigrationIgnoredEntries(input: {
+  workspacePath: string;
+  excludedIgnored: AgentMigrationExcludedIgnoredEntry[];
+  signal?: AbortSignal;
+  /** Tests only: a smaller bound than the summary's. */
+  ignoredFileMeasureLimit?: number;
+}): AgentMigrationIgnoredMeasurement {
+  const workspace = path.resolve(input.workspacePath);
+  const budget: IgnoredMeasureBudget = {
+    measured: 0,
+    limit: ignoredFileMeasureLimit(input.ignoredFileMeasureLimit),
+    signal: input.signal,
+  };
+  const entries = input.excludedIgnored.map((entry) => ({ ...entry, fileCount: 0, sizeBytes: 0 }));
+  let done = false;
+  const finished = (async () => {
+    for (const entry of entries) {
+      if (input.signal?.aborted) return;
+      const isDirectory = await lstat(path.join(workspace, entry.path))
+        .then((entryStat) => entryStat.isDirectory())
+        .catch(() => false);
+      await measureIgnoredPath(workspace, entry.path, isDirectory, budget, {}, entry);
+    }
+    done = !input.signal?.aborted;
+  })().catch(() => undefined);
+  return {
+    snapshot: () => ({
+      entries: entries.map((entry) => ({ ...entry })),
+      complete: done && !budget.cut,
+    }),
+    finished,
+  };
+}
+
+function ignoredFileMeasureLimit(requested: number | undefined): number {
+  return Math.min(
+    requested ?? MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT,
+    MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT,
+  );
 }
 
 export async function sha256File(filePath: string): Promise<string> {

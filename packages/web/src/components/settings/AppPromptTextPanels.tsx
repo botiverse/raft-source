@@ -173,9 +173,8 @@ export function MarketplacePromptTextReview({
             <FormField
               label={formatMessage({ id: "appPromptText.rejectReasonLabel" })}
               hint={formatMessage({ id: "appPromptText.rejectReasonHint" })}
-              required
             >
-              <Textarea value={reason} onChange={handleReasonChange} rows={3} maxLength={2000} className="resize-none" data-testid="app-prompt-text-reject-reason" />
+              <Textarea aria-required="true" value={reason} onChange={handleReasonChange} rows={3} maxLength={2000} className="resize-none" data-testid="app-prompt-text-reject-reason" />
             </FormField>
           )}
           confirmLabel={formatMessage({ id: "appPromptText.rejectConfirm" })}

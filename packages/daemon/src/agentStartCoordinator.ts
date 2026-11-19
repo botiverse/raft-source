@@ -1,6 +1,15 @@
 import type { AgentConfig, AgentMessage, TraceContext } from "@botiverse/raft-shared";
 import type { RecoveryGrant } from "./runtimeOutcomeOutbox";
 
+/**
+ * How a start ended for its caller. `cancelled`: a stop of the agent or the
+ * daemon's shutdown ended it before any process existed, so nothing it carried
+ * (a wake message, buffered deliveries) reached the agent. `started`: every
+ * other end: a spawn, a start joined to one already running, starting or
+ * queued, or a start held or deferred with its messages kept.
+ */
+export type AgentStartOutcome = "started" | "cancelled";
+
 export type AgentStartQueueItem = {
   agentId: string;
   startDispatchId?: string;
@@ -24,7 +33,7 @@ export type AgentStartQueueItem = {
   // Trace parent of the request that asked for this start. The spawn span
   // is created under it, even when the start waits in the queue.
   traceParent?: TraceContext | null;
-  resolve: () => void;
+  resolve: (outcome: AgentStartOutcome) => void;
   reject: (err: unknown) => void;
 };
 

@@ -24,7 +24,7 @@ import { ensureLocalAppSourceInstallation } from "./appSourceInstallationService
 import * as integrationAuditService from "./integrationAuditService";
 import { announcePermissionUpdatesChanged, announcePermissionUpdatesForApp } from "./listChangedRealtime";
 import { oauthClientIsUserManagedPredicate } from "./oauthClientManagementPolicy";
-import { isApprovedOfficialAppClient } from "./officialAppAutoInstallService";
+import { hasOfficialAppRegistryEntry, isApprovedOfficialAppClient } from "./officialAppAutoInstallService";
 
 export const APP_OUTBOUND_GROUPS = APP_NOTIFICATION_GROUPS;
 /** The group-gated events: what an App declares and an installer approves. */
@@ -182,9 +182,12 @@ export async function createAppOutboundPermissionRevision(input: {
       ...difference(requested.groups, priorGroups),
       ...difference(requested.events, priorEvents),
     ];
-    const requiresReview = client.appType === "third_party_global"
-      && (client.publishStatus === "published" || client.publishStatus === "unpublish_requested")
-      && additions.length > 0;
+    // Reviewed when published, or once the App has an official registry
+    // entry: official no longer needs the App published (#proj-apps:#71).
+    const requiresReview = additions.length > 0
+      && client.appType === "third_party_global"
+      && (client.publishStatus === "published" || client.publishStatus === "unpublish_requested"
+        || await hasOfficialAppRegistryEntry(client.id, tx));
     const currentGroups = requiresReview ? survivingGroups : requested.groups;
     const currentEvents = requiresReview ? survivingEvents : requested.events;
     const revision = client.revision + 1;

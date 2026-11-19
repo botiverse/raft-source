@@ -3,17 +3,16 @@ import { useIntl } from "react-intl";
 import { Send, User } from "lucide-react";
 import { channelIconComponent } from "../components/channel/channelIconComponent";
 import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogBody,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
   Banner,
   Button,
+  Dialog,
+  DialogBody,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
   MessageActionCard,
   MessageActionCardActions,
   MessageActionCardCollapseTrigger,
@@ -102,7 +101,8 @@ type Canonical = { channelId?: string; targetMessageId?: string; canonicalTarget
  * where the message went, with the channel as a link; the message's first
  * line is under it, with Open Message. While the server says it can still be
  * retracted, Retract Message asks first: retracting can't be undone, so the
- * dialog is red (DS AlertDialog). Once retracted the card folds to its header,
+ * dialog is red (DS Dialog at size sm; AlertDialog is only for the
+ * confirmations Raft Chat lists). Once retracted the card folds to its header,
  * marked Retracted, and stays as the record.
  */
 export function DelegatedReceiptCard({ message, receipt, time }: {
@@ -268,26 +268,27 @@ export function DelegatedReceiptCard({ message, receipt, time }: {
         </MessageActionCardContent>
       </MessageActionCard>
 
-      <AlertDialog open={confirming} onOpenChange={handleConfirmOpenChange}>
-        <AlertDialogContent data-testid="delegated-receipt-confirm">
-          <AlertDialogHeader>
-            <AlertDialogTitle>{formatMessage({ id: "assistant.receipt.retractTitle" })}</AlertDialogTitle>
-          </AlertDialogHeader>
-          <AlertDialogBody className="grid gap-3">
+      <Dialog open={confirming} onOpenChange={handleConfirmOpenChange}>
+        <DialogContent size="sm" data-testid="delegated-receipt-confirm">
+          <DialogHeader>
+            <DialogTitle>{formatMessage({ id: "assistant.receipt.retractTitle" })}</DialogTitle>
+            <DialogClose disabled={retracting} aria-label={formatMessage({ id: "common.confirm.closeDialog" })} />
+          </DialogHeader>
+          <DialogBody className="grid gap-3">
             {retractFailed ? (
               <Banner status="warning" size="sm" role="alert" data-testid="delegated-receipt-retract-error">
                 {formatMessage({ id: "assistant.receipt.retractFailed" })}
               </Banner>
             ) : null}
             <Banner status="destructive" size="sm">
-              <AlertDialogDescription>{formatMessage({ id: "assistant.receipt.retractBody" })}</AlertDialogDescription>
+              <DialogDescription>{formatMessage({ id: "assistant.receipt.retractBody" })}</DialogDescription>
             </Banner>
-          </AlertDialogBody>
-          <AlertDialogFooter>
-            <AlertDialogCancel size="lg" disabled={retracting}>
+          </DialogBody>
+          <DialogFooter>
+            <DialogClose render={<Button variant="ghost" size="lg" />} disabled={retracting}>
               {formatMessage({ id: "assistant.receipt.cancel" })}
-            </AlertDialogCancel>
-            <AlertDialogAction
+            </DialogClose>
+            <Button
               variant="danger"
               size="lg"
               disabled={retracting}
@@ -295,10 +296,10 @@ export function DelegatedReceiptCard({ message, receipt, time }: {
               data-testid="delegated-receipt-retract-confirm"
             >
               {formatMessage({ id: retracting ? "assistant.receipt.retracting" : "assistant.receipt.confirmRetract" })}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

@@ -1,3 +1,4 @@
+import { redactDiagnosticCredentials } from "./diagnosticRedaction";
 import type { RuntimeErrorClass, RuntimeErrorRequiredAction } from "./index";
 
 /**
@@ -29,15 +30,22 @@ import type { RuntimeErrorClass, RuntimeErrorRequiredAction } from "./index";
 // retried every word boundary and every split of a long run with no assignment
 // after it (`TOKEN-TOKEN-...`): cubic, seconds for 10 KB.
 const SECRET_ASSIGNMENT_KEY_PATTERN =
-  /(?<![A-Za-z0-9._-])(?=[A-Za-z0-9._-]*(?:API[_-]?KEY|SECRET|TOKEN|PASSWORD|PASSWD|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|PRIVKEY|CREDENTIAL))([A-Za-z0-9._-]+)\s*(?:=|:)\s*("[^"]*(?:"|$)|'[^']*(?:'|$)|[^\s;,"'<>]+)/gi;
+  /(?<![A-Za-z0-9._-])(?=[A-Za-z0-9._-]*(?:API[_-]?KEY|SECRET|TOKEN|PASSWORD|PASSWD|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|PRIVKEY|CREDENTIAL))([A-Za-z0-9._-]+)\s*(?:=|:)\s*(?!\[REDACTED_TOKEN\])("[^"]*(?:"|$)|'[^']*(?:'|$)|[^\s;,"'<>]+)/gi;
 // The value: quoted, bare, or an opening quote with no closing one, which
 // runs to the end of the text (a cut text can end inside a quoted secret, and
 // the bare form excludes quotes, so `password: "correct horse` would match
 // nothing and be shown).
+// A value already masked is left to the generic pass below, which keeps its
+// `key: ` as written: rewriting it to `key=` made a second scrub of
+// `password: [REDACTED_TOKEN]` (from `password: <hunter2>` or a YAML
+// `password: >-`) differ from the first.
 //
 // An address, its local part read from the start of its run only (as above:
 // `\b` retried every dot of `a.a.a...`, quadratic).
-const EMAIL_PATTERN = /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
+// Not this scrubber's own encoded URL password (`%5BREDACTED_PASSWORD%5D@host.tld`,
+// from a password with a `/` masked before the URL pass): rereading it as an
+// email changed the text on a second scrub.
+const EMAIL_PATTERN = /(?<![A-Za-z0-9._%+-])(?!%5BREDACTED_)[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
 // GitHub token family (ghp/gho/ghs/ghu/ghr), bare and not caught by the URL/
 // path redactors. Also npx/npm-style auth tokens and the common `github_pat_`
 // personal-access-token prefix, all of which are credential-shaped bare text.
@@ -63,7 +71,10 @@ function redactUrlQuery(value: string): string {
 
 /** Redact credentials, emails, URL queries and home-directory paths from runtime error text. Idempotent. */
 export function scrubRuntimeErrorText(value: string): string {
-  let scrubbed = String(value ?? "")
+  // Connection-string passwords and YAML block secrets first: the passes below
+  // would read `pw@host.tld` as an email (leaving a password's part before a
+  // `/` visible) and rewrite `secret: |` to `secret=[…]`, leaving the block.
+  let scrubbed = redactDiagnosticCredentials(String(value ?? ""), { mask: "[REDACTED_TOKEN]", hexBlobs: false, structuralOnly: true })
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer [REDACTED_TOKEN]")
     .replace(/\b(?:sk|sk-ant|sk-proj|xox[baprs]?)-[A-Za-z0-9_-]{8,}\b/g, "[REDACTED_TOKEN]")
     .replace(EMAIL_PATTERN, "[REDACTED_EMAIL]")
@@ -76,7 +87,15 @@ export function scrubRuntimeErrorText(value: string): string {
   // Generic credential assignment (password/secret/token = value): redact value.
   scrubbed = scrubbed.replace(GENERIC_CREDENTIAL_ASSIGNMENT_PATTERN, (_m, prefix: string) => `${prefix}[REDACTED_TOKEN]`);
   // GitHub token family + github_pat_.
-  return scrubbed.replace(GITHUB_TOKEN_FAMILY_PATTERN, "[REDACTED_TOKEN]");
+  scrubbed = scrubbed.replace(GITHUB_TOKEN_FAMILY_PATTERN, "[REDACTED_TOKEN]");
+  // Then the shared credential catalogue (diagnosticRedaction), the same rules
+  // the feedback log tail and `raft-computer logs` apply: JSON-quoted secret
+  // keys, `Authorization: Basic`, bare JWTs, AWS/Google keys and OAuth tokens,
+  // `--api-key <v>` flags, Raft keys. The passes above only set this text's
+  // format (labels kept, `[REDACTED_*]` markers); a new credential shape goes
+  // into the catalogue, not here. 40-hex runs stay: here they are commit and
+  // request ids, never masked on this surface.
+  return redactDiagnosticCredentials(scrubbed, { mask: "[REDACTED_TOKEN]", hexBlobs: false });
 }
 
 /** #688 bounded-diagnostic half: the most characters of runtime error text any user-visible surface carries. */

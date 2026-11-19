@@ -55,6 +55,7 @@ import {
 import { getAttachmentsForMessagesWithExecutor } from "../services/attachmentLinkingService";
 import { getStorage, isStorageNotFoundError } from "../services/storageService";
 import { streamStorageResponse } from "../services/storageResponseStream";
+import { parseThreadPreviewChars, THREAD_PREVIEW_CHARS_PARAM } from "../services/threadReplyPreview";
 import {
   isTranslationProviderConfigured,
   translatePublicMessagesBatch,
@@ -181,10 +182,12 @@ export async function loadPublicThreadPreviews(
   serverId: string,
   parentMessageIds: string[],
   traceQuery?: DbQueryTracer,
+  previewChars?: number,
 ) {
   if (parentMessageIds.length === 0) return {};
   return channelService.getThreadSummaries(channelId, {
     parentMessageIds,
+    previewChars,
     parentMessageScopeSource: "messages_page",
     includeParticipants: false,
     // Reply agents resolve like the parent rows in listPublicMessages: only
@@ -393,7 +396,7 @@ function publicAgentAvatarUrl(avatarUrl: string | null, serverId: string): strin
   return isStoredServerScopedAvatarUrl(avatarUrl, serverId) || isPublicPixelAvatarUrl(avatarUrl) ? avatarUrl : null;
 }
 
-async function listPublicMessages(channelId: string, serverId: string, limit: number, beforeMessageId?: string) {
+async function listPublicMessages(channelId: string, serverId: string, limit: number, beforeMessageId?: string, previewChars?: number) {
   const conditions = [eq(messages.channelId, channelId)];
   if (beforeMessageId !== undefined) {
     const [cursor] = await getDb()
@@ -442,7 +445,7 @@ async function listPublicMessages(channelId: string, serverId: string, limit: nu
     .limit(limit);
   const messageIds = rows.map((row) => row.id);
   const [summaries, attachmentsByMessage, mentionsByMessage, reactionsByMessage] = await Promise.all([
-    loadPublicThreadPreviews(channelId, serverId, messageIds),
+    loadPublicThreadPreviews(channelId, serverId, messageIds, undefined, previewChars),
     loadPublicAttachments(messageIds),
     loadPublicMentions(rows, serverId),
     loadPublicReactions(messageIds),
@@ -486,6 +489,7 @@ async function listPublicMessages(channelId: string, serverId: string, limit: nu
       messageId: reply.messageId,
       seq: reply.seq,
       preview: reply.preview,
+      ...(reply.truncated ? { truncated: true as const } : {}),
       senderType: reply.senderType,
       senderName: reply.senderDisplayName,
       senderAvatarUrl: reply.senderType === "user"
@@ -815,7 +819,10 @@ publicServerRouter.get("/servers/:slug/channels/:channelId/messages", async (req
       return;
     }
 
-    const rows = await listPublicMessages(channel.id, channel.serverId, limit, beforeMessageId);
+    const rows = await listPublicMessages(
+      channel.id, channel.serverId, limit, beforeMessageId,
+      parseThreadPreviewChars(req.query[THREAD_PREVIEW_CHARS_PARAM]),
+    );
     if (!rows) {
       res.status(404).json({ error: "Not found" });
       return;

@@ -642,7 +642,6 @@ export async function retireStagingSelfAccount(userId: string, actorUserId: stri
     const [updated] = await tx.update(users)
       .set({ retiredAt: now, retiredReason: "staging_self_account", traceUserId: sql`gen_random_uuid()` })
       .where(and(eq(users.id, userId), isNull(users.retiredAt))).returning({ id: users.id });
-    forgetTraceUserId(userId);
     if (!updated) {
       const [raceReceipt] = await tx.select().from(userRetirementReceipts)
         .where(eq(userRetirementReceipts.userId, userId)).limit(1);
@@ -661,6 +660,10 @@ export async function retireStagingSelfAccount(userId: string, actorUserId: stri
     }).onConflictDoNothing().returning();
     return receipt ?? null;
   });
+  // After the commit, not inside the transaction: a trace_user_id load that
+  // ran between a forget and the commit would read the old value and cache it
+  // again for a whole TTL. (Harmless when the account was already retired.)
+  forgetTraceUserId(userId);
   try {
     await revokeSocketAccess({ userId });
   } finally {

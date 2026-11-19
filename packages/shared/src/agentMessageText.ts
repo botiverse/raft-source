@@ -137,6 +137,12 @@ export interface AgentMessageLike {
   sender_timezone?: string | null;
   /** RFC 077: the personal assistant that sent this as its owner (the sender). */
   delegated_by?: { name: string } | null;
+  /**
+   * Raft voice calls: posted in the sender agent's name by something else
+   * (`voice_call`: the voice model, steered by the caller). Rendered
+   * `posted_by=voice_call`, so an agent never takes it for its own words.
+   */
+  posted_by?: string | null;
   /** RFC 082: a card message's revision, when it last changed, and the card's text (markdown); the body is its fallback text. */
   message_card?: AgentMessageCardMarker | null;
   content?: string;
@@ -438,7 +444,8 @@ export function formatAgentMessageLine(m: AgentMessageLike, style: RaftHintStyle
   const msgId = m.message_id ? m.message_id.slice(0, 8) : "-";
   const time = m.timestamp ? formatUtcTimestamp(m.timestamp) : "-";
   // RFC 077: sent by an assistant as its owner (the sender); never hidden.
-  const senderType = ` type=${m.sender_type}${m.delegated_by?.name ? ` delegated_by=@${m.delegated_by.name}` : ""}${formatAgentMessageCardHeaderFields(m.message_card)}`;
+  // Raft voice calls: posted in the sender's name by its voice call; never hidden.
+  const senderType = ` type=${m.sender_type}${m.delegated_by?.name ? ` delegated_by=@${m.delegated_by.name}` : ""}${formatAgentPostedByHeaderField(m.posted_by)}${formatAgentMessageCardHeaderFields(m.message_card)}`;
   const content = indentAgentBodyContinuationLines(m.content ?? "");
   const attachSuffix = formatAgentAttachmentSuffix(m.attachments, style);
   // Task v2 (source_tasks present): the list of every task hanging under the
@@ -451,6 +458,16 @@ export function formatAgentMessageLine(m: AgentMessageLike, style: RaftHintStyle
       : "";
   const taskReplySuffix = options.omitTaskReplyHint ? "" : formatAgentTaskReplySuffix(m, style);
   return (`[target=${target} msg=${msgId} time=${time}${senderType}] ${formatAgentSenderHandle(m)}: ${content}${attachSuffix}${taskSuffix}${taskReplySuffix}${formatAgentReplyAffordanceSuffix(m)}${formatAgentMessageCardBlock(m.message_card, m.content)}${formatAgentTaskCurrentProjection(m.task_current_projection)}${formatAgentMessageReactionsLine(m.reactions)}`);
+}
+
+/**
+ * ` posted_by=<kind>` when something other than the sender wrote a message
+ * posted in its name (`voice_call`: a Raft voice call, i.e. the voice model
+ * steered by the caller). Only a bare lowercase kind is printed, so the field
+ * can never forge more of the header.
+ */
+export function formatAgentPostedByHeaderField(postedBy: string | null | undefined): string {
+  return postedBy && /^[a-z][a-z_]*$/.test(postedBy) ? ` posted_by=${postedBy}` : "";
 }
 
 /** Batch of received-message lines (`raft message check` output). */

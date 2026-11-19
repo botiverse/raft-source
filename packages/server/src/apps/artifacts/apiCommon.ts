@@ -11,11 +11,13 @@ import { and, asc, eq, gt, inArray, isNotNull, isNull, lte, min, ne, notInArray,
 import {
   type AGENT_API_RATE_LIMITED_CODE,
   AGENT_API_ARTIFACT_COMMENT_EXCERPT_CHARS,
+  AGENT_API_ARTIFACT_SEARCH_QUERY_MAX_CHARS,
   artifactFileType,
   artifactLinkId,
   artifactPagePath,
   asArtifactId,
   asArtifactReviewId,
+  currentDate,
   isArtifactName,
   parseArtifactId,
   type AgentApiArtifactActor,
@@ -30,7 +32,7 @@ import {
   type ServerId,
   WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY,
 } from "@botiverse/raft-shared";
-import { markObjectRead } from "../../platform/activity";
+import { consumeAgentObjectNotices, markObjectRead } from "../../platform/activity";
 import { actorKey, actorNames } from "../../platform/actors";
 import type { AppNoticeOutbox, AppPaywallHit } from "../../platform/apps";
 import { agentConversationRefs, conversationNames, type ConversationName, type ConversationType } from "../../platform/conversations";
@@ -65,7 +67,7 @@ import {
   type ArtifactVersionRow,
 } from "./schema";
 import { namedForLookup, titledForLookup } from "./names";
-import { ARTIFACT_OBJECT_KIND } from "./kinds";
+import { ARTIFACT_OBJECT_KIND, ARTIFACTS_SYSTEM_APP } from "./kinds";
 import { canViewArtifacts, type ArtifactVisibilitySubject } from "./visibility";
 
 /** The calling agent, from its credential. */
@@ -253,6 +255,14 @@ export const targetNotFound = (details: Record<string, unknown>, via: "push" | "
 export const notVisible = (): ArtifactApiError => fail(404, { code: "NOT_VISIBLE", error: NOT_VISIBLE_ERROR, next: RAFT_HINTS.artifactList({}) });
 
 /**
+ * NOT_VISIBLE for a `ref` that can only be a title or an old name (no id parses from it):
+ * the same sentence, the step a search for those words (a title that changed or is off by a
+ * word). Chosen by the ref's shape alone, never by what was found, so it says nothing more.
+ */
+export const notVisibleTitle = (ref: string): ArtifactApiError =>
+  fail(404, { code: "NOT_VISIBLE", error: NOT_VISIBLE_ERROR, next: RAFT_HINTS.artifactList({ query: [...ref].slice(0, AGENT_API_ARTIFACT_SEARCH_QUERY_MAX_CHARS).join("") }) });
+
+/**
  * A version the caller can't read: no such number, revoked, or (an outsider
  * of a public Artifact) not the current one. `version` null: the Artifact has
  * no published version at all. The web's refusal says the same (webCommon).
@@ -436,6 +446,36 @@ async function seenOf(viewer: ServerViewActor, candidates: ArtifactItemRow[]): P
  */
 /** The ids an ambiguous title's refusal names in its sentence (all of them are in `details`). */
 const AMBIGUOUS_IDS_SHOWN = 5;
+/** A refusal sentence clients show whole (docs/contracts/agent-api-refusals.md): one line, at most this long. */
+const REFUSAL_SENTENCE_MAX_CHARS = 500;
+
+/** A home in a sentence: `#design`, `the whole server`, `anyone with the link`. The caller can see every candidate, so its home too. */
+function homeWords(home: AgentApiArtifactHome): string {
+  if (home.kind === "server") return home.serverName ? `everyone in ${home.serverName}` : "the whole server";
+  if (home.kind === "public") return "anyone with the link";
+  return home.conversation.target ?? "a deleted conversation";
+}
+
+/**
+ * AMBIGUOUS_ARTIFACT_NAME's sentence: each id with its home (same-titled ones differ by where they
+ * live), as many as fit in one refusal sentence, the rest counted.
+ */
+function ambiguousSentence(candidates: readonly { id: string; home: AgentApiArtifactHome }[]): string {
+  let sentence = "";
+  for (let shown = Math.min(candidates.length, AMBIGUOUS_IDS_SHOWN); shown >= 1; shown--) {
+    const listed = candidates.slice(0, shown).map((c) => `${c.id} (home: ${homeWords(c.home)})`).join(", ");
+    const more = candidates.length > shown ? ` and ${candidates.length - shown} more` : "";
+    sentence = `${candidates.length} artifacts you can see are called that, so pass the id of the one you mean instead: ${listed}${more}.`;
+    if (sentence.length <= REFUSAL_SENTENCE_MAX_CHARS) return sentence;
+  }
+  return sentence;
+}
+
+/** The agent's own path, quoted on one line for a refusal sentence (capped: the rest of the sentence must fit). */
+export function quotedPath(path: string): string {
+  const chars = [...path];
+  return JSON.stringify(chars.length > 160 ? `${chars.slice(0, 159).join("")}…` : path);
+}
 
 export async function resolveVisibleItem(agent: ArtifactAgent, rawRef: string): Promise<ArtifactItemRow> {
   await requireEnabled(agent);
@@ -453,14 +493,12 @@ export async function resolveVisibleItem(agent: ArtifactAgent, rawRef: string): 
     seen = await seenOf(viewActor(agent), await titledForLookup(db, agent.serverId, ref));
     if (seen.length === 0 && isArtifactName(ref)) seen = await seenOf(viewActor(agent), await namedForLookup(db, agent.serverId, ref));
   }
-  if (seen.length === 0) throw new ArtifactApiFailure(notVisible());
+  if (seen.length === 0) throw new ArtifactApiFailure(id === null && ref !== "" ? notVisibleTitle(ref) : notVisible());
   if (seen.length > 1) {
     const homes = await homesOf(agent, seen);
-    const shown = seen.slice(0, AMBIGUOUS_IDS_SHOWN).map((item) => item.id);
-    const more = seen.length > shown.length ? ` and ${seen.length - shown.length} more` : "";
     throw new ArtifactApiFailure(fail(409, {
       code: "AMBIGUOUS_ARTIFACT_NAME",
-      error: `${seen.length} artifacts you can see are called that: pass the id of the one you mean instead (${shown.join(", ")}${more}).`,
+      error: ambiguousSentence(seen.map((item) => ({ id: item.id, home: homes.get(item.id)! }))),
       next: RAFT_HINTS.artifactRead({ artifact: seen[0]!.id }),
       details: { ref, candidates: seen.map((item) => ({ id: item.id, title: item.title, home: homes.get(item.id)! })) },
     }));
@@ -582,7 +620,15 @@ export async function readPositionOf(actor: ArtifactActorRef, itemId: string, ex
   return row?.position ?? null;
 }
 
-/** Move the actor's read position forward to `position`; never back. */
+/**
+ * Move the actor's read position forward to `position`; never back. An agent
+ * that has now seen all of the Artifact (its read position at the item's last
+ * position) has dealt with what its notices about it said: they are consumed
+ * (consumed_via `acted`, #raft-antiproton:#16), as `raft inbox read` would.
+ * An agent left short of the end (a comment it wasn't shown in full) keeps
+ * them. The check reads the item in the same statement as the notices, so a
+ * comment committed meanwhile keeps its own notice unread.
+ */
 export async function advanceReadPosition(actor: ArtifactActorRef, itemId: string, position: number, executor: DatabaseExecutor = getDb()): Promise<void> {
   await executor.insert(artifactReadPositions)
     .values({ itemId, actorType: actor.type, actorId: actor.id, position })
@@ -595,6 +641,17 @@ export async function advanceReadPosition(actor: ArtifactActorRef, itemId: strin
     });
   // A person's Activity row knows what they have read (core's unread and badge), in this transaction.
   if (actor.type === "user") await reportRead(executor, actor.id, [{ itemId, position }]);
+  if (actor.type === "agent") {
+    await consumeAgentObjectNotices(executor, {
+      systemApp: ARTIFACTS_SYSTEM_APP,
+      agentId: actor.id,
+      objectRef: itemId,
+      now: currentDate(),
+      onlyIf: sql`exists (select 1 from ${artifactReadPositions} where ${artifactReadPositions.itemId} = ${itemId}
+        and ${artifactReadPositions.actorType} = 'agent' and ${artifactReadPositions.actorId} = ${actor.id}
+        and ${artifactReadPositions.position} >= (select ${artifactItems.lastPosition} from ${artifactItems} where ${artifactItems.id} = ${itemId}))`,
+    });
+  }
 }
 
 /**

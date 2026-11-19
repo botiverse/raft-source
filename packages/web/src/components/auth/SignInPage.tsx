@@ -3,6 +3,10 @@ import { OpenInAppOffers } from "../deeplinks/OpenInAppOffers";
 import LoginPage from "./LoginPage";
 import type { LoginPageProps } from "./LoginPage";
 
+// The second step a sign-in may ask next, loaded through this page's chunk
+// (pages/landingPages.ts loadPendingSecondFactorSignInStep).
+export { PendingSecondFactorSignInStep } from "./SecondFactorSignInStep";
+
 /**
  * The sign-in page a signed-out person gets at the address they opened
  * (App.tsx). Deep links v1: someone who taps a Raft link in a chat app or

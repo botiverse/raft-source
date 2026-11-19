@@ -30,7 +30,7 @@ type CliExecutionManifest = {
 
 const expectedCliCaseCounts = new Map([
   ["src/client.test.ts", 29],
-  ["src/commands/action/prepare.test.ts", 30],
+  ["src/commands/action/prepare.test.ts", 35],
   ["src/commands/message/_format.test.ts", 79],
   ["src/commands/task/_format.test.ts", 37],
   ["src/parserOutput.test.ts", 3],

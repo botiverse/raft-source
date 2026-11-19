@@ -5,6 +5,8 @@ import { useLocale } from "../../../i18n/LocaleProvider";
 import type { MessageId } from "../../../i18n/messages/en";
 import { useServerPermissions } from "../../../hooks/useServerPermissions";
 import { useServerFeatureFlag } from "../../../store/serverFeatureFlags";
+import { useNotificationSettingsStore } from "../../../store/notificationSettingsStore";
+import { followedThreadRepliesShown } from "../../../notifications/notificationApi";
 import { useServerStore } from "../../../store/serverStore";
 import { isElectronDesktopShell } from "../../../utils/desktopShell";
 import { useServerSsoShown } from "../sso/useServerSsoShown";
@@ -33,6 +35,8 @@ export function useSettingsSearchSettings(visiblePages: readonly string[], searc
   const serverId = useServerStore((s) => s.current?.id ?? null);
   const { role, capabilities } = useServerPermissions();
   const publicServer = useServerFeatureFlag(PUBLIC_SERVER_FEATURE_FLAG_KEY).enabled;
+  // The account's "Replies in threads I follow" row, by the rule its page uses (ContentCard).
+  const followedThreadReplies = useNotificationSettingsStore((s) => followedThreadRepliesShown(s.account));
   const sso = useServerSsoShown(serverId, searching && capabilities.editServerSettings && visiblePages.includes("administration"));
 
   return useMemo(() => {
@@ -44,6 +48,7 @@ export function useSettingsSearchSettings(visiblePages: readonly string[], searc
       "invite-links": capabilities.inviteMembers,
       "single-sign-on": capabilities.editServerSettings && sso,
       "desktop-app": !desktopApp,
+      "notification-followed-thread-replies": followedThreadReplies,
     };
     const values = { serverName };
     const text = (id: MessageId | undefined) => (id ? formatMessage({ id }, values) : undefined);
@@ -70,5 +75,5 @@ export function useSettingsSearchSettings(visiblePages: readonly string[], searc
       .map((setting, index) => ({ setting, index }))
       .sort((a, b) => (pageOrder.get(a.setting.page) ?? 0) - (pageOrder.get(b.setting.page) ?? 0) || a.index - b.index)
       .map(({ setting }) => setting);
-  }, [capabilities.editServerSettings, capabilities.inviteMembers, formatMessage, locale, publicServer, role, serverName, sso, visiblePages]);
+  }, [capabilities.editServerSettings, capabilities.inviteMembers, followedThreadReplies, formatMessage, locale, publicServer, role, serverName, sso, visiblePages]);
 }

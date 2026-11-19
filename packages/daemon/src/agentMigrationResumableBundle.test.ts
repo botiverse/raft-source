@@ -697,6 +697,54 @@ test("the streamed summary carries excludedIgnoredBySource only for a Server tha
   }
 });
 
+test("the streamed bundle does not size ignored paths while scanning, yet its summary still reports their sizes", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "migration-streamed-ignore-apart-"));
+  const workspace = path.join(root, "agents", "agent-ignore-apart");
+  try {
+    await mkdir(path.join(workspace, "repo", "datasets"), { recursive: true });
+    for (let i = 0; i < 40; i += 1) await writeFile(path.join(workspace, "repo", "datasets", `m${i}.js`), "abcd");
+    await writeFile(path.join(workspace, "MEMORY.md"), "memory\n");
+    await writeFile(path.join(workspace, ".raftbackupignore"), "**/datasets\n");
+    const reports: { phase: string; files: number }[] = [];
+    const streamed = await streamToMemory(workspace, { onProgress: (progress) => reports.push({ ...progress }) }, 0);
+    const scanned = reports.filter((report) => report.phase === "scanning");
+    assert.ok(scanned.every((report) => report.files <= 2), `scan counts only what moves: ${JSON.stringify(scanned)}`);
+    assert.deepEqual(streamed.control.transferSummary.excludedIgnored, {
+      count: 1,
+      fileCount: 40,
+      bytes: 160,
+      largest: [{ path: "repo/datasets", bytes: 160 }],
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the streamed summary marks its ignored totals partial when sizing stopped early, only for ends that accept it", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "migration-streamed-ignore-partial-"));
+  const workspace = path.join(root, "agents", "agent-ignore-partial");
+  try {
+    await mkdir(path.join(workspace, "datasets"), { recursive: true });
+    for (let i = 0; i < 40; i += 1) await writeFile(path.join(workspace, "datasets", `d${i}.csv`), "abcd");
+    await writeFile(path.join(workspace, "MEMORY.md"), "memory\n");
+    await writeFile(path.join(workspace, ".raftbackupignore"), "datasets\n");
+
+    const cut = await streamToMemory(workspace, { ignoredFileMeasureLimit: 10, reportIgnoredPartial: () => true }, 0);
+    assert.equal(cut.control.transferSummary.excludedIgnored?.fileCount, 10);
+    assert.equal(cut.control.transferSummary.excludedIgnoredPartial, true);
+
+    const older = await streamToMemory(workspace, { ignoredFileMeasureLimit: 10, reportIgnoredPartial: () => false }, 0);
+    assert.equal(older.control.transferSummary.excludedIgnored?.fileCount, 10);
+    assert.equal("excludedIgnoredPartial" in older.control.transferSummary, false, "an older end gets the summary it always got");
+
+    const whole = await streamToMemory(workspace, { reportIgnoredPartial: () => true }, 0);
+    assert.equal(whole.control.transferSummary.excludedIgnored?.fileCount, 40);
+    assert.equal("excludedIgnoredPartial" in whole.control.transferSummary, false, "sized in full: no mark");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 /** Streams a workspace to memory and serves its chunks back, for target-side tests. */
 async function buildBundle(input: Partial<StreamAgentMigrationResumableBundleInput> & { workspacePath: string }) {
   const streamed = await streamToMemory(input.workspacePath, input, 0);

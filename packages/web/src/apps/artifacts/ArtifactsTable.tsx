@@ -2,7 +2,6 @@ import { memo, useCallback, useMemo, useRef } from "react";
 import type { CSSProperties, KeyboardEvent, MouseEvent, PointerEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
 import {
-  ScrollArea,
   Table,
   TableBody,
   TableCaption,
@@ -12,6 +11,7 @@ import {
   TableHead,
   TableHeader,
   TableRow,
+  TableScroll,
   Skeleton,
 } from "@botiverse/raft-ui";
 import { CommentIcon } from "@botiverse/ricons";
@@ -105,11 +105,11 @@ export function ArtifactsTable({ items, byOpened, widths, onWidthChange, readerI
 
   return (
     <>
-      {/* A wide table pans sideways in a raft-ui ScrollArea named like the table, its edge fading where more lies past
+      {/* A wide table pans sideways in a raft-ui TableScroll named like the table, its edge fading where more lies past
           it, so a touch screen, whose scrollbar shows only while panning, sees that at rest. The mask is measured from the
           content box and as wide as the area, so the margin is on the content: on the area it would push the fade 20px past
           the edge. It sits in the page's scroller, so overscroll stays `auto` (scroll chaining as before). */}
-      <ScrollArea fade orientation="horizontal" overscroll="auto" role="region" aria-label={formatMessage({ id: "artifacts.dashboard.title" })} className="min-w-0" contentClassName="px-(--column-margin)" data-testid={testId}>
+      <TableScroll fade overscroll="auto" role="region" aria-label={formatMessage({ id: "artifacts.dashboard.title" })} className="min-w-0" contentClassName="px-(--column-margin)" data-testid={testId}>
         <Table className="table-fixed" style={tableStyle}>
           <TableCaption className="sr-only">{formatMessage({ id: "artifacts.dashboard.title" })}</TableCaption>
           <TableColgroup>
@@ -146,7 +146,7 @@ export function ArtifactsTable({ items, byOpened, widths, onWidthChange, readerI
             </TableBody>
           ) : null}
         </Table>
-      </ScrollArea>
+      </TableScroll>
       {/* Past the area, not in it: the content box is as wide as the table, so it would centre off to the right and fade. */}
       {items.length === 0 && loadingRows === 0 && empty ? empty : null}
     </>

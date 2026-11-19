@@ -37,7 +37,8 @@ export type MessagePlace =
       parentRouteKind: "channel" | "dm";
       /** Null for a joint channel's task: the dialog resolves this server's conversation itself. */
       conversationChannelId: string | null;
-      messageId: string;
+      /** Null: the task's conversation, at no message in particular (a link with no `msg=`). */
+      messageId: string | null;
     };
 
 /** The fields of `GET /channels/:id` this needs: a sub-conversation names its parent. */
@@ -64,6 +65,29 @@ function knownConversationType(channelId: string): string | null {
 
 function routeKindOf(channelId: string): "channel" | "dm" {
   return knownConversationType(channelId) === "dm" ? "dm" : "channel";
+}
+
+/**
+ * Where a task's own conversation (task v2, `type = 'task'`) opens: the task
+ * over the channel it lives in, at `messageId`. Null for any other
+ * conversation, or one whose row doesn't name its task and parent.
+ */
+export function taskConversationPlace(
+  channelId: string,
+  conversation: ConversationIdentity,
+  messageId: string | null,
+): MessagePlace | null {
+  if (conversation.type !== "task" || !conversation.parentChannelId || !conversation.taskId) return null;
+  return {
+    kind: "task",
+    taskId: conversation.taskId,
+    parentChannelId: conversation.parentChannelId,
+    parentRouteKind: routeKindOf(conversation.parentChannelId),
+    // As search opens a task hit (directTaskConversationChannelId): a joint
+    // channel's task conversation is resolved by the dialog, not passed in.
+    conversationChannelId: knownConversationType(conversation.parentChannelId) === "joint" ? null : channelId,
+    messageId,
+  };
 }
 
 /**
@@ -96,20 +120,39 @@ export async function resolveMessagePlace(
       messageId,
     };
   }
-  if (conversation?.type === "task" && conversation.parentChannelId && conversation.taskId) {
-    return {
-      kind: "task",
-      taskId: conversation.taskId,
-      parentChannelId: conversation.parentChannelId,
-      parentRouteKind: routeKindOf(conversation.parentChannelId),
-      // As search opens a task hit (directTaskConversationChannelId): a joint
-      // channel's task conversation is resolved by the dialog, not passed in.
-      conversationChannelId: knownConversationType(conversation.parentChannelId) === "joint" ? null : channelId,
-      messageId,
-    };
-  }
+  const taskPlace = conversation ? taskConversationPlace(channelId, conversation, messageId) : null;
+  if (taskPlace) return taskPlace;
   if (conversation?.type === "dm") return { kind: "dm", channelId, messageId };
   return { kind: "channel", channelId, messageId };
+}
+
+/** What a Saved row knows of its message (savedStore's SavedEntry). */
+export interface SavedMessagePlaceFields {
+  messageId: string;
+  channelId: string;
+  channelType: string;
+  parentChannelId: string | null;
+  parentChannelType: string | null;
+  taskId?: string;
+}
+
+/**
+ * Where a saved message in a task's own conversation opens: the task over its
+ * channel, at the message, as search and Activity open one. Opened as its
+ * conversation id it showed the bare `#task-…` sub-conversation with a Join
+ * that can't work (artin). Null for any other saved message.
+ */
+export function savedTaskMessagePlace(entry: SavedMessagePlaceFields): MessagePlace | null {
+  if (entry.channelType !== "task" || !entry.taskId || !entry.parentChannelId) return null;
+  return {
+    kind: "task",
+    taskId: entry.taskId,
+    parentChannelId: entry.parentChannelId,
+    parentRouteKind: entry.parentChannelType === "dm" ? "dm" : "channel",
+    // As search opens a task hit: a joint channel's task conversation is resolved by the dialog.
+    conversationChannelId: entry.parentChannelType === "joint" ? null : entry.channelId,
+    messageId: entry.messageId,
+  };
 }
 
 /** The routes a place opens through (useAppNavigate). */
@@ -117,11 +160,21 @@ export interface MessagePlaceNav {
   toMessage: (channelId: string, messageId: string) => void;
   toDmMessage: (dmChannelId: string, messageId: string) => void;
   toThreadMessage: (channelId: string, parentMessageId: string, messageId: string, routeKind?: "channel" | "dm") => void;
-  toTaskConversation: (parentChannelId: string, taskId: string, routeKind?: "channel" | "dm", onNavigated?: () => void) => void;
+  toTaskConversation: (
+    parentChannelId: string,
+    taskId: string,
+    routeKind?: "channel" | "dm",
+    onNavigated?: () => void,
+    opts?: { replace?: boolean },
+  ) => void;
 }
 
-/** Open a resolved place: one route per kind, never a sub-conversation as a page. */
-export function openMessagePlace(place: MessagePlace, nav: MessagePlaceNav): void {
+/**
+ * Open a resolved place: one route per kind, never a sub-conversation as a page.
+ * `replace`: a task place takes the current history entry's place (a link to
+ * the task's conversation page, redirected; see useTaskConversationRedirect).
+ */
+export function openMessagePlace(place: MessagePlace, nav: MessagePlaceNav, opts?: { replace?: boolean }): void {
   switch (place.kind) {
     case "dm":
       nav.toDmMessage(place.channelId, place.messageId);
@@ -146,7 +199,7 @@ export function openMessagePlace(place: MessagePlace, nav: MessagePlaceNav): voi
           conversationChannelId: place.conversationChannelId,
           focusedMessageId: place.messageId,
         });
-      });
+      }, opts?.replace ? { replace: true } : undefined);
       return;
     default:
       nav.toMessage(place.channelId, place.messageId);

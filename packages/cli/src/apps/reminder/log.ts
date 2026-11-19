@@ -9,6 +9,7 @@ import { writeText, adoptCliReplyText, NL } from "../../core/renderer";
 import { formatReminderLog, formatTriggerLog } from "../../commands/reminder/_format";
 import { invokeReminderApp, parseTriggerLog, requireTriggerKey } from "../../commands/reminder/_triggerApp";
 import { registerReminderAckCommand } from "./ack";
+import { parseReminderIdInput } from "./sealGuard";
 
 interface LogOpts {
   id?: string;
@@ -46,7 +47,7 @@ export const reminderLogCommand = defineCommand(
     name: "log",
     description: "Show lifecycle events for one reminder, or the history of one trigger key",
     options: [
-      { flags: "--id <id>", description: "Reminder id (full uuid or short prefix): that reminder's lifecycle events" },
+      { flags: "--id <id>", description: "Reminder id (full uuid, short prefix, or reminder:<id> as raft inbox check prints it): that reminder's lifecycle events" },
       { flags: "--key <key>", description: "Trigger key (raft reminder trigger): its history, newest first, last 7 days" },
       { flags: "--limit <n>", description: "With --key: at most this many entries (1-200, default 50)" },
     ],
@@ -66,7 +67,9 @@ export const reminderLogCommand = defineCommand(
       if (opts.limit !== undefined) throw cliError("INVALID_ARG", "--limit applies only with --key");
       const agentContext = ctx.loadAgentContext();
       const client = ctx.createApiClient(agentContext);
-      const res = await createAgentApiSurfaceClient(client).reminders.log({ reminderId: opts.id!.trim() });
+      const reminderId = parseReminderIdInput(opts.id).id;
+      if (!reminderId) throw cliError("INVALID_ARG", "--id is required");
+      const res = await createAgentApiSurfaceClient(client).reminders.log({ reminderId });
       if (!res.ok || !res.data?.events) {
         const code = res.status >= 500 ? "SERVER_5XX" : "LOG_FAILED";
         throw cliError(code, res.error ?? `HTTP ${res.status}`);

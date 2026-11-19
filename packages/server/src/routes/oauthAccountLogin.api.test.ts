@@ -469,6 +469,23 @@ test("happy path: lookup says account, authorize/account issues a code naming no
   assert.deepEqual(accountStages.sort(), ["authorization", "authorization", "token_exchange", "token_exchange"]);
 });
 
+// As /authorize/human: the approving client's `source: "desktop_browser"` (Raft Desktop's sheet for a page of its
+// built-in browser) is a label on the audit event; any other value is dropped, and the code is issued either way.
+test("authorize/account records `source: desktop_browser` on the authorization's audit event, and only that value", async ({ app }) => {
+  const f = await seedAccountLogin(app);
+  for (const source of ["desktop_browser", "something_else", undefined]) {
+    const answer = await authorizeAccount(app, f.person, accountBody(f.client.clientId, source === undefined ? {} : { source }).body);
+    assert.equal(answer.status, 200, answer.body);
+  }
+  const lifecycle = await getDb().select({ metadata: integrationAuditEvents.metadata }).from(integrationAuditEvents)
+    .where(and(eq(integrationAuditEvents.clientId, f.client.id), eq(integrationAuditEvents.eventType, "oauth.lifecycle")));
+  const sources = lifecycle.map(({ metadata }) => metadata as Record<string, unknown>)
+    .filter((metadata) => metadata.stage === "authorization" && metadata.result === "issued" && metadata.loginMode === "account")
+    .map((metadata) => metadata.source ?? null);
+  assert.equal(sources.length, 3, "one event for each code issued here");
+  assert.deepEqual(sources.filter((source) => source !== null), ["desktop_browser"]);
+});
+
 test("T13: concurrent exchanges of two codes leave exactly one account-mode consent row", async ({ app }) => {
   const f = await seedAccountLogin(app);
   const codes = [await accountCode(app, f), await accountCode(app, f, { scopes: ["openid", "identity"] })];

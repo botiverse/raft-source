@@ -5,7 +5,7 @@ import { useIntl } from "react-intl";
 import { Archive, Bug, Pencil, Check, X, RotateCcw, Lock, Copy, SquareTerminal } from "lucide-react";
 import { useLocation } from "react-router-dom";
 import { SIDEBAR_TAB_QUERY_PARAM, useAppNavigate } from "../../hooks/useAppNavigate";
-import { AGENT_USAGE_FEATURE_FLAG_KEY, getRuntimeDisplayName, isExternalAgentRuntime, parseRaftPermalink, isAdminOrOwner } from "@botiverse/raft-shared";
+import { AGENT_USAGE_FEATURE_FLAG_KEY, getRuntimeDisplayName, isExternalAgentRuntime, runtimeHasSubagents, parseRaftPermalink, isAdminOrOwner } from "@botiverse/raft-shared";
 import type { ExternalAgentDiagnosticsView, ReminderSummary } from "@botiverse/raft-shared";
 import { formatRuntimeLabelWithStatus } from "../../utils/runtimeAvailabilityLabel";
 import { useRuntimeDeprecatedHere } from "../../hooks/useServerRuntimeCatalog";
@@ -78,6 +78,7 @@ import { restartResetOffered } from "../../utils/agentBlockedState";
 import { AGENT_PANEL_TABS, AGENT_TABS, PUBLIC_AGENT_TABS } from "./agentDetailTabs";
 import { AgentUsageTab } from "./AgentUsageTab";
 import { useServerFeatureFlag } from "../../store/serverFeatureFlags";
+import { AgentVoiceSection } from "./AgentVoiceSection";
 import type { AgentTab } from "./agentDetailTabs";
 
 recordProfileOpenE2eEvent({ kind: "module-evaluated", module: "agent-detail" });
@@ -858,6 +859,9 @@ export function AgentDetailPanel({ agent, onClose, onBack, onOpenProfile, activi
             onRuntimeConfigOpenRequestHandled={consumeRuntimeConfigOpenRequest}
           />
 
+          {/* Raft voice: who may ask or call the agent, and who asked (its editors only; the server decides). */}
+          {canManageAgent && !agent.deletedAt && !agent.managedByAppInstallId && <AgentVoiceSection key={agent.id} agentId={agent.id} />}
+
           {/* The owner's assistant settings, where its header's gear lands (#proj-assistant:#21). */}
           {isAssistantOwner && !agent.deletedAt && <AssistantOwnerSection agentId={agent.id} />}
 
@@ -961,7 +965,7 @@ export function AgentDetailPanel({ agent, onClose, onBack, onOpenProfile, activi
         <AgentWorkspace agentId={agent.id} compact={!!onClose} hosted={isExternalAgent} />
       ) : activeTab === "activity" ? (
         <div className="flex min-h-0 flex-1 flex-col bg-layer-canvas" data-testid="agent-activity-tab">
-          <AgentActivityLog key={agent.id} agentId={agent.id} machineId={agent.machineId} canStopSubagents={canStopSubagentsOf(agent, canControlAgentRuntime)} />
+          <AgentActivityLog key={agent.id} agentId={agent.id} machineId={agent.machineId} canStopSubagents={canStopSubagentsOf(agent, canControlAgentRuntime)} hasSubagents={runtimeHasSubagents(agent.runtime)} />
         </div>
       ) : activeTab === "usage" ? (
         <AgentUsageTab key={agent.id} agentId={agent.id} />
@@ -990,7 +994,7 @@ export function AgentDetailPanel({ agent, onClose, onBack, onOpenProfile, activi
 
       {canStopAgent && showStopConfirm && (
         <ConfirmDialog
-          title={formatMessage({ id: "agent.detail.stopAgent" })}
+          title={formatMessage({ id: "agent.detail.stopAgentTitle" })}
           message={formatMessage(
             { id: "agent.detail.stopAgentConfirmMessage" },
             { name: agent.displayName || agent.name },

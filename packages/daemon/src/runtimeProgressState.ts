@@ -19,6 +19,7 @@ export class RuntimeProgressState {
   private lastEventKindValue: ParsedEvent["kind"] | null = null;
   private staleSinceMs: number | null = null;
   private turnStartedAtMs: number | null = null;
+  private turnProgressObservedValue = false;
 
   /** When this process's progress clock started (its first turn's anchor). */
   readonly createdAtMs: number;
@@ -67,6 +68,29 @@ export class RuntimeProgressState {
 
   noteTurnStarted(nowMs: number = Date.now()) {
     this.turnStartedAtMs = nowMs;
+    this.turnProgressObservedValue = false;
+  }
+
+  /**
+   * Whether the current turn produced progress the repeated-error fences count
+   * on their own (model output, tool use, a finished compaction or review;
+   * `runtimeErrorFingerprintFenceResetEvent`) since the turn started or the
+   * last turn end. Cleared by both, so a bare turn end that follows one with
+   * output is still a turn without output.
+   */
+  get turnProgressObserved(): boolean {
+    return this.turnProgressObservedValue;
+  }
+
+  noteTurnProgress() {
+    this.turnProgressObservedValue = true;
+  }
+
+  /** The current turn ended; whether it had progress (`turnProgressObserved`) before this end. */
+  takeTurnProgressAtTurnEnd(): boolean {
+    const observed = this.turnProgressObservedValue;
+    this.turnProgressObservedValue = false;
+    return observed;
   }
 
   noteRuntimeEvent(eventKind?: ParsedEvent["kind"], nowMs: number = Date.now()) {

@@ -41,7 +41,7 @@ function headers(token: string, serverId: string) {
 
 type ThreadSummary = {
   replyCount: number;
-  latestReplies?: Array<{ preview?: string; senderDisplayName?: string }>;
+  latestReplies?: Array<{ preview?: string; truncated?: boolean; senderDisplayName?: string }>;
 };
 
 type MessagesPage = {
@@ -94,6 +94,50 @@ test("messages page carries thread summaries for its parents in the same respons
   for (const key of Object.keys(body.threadSummariesByParentMessageId)) {
     assert.ok(pageIds.has(key), `summary key ${key} must reference a message in this page`);
   }
+});
+
+test("long reply previews are cut only when the client asks with threadPreviewChars", async ({ app }) => {
+  const owner = await seedUser("summary-long@slock.test", "summary-long");
+  const server = await createServerService("Long Summary Server", "summary-long-server", owner.id);
+  const channel = await createChannelService(server.id, "long-summaries", "test channel");
+  await addHuman(channel.id, owner.id);
+
+  const longReply = "长".repeat(500);
+  const parent = await createMessage(channel.id, "user", owner.id, "parent with a long reply");
+  const thread = await getOrCreateThread(parent.id, owner.id, "user");
+  await createMessage(thread.id, "user", owner.id, "short reply");
+  await createMessage(thread.id, "user", owner.id, longReply);
+
+  const token = await tokenForHuman(owner.email);
+  const page = async (query: string) => {
+    const res = await fetch(`${app.baseUrl}/api/messages/channel/${channel.id}?limit=50${query}`, {
+      headers: headers(token, server.id),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json() as MessagesPage;
+    return body.threadSummariesByParentMessageId[parent.id]?.latestReplies ?? [];
+  };
+
+  // Not asked (older clients): full content, no flag, exactly as before.
+  const full = await page("");
+  const fullLong = full.find((reply) => reply.preview?.startsWith("长"));
+  assert.equal(fullLong?.preview, longReply, "without the parameter the preview is the whole reply");
+  assert.ok(full.every((reply) => reply.truncated === undefined), "without the parameter nothing is flagged");
+
+  // Asked: cut to 199 characters + "…" and flagged; short replies untouched.
+  const cut = await page("&threadPreviewChars=200");
+  const short = cut.find((reply) => reply.preview === "short reply");
+  assert.ok(short, "a short reply keeps its whole text");
+  assert.equal(short.truncated, undefined, "an uncut preview carries no truncated flag");
+  const cutLong = cut.find((reply) => reply.preview?.startsWith("长"));
+  assert.equal(cutLong?.preview, `${"长".repeat(199)}…`, "cut to 199 characters plus an ellipsis");
+  assert.equal(cutLong?.truncated, true, "a cut preview says so explicitly");
+
+  // Over the cap is held to it; garbage is ignored.
+  const capped = await page("&threadPreviewChars=100000");
+  assert.equal(capped.find((reply) => reply.preview?.startsWith("长"))?.preview, `${"长".repeat(199)}…`);
+  const ignored = await page("&threadPreviewChars=lots");
+  assert.equal(ignored.find((reply) => reply.preview?.startsWith("长"))?.preview, longReply);
 });
 
 test("message context carries thread summaries for its window in the same response", async ({ app }) => {

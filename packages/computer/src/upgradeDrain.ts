@@ -54,6 +54,12 @@ export interface UpgradeDrainOutcome {
   /** Agents not quiet when the wait ended (an unknown runner counts once). */
   notQuietAtEnd: number;
   runners: number;
+  /**
+   * Agents the runners waited for (not quiet when their drain began), summed
+   * over the runners that finished and said so (a runner of an older version
+   * does not; absent when none did).
+   */
+  waitedFor?: number;
 }
 
 async function writeAtomic(file: string, body: string): Promise<void> {
@@ -146,6 +152,7 @@ export async function waitForUpgradeDrain(slockHome: string, options: {
     let pending = 0;
     let deadline = false;
     let ended = false;
+    let waitedFor: number | undefined;
     for (const runner of runners) {
       if ((await readRequest(slockHome, runner.serverId))?.requestId !== request.requestId) {
         await writeUpgradeDrainRequest(slockHome, runner, request).catch(() => undefined);
@@ -161,6 +168,7 @@ export async function waitForUpgradeDrain(slockHome: string, options: {
         if (own.finished === "deadline") deadline = true;
         if (own.finished === "ended") ended = true;
         pendingNotQuiet += own.finished === "quiet" ? 0 : own.notQuietAgentIds.length;
+        if (own.waitedFor !== undefined) waitedFor = (waitedFor ?? 0) + own.waitedFor;
         continue;
       }
       pending += 1;
@@ -173,6 +181,7 @@ export async function waitForUpgradeDrain(slockHome: string, options: {
         durationMs: at - startedAtMs,
         notQuietAtEnd: pendingNotQuiet,
         runners: runners.length,
+        ...(waitedFor !== undefined ? { waitedFor } : {}),
       };
     }
     await sleep(Math.max(1, Math.min(options.pollMs ?? UPGRADE_DRAIN_POLL_MS, giveUpAtMs - at)));

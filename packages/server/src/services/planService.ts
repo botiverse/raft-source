@@ -21,6 +21,7 @@ import {
   getBillingUsage,
   getEffectiveLimits,
   isAppSumoTier,
+  resolveServerBillingPlanSource,
   type BillingCapacity,
   type BillingCapacityLimitState,
   type BillingEntitlementProjection,
@@ -72,14 +73,6 @@ export async function getServerPlan(serverId: string): Promise<ServerPlan> {
   return serverPlanOf(row);
 }
 
-function isSubscriptionEntitling(status: string): boolean {
-  return status === "active" || status === "past_due";
-}
-
-function isInternalEntitlementPlan(plan: ServerPlan): boolean {
-  return plan === "founder" || plan === "partner";
-}
-
 export type ServerBillingEntitlement = BillingEntitlementProjection & {
   source: "server" | "subscription" | "appsumo" | "prepaid";
   capacity: BillingCapacity;
@@ -102,17 +95,19 @@ function projectServerBillingEntitlement(
   row: ServerBillingEntitlementRow | undefined,
   now: Date,
 ): ServerBillingEntitlement {
-  const fallbackPlan = (row?.serverPlan as ServerPlan | undefined) ?? "free";
-  const hasSubscription = Boolean(row?.subscriptionPlan);
-  const hasEntitlingSubscription = Boolean(row?.subscriptionPlan && row.status && isSubscriptionEntitling(row.status));
-  const hasInternalEntitlement = isInternalEntitlementPlan(fallbackPlan);
-  const plan = (hasInternalEntitlement
-    ? fallbackPlan
-    : hasEntitlingSubscription
-    ? row?.subscriptionPlan
-    : hasSubscription
-      ? "free"
-      : fallbackPlan) as ServerPlan;
+  const {
+    plan,
+    source,
+    hasEntitlingSubscription,
+    hasInternalEntitlement,
+  } = resolveServerBillingPlanSource(
+    {
+      serverPlan: row?.serverPlan,
+      subscriptionPlan: row?.subscriptionPlan,
+      subscriptionStatus: row?.status,
+    },
+    now,
+  );
   const projection: BillingEntitlementProjection = {
     plan,
     status: row?.status ?? null,
@@ -126,7 +121,7 @@ function projectServerBillingEntitlement(
 
   return {
     ...projection,
-    source: hasEntitlingSubscription && !hasInternalEntitlement ? "subscription" : "server",
+    source: source === "subscription" ? "subscription" : "server",
     capacity: getBillingCapacity(projection, now),
   };
 }
@@ -165,33 +160,41 @@ export async function getServerBillingEntitlements(
   return new Map(uniqueServerIds.map((serverId) => {
     const row = rowByServerId.get(serverId);
     const tier = row?.appsumoTier;
-    const entitlement = projectServerBillingEntitlement(row, now);
-    const prepaid = prepaidGrants.get(serverId);
-    // Prepaid time ranks below an entitling subscription and an AppSumo
-    // license; checkout keeps them apart, so overlap means a race to resolve.
-    if (prepaid && !isAppSumoTier(tier) && entitlement.source !== "subscription" && !isInternalEntitlementPlan(entitlement.plan)) {
+    const resolved = resolveServerBillingPlanSource(
+      {
+        serverPlan: row?.serverPlan,
+        subscriptionPlan: row?.subscriptionPlan,
+        subscriptionStatus: row?.status,
+        hasActiveAppSumo: isAppSumoTier(tier),
+        prepaid: prepaidGrants.get(serverId) ?? null,
+      },
+      now,
+    );
+    if (resolved.source === "prepaid" && resolved.prepaid) {
       const projection: BillingEntitlementProjection = {
-        plan: "pro",
-        prepaid,
+        plan: resolved.plan,
+        prepaid: resolved.prepaid,
         status: "active",
         billingInterval: null,
-        provisionedHumanSeats: prepaid.seatQuantity,
-        provisionedAgentSeats: prepaid.seatQuantity * PRO_AGENT_SEAT_BLOCK_SIZE,
-        proPackQuantity: prepaid.seatQuantity,
+        provisionedHumanSeats: resolved.prepaid.seatQuantity,
+        provisionedAgentSeats: resolved.prepaid.seatQuantity * PRO_AGENT_SEAT_BLOCK_SIZE,
+        proPackQuantity: resolved.prepaid.seatQuantity,
       };
       return [serverId, { ...projection, source: "prepaid" as const, capacity: getBillingCapacity(projection, now) }] as const;
     }
-    if (!isAppSumoTier(tier) || isInternalEntitlementPlan(entitlement.plan)) return [serverId, entitlement] as const;
-    const projection: BillingEntitlementProjection = {
-      plan: "pro",
-      appsumo: { tier, lifetime: true },
-      status: "active",
-      billingInterval: null,
-      provisionedHumanSeats: null,
-      provisionedAgentSeats: null,
-      proPackQuantity: null,
-    };
-    return [serverId, { ...projection, source: "appsumo" as const, capacity: getBillingCapacity(projection, now) }] as const;
+    if (resolved.source === "appsumo" && isAppSumoTier(tier)) {
+      const projection: BillingEntitlementProjection = {
+        plan: resolved.plan,
+        appsumo: { tier, lifetime: true },
+        status: "active",
+        billingInterval: null,
+        provisionedHumanSeats: null,
+        provisionedAgentSeats: null,
+        proPackQuantity: null,
+      };
+      return [serverId, { ...projection, source: "appsumo" as const, capacity: getBillingCapacity(projection, now) }] as const;
+    }
+    return [serverId, projectServerBillingEntitlement(row, now)] as const;
   }));
 
 }

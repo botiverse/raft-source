@@ -19,6 +19,7 @@ import {
   clientRendersDependentCustomWithOptions,
   runtimeFormV2Entry,
   validateRuntimeFormV2SubmitRef,
+  withBuiltInModelLimitVisibility,
   withSavedConnectionForm,
   type RuntimeFormOptionSourceContext,
   type RuntimeFormV2OptionSourceBody,
@@ -88,11 +89,34 @@ test("item 2: owned fields hide by rule on a connection, apiKey is required only
   assert.deepEqual(v3.dataSchema.allOf, [{ if: { properties: { providerId: { pattern: "^connection:" } } }, else: { required: ["apiKey"] } }]);
   // A gateway URL is owned: no connection value is listed for it.
   assert.equal(JSON.stringify(byScope.get("#/properties/baseUrl")).includes("connection:"), false);
-  // The limit fields are not owned: the gateway connection is listed, the preset one is not.
-  for (const key of ["contextWindow", "maxOutputTokens"]) {
-    const values = byScope.get(`#/properties/${key}`)!.condition.schema.enum as string[];
-    assert.ok(values.includes("connection:gw"), key);
-    assert.equal(values.includes("connection:ds"), false, key);
+  // The limit fields are not owned: a gateway connection is listed with its
+  // provider; a preset one only where the Computer runs its provider's typed
+  // id through a connection (typedConnectionProviderIds). Absent (every
+  // released Computer): DeepSeek directly shows them, its connection does not.
+  const limitValues = (form: ReturnType<typeof asV3>) => ["contextWindow", "maxOutputTokens"]
+    .map((key) => rulesOf(form).find((rule) => rule.scope === `#/properties/${key}`)!.condition.schema.enum as string[]);
+  for (const values of limitValues(v3)) {
+    assert.ok(values.includes("deepseek"));
+    assert.ok(values.includes("connection:gw"));
+    assert.equal(values.includes("connection:ds"), false);
+  }
+  const connections = [GATEWAY_CONNECTION, PRESET_CONNECTION];
+  const current = toRuntimeFormV3(savedBuiltin(), {
+    connections,
+    typedConnectionProviderIds: ["deepseek"],
+    revision: runtimeFormV3Revision("builtin", savedBuiltin(), V3, connections),
+  });
+  for (const values of limitValues(current)) assert.ok(values.includes("connection:ds"));
+  // A Computer without DeepSeek typed ids at all: neither, whatever the connection set says.
+  const noTyped = toRuntimeFormV3(withBuiltInModelLimitVisibility(savedBuiltin(), []), {
+    connections,
+    typedConnectionProviderIds: ["deepseek"],
+    revision: runtimeFormV3Revision("builtin", savedBuiltin(), V3, connections),
+  });
+  for (const values of limitValues(noTyped)) {
+    assert.ok(values.includes("connection:gw"));
+    assert.equal(values.includes("deepseek"), false);
+    assert.equal(values.includes("connection:ds"), false);
   }
 
   // The shared client state follows: a connection hides and drops the owned fields.

@@ -22,11 +22,17 @@ import {
   DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CODEX,
   DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR,
   DAEMON_CAPABILITY_RUNTIME_HOST_OAR_GROK,
+  DAEMON_CAPABILITY_RUNTIME_HOST_OAR_OPENCODE,
   DAEMON_CAPABILITY_AGENT_CONFIG_PUSH,
   DAEMON_CAPABILITY_CONTROL_START_CATCHUP_V1,
   DAEMON_CAPABILITY_SEQUENCED_STATUS,
   DAEMON_CAPABILITY_INTERRUPT_SUBAGENT,
   DAEMON_CAPABILITY_INTERRUPT_TURN,
+  DAEMON_CAPABILITY_AGENT_SIDE_ASK,
+  AGENT_SIDE_ASK_ANSWER_MAX_CHARS,
+  AGENT_SIDE_ASK_MAX_TIMEOUT_MS,
+  type AgentSideAskAsker,
+  type AgentSideAskOutcome,
   DAEMON_CAPABILITY_COMPUTER_UPGRADE_DRAIN_V1,
   COMPUTER_UPGRADE_DRAIN_MAX_DEADLINE_MS,
   COMPUTER_UPGRADE_DRAIN_MAX_LISTED_AGENTS,
@@ -170,6 +176,7 @@ import {
   normalizeOsIdLike,
   AGENT_MIGRATION_CAPABILITY,
   AGENT_MIGRATION_TARGET_IGNORE_SOURCES_CAPABILITY,
+  AGENT_MIGRATION_TARGET_IGNORED_PARTIAL_CAPABILITY,
   MODEL_SEEN_MAX_ITEMS_PER_REPORT,
   MACHINE_DUPLICATE_CONNECTION_CLOSE_CODE,
   MACHINE_DUPLICATE_CONNECTION_CLOSE_REASON,
@@ -200,6 +207,7 @@ import {
 import { wakeRequestAppRefTraceAttrs } from "./wakeRequestAppRef";
 import type { AppConfigWireSnapshot } from "@botiverse/raft-shared/src/appConfigTransport";
 import { RouteFailureError } from "../tracing/routeFailure";
+import type { RelayedMachineResponse } from "../machineResponseRelay";
 import { applyAgentModelSeen as applyAgentModelSeenToReadPosition } from "./agentModelSeen";
 import { TurnEndUnreadSnapshots, snapshotForUnreadSummary, type UnreadSummarySnapshotTargets } from "./turnEndUnreadSnapshot";
 import { owedReadBacklogTargets, settleUnowedReadBacklog, type UnowedReadBacklogTarget } from "./unowedReadBacklog";
@@ -258,7 +266,9 @@ import {
   daemonReportsDeliveredThirdPartyEvents,
   listManagedAgentsWithPendingThirdPartyEvents,
   planReconnectRedelivery,
+  recordMachineDaemonInstance,
   redeliverPendingThirdPartyAgentEvents,
+  requeueDroppedThirdPartyAgentEvents,
   resolveOutageStart,
   type OutageStart,
 } from "./thirdPartyAgentEventRedelivery";
@@ -267,6 +277,7 @@ import * as agentActivityLogService from "./agentActivityLogService";
 import * as computerLifecycleOperationService from "./computerLifecycleOperationService";
 import { dispatchPendingAgentArchiveOps, type AgentArchiveDispatchPort } from "./agentArchiveService";
 import * as computerUpgradeRequestService from "./computerUpgradeRequestService";
+import { computerControlRefusal } from "./computerControlAuthorization";
 import type { ComputerUpgradeDrainProgress } from "./computerUpgradeRequestService";
 import {
   recordComputerOfflineTransition,
@@ -274,12 +285,15 @@ import {
 } from "./computerOutageNotificationService";
 import { legacyRuntimeStateFromActivity } from "./legacyActivityStateInference";
 import { recordAgentContextReturned } from "../tracing/agentContextReturnTrace";
-import { agentIdHashAttrs } from "../tracing/traceIdentity";
+import { agentIdHashAttrs, launchIdHashAttrs } from "../tracing/traceIdentity";
 import { reminderAppActiveForServerStrict } from "./reminderAppGate";
 import { AgentTypingRegistry, parseAgentSendIntentFrame, type AgentSendIntentOutcome, type AgentTypingTargetPreview } from "./agentTypingService";
 import { previewAgentPostTarget } from "../routes/agentWritableTarget";
 import { previewAgentTaskReplyTarget } from "./agentTypingTaskTarget";
-import { READY_WAKE_LOST_DELIVERIES_FEATURE_FLAG_KEY, RUNNER_CREDENTIAL_RECONCILE_FEATURE_FLAG_KEY, agentRuntimeOarDisabled, agentRuntimeOarFeatureFlagKey, evaluateFeatureFlag, evaluateFeatureFlags, PASSIVE_AX_FEATURE_FLAG_KEY, PI_SESSION_ROTATION_FEATURE_FLAG_KEY, REMINDER_APP_FEATURE_FLAG_KEY, WAKE_RECYCLE_OAR_FEATURE_FLAG_KEY, WAKE_RECYCLE_TIER_GATE_FEATURE_FLAG_KEY, WAKE_RECYCLE_WARM_FEATURE_FLAG_KEY, TURN_END_COMPACTION_FEATURE_FLAG_KEY, SUBAGENT_DELEGATION_FEATURE_FLAG_KEY, VAULT_APP_FEATURE_FLAG_KEY, type AgentRuntimeOarFeatureFlagKey } from "./featureFlagService";
+import { agentProgressAtMs } from "./agentProgressMarks";
+import { RepeatedWakeGuard, type RepeatedWakeTrip } from "./agentRepeatedWakeGuard";
+import { claimRepeatedWakeNotice, clearRepeatedWakeExclusion, repeatedWakeExclusion, setRepeatedWakeExclusion } from "./agentRepeatedWakeStore";
+import { AGENT_REPEATED_WAKE_GUARD_FEATURE_FLAG_KEY, READY_WAKE_LOST_DELIVERIES_FEATURE_FLAG_KEY, RUNNER_CREDENTIAL_RECONCILE_FEATURE_FLAG_KEY, agentRuntimeOarDisabled, agentRuntimeOarFeatureFlagKey, evaluateFeatureFlag, evaluateFeatureFlags, PASSIVE_AX_FEATURE_FLAG_KEY, PI_SESSION_ROTATION_FEATURE_FLAG_KEY, REMINDER_APP_FEATURE_FLAG_KEY, WAKE_RECYCLE_OAR_FEATURE_FLAG_KEY, WAKE_RECYCLE_TIER_GATE_FEATURE_FLAG_KEY, WAKE_RECYCLE_WARM_FEATURE_FLAG_KEY, TURN_END_COMPACTION_FEATURE_FLAG_KEY, SUBAGENT_DELEGATION_FEATURE_FLAG_KEY, VAULT_APP_FEATURE_FLAG_KEY, type AgentRuntimeOarFeatureFlagKey } from "./featureFlagService";
 import { runtimeAccountUsageCacheService } from "./runtimeAccountUsageCacheService";
 import { runtimeAuthService } from "./runtimeAuthService";
 import { openAfterReplicaHop, sealForReplicaHop, type ReplicaHopRefusal } from "./runtimeAuthReplicaSeal";
@@ -296,6 +310,7 @@ import {
   type EvaluateComputerBroadcastPolicyInput,
 } from "./computerBroadcastPolicyService";
 import type { PersistedAgentActivityHint } from "./agentActivityLogService";
+import { isLegacyProcessIdleActivity, isPerTurnExitRuntime, type OnboardingWakeRoute } from "./onboardingHeldWakes";
 import { continuesEmptyWake, lastTextOf, type RunningTurn } from "./activityTurnMerge";
 import * as reminderService from "../apps/reminder/service";
 import { agentHasScope, existingAgentsHaveScope } from "./agentScopesService";
@@ -461,9 +476,10 @@ import {
 import {
   BuiltInModelCatalogError,
   assertBuiltInPresetSupportedByCatalog,
-  isBuiltInCatalogCheckedSelection,
+  builtInCatalogSelection,
   type BuiltInModelCatalogValidation,
 } from "./builtinModelCatalogCompatibility";
+import { providerConnectionProviderId } from "./providerConnectionService";
 
 export type MachineConnectionPrincipalKind = "computer" | "legacy_machine" | "unknown";
 
@@ -515,7 +531,8 @@ interface MachineConnection {
   };
   capabilities: Set<string>;
   // Reconciler step 13: the Computer's latest `computer:upgrade:draining`
-  // (in memory, this connection only; the request row does not change).
+  // (in memory, this connection only; the request row keeps only that the
+  // drain finished, UPGRADE_REQUEST_DRAIN_FINISHED_MARKER).
   upgradeDrain?: ComputerUpgradeDrainProgress;
   // Runtimes reported in the daemon `ready` message, held in-memory so
   // server-authoritative readiness (ServerSetupProjectionGate) derives runtime
@@ -926,6 +943,29 @@ function readPositiveIntegerEnv(name: string, fallback: number): number {
   if (!Number.isFinite(parsed) || parsed < 1) return fallback;
   return Math.floor(parsed);
 }
+
+/** Why a `ready` ran no restart pass (`server.third_party_event.redeliver_skipped`, trigger daemon_instance_changed). */
+type DaemonRestartRedeliverySkip =
+  | "skipped_old_daemon"
+  | "skipped_no_instance_id"
+  | "skipped_marker_failed"
+  | "skipped_same_instance"
+  | "skipped_first_instance"
+  | "skipped_returned_to_previous_instance";
+
+/**
+ * A `ready`'s `daemonInstanceId` as the server keeps it: the daemon sends a
+ * UUID (randomUUID per process); anything else that is not a short token
+ * (at most 64 characters of letters, digits and `._:-`) is no instance id.
+ * It is compared, stored (machine_daemon_instances) and traced.
+ */
+const DAEMON_INSTANCE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
+function readyDaemonInstanceId(value: unknown): string | null {
+  return typeof value === "string" && DAEMON_INSTANCE_ID_PATTERN.test(value) ? value : null;
+}
+
+/** What the app-event `ready` passes read off the machine's connection. */
+type ThirdPartyEventReadyConnection = Pick<MachineConnection, "connectedAt" | "previousCloseAt" | "daemonVersion" | "daemonInstanceId">;
 
 function durationMsBucket(ms: number | null | undefined): string {
   if (ms == null || !Number.isFinite(ms) || ms < 0) return "unknown";
@@ -1344,6 +1384,15 @@ interface CachedAgentState {
  * end the turn before it restarts the runtime instead, then answers.
  */
 const INTERRUPT_TURN_RELAY_BUDGET_MS = 20_000;
+/** A status is read from the daemon's own state: a few seconds at most. */
+const SIDE_ASK_STATUS_TIMEOUT_MS = 5_000;
+/** Past the daemon's own limit, for the answer's trip back. */
+const SIDE_ASK_RELAY_MARGIN_MS = 5_000;
+/** A side ask's outcome, plus the two the server tells apart before asking. */
+export type AgentSideAskRequestResult = {
+  outcome: AgentSideAskOutcome | "computer_offline" | "computer_upgrade_required";
+  text?: string;
+};
 
 export type AgentTurnInterruptRequestResult =
   | { outcome: AgentTurnInterruptOutcome; toolName?: string; stuckForMs?: number }
@@ -2280,6 +2329,9 @@ const DAEMON_INGRESS_RATE_LIMITED_MESSAGE_TYPES = new Set<MachineToServerMessage
   // a flood is dropped (DAEMON_INGRESS_TYPE_MAX_EVENTS). A dropped report is
   // superseded by the next one (its full snapshot, a higher seq).
   "machine:runtime_readiness",
+  // One per abnormal process end, each a bounded write (at most 100 ids): a
+  // flood from a machine is dropped instead of reaching the database.
+  "agent:inbox:dropped_app_events",
 ]);
 
 /** Per-type budgets below the default, for message types that are rare by design. */
@@ -2371,6 +2423,24 @@ function rehydrateStartIntentError(error: unknown): unknown {
  */
 export function isDaemonRuntimeErrorActivityFrame(msg: Pick<Extract<MachineToServerMessage, { type: "agent:activity" }>, "activity" | "activityKind" | "detailKind">): boolean {
   return isRuntimeErrorDetailActivity({ activity: msg.activityKind ?? msg.activity, detailKind: msg.detailKind });
+}
+
+/**
+ * #wg-rbac:#57, at ingest: what of a daemon activity frame can carry a runtime
+ * error's text is scrubbed and capped (`boundedRuntimeErrorDetail`) before it
+ * is stored, pushed or written to the activity log. A runtime-error frame's
+ * detail and text entries; and a failed start's (`runtime_unavailable`): a
+ * daemon that stopped a runtime after repeated errors reports the last error in
+ * it ("Last error: ..."), and daemons before the daemon-side scrub sent that raw.
+ */
+export function scrubDaemonRuntimeErrorActivityFrame(msg: Extract<MachineToServerMessage, { type: "agent:activity" }>): void {
+  if (!isDaemonRuntimeErrorActivityFrame(msg) && msg.detailKind !== "runtime_unavailable") return;
+  if (typeof msg.detail === "string") msg.detail = boundedRuntimeErrorDetail(msg.detail);
+  if (Array.isArray(msg.entries)) {
+    msg.entries = msg.entries.map((entry) => entry?.kind === "text" && typeof entry.text === "string"
+      ? { ...entry, text: boundedRuntimeErrorDetail(entry.text) }
+      : entry);
+  }
 }
 
 function daemonActivityJoinTraceAttrs(msg: Extract<MachineToServerMessage, { type: "agent:activity" }>): Record<string, unknown> {
@@ -3167,6 +3237,8 @@ export class AgentOrchestrator extends EventEmitter {
    * survives a replica switch and only a human start/resume clears it.
    */
   private readonly wakeCrashLoopBreaker: WakeCrashLoopBreaker;
+  /** #proj-runtime:#62: empty turns per agent on one offered input (in memory, this replica's connections). */
+  private readonly repeatedWakeGuard = new RepeatedWakeGuard({ progressAtMs: (agentId) => agentProgressAtMs(agentId) });
   /**
    * The unread summary each agent's current launch was started with, until that
    * launch's first turn ends (`agent:turn:ended`): a completed turn settles the
@@ -3908,6 +3980,8 @@ export class AgentOrchestrator extends EventEmitter {
         void this.dispatchPendingComputerLifecycleOperations().catch(() => {});
         void this.dispatchPendingAgentArchiveOps().catch(() => {});
         void this.sweepComputerVersionGates().catch(() => {});
+        // Onboarding wakes held past their bound expire (onboardingHeldWakes.ts).
+        this.emit("onboarding:held-wakes:sweep");
       }, 30_000);
     }
     if (this.runtimeOutcomeAckEnabled && !this.spawnErrorRetryTimer) {
@@ -5092,6 +5166,7 @@ export class AgentOrchestrator extends EventEmitter {
         start_failure_count: result.startFailureCount,
         blocked: result.blocked,
         launch_id_present: launchId !== null,
+        ...launchIdHashAttrs(launchId),
         // Why automatic wakes are paused, and for what: a reason shared by many
         // agents at once (a provider outage) shows up as one pause_reason.
         ...(result.outcome === "blocked" || result.outcome === "pause_retry_ended"
@@ -5198,6 +5273,7 @@ export class AgentOrchestrator extends EventEmitter {
         required_action: input.requiredAction,
         notify: result.notify,
         launch_id_present: input.launchId !== null,
+        ...launchIdHashAttrs(input.launchId),
       });
       if (result.outcome === "pause_retry_ended") {
         const cached = this.agentStateCache.get(agentId);
@@ -5701,6 +5777,7 @@ export class AgentOrchestrator extends EventEmitter {
       exit_kind: exit.kind,
       evidence_present: exit.evidence !== null,
       launch_id_present: exit.launchId !== null,
+      ...launchIdHashAttrs(exit.launchId),
     });
     if (!observation.blockedNow) return;
     const cached = this.agentStateCache.get(agentId);
@@ -7985,6 +8062,8 @@ export class AgentOrchestrator extends EventEmitter {
         // not find an older session's close here.
         this.machineLastDisconnectAt.delete(machineId);
         this.machineConnections.set(machineId, conn);
+        // Its agents' states were sent by another replica meanwhile.
+        this.agentActivityStateFanout.resetMachine(machineId);
 
         // A legacy handshake can authenticate immediately before the adoption
         // CAS and finish registering immediately after it. Revalidate after the
@@ -8666,6 +8745,100 @@ export class AgentOrchestrator extends EventEmitter {
     }
   }
 
+  /**
+   * One automatic retry of a web upgrade that failed at a download step
+   * (computerUpgradeRequestService UPGRADE_AUTO_RETRY_FAILURE_CODES). The
+   * replica a Computer is connected to claims its due retry (once, in the
+   * database) and sends it after the re-checks; a retry no replica could
+   * claim in time is skipped as `computer_offline`.
+   */
+  private async sweepComputerUpgradeAutoRetries(): Promise<void> {
+    const now = new Date(this.clock.now());
+    const emit = (row: computerUpgradeRequestService.ComputerUpgradeRequestRow) => {
+      this.io?.to(`server:${row.serverId}`).emit("machine:upgrade-request", { machineId: row.machineId, upgradeRequest: computerUpgradeRequestService.projectComputerUpgradeRequest(row, null, now) });
+    };
+    const recordSettled = (row: computerUpgradeRequestService.ComputerUpgradeRequestRow) => {
+      this.recordEvent("server.computer.upgrade_request.auto_retry", {
+        ...computerUpgradeRequestService.computerUpgradeRequestTraceAttrs(row),
+        auto_retry_result: row.autoRetryResult ?? "",
+      });
+      emit(row);
+    };
+    for (const row of await computerUpgradeRequestService.skipOfflineComputerUpgradeAutoRetries(now)) recordSettled(row);
+    for (const row of await computerUpgradeRequestService.settleAbandonedComputerUpgradeAutoRetries(now)) recordSettled(row);
+    // Only Computers this replica can send to now (open socket, fresh
+    // heartbeat), as the request endpoint routes: a stale connection must not
+    // spend the one retry.
+    const local = [...this.machineConnections.keys()].filter((machineId) => this.hasMachineLocally(machineId));
+    const claimed = await computerUpgradeRequestService.claimDueComputerUpgradeAutoRetries(local, now);
+    for (const row of claimed) {
+      let outcome: computerUpgradeRequestService.ComputerUpgradeAutoRetryOutcome;
+      try {
+        outcome = await this.runComputerUpgradeAutoRetry(row, now);
+      } catch (error) {
+        // One row's failure never holds the others, and is never left "scheduled".
+        console.warn(`[Orchestrator] upgrade auto-retry ${row.id} failed: ${error instanceof Error ? error.message : String(error)}`);
+        const settled = await computerUpgradeRequestService.recordComputerUpgradeAutoRetryResult(row.id, "failed_internal").catch(() => null);
+        if (settled) recordSettled(settled);
+        continue;
+      }
+      this.recordEvent("server.computer.upgrade_request.auto_retry", {
+        ...computerUpgradeRequestService.computerUpgradeRequestTraceAttrs(outcome.original ?? row),
+        auto_retry_result: outcome.result,
+        ...(outcome.retry ? { retry_request_id: outcome.retry.id } : {}),
+      });
+      if (outcome.original) emit(outcome.original);
+      if (outcome.retry) {
+        // The audit record of the retry: the same event a person's request
+        // writes, marked automatic and linked to the failed request.
+        this.recordEvent("upgrade_request.recorded", {
+          request_id: outcome.retry.id,
+          server_id: outcome.retry.serverId,
+          machine_id: outcome.retry.machineId,
+          target_version: outcome.retry.targetVersion,
+          created: true,
+          automatic: true,
+          auto_retry_of_request_id: row.id,
+          auto_retry_failure_code: row.autoRetryFailureCode ?? "",
+          ...(outcome.undelivered ? { undelivered: true } : {}),
+        });
+        emit(outcome.retry);
+      }
+    }
+  }
+
+  /** The re-checks and the send of one claimed retry, with this replica's live facts. */
+  protected runComputerUpgradeAutoRetry(
+    row: computerUpgradeRequestService.ComputerUpgradeRequestRow,
+    now: Date,
+  ): Promise<computerUpgradeRequestService.ComputerUpgradeAutoRetryOutcome> {
+    return computerUpgradeRequestService.runClaimedComputerUpgradeAutoRetry(row, {
+      readComputerVersion: async (machineId) => (await this.getMachineComputerVersionFact(machineId))?.version ?? null,
+      checkTarget: async (original) => {
+        const machine = await this.loadComputerBroadcastMachine(original.machineId);
+        const decision = await this.evaluateComputerBroadcastPolicy({
+          source: await this.getMachineComputerVersionFact(original.machineId),
+          platform: normalizeComputerPlatform(machine?.os),
+          requestedTargetVersion: original.targetVersion,
+          now,
+          serverId: original.serverId,
+          serviceUnreachable: this.hasMachineCapability(original.machineId, COMPUTER_CAPABILITY_SERVICE_IPC_UNREACHABLE),
+          installKind: machine?.installKind ?? null,
+        });
+        if (decision.reasonCode === "hands_unavailable") return "policy_unavailable";
+        return decision.eligibility === "eligible" && decision.targetVersion === original.targetVersion ? "offered" : "target_withdrawn";
+      },
+      controlRefusal: async (original, userId) => {
+        const machine = await machineService.getMachine(asMachineId(original.machineId));
+        if (!machine || machine.serverId !== original.serverId) return "not_a_computer";
+        return computerControlRefusal(original.serverId, userId, machine);
+      },
+      drainMs: (machineId) => this.computerUpgradeDrainMs(machineId),
+      send: async (machineId, targetVersion, requestId, drainMs) =>
+        (await this.sendComputerUpgrade(machineId, targetVersion, requestId, { drainMs })).sent,
+    }, now);
+  }
+
   private async sweepComputerLifecycleOperations(): Promise<void> {
     try {
       const expired = await computerUpgradeRequestService.expireComputerUpgradeRequests(new Date(this.clock.now()));
@@ -8675,6 +8848,11 @@ export class AgentOrchestrator extends EventEmitter {
       }
     } catch (error) {
       console.warn(`[Orchestrator] upgrade request expiry sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    try {
+      await this.sweepComputerUpgradeAutoRetries();
+    } catch (error) {
+      console.warn(`[Orchestrator] upgrade auto-retry sweep failed: ${error instanceof Error ? error.message : String(error)}`);
     }
     await this.runInTraceSpan(
       "server.computer.operation.sweep",
@@ -8789,9 +8967,12 @@ export class AgentOrchestrator extends EventEmitter {
   ): Promise<Extract<ServerToMachineMessage, { type: "machine:migration_transport:lease" }>> {
     if (msg.role !== "source") return msg;
     const target = await this.getMachineMigrationTransport(msg.targetMachineId);
-    return target?.capabilities?.includes(AGENT_MIGRATION_TARGET_IGNORE_SOURCES_CAPABILITY)
-      ? { ...msg, targetAcceptsIgnoreSources: true }
-      : msg;
+    const capabilities = target?.capabilities ?? [];
+    return {
+      ...msg,
+      ...(capabilities.includes(AGENT_MIGRATION_TARGET_IGNORE_SOURCES_CAPABILITY) ? { targetAcceptsIgnoreSources: true } : {}),
+      ...(capabilities.includes(AGENT_MIGRATION_TARGET_IGNORED_PARTIAL_CAPABILITY) ? { targetAcceptsIgnoredPartial: true } : {}),
+    };
   }
 
   protected getMachineResponseRelay() { return machineResponseRelay; }
@@ -9263,6 +9444,7 @@ export class AgentOrchestrator extends EventEmitter {
       this.machineLastDisconnectAt.set(machineId, this.clock.now());
       await this.clearMachineConnection(machineId, false);
       this.agentTyping.endForMachine(machineId);
+      this.agentActivityStateFanout.resetMachine(machineId);
       this.dispatchComputerLifecycleDisconnectObservation({
         machineId,
         serverId,
@@ -10142,7 +10324,11 @@ export class AgentOrchestrator extends EventEmitter {
       case "computer:upgrade:draining": {
         // Reconciler step 13: the Computer waits for its agents before its
         // installer runs. Kept on the connection and pushed to the web; the
-        // request row (and its stretched deadline) is unchanged.
+        // request row (and its stretched deadline) is unchanged, except that a
+        // drain that finished for the upgrade to go on (`quiet` / `deadline`)
+        // is marked on it: the Computer's next `ready` comes on a new
+        // connection, and without a receipt it means the installer left no
+        // result (UPGRADE_REQUEST_DRAIN_FINISHED_MARKER).
         if (!conn || typeof msg.requestId !== "string") break;
         const progress: ComputerUpgradeDrainProgress = {
           requestId: msg.requestId,
@@ -10165,6 +10351,9 @@ export class AgentOrchestrator extends EventEmitter {
           });
         }
         try {
+          if (progress.finished === "quiet" || progress.finished === "deadline") {
+            await computerUpgradeRequestService.recordComputerUpgradeDrainFinished({ requestId: progress.requestId, machineId });
+          }
           const open = await computerUpgradeRequestService.getOpenComputerUpgradeRequest(machineId);
           if (open && open.id === progress.requestId) {
             this.io?.to(`server:${conn.serverId}`).emit("machine:upgrade-request", { machineId, upgradeRequest: computerUpgradeRequestService.projectComputerUpgradeRequest(open, progress) });
@@ -10189,6 +10378,8 @@ export class AgentOrchestrator extends EventEmitter {
             requestId: msg.requestId,
             reason: msg.reason ?? msg.code ?? "computer_refused",
             code: msg.code ?? null,
+            // Validated in the service; absent from older Computers.
+            installer: { installerOutcome: msg.installerOutcome, installerCode: msg.installerCode, installerDiagnosticCode: msg.installerDiagnosticCode },
             observedVersion: conn?.computerVersion ?? null,
             now: new Date(this.clock.now()),
           });
@@ -10303,7 +10494,7 @@ export class AgentOrchestrator extends EventEmitter {
         // the connection as unpinned (status falls back to the unsequenced
         // path, activity to legacy state inference) while ready reconciles.
         if (conn) {
-          conn.daemonInstanceId = typeof msg.daemonInstanceId === "string" && msg.daemonInstanceId.trim() ? msg.daemonInstanceId : null;
+          conn.daemonInstanceId = readyDaemonInstanceId(msg.daemonInstanceId);
           conn.reportedHostnameHash = reportedHostnameHash(msg.hostname);
           conn.osVariant = msg.osVariant === "wsl1" || msg.osVariant === "wsl2" ? msg.osVariant : null;
           conn.capabilities = new Set((msg.capabilities ?? []).filter((capability) => typeof capability === "string" && capability.trim()));
@@ -10481,9 +10672,11 @@ export class AgentOrchestrator extends EventEmitter {
                 now: new Date(this.clock.now()),
               });
               if (settled && settled.outcome === null) {
-                // An `unresolved` receipt, recorded on the still-open request
-                // (see computer:upgrade:done); nothing settles yet.
-                this.recordEvent("server.computer.upgrade_request.unresolved_recorded", {
+                // An `unresolved` receipt (see computer:upgrade:done), or no
+                // receipt after the drain finished: recorded on the still-open
+                // request; nothing settles yet.
+                const recorded = computerUpgradeRequestService.isNoResultUpgradeReason(settled.reason) ? "no_result_recorded" : "unresolved_recorded";
+                this.recordEvent(`server.computer.upgrade_request.${recorded}`, {
                   ...computerUpgradeRequestService.computerUpgradeRequestTraceAttrs(settled),
                   via: "ready",
                 });
@@ -10928,10 +11121,9 @@ export class AgentOrchestrator extends EventEmitter {
       case "agent:activity": {
         // #wg-rbac:#57: the one point where a runtime error's text enters the
         // server. Scrub and cap it here, so the activity snapshot, the stored
-        // last_runtime_error and every push carry only the bounded text.
-        if (isDaemonRuntimeErrorActivityFrame(msg) && typeof msg.detail === "string") {
-          msg.detail = boundedRuntimeErrorDetail(msg.detail);
-        }
+        // last_runtime_error, the activity log and every push carry only the
+        // bounded text.
+        scrubDaemonRuntimeErrorActivityFrame(msg);
         const joinTraceAttrs = daemonActivityJoinTraceAttrs(msg);
         const span = this.tracer.startSpan("server.agent.activity.ingest", {
           parent: getCurrentTraceContext(),
@@ -11166,6 +11358,11 @@ export class AgentOrchestrator extends EventEmitter {
               return;
             }
 
+            // An agent on a per-turn runtime driver whose process just exited
+            // idle: onboarding wakes held for it go now (onboardingHeldWakes.ts).
+            if (isPerTurnExitRuntime(agent.runtime) && isLegacyProcessIdleActivity({ activity, detailKind, detail: msg.detail })) {
+              this.emit("agent:per-turn-process-idle", { agentId: msg.agentId, serverId: agent.serverId });
+            }
             const kimiCircuitDecision = this.planKimiActivityCircuitBreaker({
               agent,
               activity,
@@ -11187,6 +11384,11 @@ export class AgentOrchestrator extends EventEmitter {
               });
               return;
             }
+            // #proj-runtime:#62: a clean turn end is checked for progress off this path.
+            // Server time, not the daemon's `observedAtMs`: turns are compared
+            // with progress marks the server stamps, and a Computer's clock may
+            // be off. A heartbeat repeats a state, it is no new frame here.
+            if (msg.isHeartbeat !== true) this.observeRepeatedWakeActivity(agent, machineId, conn?.daemonVersion, activity, detailKind, this.clock.now());
 
             const acceptedAttrs: Record<string, unknown> = {
               activity,
@@ -12031,6 +12233,44 @@ export class AgentOrchestrator extends EventEmitter {
         break;
       }
 
+      // A runtime process ended abnormally holding app events it had acked
+      // (thirdPartyAgentEventRedelivery, the next-start pass): only this
+      // machine's agent's own pushed rows go back to `queued`. Frames from one
+      // socket are handled concurrently, so the requeue joins the agent's
+      // next-start chain here, before any await: the `agent:runtime:ready` of
+      // the process that follows (sent after this frame) runs its pass only
+      // once the requeue has committed.
+      case "agent:inbox:dropped_app_events": {
+        await this.chainThirdPartyEventAgentWork(typeof msg.agentId === "string" ? msg.agentId : "", () => this.runInTraceSpan(
+          "server.third_party_event.dropped_on_exit.ingest",
+          { kind: "consumer", attrs: { agent_id: msg.agentId, machine_id: machineId } },
+          async (): Promise<TraceAttributes> => {
+            if (typeof msg.agentId !== "string" || !Array.isArray(msg.eventIds)) return { outcome: "dropped", reason: "invalid_frame" };
+            const exitReason = typeof msg.exitReason === "string" && /^[a-z_]{1,48}$/.test(msg.exitReason) ? msg.exitReason : "other";
+            const launchId = typeof msg.launchId === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(msg.launchId) ? msg.launchId : null;
+            const listed = { exit_reason: exitReason, listed_count: msg.eventIds.length, ...(launchId ? { launch_id: launchId } : {}) };
+            const agent = await this.validateMachineAgentMessage(machineId, conn?.serverId ?? null, msg.agentId, msg.type);
+            if (!agent) return { outcome: "dropped", reason: "invalid_agent", ...listed };
+            // Of a daemon process that is not the connected one: stale.
+            if (conn?.daemonInstanceId && msg.daemonInstanceId !== conn.daemonInstanceId) {
+              return { outcome: "dropped", reason: "stale_instance", ...listed };
+            }
+            const result = await requeueDroppedThirdPartyAgentEvents({ agentId: msg.agentId, eventIds: msg.eventIds, now: new Date(this.clock.now()) });
+            return {
+              outcome: result.outcome,
+              ...listed,
+              // Trace only: the process's launch against the agent's current
+              // one (a stop then a start may already have moved it on).
+              ...(launchId && agent.expectedLaunchId ? { launch_matches_expected: launchId === agent.expectedLaunchId } : {}),
+              requeued_count: result.requeued.length,
+              ...Object.fromEntries(Object.entries(result.ignored).map(([reason, count]) => [`ignored_${reason}`, count])),
+            };
+          },
+          (attrs) => ({ attrs }),
+        ).then(() => undefined));
+        break;
+      }
+
       case "agent:runtime:ready": {
         await this.runInTraceSpan(
           "server.agent.runtime_ready.ingest",
@@ -12041,6 +12281,9 @@ export class AgentOrchestrator extends EventEmitter {
             if (!agent) return { outcome: "dropped", reason: "invalid_agent" };
             // The breaker itself ignores a launch that is not its current start.
             const progress = await this.observeStartProgress(msg.agentId, msg.launchId);
+            // A runtime of the agent runs again: its queued app events go out
+            // (the ones an abnormal end dropped, thirdPartyAgentEventRedelivery).
+            this.startThirdPartyEventNextStartPass(machineId, msg.agentId, conn);
             return { outcome: progress.changed ? "streak_cleared" : "unchanged", unpaused: progress.unpaused };
           },
           (attrs) => ({ attrs }),
@@ -12070,6 +12313,7 @@ export class AgentOrchestrator extends EventEmitter {
                 release_cause: restored.releaseCause,
                 lifted_reason: restored.reason,
                 launch_id_present: restored.launchId !== null,
+                ...launchIdHashAttrs(restored.launchId),
               });
             }
             return {
@@ -12638,6 +12882,8 @@ export class AgentOrchestrator extends EventEmitter {
       case "agent:interrupt-turn:result":
       // #proj-runtime:#41: the daemon's answer to a stop-this-sub-agent request.
       case "agent:interrupt-subagent:result":
+      // #wg-runtime-form:#22: the daemon's answer to a voice status or side question.
+      case "agent:side-ask:result":
         this.emit(`machine:response:${machineId}`, msg);
         void this.getMachineResponseRelay().forward(machineId, msg,
           (event, attrs) => this.recordMachineResponseRelay(event, attrs));
@@ -13404,6 +13650,7 @@ export class AgentOrchestrator extends EventEmitter {
         sendLocally: () => {
           if (!conn) return false;
           conn.ws.send(JSON.stringify(msg));
+          this.noteRepeatedWakeFrameSent(msg);
           return true;
         },
         // A provider connect's API key crosses Redis sealed (runtimeAuthReplicaSeal.ts).
@@ -14787,7 +15034,109 @@ export class AgentOrchestrator extends EventEmitter {
     const conn = this.machineConnections.get(machineId);
     if (!conn || conn.ws.readyState !== 1) return false;
     conn.ws.send(JSON.stringify(msg));
+    this.noteRepeatedWakeFrameSent(msg);
     return true;
+  }
+
+  /**
+   * #proj-runtime:#62: what this replica just handed an agent on its Computer.
+   * A delivery or a start offers input (a start with a wake message offers
+   * only that: the daemon ignores the catch-up then); a stop, or a start a
+   * person asked for, starts the count over.
+   */
+  private noteRepeatedWakeFrameSent(msg: ServerToMachineMessage): void {
+    if (msg.type === "agent:deliver") {
+      this.repeatedWakeGuard.noteOffered(msg.agentId, [msg.message], { drivesLoop: true });
+    } else if (msg.type === "agent:start") {
+      if (msg.humanStart) this.repeatedWakeGuard.forget(msg.agentId);
+      if (msg.wakeMessage) this.repeatedWakeGuard.noteOffered(msg.agentId, [msg.wakeMessage], { drivesLoop: true });
+      else this.repeatedWakeGuard.noteOffered(msg.agentId, msg.resumeMessages ?? [], { drivesLoop: false });
+    } else if (msg.type === "agent:stop") {
+      this.repeatedWakeGuard.forget(msg.agentId);
+    }
+  }
+
+  /** #proj-runtime:#62: feed an accepted activity frame; a clean turn end is decided off the ingest path. */
+  private observeRepeatedWakeActivity(
+    agent: CachedAgentState,
+    machineId: string,
+    daemonVersion: string | null | undefined,
+    activity: AgentActivityKind,
+    detailKind: AgentActivityDetailKind,
+    atMs: number,
+  ): void {
+    const turn = this.repeatedWakeGuard.noteActivity(agent.id, activity, detailKind, atMs);
+    if (!turn) return;
+    void this.repeatedWakeGuard.completeTurn(agent.id, turn)
+      .then((trip) => (trip ? this.onRepeatedWakeTrip(agent, machineId, daemonVersion ?? null, trip) : undefined))
+      .catch((error: unknown) => {
+        console.warn(`[Agent ${agent.id}] repeated-wake check failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+  }
+
+  /**
+   * #proj-runtime:#62: the guard tripped. Always recorded; with
+   * `agent_repeated_wake_guard` on for the server, the process stops (the
+   * agent stays on), the message is left out of later catch-ups until a person
+   * starts the agent, and the owner is told once per message.
+   */
+  private async onRepeatedWakeTrip(agent: CachedAgentState, machineId: string, daemonVersion: string | null, trip: RepeatedWakeTrip): Promise<void> {
+    const enforced = await evaluateFeatureFlag({ key: AGENT_REPEATED_WAKE_GUARD_FEATURE_FLAG_KEY, serverId: agent.serverId })
+      .then((evaluation) => evaluation.enabled === true, () => false);
+    const attrs: TraceAttributes = {
+      agent_id: agent.id,
+      server_id: agent.serverId,
+      machine_id: machineId,
+      runtime: agent.runtime,
+      daemon_version: daemonVersion,
+      message_id: trip.input.messageId,
+      channel_id: trip.input.channelId,
+      offered_count: trip.input.key.split(",").length,
+      empty_turns: trip.emptyTurns,
+      tool_starts: trip.toolStarts,
+      streak_ms: this.clock.now() - trip.streakStartedAtMs,
+      enforced,
+    };
+    console.warn(
+      `[Agent ${agent.id}] woken ${trip.emptyTurns} turns in a row by message ${trip.input.messageId} with no progress`
+      + (enforced ? "; stopping its process" : " (count only)"),
+    );
+    await this.runInTraceSpan("server.agent.repeated_wake", { attrs }, async () => {
+      if (!enforced) return "count_only";
+      const { excludeId, messageId } = trip.input;
+      // Before the stop, so a start racing it already leaves the message out.
+      if (excludeId !== null) await setRepeatedWakeExclusion(agent.id, excludeId);
+      try {
+        await this.stopAgent(agent.id, "internal");
+      } catch (error) {
+        // No replica holds the Computer now: the next empty turn trips again.
+        this.repeatedWakeGuard.rearm(agent.id);
+        console.warn(`[Agent ${agent.id}] repeated-wake stop not delivered: ${error instanceof Error ? error.message : String(error)}`);
+        return "stop_undelivered";
+      }
+      // A trip on input that names no message (before this replica offered
+      // anything, or a notice) stops only: a repeat after the next start trips
+      // again with a message to name.
+      if (messageId !== null && await claimRepeatedWakeNotice(agent.id, messageId)) {
+        await this.postRepeatedWakeStoppedNotice(agent.id, { emptyTurns: trip.emptyTurns, messageId, channelId: trip.input.channelId, excluded: excludeId !== null });
+      }
+      return excludeId !== null ? "stopped_excluded" : "stopped";
+    }, (outcome) => ({ attrs: { outcome } }));
+  }
+
+  protected async postRepeatedWakeStoppedNotice(
+    agentId: string,
+    input: { emptyTurns: number; messageId: string; channelId: string | null; excluded: boolean },
+  ): Promise<boolean> {
+    if (!this.io) return false;
+    const channel = input.channelId ? await channelService.getChannel(input.channelId).catch(() => null) : null;
+    const messageRef = channel?.name && (channel.type === "channel" || channel.type === "private")
+      ? `#${channel.name} msg=${input.messageId.slice(0, 8)}`
+      : null;
+    return postAgentActionRequiredNotice(this.io, this, {
+      agentId,
+      notice: { kind: "repeated_wake_stopped", emptyTurns: input.emptyTurns, messageRef, excluded: input.excluded },
+    });
   }
 
   async handleRoutedMachineCommand(machineId: string, msg: ServerToMachineMessage): Promise<boolean> {
@@ -15645,21 +15994,76 @@ export class AgentOrchestrator extends EventEmitter {
     serverId: string | null | undefined,
     runtime: string | null | undefined,
   ): Promise<boolean> {
-    if (!this.hasMachineCapability(machineId, DAEMON_CAPABILITY_RUNTIME_HOST_OAR)) return false;
+    return this.agentRuntimeOarRequestedFor((capability) => this.hasMachineCapability(machineId, capability), serverId, runtime);
+  }
+
+  /** agentRuntimeOarRequested with the machine's capabilities from wherever the caller read them. */
+  private async agentRuntimeOarRequestedFor(
+    hasCapability: (capability: string) => boolean,
+    serverId: string | null | undefined,
+    runtime: string | null | undefined,
+  ): Promise<boolean> {
+    if (!hasCapability(DAEMON_CAPABILITY_RUNTIME_HOST_OAR)) return false;
     // No legacy driver to choose instead: its flag admitted it at create/switch.
     if (isOarOnlyRuntime(runtime)) return true;
     if (agentRuntimeOarDisabled()) return false;
     // Codex: no flag (retired, #raft-architecture:#32). Earlier Computers
     // advertise the OAR host with an unfinished Codex launch, so the
     // capability alone decides.
-    if (runtime === "codex") return this.hasMachineCapability(machineId, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CODEX);
+    if (runtime === "codex") return hasCapability(DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CODEX);
     const key = agentRuntimeOarFeatureFlagKey(runtime);
     if (!key) return false;
     // Earlier Computers carry a Grok launch without the fixes it needs by default (#oar-raft:#4).
-    if (runtime === "grok" && !this.hasMachineCapability(machineId, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_GROK)) return false;
+    if (runtime === "grok" && !hasCapability(DAEMON_CAPABILITY_RUNTIME_HOST_OAR_GROK)) return false;
     // #oar-raft:#10: only a Computer that can load the Cursor SDK (Linux, non-SEA) runs Cursor on OAR.
-    if (runtime === "cursor" && !this.hasMachineCapability(machineId, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR)) return false;
+    if (runtime === "cursor" && !hasCapability(DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR)) return false;
+    // Earlier Computers have no OpenCode launch on their OAR host.
+    if (runtime === "opencode" && !hasCapability(DAEMON_CAPABILITY_RUNTIME_HOST_OAR_OPENCODE)) return false;
     return this.startConfigFlagEnabled(key, serverId);
+  }
+
+  /**
+   * How a server-built onboarding wake (a synthetic seq-0 message no read can
+   * return) goes to this agent: see services/onboardingHeldWakes.ts. Only a
+   * runtime whose legacy daemon driver exits after every turn changes
+   * (`agent.runtime`), and not when its starts ask for the OAR host (one live
+   * session, no per-turn exit): the same decision `agent:start` makes, on the
+   * machine's capabilities from the socket here or the replica mirror. Such an
+   * agent gets it transient now when nothing can drop it: the agent is not
+   * active (this delivery starts it, with the wake as its start input), or
+   * its process has exited idle (the daemon's "Process idle"; the delivery
+   * starts the next process with it). Otherwise (a start in flight, a turn
+   * running, a process exiting) it is held until that "Process idle".
+   */
+  async onboardingWakeRoute(agentId: string): Promise<OnboardingWakeRoute> {
+    const agent = await this.getAuthoritativeAgentForDelivery(agentId);
+    if (!agent || !isPerTurnExitRuntime(agent.runtime)) return "unchanged";
+    const capabilities = await this.machineCapabilitiesForOnboardingWake(agent.machineId);
+    if (await this.agentRuntimeOarRequestedFor((capability) => capabilities.has(capability), agent.serverId, agent.runtime)) {
+      return "unchanged";
+    }
+    if (agent.status !== "active") return "transient_now";
+    // This replica's view, or the shared mirror when it is newer (the frames
+    // reach the replica that owns the machine socket).
+    const local = this.agentActivity.get(agentId) ?? null;
+    const shared = this.replicaStateStore.isAvailable()
+      ? await this.replicaStateStore.getAgentActivity(agentId).catch(() => null)
+      : null;
+    const latest = !shared ? local : !local ? shared : shared.updatedAt >= local.updatedAt ? shared : local;
+    return isLegacyProcessIdleActivity(latest) ? "transient_now" : "hold";
+  }
+
+  private async machineCapabilitiesForOnboardingWake(machineId: string | null): Promise<ReadonlySet<string>> {
+    if (!machineId) return new Set();
+    const local = this.machineConnections.get(machineId);
+    if (local) return local.capabilities;
+    if (!this.replicaStateStore.isAvailable()) return new Set();
+    try {
+      const parsed: unknown = JSON.parse((await this.replicaStateStore.getMachineMeta(machineId))?.probeCapabilities ?? "[]");
+      return new Set(Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === "string") : []);
+    } catch {
+      return new Set();
+    }
   }
 
   /**
@@ -16010,6 +16414,17 @@ export class AgentOrchestrator extends EventEmitter {
     // starts in a row, and for the wait before a retry-once retry. A human
     // start/resume always passes and opens a new episode below.
     const humanStart = startCause === "manual" || startCause === "resume";
+    // #proj-runtime:#62: a person's start (Start, Resume: `human_start`, the
+    // rule that also forgets the count) hands the agent back the message a
+    // repeated-wake stop left out; any other start keeps leaving it out.
+    let repeatedWakeExcluded: string | null = null;
+    if (options.control === "human_start") {
+      await clearRepeatedWakeExclusion(agentId).catch((error: unknown) => {
+        console.warn(`[Agent ${agentId}] repeated-wake exclusion not cleared: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    } else {
+      repeatedWakeExcluded = await repeatedWakeExclusion(agentId);
+    }
     const wakeHold = humanStart ? null : await this.wakeCrashLoopBreaker.automaticWakeHold(agentId, this.clock.now());
     if (wakeHold) {
       this.recordLifecycleEvent({
@@ -16115,9 +16530,16 @@ export class AgentOrchestrator extends EventEmitter {
       ReturnType<AgentOrchestrator["validateBuiltInPresetForMachine"]>
     > = null;
     try {
+      // A typed id through a saved preset connection is checked like a direct one.
+      const connectionProviderId = normalizedRuntimeConfig.runtime === "builtin"
+        && normalizedRuntimeConfig.provider.kind === "connection"
+        && normalizedRuntimeConfig.model.kind === "custom"
+        ? await providerConnectionProviderId(agent.serverId, normalizedRuntimeConfig.provider.connectionId)
+        : null;
       catalogValidation = await this.validateBuiltInPresetForMachine(
         agent.machineId,
         normalizedRuntimeConfig,
+        connectionProviderId,
       );
     } catch (error) {
       if (error instanceof BuiltInModelCatalogError) {
@@ -16271,6 +16693,18 @@ export class AgentOrchestrator extends EventEmitter {
               historyCutoff,
               terminalObligation ? { chain, obligation: terminalObligation } : { chain },
             );
+            // #proj-runtime:#62: the message a repeated-wake stop named stays
+            // out of automatic starts' catch-up (it stays unread). A person's
+            // start cleared it above. Not with a terminal obligation, whose
+            // batch must match what it renders.
+            if (!terminalObligation && repeatedWakeExcluded) {
+              const keep = catchup.messages.map((m) => m.message_id !== repeatedWakeExcluded);
+              if (keep.includes(false)) {
+                catchup.messages = catchup.messages.filter((_, i) => keep[i]);
+                catchup.sources = catchup.sources.filter((_, i) => keep[i]);
+                span.addEvent("resume_catchup.repeated_wake_excluded", { outcome: "excluded", reason: "repeated_wake" });
+              }
+            }
             obligationBatch = catchup.obligationBatch;
             // task #1221: the owed catch-up has nothing left unread (read
             // since): it is settled, not owed to a later start.
@@ -17621,6 +18055,47 @@ export class AgentOrchestrator extends EventEmitter {
     return { outcome: response.outcome };
   }
 
+  /**
+   * #wg-runtime-form:#22 (Raft voice): what the agent is doing now, or one
+   * question answered by a read-only fork of its session, from its Computer
+   * (agentVoiceService decides who may ask). Same carrier and relay as
+   * interruptAgentTurn; the relay waits the daemon's own limit plus a margin.
+   */
+  async sideAskAgent(
+    agentId: string,
+    machineId: string | null,
+    ask: { kind: "status" } | { kind: "question"; question: string; asker: AgentSideAskAsker },
+  ): Promise<AgentSideAskRequestResult> {
+    if (!machineId) return { outcome: "agent_not_running" };
+    const fact = await this.readProbeCarrierFact(machineId);
+    if (!fact) return { outcome: "computer_offline" };
+    if (!fact.capabilities.includes(DAEMON_CAPABILITY_AGENT_SIDE_ASK)) return { outcome: "computer_upgrade_required" };
+    const requestId = crypto.randomUUID();
+    const timeoutMs = ask.kind === "status" ? SIDE_ASK_STATUS_TIMEOUT_MS : AGENT_SIDE_ASK_MAX_TIMEOUT_MS;
+    let response: RelayedMachineResponse;
+    try {
+      response = await this.getMachineResponseRelay().request({
+        requestId, machineId, type: "agent:side-ask:result", agentId,
+      }, timeoutMs + SIDE_ASK_RELAY_MARGIN_MS, () => this.sendRequiredToMachine(machineId, {
+        type: "agent:side-ask",
+        agentId,
+        requestId,
+        timeoutMs,
+        ...ask,
+      }), (event, attrs) => this.recordMachineResponseRelay(event, attrs));
+    } catch (error) {
+      // No answer is an outcome here, not a failure of the person's request.
+      if (error instanceof RouteFailureError && error.subkind === "daemon_timeout") return { outcome: "timed_out" };
+      if (error instanceof RouteFailureError && error.subkind === "daemon_offline") return { outcome: "computer_offline" };
+      throw error;
+    }
+    if (response.type !== "agent:side-ask:result") throw new Error("Unexpected side-ask response");
+    return {
+      outcome: response.outcome,
+      ...(typeof response.text === "string" ? { text: response.text.slice(0, AGENT_SIDE_ASK_ANSWER_MAX_CHARS) } : {}),
+    };
+  }
+
   async requestProviderProbe(
     machineId: string,
     input: { requestId: string; probeId: string; runtime: string; model: string },
@@ -17842,14 +18317,17 @@ export class AgentOrchestrator extends EventEmitter {
   async validateBuiltInPresetForMachine(
     machineId: string,
     config: RuntimeConfig,
+    /** A saved connection's provider, when the caller resolved it (builtInCatalogSelection). */
+    connectionProviderId: string | null,
   ): Promise<
     | (BuiltInModelCatalogValidation & {
         authority: MachineConnectionGeneration;
       })
     | null
   > {
-    if (!isBuiltInCatalogCheckedSelection(config)) return null;
-    const requestedModel = config.model.kind === "preset" ? config.model.id : config.model.name;
+    const selection = builtInCatalogSelection(config, connectionProviderId);
+    if (!selection) return null;
+    const requestedModel = selection.model.kind === "preset" ? selection.model.id : selection.model.name;
     let detection: MachineRuntimeModelDetection;
     try {
       detection = await this.detectMachineRuntimeModelsWithAuthority(
@@ -17878,6 +18356,7 @@ export class AgentOrchestrator extends EventEmitter {
         daemonVersion: detection.daemonVersion,
         computerVersion: detection.computerVersion,
       },
+      connectionProviderId,
     );
     return validation
       ? { ...validation, authority: detection.authority }
@@ -18590,11 +19069,11 @@ export class AgentOrchestrator extends EventEmitter {
     return resolveOutageStart({ lastHeartbeat, closedAt: conn?.previousCloseAt, connectedAt: connectedAtMs });
   }
 
-  /** Starts the reconnect pass for a `ready` without waiting for it (shutdown does). */
+  /** Starts the reconnect and restart passes for a `ready` without waiting for them (shutdown does). */
   private startThirdPartyEventReconnectPass(
     machineId: string,
     agentIds: readonly string[],
-    conn: { connectedAt?: number; previousCloseAt?: number; daemonVersion: string | null } | undefined,
+    conn: ThirdPartyEventReadyConnection | undefined,
   ): void {
     const pass = this.runThirdPartyEventReconnectPass(machineId, agentIds, conn)
       .finally(() => {
@@ -18886,17 +19365,32 @@ export class AgentOrchestrator extends EventEmitter {
   }
 
   /**
-   * The app-event reconnect pass for a machine's `ready`
-   * (thirdPartyAgentEventRedelivery): only after an outage longer than a
-   * parked ack-retry record lives, with a known start, from a daemon that
-   * reports delivered events; otherwise traced as skipped. Never throws.
+   * The app-event passes for a machine's `ready` (thirdPartyAgentEventRedelivery),
+   * one after the other: the reconnect pass, then the restart pass. The
+   * reconnect pass's claims set `updated_at` to now, after the new daemon
+   * connected, so the restart pass never sends one of its events again.
+   * Never throws.
    */
   protected async runThirdPartyEventReconnectPass(
     machineId: string,
     agentIds: readonly string[],
-    conn: { connectedAt?: number; previousCloseAt?: number; daemonVersion: string | null } | undefined,
+    conn: ThirdPartyEventReadyConnection | undefined,
   ): Promise<void> {
     if (agentIds.length === 0) return;
+    await this.runThirdPartyEventOutagePass(machineId, agentIds, conn);
+    await this.runThirdPartyEventDaemonRestartPass(machineId, agentIds, conn);
+  }
+
+  /**
+   * The reconnect pass: only after an outage longer than a parked ack-retry
+   * record lives, with a known start, from a daemon that reports delivered
+   * events; otherwise traced as skipped. Never throws.
+   */
+  private async runThirdPartyEventOutagePass(
+    machineId: string,
+    agentIds: readonly string[],
+    conn: ThirdPartyEventReadyConnection | undefined,
+  ): Promise<void> {
     try {
       const reconnectedAtMs = conn?.connectedAt ?? this.clock.now();
       const plan = planReconnectRedelivery({
@@ -18933,6 +19427,110 @@ export class AgentOrchestrator extends EventEmitter {
         error_class: errorClassOf(err),
       });
     }
+  }
+
+  /**
+   * The restart pass: only when this `ready` comes from another daemon
+   * instance than the machine's last one (recordMachineDaemonInstance: a
+   * restart or upgrade lost what the old daemon held), from a daemon that
+   * reports delivered events. A `ready` of the same instance (a socket
+   * reconnect), the first one recorded for the machine, the instance the
+   * marker had just replaced coming back (two daemons taking turns), one
+   * without an instance id, or a marker that could not be written: traced as skipped,
+   * nothing sent. Never throws.
+   */
+  private async runThirdPartyEventDaemonRestartPass(
+    machineId: string,
+    agentIds: readonly string[],
+    conn: ThirdPartyEventReadyConnection | undefined,
+  ): Promise<void> {
+    const skipped = (outcome: DaemonRestartRedeliverySkip, attrs: Record<string, string> = {}) => this.recordEvent("server.third_party_event.redeliver_skipped", {
+      trigger: "daemon_instance_changed",
+      outcome,
+      machine_id: machineId,
+      ...attrs,
+    });
+    if (!daemonReportsDeliveredThirdPartyEvents(conn?.daemonVersion)) return skipped("skipped_old_daemon");
+    const daemonInstanceId = conn?.daemonInstanceId;
+    if (!daemonInstanceId) return skipped("skipped_no_instance_id");
+    let observed: Awaited<ReturnType<typeof recordMachineDaemonInstance>>;
+    try {
+      observed = await recordMachineDaemonInstance({ machineId, daemonInstanceId, now: new Date(this.clock.now()) });
+    } catch (err) {
+      console.warn(`[Orchestrator] daemon instance marker not written for machine ${machineId}; no restart re-delivery:`, err instanceof Error ? err.message : err);
+      return skipped("skipped_marker_failed", { error_class: errorClassOf(err) });
+    }
+    if (observed === "same") return skipped("skipped_same_instance");
+    if (observed === "first") return skipped("skipped_first_instance");
+    if (observed === "returned_to_previous") return skipped("skipped_returned_to_previous_instance");
+    try {
+      await redeliverPendingThirdPartyAgentEvents({
+        trigger: "daemon_instance_changed",
+        daemonConnectedAt: new Date(conn?.connectedAt ?? this.clock.now()),
+        agentIds,
+        excludeEventIds: this.thirdPartyEventIdsInFlight(),
+        parkedMaxMs: AgentOrchestrator.AGENT_DELIVERY_PARKED_MAX_MS,
+        deliverer: this,
+        tracer: this.tracer,
+        machineId,
+      });
+    } catch (err) {
+      console.error(`[Orchestrator] third-party event restart pass failed for machine ${machineId}:`, err);
+      this.recordEvent("server.third_party_event.redeliver_failed", {
+        outcome: "failed",
+        trigger: "daemon_instance_changed",
+        machine_id: machineId,
+        error_class: errorClassOf(err),
+      });
+    }
+  }
+
+  /**
+   * The next-start pass for one agent whose runtime is ready, in the
+   * background (awaitThirdPartyEventReconnectPasses waits for it): its
+   * `queued` app events, from a daemon that reports delivered events. Never
+   * throws.
+   */
+  private startThirdPartyEventNextStartPass(
+    machineId: string,
+    agentId: string,
+    conn: Pick<MachineConnection, "daemonVersion"> | undefined,
+  ): void {
+    if (!daemonReportsDeliveredThirdPartyEvents(conn?.daemonVersion)) return;
+    void this.chainThirdPartyEventAgentWork(agentId, () => redeliverPendingThirdPartyAgentEvents({
+      trigger: "runtime_ready",
+      agentIds: [agentId],
+      excludeEventIds: this.thirdPartyEventIdsInFlight(),
+      deliverer: this,
+      tracer: this.tracer,
+      machineId,
+    }).then(() => undefined, (err: unknown) => {
+      console.error(`[Orchestrator] third-party event next-start pass failed for agent ${agentId}:`, err);
+      this.recordEvent("server.third_party_event.redeliver_failed", {
+        outcome: "failed",
+        trigger: "runtime_ready",
+        machine_id: machineId,
+        error_class: errorClassOf(err),
+      });
+    }));
+  }
+
+  /**
+   * One agent's app-event work in order (a dropped-events requeue, then the
+   * next-start passes): `work` starts once the agent's earlier work settled,
+   * and is linked synchronously, so the order is the order of the calls.
+   * awaitThirdPartyEventReconnectPasses waits for the chain. Returns `work`'s
+   * own result (the chain itself never rejects).
+   */
+  private chainThirdPartyEventAgentWork(agentId: string, work: () => Promise<void>): Promise<void> {
+    const key = `runtime_ready:${agentId}`;
+    const previous = this.thirdPartyEventReconnectPasses.get(key) ?? Promise.resolve();
+    const result = previous.then(work);
+    const link: Promise<void> = result.catch(() => undefined).finally(() => {
+      if (this.thirdPartyEventReconnectPasses.get(key) === link) this.thirdPartyEventReconnectPasses.delete(key);
+    });
+    this.thirdPartyEventReconnectPasses.set(key, link);
+    return result;
   }
 
   /**
@@ -20685,7 +21283,7 @@ export class AgentOrchestrator extends EventEmitter {
           this.io?.to(agentEventRoom(agent.serverId, agent.assistantOwnerUserId)).except(agentActivityCapableServerRoom(agent.serverId)).emit("agent:activity", publicPayload);
           this.io?.to(agentActivityRoom(agentId)).emit("agent:activity", publicPayload);
         }
-        this.agentActivityStateFanout.observe(agentActivityStateRoom(agent.serverId, agent.assistantOwnerUserId), agentId, activity, timestamp, nextSeq);
+        this.agentActivityStateFanout.observe(agentActivityStateRoom(agent.serverId, agent.assistantOwnerUserId), agentId, activity, timestamp, nextSeq, agent.machineId);
         // Joint membership exposes basic presence, never the agent's unrelated
         // work summary, diagnostics, or runtime correlation identifiers.
         void this.emitJointActivityToProjectionRooms(agent.id, agent.serverId, {

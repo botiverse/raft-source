@@ -1,5 +1,5 @@
 import type { IntlShape } from "react-intl";
-import { formatRelativeTimeParts } from "../../../utils/relativeTime";
+import { formatRelativeTime, formatRelativeTimeParts } from "../../../utils/relativeTime";
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -31,19 +31,31 @@ const SHORT_IDS = {
   day: "machine.rack.resetsInDays",
 } as const;
 
-/**
- * A used-up cell's words when its reset is known: `short` in the cell
- * ("Back in 3h"), `full` for its name ("Used up · back in 3 hours"), the
- * same count. Null when the reset isn't known or has passed. The usage
- * column (RACK_USAGE_CELL_PX) is as wide as the widest of them with a
- * two-digit count and the attention pixel, so none is cut off.
- */
 /** When a reset comes, relative, as the usage card and cell count it ("in 6 days"); null when unknown or past. */
 export function resetWhen(resetsAt: string | null | undefined, locale: string, nowMs: number): string | null {
   const reset = rackReset(resetsAt, nowMs);
   return reset ? formatRelativeTimeParts(reset.count, reset.unit, locale, { numeric: "always" }) : null;
 }
 
+/**
+ * A usage window's reset in words, wherever a window's reset is said (the
+ * usage card, the profile row, the pickers' line): to come, counted as the
+ * cell counts it (`resetWhen`: "in 5 days"); already passed, how long ago
+ * ("3 hours ago"), so a reading older than its reset shows it rather than
+ * hiding it. Null when unknown or not a time.
+ */
+export function usageResetText(resetsAt: string | null | undefined, locale: string, nowMs: number): string | null {
+  if (!resetsAt || Number.isNaN(Date.parse(resetsAt))) return null;
+  return resetWhen(resetsAt, locale, nowMs) ?? formatRelativeTime(resetsAt, locale);
+}
+
+/**
+ * A used-up cell's words when its reset is known: `short` in the cell
+ * ("Back in 3h"), `full` for its name ("Used up · resets in 3 hours"), the
+ * same count. Null when the reset isn't known or has passed. The usage
+ * column (RACK_USAGE_CELL_PX) is as wide as the widest of them with a
+ * two-digit count and the attention pixel, so none is cut off.
+ */
 export function rackResetText(
   resetsAt: string | null | undefined,
   { formatMessage, locale }: Pick<IntlShape, "formatMessage" | "locale">,

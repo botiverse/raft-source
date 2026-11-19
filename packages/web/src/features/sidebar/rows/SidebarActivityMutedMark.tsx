@@ -8,7 +8,7 @@ import { BellOff } from "lucide-react";
 export function SidebarActivityMutedMark() {
   const { formatMessage } = useIntl();
   return (
-    <Tooltip content={formatMessage({ id: "layout.sidebar.activityMutedTitle" })}>
+    <Tooltip content={formatMessage({ id: "notifications.level.muteNote" })}>
     <SidebarItemMetaIcon
       className="shrink-0"
       data-slot="sidebar-item-meta-icon"

@@ -6,6 +6,7 @@ import remarkGfm from "remark-gfm";
 import remarkCjkFriendly from "remark-cjk-friendly";
 import { InlineCode } from "@botiverse/raft-ui";
 import { remarkAutolinkBareUrls } from "../../utils/markdownAutolink";
+import { messageCardFallbackText } from "../../utils/messageCardFallbackText";
 
 const INLINE_PREVIEW_CODE_CLASS =
   "border-0 bg-transparent p-0 font-normal leading-[inherit] text-inherit";
@@ -59,7 +60,9 @@ interface InlineMarkdownPreviewProps {
   linkClassName?: string;
 }
 
-export default function InlineMarkdownPreview({ markdown, linkClassName }: InlineMarkdownPreviewProps) {
+export default function InlineMarkdownPreview({ markdown: source, linkClassName }: InlineMarkdownPreviewProps) {
+  // A card message's preview reads its acting buttons as their labels (RFC 086; messageCardFallbackText.ts).
+  const markdown = messageCardFallbackText(source);
   // The same <span> the parser renders the paragraph as (INLINE_COMPONENTS.p).
   if (isPlainPreviewText(markdown)) return <span>{markdown}</span>;
   return <ParsedMarkdownPreview markdown={markdown} linkClassName={linkClassName} />;

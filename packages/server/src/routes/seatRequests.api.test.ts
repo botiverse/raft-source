@@ -14,7 +14,7 @@ import { randomUUID } from "node:crypto";
 
 import { and, eq } from "drizzle-orm";
 import type { Server as SocketServer } from "socket.io";
-import { PRO_AGENT_SEAT_BLOCK_SIZE, PRO_SEAT_ADD_FEATURE_FLAG_KEY, SERVER_GUEST_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
+import { PRO_AGENT_SEAT_BLOCK_SIZE, PRO_SEAT_ADD_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
 import type { ActionCardMetadata } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
 import { actionCards, channelHumans, channels, featureFlags, inboxNotificationFacts, messages, productEvents, serverInvites, serverMembers, servers, subscriptions, users } from "../db/schema";
@@ -449,7 +449,6 @@ test("visibility comes first: an owner who can't see the request (it's in anothe
 
 test("Guest → member: the server names the Guest, only a Guest qualifies, and the owner's Add Seats changes the role", async ({ app }) => {
   const { owner, admin, member, server } = await seedWorld();
-  await setFlag(true, SERVER_GUEST_FEATURE_FLAG_KEY);
   const guest = await seedUser("seats-guest");
   await seedBoundGuest({ serverId: server.id, userId: guest.id });
 

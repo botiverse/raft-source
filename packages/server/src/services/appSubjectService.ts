@@ -20,6 +20,15 @@ export function parseAppSubject(raw: string): AppSubject | null {
   return UUID_RE.test(raw) ? raw as AppSubject : null;
 }
 
+type AppSubjectMapping = (input: { clientId: string; sub: AppSubject }) => Promise<string | null>;
+let mappingForTests: AppSubjectMapping | null = null;
+
+/** Tests only: another mapping (null restores the real one), to prove a caller goes through resolveAppSubjectToUserId. */
+export function __setAppSubjectMappingForTests(mapping: AppSubjectMapping | null): void {
+  if (process.env.NODE_ENV !== "test") throw new Error("App subject mapping hooks are test-only");
+  mappingForTests = mapping;
+}
+
 /**
  * The Raft user an App means by `sub`: THE one place an App subject becomes a
  * user id. Null when the subject names no one.
@@ -34,6 +43,7 @@ export function parseAppSubject(raw: string): AppSubject | null {
  * id returned here, and never compare `users.id` with a subject directly.
  */
 export async function resolveAppSubjectToUserId(input: { clientId: string; sub: AppSubject }): Promise<string | null> {
+  if (mappingForTests) return mappingForTests(input);
   const [user] = await getDb()
     .select({ id: users.id })
     .from(users)

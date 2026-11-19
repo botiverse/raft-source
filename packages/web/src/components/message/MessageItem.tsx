@@ -1,4 +1,5 @@
 import { ArtifactMessageRefs, ArtifactSavedAttachments, useArtifactAttachmentMenu } from "../../apps/artifacts";
+import { ProfileDescription } from "./ProfileDescription";
 import { channelAnnouncementNoticeLine } from "../channel/channelAnnouncementNotice";
 import { trackMessageAction, messageMenuSurface } from "../../analytics/entries";
 import { MessageLinkCardsProvider, useMessageLinkCards } from "./useMessageLinkCards";
@@ -296,6 +297,7 @@ import { useOpenRaftPermalink } from "./useOpenRaftPermalink";
 import { taskNumberSigil } from "./messageMarkdownRefs";
 import type { MentionEntry } from "./messageMarkdownRefs";
 import { LinkCardBoundary } from "./LinkCardBoundary";
+import { messageCardFallbackText } from "../../utils/messageCardFallbackText";
 
 export type { MentionEntry };
 
@@ -2437,6 +2439,7 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message: rawMe
     conversationId: message.channelId,
     enabled: !readOnlyProjection && !forwardedBundleMetadata,
     target: messageBodyRef,
+    card: messageCard?.acting ?? null,
   });
   // Stryker disable all: React effect wiring delegates branch decisions to
   // behavior-tested helpers; source contracts pin the API endpoint and render
@@ -3191,7 +3194,7 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message: rawMe
   }, [trackFromMenu]);
   const closeCreateFromMessage = useCallback(() => setCreateFromMessageOpen(false), []);
   const createFromMessageSource = useMemo(
-    () => ({ id: message.id, senderName: senderDisplayName, text: message.content }),
+    () => ({ id: message.id, senderName: senderDisplayName, text: messageCardFallbackText(message.content) }),
     [message.id, message.content, senderDisplayName],
   );
 
@@ -3826,7 +3829,7 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message: rawMe
   }, [inThread, senderHandleText]);
   const handleCopyMarkdown = useCallback(() => {
     trackFromMenu("copy_markdown");
-    void navigator.clipboard.writeText(message.content).then(() => setCtxMenu(null));
+    void navigator.clipboard.writeText(messageCardFallbackText(message.content)).then(() => setCtxMenu(null));
   }, [message.content, trackFromMenu]);
   // "Select Text" (touch menu only): a bottom sheet with the message's text,
   // natively selectable, since the touch row itself is not (index.css
@@ -4148,9 +4151,18 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message: rawMe
           </Tooltip>
         </MessageItemGutter>
       )}
-      <MessageItemContent>
+      <MessageItemContent className="@container/message">
         {groupState?.showName === false && !showSelectedGroupedHeader ? null : (
-          <MessageItemHeader>
+          // In a message at least 48rem wide, the header keeps the right fifth
+          // of the row empty (end padding), so a long description stops there
+          // and the gap follows the message's width, not a fixed length
+          // (cindyz, #triage:12ce35d4). Padding, not a cap on the sender
+          // group: the group stays at its content width (a delegated row's
+          // "sent by" stays beside the name), and the header box stays full
+          // width, so raft-ui's hover fade under the toolbar lands in the empty
+          // padding, not on the time. The container is the message, so a
+          // narrow thread panel keeps the full width.
+          <MessageItemHeader className="@3xl/message:pe-[20%]">
           {/* The name, notes and time stand on the name's baseline
               (raft-design alignment.md, "Text of different sizes on one
               line"): raft-ui's MessageItemHeader and MessageItemSenderGroup
@@ -4229,15 +4241,17 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message: rawMe
             </Tooltip>
           )}
           {senderDescriptionText && (
-            <Tooltip content={senderDescriptionText}>
+            <ProfileDescription text={senderDescriptionText}>
+            {(content) => (
             <MessageItemMeta
               render={<span />}
               className={`min-w-0 shrink truncate ${messageMetaSizeClass}`}
               data-testid={`message-sender-description-${message.id}`}
             >
-              {senderDescriptionText}
+              {content}
             </MessageItemMeta>
-            </Tooltip>
+            )}
+            </ProfileDescription>
           )}
           </span>
           </MessageItemSenderGroup>
@@ -4302,7 +4316,7 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message: rawMe
                 />
               );
             }
-            if (messageCard) return <MessageCardBody read={messageCard} />;
+            if (messageCard) return <MessageCardBody read={messageCard} actions={linkCards.messageCard} />;
             if (isTranslationPending) {
               return (
                 <Skeleton
@@ -5009,7 +5023,7 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message: rawMe
         onClosed={handleSelectTextClosed}
         senderName={senderDisplayName}
         time={time}
-        markdown={message.content}
+        markdown={messageCardFallbackText(message.content)}
         quoteChannelId={quoteComposerChannelId}
       />
     )}

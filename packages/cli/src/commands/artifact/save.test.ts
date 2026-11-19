@@ -100,8 +100,12 @@ test("save: the Server's refusals in the shared words, with their codes", async 
   const hidden = await run(["artifact", "save", ATT], refusal(409, "ALREADY_SAVED", { attachmentId: ATT }));
   assert.ok(hidden.stderr.includes("That attachment was already saved as an artifact you can't see; nothing new was made."), hidden.stderr);
   assert.ok(hidden.stderr.includes(`Push your own copy: mkdir <dir>, raft attachment view ${ATT} --output <dir>/<file name>`) && hidden.stderr.includes("Code: ALREADY_SAVED"), hidden.stderr);
-  const big = await run(["artifact", "save", ATT], refusal(422, "ATTACHMENT_NOT_SAVABLE", { attachmentId: ATT, reason: "too_large", limit: 15 * 1024 * 1024 }));
-  assert.ok(big.stderr.includes("larger than an artifact file may be (15 MiB for this kind of file)") && big.stderr.includes("Code: ATTACHMENT_NOT_SAVABLE"), big.stderr);
-  const down = await run(["artifact", "save", ATT], refusal(503, "CONTENT_UNAVAILABLE", {}));
-  assert.ok(down.stderr.includes(`Try again later: raft artifact save ${ATT}`) && down.stderr.includes("Code: CONTENT_UNAVAILABLE"), down.stderr);
+  // Too large: the Server's own sentence (#wg-ax:#13 P3).
+  const tooLarge = "That attachment is larger than the 15 MiB an artifact file of its kind may be, so it can't be saved as one: keep it as an attachment, or push a smaller version of the file.";
+  const big = await run(["artifact", "save", ATT], () => ({ ok: false, status: 422, data: null, error: tooLarge, errorCode: "ATTACHMENT_NOT_SAVABLE", errorBody: { error: tooLarge, code: "ATTACHMENT_NOT_SAVABLE", details: { attachmentId: ATT, reason: "too_large", limit: 15 * 1024 * 1024 } } }) as unknown as ApiResponse<unknown>);
+  assert.ok(big.stderr.startsWith(`Error: ${tooLarge}\nCode: ATTACHMENT_NOT_SAVABLE\n`), big.stderr);
+  // Storage that can't take it (a deliberate 503): the Server's sentence, which says whether to try again, not "Retry in a moment".
+  const unset = "Nothing was saved: this server's file storage for Artifacts isn't set up, so tell an admin of this server, since retrying won't help.";
+  const down = await run(["artifact", "save", ATT], () => ({ ok: false, status: 503, data: null, error: unset, errorCode: "CONTENT_UNAVAILABLE", errorBody: { error: unset, code: "CONTENT_UNAVAILABLE" } }) as unknown as ApiResponse<unknown>);
+  assert.equal(down.stderr, `Error: ${unset}\nCode: CONTENT_UNAVAILABLE\nNext action: Do what the error says.\n`);
 });

@@ -25,6 +25,7 @@ export function ComputerServiceActionsCard({
   machine,
   computerOperationProgress,
   handleComputerRestartClick,
+  canControl,
   cardState,
   versionTier,
   webUpgradeOn,
@@ -47,6 +48,8 @@ export function ComputerServiceActionsCard({
   machine: Machine;
   computerOperationProgress: ReturnType<typeof useComputerRestart>["progress"];
   handleComputerRestartClick: ReturnType<typeof useComputerRestart>["restart"];
+  /** May restart or upgrade it (canControlComputer); without it both buttons are hidden, the status stays. */
+  canControl: boolean;
   cardState: UpgradeCard["cardState"];
   versionTier: UpgradeCard["versionTier"];
   webUpgradeOn: UpgradeCard["webUpgradeOn"];
@@ -145,7 +148,10 @@ export function ComputerServiceActionsCard({
           const outcomeLine = cardState.kind === "oneClick" && upgradeRefusal === "unknown"
             ? formatMessage({ id: "machine.detail.upgradeStatus.refusedUnknown" })
             : cardState.kind !== "upgrading" && cardState.kind !== "upToDate" && cardState.kind !== "managedByDesktop" && requestOutcomeStillTrue
-              ? upgradeRequest?.state === "failed"
+              ? upgradeRequest?.state === "failed" && upgradeRequest.autoRetry?.state === "scheduled"
+                // A download-step failure the server retries once by itself shortly.
+                ? formatMessage({ id: "machine.detail.upgradeStatus.failedRetryScheduled" }, { version: upgradeRequest.targetVersion })
+                : upgradeRequest?.state === "failed"
                 ? formatMessage(
                     { id: "machine.detail.upgradeStatus.failed" },
                     { version: machineVersion, command: statusCommand },
@@ -158,7 +164,7 @@ export function ComputerServiceActionsCard({
                 {statusSentence}
               </p>
               <div className="flex flex-wrap items-center gap-2" data-testid="computer-upgrade-actions">
-                {cardState.kind !== "upgrading" && (
+                {canControl && cardState.kind !== "upgrading" && (
                   <Tooltip content={formatMessage({ id: "machine.detail.restartTooltip" })}>
                   <Button size="md"
                     variant="outline"
@@ -182,7 +188,7 @@ export function ComputerServiceActionsCard({
                 )}
                 {/* The one pink action on this page: the upgrade the
                     computer is waiting for. */}
-                {cardState.kind === "oneClick" && (
+                {canControl && cardState.kind === "oneClick" && (
                   <Tooltip content={formatMessage({ id: "machine.detail.upgradeToVersion" }, { version: cardState.version })}>
                   {/* With the repair recommended or the failure's steps
                       below, the web upgrade stays, as the secondary way. */}

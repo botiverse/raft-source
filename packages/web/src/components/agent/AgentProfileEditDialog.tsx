@@ -408,7 +408,7 @@ export default function AgentProfileEditDialog({ agent, open, field, onClose, ro
       <AlertDialog open={confirmDiscard} onOpenChange={handleConfirmDiscardChange}>
         <AlertDialogContent data-testid="agent-profile-edit-discard">
           <AlertDialogHeader>
-            <AlertDialogTitle>{formatMessage({ id: "message.chatPanel.overflow.unsavedTitle" })}</AlertDialogTitle>
+            <AlertDialogTitle>{formatMessage({ id: "agent.detail.editProfile.discardTitle" })}</AlertDialogTitle>
           </AlertDialogHeader>
           <AlertDialogBody>{formatMessage({ id: "agent.detail.editProfile.discardBody" })}</AlertDialogBody>
           <AlertDialogFooter>
@@ -418,7 +418,7 @@ export default function AgentProfileEditDialog({ agent, open, field, onClose, ro
               size="lg"
               onClick={handleDiscardClick}
             >
-              {formatMessage({ id: "message.chatPanel.overflow.discardChanges" })}
+              {formatMessage({ id: "agent.detail.editProfile.discard" })}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

@@ -2,6 +2,9 @@ import express, { type ErrorRequestHandler, type RequestHandler, type Router } f
 
 import {
   asMachineId,
+  asMachineOperationId,
+  asServerId,
+  type MachineOperationStarted,
   isAdminOrOwner,
   RUNTIME_AUTH_SERVER_GATED_RUNTIMES,
   isRuntimeAccountUsageProvider,
@@ -43,9 +46,10 @@ import { runtimeAuthService } from "../services/runtimeAuthService";
 import { addTraceEvent } from "../tracing/semanticTrace";
 import { RouteFailureError } from "../tracing/routeFailure";
 import { refuse } from "../lib/refusal";
+import { readMachineOperation, startMachineOperation, type MachineOperationAnswer } from "../services/machineOperations";
 
 /**
- * task #17: log a Computer's runtime (Claude Code, Codex, Kimi, Qoder, Antigravity, Grok, CodeBuddy, and
+ * task #17: log a Computer's runtime (Claude Code, Codex, Kimi, Qoder, Antigravity, Grok, and
  * Pi and OpenCode per model provider) in or out from the web, or save a Qwen Code, Pi or
  * OpenCode provider's API key on it
  * (docs/contracts/runtime-auth.md). People only: `/api/servers` takes a user
@@ -126,14 +130,38 @@ function orchestratorOf(req: { app: { get(name: string): unknown } }): AgentOrch
 
 type Unavailable = "computer_offline" | "computer_upgrade_required" | "computer_not_attached";
 
+function availabilityErrorBody(availability: Unavailable): { error: string; code: Unavailable } {
+  return availability === "computer_offline"
+    ? { error: "This Computer is offline.", code: "computer_offline" }
+    : availability === "computer_not_attached"
+      ? { error: "This Computer has no owner, so its runtimes cannot be signed in from here.", code: "computer_not_attached" }
+      : { error: "Upgrade this Computer to sign in from here.", code: "computer_upgrade_required" };
+}
+
 function sendAvailabilityError(res: { status(code: number): { json(body: unknown): void } }, availability: Unavailable): void {
-  res.status(409).json(
-    availability === "computer_offline"
-      ? { error: "This Computer is offline.", code: "computer_offline" }
-      : availability === "computer_not_attached"
-        ? { error: "This Computer has no owner, so its runtimes cannot be signed in from here.", code: "computer_not_attached" }
-        : { error: "Upgrade this Computer to sign in from here.", code: "computer_upgrade_required" },
-  );
+  res.status(409).json(availabilityErrorBody(availability));
+}
+
+/**
+ * Answer what waits on the Computer (#otter-lounge:#1): at once, or, for a
+ * client that asked (`respondAsync: true`), as 202 `{operationId}` with the
+ * answer kept for GET …/machine-operations/:operationId, since the edge in
+ * front of the API closes a request that sends nothing for 30 s.
+ */
+async function answerMachineWait(
+  req: express.Request,
+  res: express.Response,
+  wait: () => Promise<MachineOperationAnswer>,
+  failure: MachineOperationAnswer,
+): Promise<void> {
+  res.setHeader("Cache-Control", "private, no-store");
+  if (req.body?.respondAsync === true) {
+    const operationId = await startMachineOperation({ userId: req.userId!, serverId: asServerId(req.serverId!), surface: "web" }, wait, failure);
+    res.status(202).json({ operationId } satisfies MachineOperationStarted);
+    return;
+  }
+  const answer = await wait().catch(() => failure);
+  res.status(answer.status).json(answer.body);
 }
 
 /**
@@ -446,28 +474,34 @@ export function mountRuntimeAuthRoutes(serverRouter: Router): void {
         sendAvailabilityError(res, "computer_upgrade_required");
         return;
       }
-      try {
-        const result = await orchestrator.logoutRuntime(actors.machine.id, runtime, providerId);
-        addTraceEvent("runtime_auth.logout.result", {
-          machine_id: actors.machine.id,
-          runtime,
-          provider_id: providerId,
-          user_id: req.userId,
-          outcome: result.kind,
-          ...("reason" in result ? { reason: result.reason } : {}),
-        });
-        res.status(200).json({ result });
-      } catch (error) {
-        if (error instanceof RouteFailureError && error.subkind === "daemon_timeout") {
-          res.status(504).json({ error: "The Computer did not answer in time. Try again.", code: "computer_timeout" });
-          return;
-        }
-        if (error instanceof RouteFailureError && error.subkind === "daemon_offline") {
-          sendAvailabilityError(res, "computer_offline");
-          return;
-        }
-        throw error;
+      // Each sign-out runs on the Computer: bounded per person and Computer, like a connect.
+      if (!await runtimeAuthService.allowProviderRequest("logout", req.userId!, actors.machine.id)) {
+        addTraceEvent("runtime_auth.logout.rate_limited", { machine_id: actors.machine.id, runtime, user_id: req.userId });
+        sendRateLimited(res);
+        return;
       }
+      await answerMachineWait(req, res, async (): Promise<MachineOperationAnswer> => {
+        try {
+          const result = await orchestrator.logoutRuntime(actors.machine.id, runtime, providerId);
+          addTraceEvent("runtime_auth.logout.result", {
+            machine_id: actors.machine.id,
+            runtime,
+            provider_id: providerId,
+            user_id: req.userId,
+            outcome: result.kind,
+            ...("reason" in result ? { reason: result.reason } : {}),
+          });
+          return { status: 200, body: { result } };
+        } catch (error) {
+          if (error instanceof RouteFailureError && error.subkind === "daemon_timeout") {
+            return { status: 504, body: { error: "The Computer did not answer in time. Try again.", code: "computer_timeout" } };
+          }
+          if (error instanceof RouteFailureError && error.subkind === "daemon_offline") {
+            return { status: 409, body: availabilityErrorBody("computer_offline") };
+          }
+          throw error;
+        }
+      }, { status: 500, body: { error: "Failed to sign out" } });
     } catch {
       res.status(500).json({ error: "Failed to sign out" });
     }
@@ -493,6 +527,26 @@ export function mountRuntimeAuthRoutes(serverRouter: Router): void {
    * the current bundle sends: a Claude redeem without one is refused here,
    * and a Codex redeem never yields them.
    */
+  /**
+   * A Computer wait started with `respondAsync` (answerMachineWait): pending,
+   * or the status and body the request would have answered. Only the person
+   * who started it; anyone else, an unknown id or an expired one is 404.
+   */
+  serverRouter.get("/:id/machine-operations/:operationId", async (req, res) => {
+    try {
+      const operationId = asMachineOperationId(req.params.operationId);
+      const view = operationId ? await readMachineOperation({ userId: req.userId!, serverId: asServerId(req.serverId!), surface: "web" }, operationId) : null;
+      res.setHeader("Cache-Control", "private, no-store");
+      if (!view) {
+        refuse(res, 404, { code: "operation_not_found", error: "This operation is unknown or has expired." });
+        return;
+      }
+      res.status(200).json(view);
+    } catch {
+      res.status(500).json({ error: "Failed to read the operation" });
+    }
+  });
+
   serverRouter.post("/:id/machines/:machineId/runtime-account-usage/:provider/limit-reset", async (req, res) => {
     try {
       const provider = req.params.provider;
@@ -549,45 +603,45 @@ export function mountRuntimeAuthRoutes(serverRouter: Router): void {
         sendAvailabilityError(res, "computer_not_attached");
         return;
       }
-      // Each Claude redeem starts the person's Claude Code on the Computer: bounded per person and Computer.
-      if (provider === "claude" && !await runtimeAuthService.allowClaudeLimitResetRequest("redeem", req.userId!, actors.machine.id)) {
+      // Each redeem runs on the Computer (Claude's starts Claude Code): bounded per person and Computer.
+      if (!await runtimeAuthService.allowClaudeLimitResetRequest(provider === "claude" ? "redeem" : "codex_redeem", req.userId!, actors.machine.id)) {
         addTraceEvent("runtime_account_usage.limit_reset.rate_limited", { machine_id: actors.machine.id, provider, user_id: req.userId });
         sendRateLimited(res);
         return;
       }
-      try {
-        const reply = await orchestrator.redeemRuntimeLimitReset(actors.machine.id, provider, idempotencyKey, kind);
-        const parsedResult = runtimeLimitResetResultSchema.safeParse(reply.result);
-        // An answer this server cannot read says nothing about whether a reset was spent.
-        const result: RuntimeLimitResetResult = parsedResult.success ? parsedResult.data : { kind: "unknown" };
-        const parsedSnapshot = reply.snapshot === undefined ? null : safeParseRuntimeAccountUsageSnapshot(reply.snapshot);
-        addTraceEvent("runtime_account_usage.limit_reset.result", {
-          machine_id: actors.machine.id,
-          provider,
-          user_id: req.userId,
-          outcome: result.kind,
-          ...("reason" in result ? { reason: result.reason } : {}),
-          ...(kind ? { reset_kind: kind } : {}),
-          ...(result.kind === "unknown" && result.fiveHourSpent ? { five_hour_spent: true } : {}),
-          snapshot: parsedSnapshot?.success ? "fresh" : "none",
-        });
-        res.setHeader("Cache-Control", "private, no-store");
-        // Window scopes only to a client that reads them (an older web bundle's strict parse would drop the snapshot).
-        const snapshot = parsedSnapshot?.success ? runtimeAccountUsageSnapshotForClient(parsedSnapshot.data, req.header(RAFT_CLIENT_CAPABILITIES_HEADER)) : null;
-        res.status(200).json({ result, snapshot });
-      } catch (error) {
-        if (error instanceof RouteFailureError && error.subkind === "daemon_timeout") {
-          addTraceEvent("runtime_account_usage.limit_reset.result", { machine_id: actors.machine.id, provider, user_id: req.userId, outcome: "timeout" });
-          res.status(504).json({ error: "The Computer did not answer in time. Try again; it won't use a second reset.", code: "computer_timeout" });
-          return;
+      const clientCapabilities = req.header(RAFT_CLIENT_CAPABILITIES_HEADER);
+      await answerMachineWait(req, res, async (): Promise<MachineOperationAnswer> => {
+        try {
+          const reply = await orchestrator.redeemRuntimeLimitReset(actors.machine.id, provider, idempotencyKey, kind);
+          const parsedResult = runtimeLimitResetResultSchema.safeParse(reply.result);
+          // An answer this server cannot read says nothing about whether a reset was spent.
+          const result: RuntimeLimitResetResult = parsedResult.success ? parsedResult.data : { kind: "unknown" };
+          const parsedSnapshot = reply.snapshot === undefined ? null : safeParseRuntimeAccountUsageSnapshot(reply.snapshot);
+          addTraceEvent("runtime_account_usage.limit_reset.result", {
+            machine_id: actors.machine.id,
+            provider,
+            user_id: req.userId,
+            outcome: result.kind,
+            ...("reason" in result ? { reason: result.reason } : {}),
+            ...(kind ? { reset_kind: kind } : {}),
+            ...(result.kind === "unknown" && result.fiveHourSpent ? { five_hour_spent: true } : {}),
+            snapshot: parsedSnapshot?.success ? "fresh" : "none",
+          });
+          // Window scopes only to a client that reads them (an older web bundle's strict parse would drop the snapshot).
+          const snapshot = parsedSnapshot?.success ? runtimeAccountUsageSnapshotForClient(parsedSnapshot.data, clientCapabilities) : null;
+          return { status: 200, body: { result, snapshot } };
+        } catch (error) {
+          if (error instanceof RouteFailureError && error.subkind === "daemon_timeout") {
+            addTraceEvent("runtime_account_usage.limit_reset.result", { machine_id: actors.machine.id, provider, user_id: req.userId, outcome: "timeout" });
+            return { status: 504, body: { error: "The Computer did not answer in time. Try again; it won't use a second reset.", code: "computer_timeout" } };
+          }
+          if (error instanceof RouteFailureError && error.subkind === "daemon_offline") {
+            addTraceEvent("runtime_account_usage.limit_reset.result", { machine_id: actors.machine.id, provider, user_id: req.userId, outcome: "computer_offline" });
+            return { status: 409, body: availabilityErrorBody("computer_offline") };
+          }
+          throw error;
         }
-        if (error instanceof RouteFailureError && error.subkind === "daemon_offline") {
-          addTraceEvent("runtime_account_usage.limit_reset.result", { machine_id: actors.machine.id, provider, user_id: req.userId, outcome: "computer_offline" });
-          sendAvailabilityError(res, "computer_offline");
-          return;
-        }
-        throw error;
-      }
+      }, { status: 500, body: { error: "Failed to use a limit reset" } });
     } catch {
       res.status(500).json({ error: "Failed to use a limit reset" });
     }
@@ -654,42 +708,42 @@ export function mountRuntimeAuthRoutes(serverRouter: Router): void {
         return;
       }
       const usageProvider: RuntimeAccountUsageProvider = provider;
-      try {
-        const reply = await orchestrator.readRuntimeLimitResets(actors.machine.id, usageProvider, {
-          atFiveHourLimit: await claudeAtFiveHourLimit(actors.machine.id),
-          atFiveHourLimitConsent: consent === true,
-          includeFiveHour: true,
-        });
-        const parsed = runtimeLimitResetsReadResultSchema.safeParse(reply.result);
-        // An answer this server cannot read: nothing is known, not even whether the older program spent its reset.
-        const result: RuntimeLimitResetsReadResult = parsed.success ? parsed.data : { kind: "unknown" };
-        addTraceEvent("runtime_account_usage.limit_resets.read.result", {
-          machine_id: actors.machine.id,
-          provider: usageProvider,
-          user_id: req.userId,
-          outcome: result.kind,
-          consent: consent === true,
-          ...("reason" in result ? { reason: result.reason } : {}),
-          ...(result.kind === "read" ? {
-            ...(result.program ? { program: result.program } : {}),
-            ...(result.fiveHourSpent ? { five_hour_spent: true } : {}),
-            available_kinds: result.resets.filter((reset) => reset.state === "available").length,
-          } : {}),
-        });
-        res.setHeader("Cache-Control", "private, no-store");
-        res.status(200).json({ result });
-      } catch (error) {
-        if (error instanceof RouteFailureError && error.subkind === "daemon_timeout") {
-          addTraceEvent("runtime_account_usage.limit_resets.read.result", { machine_id: actors.machine.id, provider: usageProvider, user_id: req.userId, outcome: "timeout" });
-          res.status(504).json({ error: "The Computer did not answer in time. Try again.", code: "computer_timeout" });
-          return;
+      const atFiveHourLimit = await claudeAtFiveHourLimit(actors.machine.id);
+      await answerMachineWait(req, res, async (): Promise<MachineOperationAnswer> => {
+        try {
+          const reply = await orchestrator.readRuntimeLimitResets(actors.machine.id, usageProvider, {
+            atFiveHourLimit,
+            atFiveHourLimitConsent: consent === true,
+            includeFiveHour: true,
+          });
+          const parsed = runtimeLimitResetsReadResultSchema.safeParse(reply.result);
+          // An answer this server cannot read: nothing is known, not even whether the older program spent its reset.
+          const result: RuntimeLimitResetsReadResult = parsed.success ? parsed.data : { kind: "unknown" };
+          addTraceEvent("runtime_account_usage.limit_resets.read.result", {
+            machine_id: actors.machine.id,
+            provider: usageProvider,
+            user_id: req.userId,
+            outcome: result.kind,
+            consent: consent === true,
+            ...("reason" in result ? { reason: result.reason } : {}),
+            ...(result.kind === "read" ? {
+              ...(result.program ? { program: result.program } : {}),
+              ...(result.fiveHourSpent ? { five_hour_spent: true } : {}),
+              available_kinds: result.resets.filter((reset) => reset.state === "available").length,
+            } : {}),
+          });
+          return { status: 200, body: { result } };
+        } catch (error) {
+          if (error instanceof RouteFailureError && error.subkind === "daemon_timeout") {
+            addTraceEvent("runtime_account_usage.limit_resets.read.result", { machine_id: actors.machine.id, provider: usageProvider, user_id: req.userId, outcome: "timeout" });
+            return { status: 504, body: { error: "The Computer did not answer in time. Try again.", code: "computer_timeout" } };
+          }
+          if (error instanceof RouteFailureError && error.subkind === "daemon_offline") {
+            return { status: 409, body: availabilityErrorBody("computer_offline") };
+          }
+          throw error;
         }
-        if (error instanceof RouteFailureError && error.subkind === "daemon_offline") {
-          sendAvailabilityError(res, "computer_offline");
-          return;
-        }
-        throw error;
-      }
+      }, { status: 500, body: { error: "Failed to read the limit resets" } });
     } catch {
       res.status(500).json({ error: "Failed to read the limit resets" });
     }

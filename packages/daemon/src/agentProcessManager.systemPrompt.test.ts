@@ -115,7 +115,7 @@ const wakeMessage = (overrides: Partial<AgentMessage> = {}): AgentMessage => ({
 
 // Every way a fresh session can start. Without a native standing prompt the
 // first input is the only place the runtime ever sees it.
-const freshStarts: Array<[string, (manager: AgentProcessManager) => Promise<void>, RegExp]> = [
+const freshStarts: Array<[string, (manager: AgentProcessManager) => Promise<unknown>, RegExp]> = [
   ["a wake message", (manager) => manager.startAgent("agent-1", promptConfig({ description: "role" }), wakeMessage()), /^\[Raft inbox notice:/],
   ["a transient wake", (manager) => manager.startAgent("agent-1", promptConfig({ description: "role" }), wakeMessage(), undefined, undefined, undefined, true), /^System notice received:/],
   ["resume catch-up for a dropped session", (manager) => manager.startAgent("agent-1", promptConfig({ description: "role" }), undefined, undefined, undefined, "launch-1", false, [wakeMessage()]), /message-body-sentinel/],

@@ -168,9 +168,13 @@ export const isCommitSha = (value: unknown): value is string => typeof value ===
 /** Two shas of the same commit: one is a prefix of the other. */
 export const sameCommit = (a: string, b: string): boolean => a.toLowerCase().startsWith(b.toLowerCase()) || b.toLowerCase().startsWith(a.toLowerCase());
 
-/** The runs of one metric out of perf.page_runs rows (a column, or a key of `extra`); rows without a number are skipped. */
+/**
+ * The runs of one metric out of perf.page_runs rows (a column, or a key of `extra`); rows without a number are skipped,
+ * and so are rows their collection left out of its own medians because the host was busy (`extra.host_left_out`, `interact`).
+ */
 export function metricRuns(rows: ReadonlyArray<Record<string, unknown>>, metric: string): number[] {
   return rows
+    .filter((row) => (row.extra as Record<string, unknown> | undefined)?.host_left_out !== 1)
     .map((row) => (metric in row ? row[metric] : (row.extra as Record<string, unknown> | undefined)?.[metric]))
     .filter((v): v is number => typeof v === "number" && Number.isFinite(v));
 }

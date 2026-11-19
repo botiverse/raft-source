@@ -512,6 +512,19 @@ export function appBotAddUrl(input: { serverSlug: string; clientKey: string }): 
   return `${getAppUrl()}/s/${encodeURIComponent(input.serverSlug)}/apps?app_bot=${encodeURIComponent(input.clientKey)}`;
 }
 
+/**
+ * The installation lookup's `app_page_url`: this App's page on the Server,
+ * what its card on the Apps page opens,
+ * `<web origin>/s/<server slug>/apps?installed_app=<app id>`, with the App's
+ * row id (`oauth_clients.id`, never the public client_id), which the web
+ * matches against an installed App's `id` (web features/apps/useAppBotLink.ts,
+ * `installedAppDetailSearch`). Same origin and slug as `appBotAddUrl`, and the
+ * same rule: a link to show now, read fresh from lookup.
+ */
+export function appInstalledPageUrl(input: { serverSlug: string; appId: string }): string {
+  return `${getAppUrl()}/s/${encodeURIComponent(input.serverSlug)}/apps?installed_app=${encodeURIComponent(input.appId)}`;
+}
+
 /** The installation lookup's `bot`. */
 export type AppFacingInstallationBot = {
   handle: string;

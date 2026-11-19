@@ -10,8 +10,13 @@
 //   to a smaller home: only their rows, objectActivityPeople listing whose
 //   rows there are), in the moving one; after the commit,
 //   announceActivityChanged tells the people whose rows went;
+// - consumeAgentObjectNotices: an agent dealt with one of the app's objects
+//   through the app (read or commented on it), in the transaction that
+//   records it: its unread notices about that object are consumed
+//   (consumed_via `acted`), as `raft inbox read` would;
 // - announceObjectEvents: after the commit of a transaction that recorded
 //   object events, tell their recipients' clients that Activity changed
 //   (`activity:changed`).
 export { forgetObjectActivity, markObjectRead, objectActivityPeople, type ForgottenActivityRow, type ObjectReadThrough } from "../services/objectInboxStates";
 export { announceActivityChanged, announceForgottenRows, announceObjectEvents } from "../services/activityRealtime";
+export { consumeAgentObjectNotices } from "../services/agentObjectNotices";

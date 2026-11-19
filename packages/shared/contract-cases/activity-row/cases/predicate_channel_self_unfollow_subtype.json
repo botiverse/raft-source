@@ -1,0 +1,43 @@
+{
+  "formatVersion": 1,
+  "id": "predicate_channel_self_unfollow_subtype",
+  "rule": "predicate",
+  "title": "On a channel row, channel.self_unfollow_thread does not count",
+  "why": "The noise subtypes never count, on any row kind. Decided (Tenny, #14988 review): follow the server (RisingWave).",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/web/src/store/inboxInPlaceUnread.ts (liveActivityUnread, liveUnreadFields)",
+      "packages/web/src/store/inboxRowPosition.ts (rowPositionVerdict, with inbox_row_position_v1 on)"
+    ],
+    "server": [
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (unread_count FILTER)",
+      "packages/server/src/services/inboxUnreadEligibility.ts (isMessageUnreadEligibleForReceiver)"
+    ]
+  },
+  "given": {
+    "viewer": {
+      "type": "user",
+      "id": "viewer-1"
+    },
+    "scope": {
+      "rowKind": "channel"
+    },
+    "message": {
+      "senderType": "system",
+      "senderId": "system",
+      "messageType": "system",
+      "causalActorType": "user",
+      "causalActorId": "user-2",
+      "systemSubtype": "channel.self_unfollow_thread",
+      "mentions": []
+    }
+  },
+  "steps": [],
+  "expect": {
+    "verdict": {
+      "counts": false,
+      "mention": false
+    }
+  }
+}

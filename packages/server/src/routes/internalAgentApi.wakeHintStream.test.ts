@@ -19,6 +19,8 @@ import { mintAgentCredential } from "../services/agentCredentialService";
 import { AgentOrchestrator } from "../services/agentOrchestrator";
 import { referenceAgentInboxChain } from "../test/agentInboxChainReference";
 import { BasicTracer, MemoryTraceSink } from "@botiverse/raft-shared";
+import { __resetDrainStateForTests, markDraining } from "../services/drainState";
+import { sharedSseStreamRegistry } from "../services/sseStreamRegistry";
 import { createMessage, __setExternalAgentInboxChainSelectorForTests, __setExternalWakeFollowUpPullDelaysMsForTests } from "../services/messageService";
 
 
@@ -162,6 +164,33 @@ test("stream honors Last-Event-ID: already-seen hints are not replayed", async (
   });
   const { events } = await readWakeHintEvents(res.body!, 1, 4000);
   assert.deepEqual(events.map((e) => e.id), [String(newer.seq)], "seq<=Last-Event-ID must be filtered from replay");
+});
+
+// Deployment thread 3f292dc3: a stream opened in the seconds after a drain
+// starts (the ALB still routes here) is outside the going-away snapshot and
+// was hard-cut at deregistration expiry, so a draining task answers 503.
+test("a draining task answers 503 before any stream opens; the stream opens once it is not draining", async ({ app }) => {
+  const f = await seedExternalFixture();
+  const orchestrator = new AgentOrchestrator() as any;
+  app.app.set("agentOrchestrator", orchestrator);
+  const openStreamsBefore = sharedSseStreamRegistry.size;
+  markDraining();
+  try {
+    const res = await fetch(`${app.baseUrl}/internal/agent-api/wake-hints/stream`, {
+      headers: { Authorization: `Bearer ${f.apiKey}` },
+    });
+    assert.equal(res.status, 503);
+    assert.doesNotMatch(res.headers.get("content-type") ?? "", /text\/event-stream/);
+    assert.equal(((await res.json()) as { code?: string }).code, "server_draining");
+    assert.equal(sharedSseStreamRegistry.size, openStreamsBefore, "no stream registered");
+  } finally {
+    __resetDrainStateForTests();
+  }
+  const res = await fetch(`${app.baseUrl}/internal/agent-api/wake-hints/stream`, {
+    headers: { Authorization: `Bearer ${f.apiKey}` },
+  });
+  assert.equal(res.status, 200);
+  await res.body?.cancel();
 });
 
 test("auth failure is a JSON error before any stream opens", async ({ app }) => {

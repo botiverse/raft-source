@@ -108,9 +108,18 @@ export const agentApiSendBodySchema = lazySchema("agentApiSendBodySchema", () =>
 const agentApiSendCardSchema = lazySchema("agentApiSendCardSchema", () => z.object({}).passthrough()
   .describe("A message card (RFC 082): { version: 1, header?, root, elements }, validated by the Server"));
 
+/**
+ * RFC 086: an App's acting buttons on a card, read loosely here and checked
+ * by the Server against the card (400 `message_card_actions_not_allowed`).
+ */
+const agentApiSendCardActionsSchema = lazySchema("agentApiSendCardActionsSchema", () => z.record(z.string(), z.object({}).passthrough())
+  .describe("A card's acting buttons (RFC 086): Button element id -> { kind: \"execute\", action_id, confirm: \"prepare\" } or { kind: \"execute\", action_id, undoWindowMs }, each with an optional form { fields } of TextInput and SecretInput fields"));
+
 export const agentApiSendV2BodySchema = lazySchema("agentApiSendV2BodySchema", () => agentApiSendBodyKnownSchema.extend({
   mentions: z.array(agentApiStructuredMentionSchema).optional(),
   card: agentApiSendCardSchema.optional(),
+  actions: agentApiSendCardActionsSchema.optional(),
+  for: z.string().optional(),
 }).passthrough());
 
 /**
@@ -126,6 +135,8 @@ export const agentApiMessageCardUpdateBodySchema = lazySchema("agentApiMessageCa
   /** The revision the caller last read; another current revision refuses with 409 `card_revision_conflict`. */
   expectedRevision: z.number().int().positive().optional(),
   idempotencyKey: optionalStringSchema,
+  actions: agentApiSendCardActionsSchema.optional(),
+  for: z.string().optional(),
 }).passthrough());
 
 /** A card update's answer (also the replay of a repeated `idempotencyKey`). */
@@ -247,6 +258,9 @@ export const agentApiMessageEnvelopeSchema = lazySchema("agentApiMessageEnvelope
   senderTimezone: z.string().nullable().optional(),
   sender_timezone: z.string().nullable().optional(),
   delegated_by: z.object({ name: z.string() }).passthrough().nullable().optional(),
+  // Raft voice calls: posted in the sender agent's name by something else (`voice_call`). A string, so a later kind still parses.
+  posted_by: z.string().nullable().optional(),
+  voiceCallId: z.string().nullable().optional(),
   external_message: agentApiExternalMessageProvenanceSchema.optional(),
   channel_type: optionalStringSchema,
   channel_name: optionalStringSchema,
@@ -418,7 +432,42 @@ export interface AgentApiSendV2Body extends AgentApiSendBodyKnownFields {
    * when absent; only a `content` the sender wrote mentions anyone.
    */
   card?: MessageCardInput;
+  /**
+   * RFC 086 (an App's bot only): the card's acting buttons, Button element
+   * id -> RFC 076 execute action (`{ kind: "execute", action_id, confirm:
+   * "prepare" }` or `{ kind: "execute", action_id, undoWindowMs }`), at most
+   * 4. Each acting Button is written as a navigate Button whose `action.url`
+   * is the App's fallback page for it (https, on the App's verified
+   * link-preview origin); Raft stores it disabled with "Update Raft to use
+   * this button" for clients that can't press it.
+   */
+  actions?: Record<string, MessageCardExecuteActionInput>;
+  /**
+   * RFC 086: with `actions`, the one person who may press them, named by the
+   * App subject (`sub`) Sign in with Raft gave the App for them; Raft resolves
+   * it through its subject mapping, stores the user id and mentions them in
+   * the fallback. Fixed at send.
+   */
+  for?: string;
   [key: string]: unknown;
+}
+
+/**
+ * RFC 086: an acting button's action (RFC 076's execute action), with an
+ * optional `form` the person fills in first (§5.1): a SecretInput only on a
+ * `confirm: "prepare"` button, from an official App with a card encryption
+ * key.
+ */
+export type MessageCardExecuteActionInput =
+  | { kind: "execute"; action_id: string; confirm: "prepare"; form?: MessageCardFormInput }
+  | { kind: "execute"; action_id: string; undoWindowMs: number; form?: MessageCardFormInput };
+
+/** RFC 086 §5.1: a form on an acting button, 1-4 fields (messageCardFormSchema checks it). */
+export interface MessageCardFormInput {
+  fields: Array<
+    | { type: "TextInput"; id: string; label: string; placeholder?: string; required?: boolean; maxLength?: number; default?: string }
+    | { type: "SecretInput"; id: string; label: string; placeholder?: string; required?: boolean }
+  >;
 }
 
 /**
@@ -433,6 +482,10 @@ export interface AgentApiMessageCardUpdateBody {
   expectedRevision?: number;
   /** The same key with the same body answers the first result again; with another body, 409 `idempotency_key_reused`. */
   idempotencyKey?: string;
+  /** RFC 086: the new card's acting buttons, checked again as at send; absent, the card's acting buttons end. */
+  actions?: Record<string, MessageCardExecuteActionInput>;
+  /** RFC 086: `for` is fixed at send; only the same person (by their App subject, as at send) may be named here. */
+  for?: string;
   [key: string]: unknown;
 }
 
@@ -487,6 +540,10 @@ export interface AgentApiMessageEnvelope {
   sender_timezone?: string | null;
   /** RFC 077: the personal assistant that sent this as its owner (the sender). */
   delegated_by?: { name: string } | null;
+  /** Raft voice calls: posted in the sender agent's name by something else (`voice_call`); rendered `posted_by=<kind>`. */
+  posted_by?: string | null;
+  /** The camelCase row field history reads carry; read as `posted_by: "voice_call"`. */
+  voiceCallId?: string | null;
   external_message?: AgentApiExternalMessageProvenance;
   channel_type?: string;
   channel_name?: string;

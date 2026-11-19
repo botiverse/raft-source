@@ -1,6 +1,6 @@
 {
   "schema": "raft-agent-api-description.v1",
-  "manifestVersion": "a3e643c6f6e06751",
+  "manifestVersion": "27fac753c1d15016",
   "basePath": "/internal/agent-api",
   "capabilities": [
     "read",
@@ -1065,6 +1065,18 @@
                       }
                     ]
                   },
+                  "posted_by": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "voiceCallId": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
                   "external_message": {
                     "type": "object",
                     "properties": {
@@ -1829,6 +1841,18 @@
                       {
                         "type": "null"
                       }
+                    ]
+                  },
+                  "posted_by": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "voiceCallId": {
+                    "type": [
+                      "string",
+                      "null"
                     ]
                   },
                   "external_message": {
@@ -3360,6 +3384,18 @@
                           }
                         ]
                       },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
                       "external_message": {
                         "type": "object",
                         "properties": {
@@ -3932,6 +3968,18 @@
                           {
                             "type": "null"
                           }
+                        ]
+                      },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
                         ]
                       },
                       "external_message": {
@@ -4672,6 +4720,18 @@
                           }
                         ]
                       },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
                       "external_message": {
                         "type": "object",
                         "properties": {
@@ -5244,6 +5304,18 @@
                           {
                             "type": "null"
                           }
+                        ]
+                      },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
                         ]
                       },
                       "external_message": {
@@ -6081,6 +6153,21 @@
               "properties": {},
               "additionalProperties": {},
               "description": "A message card (RFC 082): { version: 1, header?, root, elements }, validated by the Server"
+            },
+            "actions": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string"
+              },
+              "additionalProperties": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": {}
+              },
+              "description": "A card's acting buttons (RFC 086): Button element id -> { kind: \"execute\", action_id, confirm: \"prepare\" } or { kind: \"execute\", action_id, undoWindowMs }, each with an optional form { fields } of TextInput and SecretInput fields"
+            },
+            "for": {
+              "type": "string"
             }
           },
           "additionalProperties": {}
@@ -6187,6 +6274,18 @@
                           {
                             "type": "null"
                           }
+                        ]
+                      },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
                         ]
                       },
                       "external_message": {
@@ -6761,6 +6860,18 @@
                           {
                             "type": "null"
                           }
+                        ]
+                      },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
                         ]
                       },
                       "external_message": {
@@ -7501,6 +7612,18 @@
                           }
                         ]
                       },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
                       "external_message": {
                         "type": "object",
                         "properties": {
@@ -8073,6 +8196,18 @@
                           {
                             "type": "null"
                           }
+                        ]
+                      },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
                         ]
                       },
                       "external_message": {
@@ -8886,6 +9021,18 @@
                     {
                       "type": "null"
                     }
+                  ]
+                },
+                "posted_by": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "voiceCallId": {
+                  "type": [
+                    "string",
+                    "null"
                   ]
                 },
                 "external_message": {
@@ -9876,6 +10023,18 @@
                 }
               ]
             },
+            "posted_by": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "voiceCallId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "external_message": {
               "type": "object",
               "properties": {
@@ -10502,6 +10661,18 @@
                 }
               ]
             },
+            "posted_by": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "voiceCallId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "external_message": {
               "type": "object",
               "properties": {
@@ -11052,6 +11223,21 @@
               "maximum": 9007199254740991
             },
             "idempotencyKey": {
+              "type": "string"
+            },
+            "actions": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string"
+              },
+              "additionalProperties": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": {}
+              },
+              "description": "A card's acting buttons (RFC 086): Button element id -> { kind: \"execute\", action_id, confirm: \"prepare\" } or { kind: \"execute\", action_id, undoWindowMs }, each with an optional form { fields } of TextInput and SecretInput fields"
+            },
+            "for": {
               "type": "string"
             }
           },
@@ -13237,6 +13423,18 @@
                       }
                     ]
                   },
+                  "posted_by": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "voiceCallId": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
                   "external_message": {
                     "type": "object",
                     "properties": {
@@ -14496,6 +14694,18 @@
                       {
                         "type": "null"
                       }
+                    ]
+                  },
+                  "posted_by": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "voiceCallId": {
+                    "type": [
+                      "string",
+                      "null"
                     ]
                   },
                   "external_message": {
@@ -15849,6 +16059,198 @@
           },
           "required": [
             "artifact"
+          ],
+          "additionalProperties": {}
+        }
+      }
+    },
+    {
+      "key": "assistantOwnerArtifactPublishAsOwner",
+      "method": "POST",
+      "path": "/assistant/owner-artifact/as-owner",
+      "fullPath": "/internal/agent-api/assistant/owner-artifact/as-owner",
+      "client": {
+        "resource": "assistant",
+        "method": "publishArtifactAsOwner"
+      },
+      "capability": "send",
+      "description": "Personal assistants only, and only while your owner has \"send as me\" on: publish an Artifact AS your owner (they are its author) into a conversation they may post in now, named as they name it (home: #channel, dm:@peer, or an id); or a new version of one you published as them (artifact + base, the version you read; no home). The rules of sending as them apply: not your own DM with them (publish there as yourself with owner-artifact), a DM only while they let you read DMs, never a conversation bridged to an external chat. Any home you can't use answers the one TARGET_NOT_FOUND, whatever the reason; joint (shared) channels are not supported yet: a joint as home, or a new version of one homed in a joint, answers not-found too. Raft posts a receipt in your DM with your owner; you needn't tell them. If the answer is UNSEEN_CHANGES, read it with owner-artifact first and send the same publish with seen = the position it returned: the same publish without seen is held again.",
+      "sideEffect": "write",
+      "idempotency": "none",
+      "destructive": false,
+      "audience": "both",
+      "retryPolicy": "single_attempt",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false
+      },
+      "request": {
+        "params": null,
+        "query": null,
+        "body": {
+          "type": "object",
+          "properties": {
+            "home": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048
+            },
+            "artifact": {
+              "type": "string",
+              "minLength": 1
+            },
+            "title": {
+              "type": "string"
+            },
+            "description": {
+              "type": "string"
+            },
+            "entry": {
+              "type": "string"
+            },
+            "note": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "base": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "seen": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "files": {
+              "type": "array",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$"
+                      },
+                      "size": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      }
+                    },
+                    "required": [
+                      "path",
+                      "sha256",
+                      "size"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "content": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "path",
+                      "content"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "content_base64": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "path",
+                      "content_base64"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            },
+            "delete": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "files"
+          ],
+          "additionalProperties": {}
+        }
+      },
+      "response": {
+        "kind": "json",
+        "body": {
+          "type": "object",
+          "properties": {
+            "artifact": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string"
+                },
+                "version": {
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                },
+                "unchanged": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "id",
+                "url",
+                "version",
+                "unchanged"
+              ],
+              "additionalProperties": {}
+            },
+            "home": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "ref": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "ref"
+              ],
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "artifact",
+            "home"
           ],
           "additionalProperties": {}
         }
@@ -19645,6 +20047,18 @@
                           }
                         ]
                       },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
                       "external_message": {
                         "type": "object",
                         "properties": {
@@ -20217,6 +20631,18 @@
                           {
                             "type": "null"
                           }
+                        ]
+                      },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
                         ]
                       },
                       "external_message": {
@@ -21514,6 +21940,18 @@
                           }
                         ]
                       },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
                       "external_message": {
                         "type": "object",
                         "properties": {
@@ -22086,6 +22524,18 @@
                           {
                             "type": "null"
                           }
+                        ]
+                      },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
                         ]
                       },
                       "external_message": {
@@ -22883,6 +23333,18 @@
                               }
                             ]
                           },
+                          "posted_by": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "voiceCallId": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
                           "external_message": {
                             "type": "object",
                             "properties": {
@@ -23526,6 +23988,18 @@
                           }
                         ]
                       },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
                       "external_message": {
                         "type": "object",
                         "properties": {
@@ -24098,6 +24572,18 @@
                           {
                             "type": "null"
                           }
+                        ]
+                      },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
                         ]
                       },
                       "external_message": {
@@ -24965,6 +25451,18 @@
                           }
                         ]
                       },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
                       "external_message": {
                         "type": "object",
                         "properties": {
@@ -25537,6 +26035,18 @@
                           {
                             "type": "null"
                           }
+                        ]
+                      },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
                         ]
                       },
                       "external_message": {
@@ -26360,6 +26870,18 @@
                               }
                             ]
                           },
+                          "posted_by": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "voiceCallId": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
                           "external_message": {
                             "type": "object",
                             "properties": {
@@ -27003,6 +27525,18 @@
                           }
                         ]
                       },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
                       "external_message": {
                         "type": "object",
                         "properties": {
@@ -27575,6 +28109,18 @@
                           {
                             "type": "null"
                           }
+                        ]
+                      },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
                         ]
                       },
                       "external_message": {
@@ -28882,6 +29428,18 @@
                               }
                             ]
                           },
+                          "posted_by": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "voiceCallId": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
                           "external_message": {
                             "type": "object",
                             "properties": {
@@ -29526,6 +30084,18 @@
                           }
                         ]
                       },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
                       "external_message": {
                         "type": "object",
                         "properties": {
@@ -30098,6 +30668,18 @@
                           {
                             "type": "null"
                           }
+                        ]
+                      },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
                         ]
                       },
                       "external_message": {
@@ -31269,6 +31851,18 @@
                       }
                     ]
                   },
+                  "posted_by": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "voiceCallId": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
                   "external_message": {
                     "type": "object",
                     "properties": {
@@ -31978,6 +32572,18 @@
                       {
                         "type": "null"
                       }
+                    ]
+                  },
+                  "posted_by": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "voiceCallId": {
+                    "type": [
+                      "string",
+                      "null"
                     ]
                   },
                   "external_message": {
@@ -32782,6 +33388,18 @@
                           }
                         ]
                       },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
                       "external_message": {
                         "type": "object",
                         "properties": {
@@ -33354,6 +33972,18 @@
                           {
                             "type": "null"
                           }
+                        ]
+                      },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
                         ]
                       },
                       "external_message": {
@@ -34094,6 +34724,18 @@
                           }
                         ]
                       },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
                       "external_message": {
                         "type": "object",
                         "properties": {
@@ -34666,6 +35308,18 @@
                           {
                             "type": "null"
                           }
+                        ]
+                      },
+                      "posted_by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "voiceCallId": {
+                        "type": [
+                          "string",
+                          "null"
                         ]
                       },
                       "external_message": {
@@ -40756,6 +41410,178 @@
       }
     },
     {
+      "key": "integrationAppCardButtons",
+      "method": "POST",
+      "path": "/integrations/app/card-buttons",
+      "fullPath": "/internal/agent-api/integrations/app/card-buttons",
+      "client": {
+        "resource": "integrations",
+        "method": "cardButtons"
+      },
+      "capability": "read",
+      "description": "Read or set whether an App's card buttons act on this Server (needs manageIntegrations here). An App Raft did not review acts on its own Server by default (withdraw switches that off, allow switches it on again); anywhere else only once allowed, for the exact action endpoint in force: show first, then allow with actionEndpoint exactly as shown. If the App changes its endpoint, it only opens links until allowed again.",
+      "sideEffect": "write",
+      "idempotency": "none",
+      "destructive": false,
+      "audience": "both",
+      "retryPolicy": "single_attempt",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false
+      },
+      "request": {
+        "params": null,
+        "query": null,
+        "body": {
+          "type": "object",
+          "properties": {
+            "clientKey": {
+              "type": "string",
+              "minLength": 1
+            },
+            "action": {
+              "type": "string",
+              "enum": [
+                "show",
+                "allow",
+                "withdraw"
+              ]
+            },
+            "actionEndpoint": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "clientKey",
+            "action"
+          ],
+          "additionalProperties": {}
+        }
+      },
+      "response": {
+        "kind": "json",
+        "body": {
+          "type": "object",
+          "properties": {
+            "clientId": {
+              "type": "string"
+            },
+            "clientKey": {
+              "type": "string"
+            },
+            "cardButtons": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "mode": {
+                      "type": "string",
+                      "enum": [
+                        "own_server",
+                        "allow"
+                      ]
+                    },
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "no_endpoint",
+                        "off",
+                        "suspended",
+                        "on",
+                        "pending_review",
+                        "not_allowed",
+                        "endpoint_changed",
+                        "allowed"
+                      ]
+                    },
+                    "inForce": {
+                      "type": "boolean"
+                    },
+                    "actionEndpoint": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "pendingActionEndpoint": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "allowedActionEndpoint": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "changedAt": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "changedBy": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "enum": [
+                                "human",
+                                "agent"
+                              ]
+                            },
+                            "id": {
+                              "type": "string"
+                            },
+                            "name": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "id",
+                            "name"
+                          ],
+                          "additionalProperties": {}
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "mode",
+                    "state",
+                    "inForce",
+                    "actionEndpoint",
+                    "pendingActionEndpoint",
+                    "allowedActionEndpoint",
+                    "changedAt",
+                    "changedBy"
+                  ],
+                  "additionalProperties": {}
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "clientId",
+            "clientKey",
+            "cardButtons"
+          ],
+          "additionalProperties": {}
+        }
+      }
+    },
+    {
       "key": "integrationAppStatus",
       "method": "GET",
       "path": "/integrations/app/status",
@@ -41127,6 +41953,12 @@
                           "type": "string",
                           "minLength": 1,
                           "maxLength": 120
+                        },
+                        "suggestedRuntime": {
+                          "description": "Runtime id to start the Create Agent dialog on (for example \"claude\" or \"codex\"), only when the person named that runtime; the person still picks, and sees it was your suggestion. An id this server does not offer for new agents is refused, and the refusal lists the offered ids. Not with hosting: \"antiproton\".",
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 40
                         },
                         "hosting": {
                           "description": "Where the new agent runs: \"antiproton\" proposes a cloud agent (one that runs in Raft's cloud, not on a Computer); omit it or use \"computer\" for a Computer the human picks. The human can change it.",
@@ -41886,6 +42718,34 @@
             },
             "existing": {
               "type": "boolean"
+            },
+            "preparedRequest": {
+              "type": "object",
+              "properties": {
+                "summary": {
+                  "type": "string"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "for": {
+                  "type": "string"
+                },
+                "operation": {
+                  "type": "string"
+                },
+                "result": {
+                  "type": "string",
+                  "const": "reply"
+                }
+              },
+              "required": [
+                "summary",
+                "for",
+                "operation",
+                "result"
+              ],
+              "additionalProperties": {}
             }
           },
           "required": [
@@ -41943,6 +42803,23 @@
             "messageId": {
               "type": "string"
             },
+            "preparedRequest": {
+              "type": "object",
+              "properties": {
+                "outcome": {
+                  "type": "string",
+                  "const": "withdrawn"
+                },
+                "summary": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "outcome",
+                "summary"
+              ],
+              "additionalProperties": {}
+            },
             "metadata": {
               "type": "object",
               "properties": {
@@ -41963,6 +42840,123 @@
           "required": [
             "messageId",
             "metadata"
+          ],
+          "additionalProperties": {}
+        }
+      }
+    },
+    {
+      "key": "actionOperations",
+      "method": "GET",
+      "path": "/prepare-action/operations",
+      "fullPath": "/internal/agent-api/prepare-action/operations",
+      "client": {
+        "resource": "actions",
+        "method": "operations"
+      },
+      "capability": "tasks",
+      "description": "List the operations the bound agent may prepare as a request card (request:prepare) on its server: each with its args, whom to ask and what the person sees. Empty while request cards are off for the server.",
+      "sideEffect": "read",
+      "idempotency": "natural",
+      "destructive": false,
+      "audience": "both",
+      "retryPolicy": "retry",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true
+      },
+      "request": {
+        "params": null,
+        "query": null,
+        "body": null
+      },
+      "response": {
+        "kind": "json",
+        "body": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "operations": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "operation": {
+                    "type": "string"
+                  },
+                  "summary": {
+                    "type": "string"
+                  },
+                  "args": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "name": {
+                          "type": "string"
+                        },
+                        "description": {
+                          "type": "string"
+                        },
+                        "required": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "name",
+                        "description",
+                        "required"
+                      ],
+                      "additionalProperties": {}
+                    }
+                  },
+                  "confirmer": {
+                    "type": "string"
+                  },
+                  "personSees": {
+                    "type": "object",
+                    "properties": {
+                      "title": {
+                        "type": "string"
+                      },
+                      "button": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "title",
+                      "button"
+                    ],
+                    "additionalProperties": {}
+                  },
+                  "example": {
+                    "type": "object",
+                    "propertyNames": {
+                      "type": "string"
+                    },
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "required": [
+                  "operation",
+                  "summary",
+                  "args",
+                  "confirmer",
+                  "personSees",
+                  "example"
+                ],
+                "additionalProperties": {}
+              }
+            }
+          },
+          "required": [
+            "enabled",
+            "operations"
           ],
           "additionalProperties": {}
         }

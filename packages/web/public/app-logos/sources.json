@@ -173,6 +173,15 @@
       "retrievedAt": "2026-10-26",
       "modifications": "None; original downloaded file bytes.",
       "archiveMember": "Canva logos/svg/Canva Icon logo.svg"
+    },
+    {
+      "key": "perplexity",
+      "file": "perplexity.png",
+      "sourcePage": "https://www.perplexity.ai",
+      "sourceUrl": "https://www.perplexity.ai/favicon.png",
+      "sha256": "0f310164224f649803cf1ae586cd1d881a718e899a86716b5ebf7b878f5be29c",
+      "retrievedAt": "2026-11-13",
+      "modifications": "None; original downloaded file bytes."
     }
   ]
 }

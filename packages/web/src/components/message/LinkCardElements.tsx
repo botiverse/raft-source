@@ -17,8 +17,8 @@ import { CardBadge, CardColumn, CardDuration, CardRelativeTime, CardRowSeparator
  * not drawn here but in the card's actions row (LinkCardActions.tsx), so a
  * Stack that holds only buttons draws nothing.
  */
-export function LinkCardElements({ card }: { card: LinkCardV2 }) {
-  return <LinkCardNode card={card} id={card.root} depth={0} inRow={false} />;
+export function LinkCardElements({ card, surface }: { card: LinkCardV2; surface: LinkCardSurface }) {
+  return <LinkCardNode card={card} id={card.root} depth={0} inRow={false} surface={surface} />;
 }
 
 /** Whether an element draws anything here: not a Button, not a missing id, not a Stack of only those (within the depth bound). */
@@ -29,7 +29,15 @@ function drawsSomething(card: LinkCardV2, id: string, depth: number): boolean {
   return (node.children ?? []).some((child) => drawsSomething(card, child, depth + 1));
 }
 
-function LinkCardNode({ card, id, depth, inRow }: { card: LinkCardV2; id: string; depth: number; inRow: boolean }): ReactNode {
+/**
+ * Where the card is drawn: `card`, the block card under a message, or `popover`, the hover card a chip opens. A
+ * Badge takes the App's `color` on both (RFC 076 §15, badge.color.v1; DS AppLinkCard › The app's color, PreviewCard
+ * › Item card): the surface only says which one the badge's hairline ring is decided against. Until 2026-11-14 only
+ * the block card took the colour, and Stamp, which sends hover cards only, showed none (#proj-apps:#51).
+ */
+export type LinkCardSurface = "card" | "popover";
+
+function LinkCardNode({ card, id, depth, inRow, surface }: { card: LinkCardV2; id: string; depth: number; inRow: boolean; surface: LinkCardSurface }): ReactNode {
   const node = Object.hasOwn(card.elements, id) ? card.elements[id] : undefined;
   if (!node || depth > 4) return null;
   switch (node.type) {
@@ -47,7 +55,7 @@ function LinkCardNode({ card, id, depth, inRow }: { card: LinkCardV2; id: string
           {row && index > 0 && !isBadge(ids[index - 1]) && !isBadge(child)
             ? <CardRowSeparator data-link-card-separator="" />
             : null}
-          <LinkCardNode card={card} id={child} depth={depth + 1} inRow={row} />
+          <LinkCardNode card={card} id={child} depth={depth + 1} inRow={row} surface={surface} />
         </Fragment>
       ));
       // A row is the item card's details row (PreviewCardMeta), wrapping only when the App asks.
@@ -57,7 +65,7 @@ function LinkCardNode({ card, id, depth, inRow }: { card: LinkCardV2; id: string
     case "Text":
       return <CardText tone={node.props.tone} mono={node.props.mono} inRow={inRow} data-link-card-text={node.props.tone}>{node.props.text}</CardText>;
     case "Badge":
-      return <CardBadge inRow={inRow} data-link-card-badge={node.props.tone}>{node.props.text}</CardBadge>;
+      return <CardBadge inRow={inRow} fill={node.props.color} surface={surface} data-link-card-badge={node.props.tone}>{node.props.text}</CardBadge>;
     case "RelativeTime":
       return <CardRelativeTime at={node.props.at} data-link-card-time="" />;
     case "Duration":

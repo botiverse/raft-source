@@ -4,20 +4,19 @@ import { useIntl } from "react-intl";
 import type { IntlShape } from "react-intl";
 import { TriangleAlert } from "lucide-react";
 import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogBody,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
   Banner,
   BannerAction,
   BannerDescription,
   BannerTitle,
   Button,
+  Dialog,
+  DialogBody,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
 } from "@botiverse/raft-ui";
 import { ARTIFACT_WEB_ERROR_CODES } from "@botiverse/raft-shared";
 import type { ArtifactViewerData, ArtifactWebHomeChange } from "@botiverse/raft-shared";
@@ -345,12 +344,12 @@ export function ArtifactNarrowHomeDialogs({ to, finalFocus, onClose, onUnpublish
     onClose();
   }, [onClose, to]);
   return (
-    <AlertDialog open={to !== null} onOpenChange={handleOpenChange}>
+    <Dialog open={to !== null} onOpenChange={handleOpenChange}>
       {to === "server" ? <NarrowToServer {...props} finalFocus={finalFocus} movingRef={movingRef} onConfirmStart={onConfirmStart} /> : null}
       {to === "conversation" ? <NarrowToOriginal {...props} finalFocus={finalFocus} movingRef={movingRef} onConfirmStart={onConfirmStart} /> : null}
       {to === "unpublish" ? <UnpublishConfirmation finalFocus={finalFocus} movingRef={movingRef} onConfirm={onUnpublish} onClose={onClose} onConfirmStart={onConfirmStart} /> : null}
       {to === "public" ? <WidenPublicConfirmation finalFocus={finalFocus} movingRef={movingRef} onConfirm={onWidenPublic} onClose={onClose} onConfirmStart={onConfirmStart} embed={embed} /> : null}
-    </AlertDialog>
+    </Dialog>
   );
 }
 
@@ -443,30 +442,31 @@ function ActConfirmation({ finalFocus, movingRef, onConfirm, onClose, onConfirmS
     });
   }, [movingRef, onConfirm, onConfirmStart, onClose]);
   return (
-    <AlertDialogContent finalFocus={finalFocus} data-testid={testId}>
-      <AlertDialogHeader>
-        <AlertDialogTitle>{title}</AlertDialogTitle>
-      </AlertDialogHeader>
+    <DialogContent size="sm" finalFocus={finalFocus} data-testid={testId}>
+      <DialogHeader>
+        <DialogTitle>{title}</DialogTitle>
+        <DialogClose disabled={moving} aria-label={formatMessage({ id: "common.confirm.closeDialog" })} />
+      </DialogHeader>
       {body || notice ? (
-        <AlertDialogBody className="grid gap-3">
-          {body ? <AlertDialogDescription>{body}</AlertDialogDescription> : null}
+        <DialogBody className="grid gap-3">
+          {body ? <DialogDescription>{body}</DialogDescription> : null}
           {notice ? (
             <Banner status="warning" size="sm" role="none">
               <TriangleAlert />
               <BannerDescription>{notice}</BannerDescription>
             </Banner>
           ) : null}
-        </AlertDialogBody>
+        </DialogBody>
       ) : null}
-      <AlertDialogFooter>
-        <AlertDialogCancel size="lg" disabled={moving} data-testid="artifact-home-cancel">
+      <DialogFooter>
+        <DialogClose render={<Button variant="ghost" size="lg" />} disabled={moving} data-testid="artifact-home-cancel">
           {formatMessage({ id: "artifacts.share.cancel" })}
-        </AlertDialogCancel>
-        <AlertDialogAction variant={variant} size="lg" loading={moving} disabled={moving} onClick={confirm} data-testid="artifact-home-confirm">
+        </DialogClose>
+        <Button variant={variant} size="lg" loading={moving} disabled={moving} onClick={confirm} data-testid="artifact-home-confirm">
           {confirmLabel}
-        </AlertDialogAction>
-      </AlertDialogFooter>
-    </AlertDialogContent>
+        </Button>
+      </DialogFooter>
+    </DialogContent>
   );
 }
 
@@ -522,7 +522,7 @@ function NarrowToOriginal(props: NarrowContentProps) {
 }
 
 /**
- * A narrowing's confirmation (DS AlertDialog, orange: people lose it, and
+ * A narrowing's confirmation (DS Dialog at size sm, orange: people lose it, and
  * it can be widened again): what it does (the title), the preview's count
  * for `target` (null: there is nothing to narrow to any more, said so and
  * nothing is asked), then the home route with that count. While the count
@@ -542,22 +542,23 @@ function NarrowConfirmation({ data, onMoved, onStale, finalFocus, movingRef, onC
   const narrowing: Narrowing | null = target ? asked.narrowing : noTarget;
   const checking = narrowing?.status === "loading";
   return (
-    <AlertDialogContent finalFocus={finalFocus} data-testid="artifact-narrow-dialog">
-      <AlertDialogHeader>
-        <AlertDialogTitle>{title}</AlertDialogTitle>
-      </AlertDialogHeader>
+    <DialogContent size="sm" finalFocus={finalFocus} data-testid="artifact-narrow-dialog">
+      <DialogHeader>
+        <DialogTitle>{title}</DialogTitle>
+        <DialogClose disabled={moving} aria-label={formatMessage({ id: "common.confirm.closeDialog" })} />
+      </DialogHeader>
       {/* The live region stays mounted throughout; the body only while the preview draws something (no empty padding). */}
       <NarrowingAnnouncer narrowing={narrowing} />
       {narrowing && noticeShown(narrowing, formatMessage) ? (
-        <AlertDialogBody className="grid gap-3">
+        <DialogBody className="grid gap-3">
           <NarrowingNotice narrowing={narrowing} moving={moving} onRetry={retry} />
-        </AlertDialogBody>
+        </DialogBody>
       ) : null}
-      <AlertDialogFooter>
-        <AlertDialogCancel size="lg" disabled={moving} data-testid="artifact-narrow-cancel">
+      <DialogFooter>
+        <DialogClose render={<Button variant="ghost" size="lg" />} disabled={moving} data-testid="artifact-narrow-cancel">
           {formatMessage({ id: "artifacts.share.cancel" })}
-        </AlertDialogCancel>
-        <AlertDialogAction
+        </DialogClose>
+        <Button
           variant="warning"
           size="lg"
           loading={moving || checking}
@@ -567,8 +568,8 @@ function NarrowConfirmation({ data, onMoved, onStale, finalFocus, movingRef, onC
           data-testid="artifact-narrow-confirm"
         >
           {confirmLabel}
-        </AlertDialogAction>
-      </AlertDialogFooter>
-    </AlertDialogContent>
+        </Button>
+      </DialogFooter>
+    </DialogContent>
   );
 }

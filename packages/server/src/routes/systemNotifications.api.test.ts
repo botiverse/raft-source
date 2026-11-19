@@ -512,6 +512,63 @@ test("usage-limit attention comes from model groups' windows only once the accou
   assert.deepEqual(used.map((notification) => notification.provider), ["antigravity", "antigravity"], "rate limited: the groups' windows notify");
 });
 
+// Claude's Fable week at its limit: OAR says rate limited, but all models
+// still run, as the web's cell shows (allModelsUsageAccount). No "Claude used
+// up" notice until all models are used up; an older Computer's windows carry
+// no scope, and the label names the model.
+test("usage-limit attention: a Claude model's window at its limit alone is no notice, scoped or not; all models used up is", async ({ db }) => {
+  void db;
+  const owner = await createVerifiedUser(`ula-model-${randomUUID().slice(0, 8)}@slock.test`);
+  const server = await createServer("Usage attention models", `usage-attention-model-${randomUUID().slice(0, 8)}`, owner.id);
+  const machineFor = async (name: string) => {
+    const [machine] = await getDb().insert(machines).values({
+      serverId: server.id,
+      userId: owner.id,
+      name,
+      apiKeyHash: `unused-model-attention-${randomUUID()}`,
+    }).returning();
+    await getDb().insert(agents).values({ serverId: server.id, name: `${name}-agent`, machineId: machine!.id, runtime: "claude", status: "active" });
+    return machine!.id;
+  };
+  const now = new Date("2026-11-12T08:00:00.000Z");
+  const service = new UsageLimitAttentionService(() => now);
+  const claude = (allModels: "ok" | "limit_reached", scoped: boolean, at = now) => parseRuntimeAccountUsageSnapshot({
+    protocolVersion: RUNTIME_ACCOUNT_USAGE_PROTOCOL_VERSION,
+    provider: "claude",
+    collectedAt: at.toISOString(),
+    staleAfter: new Date(at.getTime() + 60_000).toISOString(),
+    collectorVersion: "test",
+    accounts: [{
+      accountKey: "e".repeat(64),
+      health: "rate_limited",
+      windows: [
+        { id: "w0_aaaaaaaaaaaa", label: "Current week (all models)", status: allModels, usedRatio: allModels === "ok" ? 0.85 : 1, ...(scoped ? { scope: { kind: "account" } } : {}) },
+        { id: "w1_bbbbbbbbbbbb", label: "Current week (Fable)", status: "limit_reached", usedRatio: 1, ...(scoped ? { scope: { kind: "model", name: "Fable" } } : {}) },
+      ],
+    }],
+  });
+  const windowsOf = async (machineId: string) => (await service.listForReceiver(server.id, owner.id)).notifications
+    .filter((notification) => notification.machine.id === machineId)
+    .map((notification) => notification.windowKey)
+    .sort();
+
+  const scopedFable = await machineFor("scoped-fable");
+  await service.ingest(scopedFable, claude("ok", true));
+  assert.deepEqual(await windowsOf(scopedFable), [], "Fable used up (scoped): no notice");
+
+  const legacyFable = await machineFor("legacy-fable");
+  await service.ingest(legacyFable, claude("ok", false));
+  assert.deepEqual(await windowsOf(legacyFable), [], "Fable used up (an older Computer, no scope): no notice");
+
+  const allUsedUp = await machineFor("all-used-up");
+  await service.ingest(allUsedUp, claude("limit_reached", false));
+  assert.deepEqual(await windowsOf(allUsedUp), ["w0_aaaaaaaaaaaa", "w1_bbbbbbbbbbbb"], "all models used up: Claude is used up");
+
+  // All models back (Fable still used up): both notices resolve.
+  await service.ingest(allUsedUp, claude("ok", false, new Date(now.getTime() + 60_000)));
+  assert.deepEqual(await windowsOf(allUsedUp), [], "all models back: no notice, Fable's included");
+});
+
 // As above: an offline Computer takes no hosted assistant with it.
 test("the offline-computer notice never counts a hosted personal assistant, even for its owner", async ({ app }) => {
   const owner = await createVerifiedUser(`offline-owner-${randomUUID().slice(0, 8)}@slock.test`);

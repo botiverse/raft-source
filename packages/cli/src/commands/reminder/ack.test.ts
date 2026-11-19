@@ -137,8 +137,9 @@ test("seal and unseal all-pending use exact local item identities", async () => 
     }) as never,
   });
 
+  // The id as the Inbox prints one firing: --all-pending still covers every revision.
   await reminderSealCommand.handler(ctx, {
-    id: "12345678",
+    id: `reminder:${reminderId}:7`,
     allPending: true,
     owner: "@Stone",
     until: "deploy",
@@ -624,4 +625,35 @@ test("ack rejects a short id that is ambiguous across active or acknowledged rem
       return true;
     },
   );
+});
+
+test("ack takes the id as raft inbox check prints it: reminder:<id>:<rev> also gives the revision", async () => {
+  const { io, stdout } = memoryIo();
+  const acked: unknown[] = [];
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (method: string, path: string, body?: unknown): Promise<ApiResponse<unknown>> => {
+        if (method === "GET" && path === "/internal/agent-api/inbox") {
+          return ok({ rows: [], items: [dueItem({ revision: "7" }), dueItem({ revision: "8" })], acknowledged_app_sources: [] });
+        }
+        if (method === "POST" && path === "/internal/agent-api/inbox/ack") {
+          acked.push(body);
+          return ok({ ok: true, itemId: `reminder:${reminderId}:8`, remaining_app_items: 1 });
+        }
+        throw new Error(`unexpected request ${method} ${path}`);
+      },
+    }) as never,
+  });
+
+  await reminderAckCommand.handler(ctx, { id: `reminder:${reminderId}:8` } as never);
+  assert.deepEqual(acked, [{ itemId: `reminder:${reminderId}:8` }]);
+  assert.match(stdout.join(""), new RegExp(`Reminder ${reminderId} revision 8 fired item acknowledged`));
+
+  await assert.rejects(
+    async () => reminderAckCommand.handler(ctx, { id: `reminder:${reminderId}:8`, revision: "7" }),
+    /--id names revision 8 but --revision is 7/,
+  );
+  assert.equal(acked.length, 1);
 });

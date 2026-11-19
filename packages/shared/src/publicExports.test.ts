@@ -23,6 +23,10 @@ const expectedExports = {
     types: "./announcement-presentation.ts",
     default: "./announcement-presentation.ts",
   },
+  "./announcement-version-rules": {
+    types: "./announcement-version-rules.ts",
+    default: "./announcement-version-rules.ts",
+  },
   ".": {
     types: "./src/index.ts",
     default: "./src/index.ts",
@@ -34,6 +38,14 @@ const expectedExports = {
   "./feature-flag-client-rules": {
     types: "./feature-flag-client-rules.ts",
     default: "./feature-flag-client-rules.ts",
+  },
+  "./feature-flag-default-policy": {
+    types: "./feature-flag-default-policy.ts",
+    default: "./feature-flag-default-policy.ts",
+  },
+  "./feature-flag-evaluation": {
+    types: "./feature-flag-evaluation.ts",
+    default: "./feature-flag-evaluation.ts",
   },
   "./feature-flag-taxonomy": {
     types: "./feature-flag-taxonomy.ts",
@@ -88,6 +100,10 @@ const expectedExports = {
   "./src/externalLinkSchemes": {
     types: "./src/externalLinkSchemes.ts",
     default: "./src/externalLinkSchemes.ts",
+  },
+  "./src/linkRouter": {
+    types: "./src/linkRouter.ts",
+    default: "./src/linkRouter.ts",
   },
   "./src/sameSite": {
     types: "./src/sameSite.ts",
@@ -200,6 +216,14 @@ const expectedExports = {
   "./src/appLinkPreview": {
     types: "./src/appLinkPreview.ts",
     default: "./src/appLinkPreview.ts",
+  },
+  "./src/sealedInputs": {
+    types: "./src/sealedInputs.ts",
+    default: "./src/sealedInputs.ts",
+  },
+  "./src/sealedInputsVectors.testkit": {
+    types: "./src/sealedInputsVectors.testkit.ts",
+    default: "./src/sealedInputsVectors.testkit.ts",
   },
   "./src/appRuntimeTrace": {
     types: "./src/appRuntimeTrace.ts",

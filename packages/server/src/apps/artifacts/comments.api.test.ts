@@ -1211,3 +1211,44 @@ test("object events older than 90 days are pruned", async ({ app, seed }) => {
   // Data stays small: the CHECK refuses a large one.
   await assert.rejects(getDb().insert(objectEvents).values({ ...base, data: { big: randomBytes(6000).toString("base64") } }));
 });
+
+// #raft-antiproton:#16: an agent that dealt with the Artifact through the app
+// (read it, listed its comments) has handled what its notices about it said,
+// even without `raft inbox read`: once it has seen all of it, they are
+// consumed (`delivered`, consumed_via `acted`), so they leave its inbox and no
+// restart re-delivery repeats them. Short of the end, they stay unread.
+test("acting on the Artifact consumes its notices to the agent once it has seen all of it (consumed_via acted); short of the end they stay", async ({ app, seed }) => {
+  const world = await seedWorld(seed, app);
+  const id = await createSite(world, app);
+  const noticesOfA = async () => (await eventsOf(world.agentA.id)).filter((event) => event.objectRef === id);
+  await read(app, world.keys.b, id);
+
+  // A short comment by B: A, a follower, is told; reading the Artifact shows it whole, so the notice is handled.
+  assert.equal((await comment(app, world.keys.b, id, { body: "short and whole", path: "a.html" })).status, 201);
+  const [first] = await noticesOfA();
+  assert.ok(first && (first.status === "queued" || first.status === "delivering"), `unread before A acts: ${first?.status}`);
+  assert.equal(first.consumedVia, null);
+  assert.equal((await read(app, world.keys.a, id)).status, 200);
+  const handled = (await noticesOfA()).find((event) => event.id === first.id)!;
+  assert.equal(handled.status, "delivered");
+  assert.equal(handled.consumedVia, "acted");
+  assert.ok(handled.deliveredAt);
+
+  // A long comment: the read cuts it short, so A hasn't seen all of it and the notice stays unread...
+  assert.equal((await comment(app, world.keys.b, id, { body: "x".repeat(AGENT_API_ARTIFACT_COMMENT_EXCERPT_CHARS + 50), path: "a.html" })).status, 201);
+  const second = (await noticesOfA()).find((event) => event.id !== first.id)!;
+  assert.equal((await read(app, world.keys.a, id)).body.unseen.unread, 1);
+  const stillUnread = (await noticesOfA()).find((event) => event.id === second.id)!;
+  assert.ok(stillUnread.status === "queued" || stillUnread.status === "delivering", `a notice A hasn't seen all of stays unread: ${stillUnread.status}`);
+  assert.equal(stillUnread.consumedVia, null);
+  // ...until A lists the comments, which shows it whole.
+  assert.equal((await call(app.baseUrl, "GET", `/artifacts/${id}/comments`, world.keys.a)).status, 200);
+  const listed = (await noticesOfA()).find((event) => event.id === second.id)!;
+  assert.equal(listed.status, "delivered");
+  assert.equal(listed.consumedVia, "acted");
+
+  // Only A's notices about this Artifact: B's own notices (A's reply, below) are B's to handle.
+  assert.equal((await comment(app, world.keys.a, id, { body: "thanks" })).status, 201);
+  const toB = (await eventsOf(world.agentB.id)).filter((event) => event.objectRef === id);
+  assert.ok(toB.length > 0 && toB.every((event) => event.consumedVia === null), "A acting consumes nothing of B's");
+});

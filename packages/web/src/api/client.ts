@@ -17,7 +17,7 @@ import {
   continueWebHttpClientTrace,
   finishWebHttpClientTrace,
 } from "../utils/webHttpClientTrace";
-import { readBootFetch, takeBootFetch } from "../boot/bootPrefetch";
+import { bootServerWait, readBootFetch, takeBootFetch } from "../boot/bootPrefetch";
 import { RUNTIME_API_BASE } from "../runtimeEndpoints";
 import { recordFailedRequestTraceId } from "../utils/requestTraceId";
 import { forgetLocalUser } from "../store/localTables/persistence";
@@ -42,7 +42,12 @@ const networkAdapter = api.defaults.adapter;
 const bootPrefetchAdapter: AxiosAdapter = async (config) => {
   const toNetwork = () => axios.getAdapter(networkAdapter)(config);
   if ((config.method ?? "get").toLowerCase() !== "get" || config.signal?.aborted) return toNetwork();
-  const early = takeBootFetch(api.getUri(config), AxiosHeaders.from(config.headers).toJSON());
+  const url = api.getUri(config);
+  const headers = AxiosHeaders.from(config.headers).toJSON();
+  const taken = takeBootFetch(url, headers);
+  // Only a boot server read on a cold device waits; everything else stays synchronous.
+  const waiting = taken ? null : bootServerWait(url, headers, config.signal);
+  const early = taken ?? (waiting ? await waiting : null);
   const answer = early ? await readBootFetch(early) : null;
   if (!early || !answer || config.signal?.aborted || (config.validateStatus && !config.validateStatus(answer.status))) return toNetwork();
   continueWebHttpClientTrace(config, early.h.traceparent, early.t);
@@ -138,6 +143,7 @@ api.interceptors.response.use(
     finishWebHttpClientTrace(originalRequest, {
       statusCode: error.response?.status,
       cancelled: axios.isCancel(error),
+      failure: error,
       responseData: error.response?.data,
       responseHeaders: error.response?.headers,
     });

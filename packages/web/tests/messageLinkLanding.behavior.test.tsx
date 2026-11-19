@@ -10,7 +10,7 @@ import {
   parseMessageLink,
   resetMessageLinkLandingForTests,
 } from "../src/utils/messageLinkLanding";
-import { movePageLanding, notePageLocation, pageLandingAt, spendPageLanding, subscribePageLanding } from "../src/utils/pageLanding";
+import { isComingBackToWeb, movePageLanding, notePageLocation, pageLandingAt, spendPageLanding, subscribePageLanding } from "../src/utils/pageLanding";
 import { getExternalBrowserLoginUrl } from "../src/utils/socialAuth";
 
 // Deep links v1 (item d): the message link format "Copy link" builds, and
@@ -111,7 +111,7 @@ test("signing in from an in-app browser keeps the link's query in the system bro
 
 test("the page landing is whatever address the page was first loaded on, with where it came from", () => {
   resetMessageLinkLandingForTests({ pathname: "/s/acme/tasks", search: "?task=c1%3Atask%3A7", referrer: "https://mail.example.com/x", origin: "https://app.raft.build" });
-  assert.deepEqual(pageLandingAt("/s/acme/tasks"), { pathname: "/s/acme/tasks", search: "?task=c1%3Atask%3A7", fromOutside: true });
+  assert.deepEqual(pageLandingAt("/s/acme/tasks"), { pathname: "/s/acme/tasks", search: "?task=c1%3Atask%3A7", fromOutside: true, noReferrer: false });
   assert.equal(pageLandingAt("/s/acme/channel/c1"), null, "another page");
   assert.equal(isMessageLinkLanding("/s/acme/tasks", "?task=c1%3Atask%3A7"), false, "not a message link: none of its states");
 
@@ -183,7 +183,7 @@ function bootAt(address: string, navigation: "navigate" | "reload" | "back_forwa
 
 test("at boot: a fresh load is the landing, for any page and for a message link; a reload or Back/Forward is not", () => {
   bootAt("/s/acme/tasks", "navigate");
-  assert.deepEqual(pageLandingAt("/s/acme/tasks"), { pathname: "/s/acme/tasks", search: "", fromOutside: true });
+  assert.deepEqual(pageLandingAt("/s/acme/tasks"), { pathname: "/s/acme/tasks", search: "", fromOutside: true, noReferrer: true });
 
   bootAt("/s/acme/channel/c1?msg=m1", "navigate");
   assert.equal(pageLandingAt("/s/acme/channel/c1")?.search, "?msg=m1");
@@ -194,6 +194,31 @@ test("at boot: a fresh load is the landing, for any page and for a message link;
     bootAt("/s/acme/channel/c1?msg=m1", navigation);
     assert.equal(pageLandingAt("/s/acme/channel/c1"), null, navigation);
     assert.equal(isMessageLinkLanding("/s/acme/channel/c1", "?msg=m1"), false, navigation);
+  }
+});
+
+test("Raft Desktop's offer: a mere place opened with no referrer is coming back to the web app; a link, or a page from another site, is not", () => {
+  const comingBack = (pathname: string, search: string, referrer?: string) => {
+    resetMessageLinkLandingForTests({ pathname, search, referrer, origin: "https://app.raft.build" });
+    const landing = pageLandingAt(pathname);
+    assert.notEqual(landing, null, `${pathname}${search}: still a landing`);
+    return isComingBackToWeb(landing!);
+  };
+  // A bookmark, the start page, the address bar.
+  for (const pathname of ["/s/acme/channel/c1", "/s/acme/dm/d1", "/s/acme", "/s/acme/tasks"]) {
+    assert.equal(comingBack(pathname, ""), true, pathname);
+  }
+  // The same places opened from another site's page, or followed inside Raft.
+  assert.equal(comingBack("/s/acme/channel/c1", "", "https://mail.example.com/x"), false);
+  assert.equal(comingBack("/s/acme/channel/c1", "", "https://app.raft.build/s/acme"), false);
+  // Links, with no referrer.
+  for (const [pathname, search] of [
+    ["/s/acme/channel/c1", "?msg=m1"],
+    ["/s/acme/channel/c1", "?thread=c1:p1"],
+    ["/s/acme/tasks", "?task=c1%3Atask%3A7"],
+    ["/s/acme/artifacts", "?artifact=a1"],
+  ] as const) {
+    assert.equal(comingBack(pathname, search), false, `${pathname}${search}`);
   }
 });
 

@@ -73,6 +73,8 @@ export const STEP_UP_ACTIONS = {
   integration_webhook_secret_rotate: "Confirm it's you with your second step before creating a new app webhook signing secret.",
   // POST /api/integrations/clients, and the register_app action card (services/actionCardSecondFactor.ts).
   integration_app_register: "Confirm it's you with your second step before registering an app.",
+  // DELETE /api/me/sessions/:familyId and POST /api/me/sessions/revoke-others with `reason: "lost_device"` (routes/mySessions.ts).
+  session_revoke: "Confirm it's you with your second step before disconnecting a lost device.",
 } as const;
 
 export type StepUpAction = keyof typeof STEP_UP_ACTIONS;

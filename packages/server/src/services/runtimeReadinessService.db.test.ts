@@ -1,9 +1,9 @@
 import { dbTest as test } from "../test/integration/dbTest";
 import assert from "node:assert/strict";
 import { parseRuntimeReadinessReport, type ReadinessFact } from "@botiverse/raft-shared";
-import { computerOutageOccurrences, computerReadinessReports, computers, computerUpgradeRequests, machines } from "../db/schema";
-import { eq } from "drizzle-orm";
-import { loadComputerReadinessInputs, loadRuntimeReadinessFacts, releaseReadinessNotices, serverFactsForComputer, storeRuntimeReadinessReport } from "./runtimeReadinessService";
+import { agents, computerOutageOccurrences, computerReadinessReports, computers, computerUpgradeRequests, machines } from "../db/schema";
+import { eq, sql } from "drizzle-orm";
+import { loadComputerReadinessInputs, loadReadinessAgentsByMachine, loadRuntimeReadinessFacts, releaseReadinessNotices, serverFactsForComputer, storeRuntimeReadinessReport } from "./runtimeReadinessService";
 
 const verify: ReadinessFact = { resource: { kind: "login", key: "shared:claude" }, code: "verification_required", behaviour: "blocked", since: 5_000 };
 
@@ -107,4 +107,18 @@ test("#68 F1: a frame with 1,000 made-up codes stores 50 facts and tells nobody"
   const stored = await storeRuntimeReadinessReport(machine!.id, report, new Date("2026-11-12T12:00:00Z"), db);
   assert.deepEqual(stored?.toNotify, []);
   assert.equal((await loadRuntimeReadinessFacts([machine!.id], db)).get(machine!.id)?.length, 50);
+});
+
+test("#68: the needs-attention agents leave out another person's personal assistant, as the machine list's counts do", async ({ db, seed }) => {
+  const owner = await seed.human();
+  const member = await seed.human();
+  const server = await seed.server({ owner, members: [member] });
+  const [machine] = await db.insert(machines).values({ serverId: server.id, userId: owner.id, name: "shared", apiKeyHash: "hash" }).returning({ id: machines.id });
+  // The table refuses an assistant on a Computer today (0656); without that rule this read is what keeps it hidden.
+  await db.execute(sql`alter table agents drop constraint if exists agents_assistant_not_on_machine`);
+  const [plain] = await db.insert(agents).values({ serverId: server.id, name: "plain", machineId: machine!.id }).returning({ id: agents.id });
+  const [assistant] = await db.insert(agents).values({ serverId: server.id, name: "owners-assistant", machineId: machine!.id, assistantOwnerUserId: owner.id }).returning({ id: agents.id });
+  const ids = async (userId: string) => ((await loadReadinessAgentsByMachine([machine!.id], { userId }, db)).get(machine!.id) ?? []).map((agent) => agent.id).sort();
+  assert.deepEqual(await ids(member.id), [plain!.id], "a member does not find the owner's assistant");
+  assert.deepEqual(await ids(owner.id), [plain!.id, assistant!.id].sort(), "its owner does");
 });

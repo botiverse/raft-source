@@ -1,6 +1,7 @@
 // Each display locale's catalog ships in three parts in a web build
 // (scripts/catalogPartsPlugin.ts), docs/frontend/i18n/README.md "First-screen part":
-// - first: every id the first download's code names; the first render waits for it;
+// - first: every id the first download's code names, and the FIRST_PART_PAGES'
+//   (the sign-in page); the first render waits for it;
 // - boot: the ids of the pages main.tsx starts at boot from the address (a
 //   landing page, a thread or Artifact link, the server setup steps...: the
 //   chunks BOOT_CHUNK_LOADERS and BOOT_CHUNK_PAGES name), which such a page
@@ -53,6 +54,16 @@ export const BOOT_CHUNK_LOADERS = [
 
 /** Pages the address names that App.tsx loads lazily on its own (not through a loader above). */
 export const BOOT_CHUNK_PAGES = ["src/components/window/ThreadWindowRoute.tsx"] as const;
+
+/**
+ * Pages outside the first download whose words ship in the first part all the
+ * same, so they load with no catalog gate: the sign-in page (and the chunks it
+ * imports), the first screen of a signed-out load, which is kept out of the
+ * first download only for signed-in loads (docs/frontend/boot-bundle.md). With
+ * its words in the first part it waits for no other part, as when it was in
+ * the first download. The build fails when one is gone.
+ */
+export const FIRST_PART_PAGES = ["src/components/auth/SignInPage.tsx"] as const;
 
 // A string literal in built code that is an id ("common.confirm.cancel"),
 // or the head of one built from it ("push." + x, `agent.status.${s}`).

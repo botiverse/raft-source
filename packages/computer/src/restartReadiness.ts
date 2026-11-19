@@ -67,9 +67,20 @@ export function classifyRestartReadiness(
   targetServerIds: readonly string[],
   requestedAtMs: number,
   expectedVersion: string = COMPUTER_VERSION,
+  /**
+   * `servicePid`: the live service, so only its spawn records name a starting
+   * runner (an earlier service's orphan stays "not started yet").
+   * `nowMs`: when the facts were read, for a spawned runner's age.
+   */
+  context: { servicePid?: number; nowMs?: number } = {},
 ): RestartReadinessSnapshot {
   const targets = [...new Set(targetServerIds)].sort();
-  const verdict = machineReadiness(facts, { targetServerIds: targets, expectedVersion });
+  const verdict = machineReadiness(facts, {
+    targetServerIds: targets,
+    expectedVersion,
+    ...(context.servicePid !== undefined ? { servicePid: context.servicePid } : {}),
+    ...(context.nowMs !== undefined ? { nowMs: context.nowMs } : {}),
+  });
   const reasons = new Map(verdict.reasons.map((reason) => [reason.serverId, reason]));
   const runners = new Map(facts.runners.map((runner) => [runner.serverId, runner]));
 
@@ -99,6 +110,8 @@ export interface WaitForRestartReadinessOptions {
   now?: () => number;
   collectFacts?: (slockHome: string, serverIds: readonly string[]) => Promise<MachineFacts>;
   expectedVersion?: string;
+  /** The live (replacement) service's pid: see classifyRestartReadiness. */
+  servicePid?: number;
   signal?: AbortSignal;
   /** Fires once per server the first time it is observed connected. */
   onConnected?: (runner: Extract<RestartRunnerState, { state: "connected" }>) => void;
@@ -129,7 +142,10 @@ export async function waitForRestartReadiness(
   for (;;) {
     opts.signal?.throwIfAborted();
     const facts = await collect(slockHome, targetServerIds);
-    const snapshot = classifyRestartReadiness(facts, targetServerIds, requestedAtMs, opts.expectedVersion);
+    const snapshot = classifyRestartReadiness(facts, targetServerIds, requestedAtMs, opts.expectedVersion, {
+      nowMs: now(),
+      ...(opts.servicePid !== undefined ? { servicePid: opts.servicePid } : {}),
+    });
     for (const runner of snapshot.runners) {
       if (runner.state === "connected" && !announced.has(runner.serverId)) {
         announced.add(runner.serverId);

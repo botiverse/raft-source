@@ -264,6 +264,6 @@ test("v2-only copy stays off the v1 definition: the frozen v1 sample has no mode
   const { releasedRuntimeFormDefinition } = await import("@botiverse/raft-runtime-form");
   const v1 = releasedRuntimeFormDefinition("builtin-pi.create.v3");
   assert.equal(v1?.uiSchema?.localization?.model?.hint, undefined, "v1 clients never see it");
-  assert.equal(buildRuntimeFormV2("builtin").uiSchema?.localization?.model?.hint, "Use a model ID the selected provider supports.");
+  assert.equal(buildRuntimeFormV2("builtin").uiSchema?.localization?.model?.hint, "Pick a model from the list. Where the provider allows it, you can also type a model ID.");
   assert.equal(buildRuntimeFormV2("builtin").schemaVersion, "builtin-pi.create.v3", "no version bump");
 });

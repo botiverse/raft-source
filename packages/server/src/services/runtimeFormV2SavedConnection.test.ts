@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { beforeEach, vi } from "vitest";
 
-import { RUNTIME_CONFIG_VERSION, type RuntimeConfig } from "@botiverse/raft-shared";
+import { parseRuntimeConfig, RUNTIME_CONFIG_VERSION, type RuntimeConfig } from "@botiverse/raft-shared";
 
 import { isProviderConnectionsEnabled } from "./providerConnectionFeature";
 import { listProviderConnections } from "./providerConnectionService";
@@ -255,6 +255,83 @@ test("an unlisted model on a connection submit is carried as custom for the rout
   assert.equal(built.ok, true);
   if (!built.ok) return;
   assert.deepEqual(built.runtimeConfig.model, { kind: "custom", name: "some/typed-model" });
+});
+
+// A saved preset connection takes a model exactly as its provider chosen
+// directly does (one rule, builtInModelFromValues): the same stored model, or
+// the same refusal, for every case. Only the provider differs.
+test("a preset connection submit stores the model its provider would, typed ids and limits included", () => {
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ["deepseek", { model: "deepseek/deepseek-v4-pro" }],
+    ["deepseek", { model: "deepseek/deepseek-v4-pro", contextWindow: "64000" }],
+    ["deepseek", { model: "deepseek-v5-preview", contextWindow: "128000", maxOutputTokens: "8000", reasoningEffort: "high" }],
+    ["deepseek", { model: "deepseek/deepseek-v5-preview" }],
+    ["deepseek", { model: "deepseek/deepseek-v4-pro", contextWindow: "abc" }],
+    ["openai", { model: "gpt-typed-2099", reasoningEffort: "high" }],
+    ["openai", { model: "gpt-typed-2099" }],
+  ];
+  for (const [providerId, extra] of cases) {
+    const label = `${providerId} ${JSON.stringify(extra)}`;
+    const direct = buildRuntimeConfigFromFormValues("builtin", { providerId, apiKey: "k", loadLocalPlugins: false, ...extra });
+    const viaConnection = buildRuntimeConfigFromFormValues(
+      "builtin",
+      { providerId: "connection:conn-x", loadLocalPlugins: false, ...extra },
+      { savedConnectionProviderId: providerId },
+    );
+    assert.equal(viaConnection.ok, direct.ok, label);
+    if (!direct.ok || !viaConnection.ok) {
+      assert.deepEqual(!viaConnection.ok && viaConnection.issue, !direct.ok && direct.issue, label);
+      continue;
+    }
+    // The direct model as stored: the shared parser normalizes a direct preset's typed id.
+    const stored = parseRuntimeConfig({ runtimeConfig: direct.runtimeConfig });
+    assert.ok(stored.ok, label);
+    if (!stored.ok) continue;
+    assert.deepEqual(viaConnection.runtimeConfig.model, stored.config.model, label);
+    assert.deepEqual(viaConnection.runtimeConfig.provider, { kind: "connection", connectionId: "conn-x" }, label);
+  }
+});
+
+test("a preset connection's typed id follows the Computer: only one that runs it through a connection gets the typed field", async () => {
+  connectionsEnabled.mockResolvedValue(true);
+  connections.mockResolvedValue(CONNECTION_SUMMARIES);
+  const clientCapabilities = ["dependent_select.custom_value_with_options"];
+  const modelSourceFor = async (catalog: Record<string, unknown>) => {
+    const resolution = await resolveSource(sourceContext("model", {
+      formRevision: savedConnectionFormRevision("builtin", runtimeFormV2Entry("builtin")!.buildForm(), clientCapabilities),
+      connectionsVisible: true,
+      clientCapabilities,
+      agentOrchestrator: {
+        detectMachineRuntimeModels: async () => { throw new Error("not used"); },
+        detectMachineRuntimeModelsWithAuthority: async () => ({
+          outcome: {
+            kind: "live",
+            value: {
+              models: [{ id: "deepseek/deepseek-v4-pro", label: "V4 Pro" }],
+              catalog: { protocolVersion: 1, runtime: "builtin", runtimeVersion: "1.2.3", ...catalog },
+            },
+          },
+          daemonVersion: "1.0.0",
+          computerVersion: "1.0.0",
+        }),
+      },
+    } as unknown as Partial<RuntimeFormOptionSourceContext>));
+    assert.equal(resolution.kind, "source");
+    const source = (resolution as unknown as { source: { optionsByValue: Record<string, unknown>; customValueAllowedByValue: Record<string, boolean> } }).source;
+    return source;
+  };
+  // A Computer that runs a typed DeepSeek id directly only (every released one that reports typed ids).
+  const older = await modelSourceFor({ customModelProviderIds: ["deepseek"] });
+  assert.equal(older.customValueAllowedByValue.deepseek, true);
+  assert.equal(older.customValueAllowedByValue["connection:conn-1"], false);
+  assert.deepEqual(older.optionsByValue["connection:conn-1"], older.optionsByValue.deepseek, "the list is the provider's either way");
+  const current = await modelSourceFor({ customModelProviderIds: ["deepseek"], customModelConnectionProviderIds: ["deepseek"] });
+  assert.equal(current.customValueAllowedByValue.deepseek, true);
+  assert.equal(current.customValueAllowedByValue["connection:conn-1"], true);
+  assert.equal(current.customValueAllowedByValue["connection:conn-2"], true, "a gateway connection is unchanged");
+  // Never wider than the provider itself on that Computer.
+  const none = await modelSourceFor({ customModelConnectionProviderIds: ["deepseek"] });
+  assert.equal(none.customValueAllowedByValue["connection:conn-1"], false);
 });
 
 test("any client-sent connection-owned field is refused: non-empty, empty string and null alike", () => {

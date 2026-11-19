@@ -22,6 +22,8 @@ import { InstallOnAnotherComputer } from "../machine/localComputer/InstallOnAnot
 import { localComputerOnboardingErrorMessage } from "../machine/localComputer/localComputerCopy";
 import { useServerStore } from "../../store/serverStore";
 import { RUNTIME_INSTALL_COMMANDS } from "../machine/runtimeInstallCommands";
+import { SetupDesktopDownload } from "./SetupDesktopDownload";
+import { useDesktopFirstOffer } from "./useDesktopFirstOffer";
 
 const RECOMMENDED_RUNTIME_IDS = ["claude", "codex"] as const;
 
@@ -101,6 +103,8 @@ export type ServerSetupComputerRuntimeStepProps = {
    */
   onCopyCommand?: (target: CopyTarget) => void;
   onUseThisComputer?: () => void;
+  /** In a browser: the Raft Desktop installer link (`download_app`) or "Install with a command" (`install_myself`). */
+  onChooseConnectWay?: (way: "download_app" | "install_myself") => void;
   onLeaveSetup?: (way: "switch_server" | "server_settings") => void;
 };
 
@@ -177,6 +181,7 @@ export default function ServerSetupComputerRuntimeStep({
   onNext,
   onCopyCommand,
   onUseThisComputer,
+  onChooseConnectWay,
   onLeaveSetup,
 }: ServerSetupComputerRuntimeStepProps) {
   const intl = useIntl();
@@ -200,6 +205,7 @@ export default function ServerSetupComputerRuntimeStep({
   // another laptop): "Install on another computer" shows the command guide here.
   const [anotherMachine, setAnotherMachine] = useState(false);
   const showAnotherMachine = useCallback(() => setAnotherMachine(true), []);
+  const desktopOffer = useDesktopFirstOffer(onChooseConnectWay); // In a browser: Raft Desktop first (SetupDesktopDownload.tsx).
   // The connect step is no longer collapsible, so only the motion phase is read
   // from here; `computerExpanded` still drives the reducer's phase transitions.
   const [{ phase: connectionMotionPhase }, dispatchConnectionMotion] = useReducer(connectionMotionReducer, {
@@ -244,6 +250,7 @@ export default function ServerSetupComputerRuntimeStep({
   // and onboarding simply never used the answer. Two screens, one fact, two attitudes: the
   // computer page recognised the user, this one asked who they were.
   const recovering = !computerOnline && hasConnectedComputer;
+  const desktopFirst = !computerHost && !recovering && desktopOffer.offered;
   const recoveringMany = recovering && offlineComputers.length > 1;
   // The computer has actually answered the runtime question (whatever the answer was),
   // as opposed to being online but not having reported yet.
@@ -383,7 +390,8 @@ export default function ServerSetupComputerRuntimeStep({
           {!recovering && useHost && !anotherMachine ? (
             <InstallOnAnotherComputer onOpen={showAnotherMachine} className="mt-3" />
           ) : null}
-          {recovering || (useHost && !anotherMachine) || hostPending ? null : (
+          {desktopFirst && !computerOnline ? <SetupDesktopDownload offer={desktopOffer} /> : null}
+          {recovering || (useHost && !anotherMachine) || hostPending || desktopFirst ? null : (
             <>
               <ComputerCommandGuide
                 computerCommand={setupCommand}
@@ -399,9 +407,9 @@ export default function ServerSetupComputerRuntimeStep({
               {computerOnline ? null : <ConnectComputerInstructions platform={platform} />}
             </>
           )}
-          {recovering || (useHost && !anotherMachine) ? null : (
+          {recovering || (useHost && !anotherMachine) || (desktopFirst && !computerOnline) ? null : (
           <ConnectProgressLog
-            showApproval={(!useHost || anotherMachine) && !hostPending}
+            showApproval={(!useHost || anotherMachine) && !hostPending && !desktopFirst}
             computerName={computer?.name ?? null}
             computerOnline={computerOnline}
             waiting={verifyingComputer}

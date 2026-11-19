@@ -52,6 +52,8 @@ export interface MessageSearchResult {
   delegatedBy?: { id: string; name: string; displayName: string; avatarUrl: string | null; deleted: boolean } | null;
   /** RFC 077: a delegated message its owner retracted (content is the placeholder). */
   retracted?: boolean;
+  /** Raft voice calls: posted in the sender agent's name by its voice call (messages.voice_call_id). */
+  postedByVoiceCall?: boolean;
   content: string;
   snippet: string;
   createdAt: string;
@@ -949,6 +951,8 @@ export function buildMessageSearchStatement(
           ) ELSE NULL END AS "delegatedBy",
           -- RFC 077: its owner retracted it (content is the placeholder).
           (m.delegated_by_agent_id IS NOT NULL AND m.deleted_at IS NOT NULL) AS "retracted",
+          -- Raft voice calls: posted in the agent's name by its voice call.
+          (m.voice_call_id IS NOT NULL) AS "postedByVoiceCall",
           m.content AS "content",
           m.created_at AS "createdAt"${tsQuery && params.sort === "recent" && params.recentPlan === "server_timeline_walk"
             ? sql`,

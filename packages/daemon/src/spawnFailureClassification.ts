@@ -1,3 +1,5 @@
+import os from "node:os";
+import path from "node:path";
 import {
   isRuntimeModelDetectionLookupReason,
   isSpawnFailureLookupReason,
@@ -19,7 +21,7 @@ import { formatRuntimeResetSessionGuidance } from "./runtimeErrorDiagnostics";
 
 export type { SpawnFailureReason } from "./spawnFailureErrors";
 
-type RuntimeModelNotFoundErrorLike = { model: string };
+type RuntimeModelNotFoundErrorLike = { model: string; ignoredWorkspaceCode?: readonly string[]; hostExtensionDir?: string | null };
 
 export const PROVIDER_API_KEY_INVALID_USER_MESSAGE =
   "Couldn't start: there's a problem with the API key. Copy the full key again from your provider's dashboard, save, and retry.";
@@ -98,6 +100,19 @@ export function agentEnvVarsNotAllowedUserMessage(names: readonly string[], inva
 }
 
 /**
+ * The agent dir as everyone who sees the agent's error may read it (Tenny's
+ * 1.28.0 review): under the Computer user's home as `~/…`, so the user name
+ * stays out; anywhere else only as "its Pi agent folder".
+ */
+export function displayHostDir(dir: string, home: string = os.homedir()): string {
+  if (!home) return "its Pi agent folder";
+  const relative = path.relative(home, dir);
+  const outside = relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
+  if (relative && !outside) return `~/${relative.split(path.sep).join("/")}`;
+  return "its Pi agent folder";
+}
+
+/**
  * Map a launch failure to a stable reason + a user message. Raw detail stays
  * out of it, except where a typed error builds its own sentence (an OAR-only
  * start quotes its runtime's masked first line, agentHostRouter.ts).
@@ -148,10 +163,17 @@ export function classifySpawnFailure(error: unknown): SpawnFailureClassification
           ? (error as { cause: RuntimeModelNotFoundErrorLike }).cause
           : null;
       const model = typed ? typed.model : "the configured model";
+      const workspaceCode = typed?.ignoredWorkspaceCode ?? [];
+      const hostDir = typed?.hostExtensionDir ?? null;
       return {
         reason,
         detail,
-        userMessage: `Model ${model} is not available for this runtime on this computer: it may have been renamed or removed in this runtime version, or its provider has no usable API key here. Choose another model, or fix the provider's key, in the agent's settings.`,
+        // #proj-raft-computer:1bfb0122: a model only the agent's own workspace
+        // code defined (Raft stopped loading it in 1.25.0, #14773) is named as such.
+        // The cause is inferred (the workspace has such code), so it is said as one and the usual way out stays.
+        userMessage: workspaceCode.length > 0 && hostDir
+          ? `Model ${model} is not on this Computer. This agent's workspace has Pi code that Raft no longer loads, for security (${workspaceCode.join(", ")}). If the model came from there, install that extension or package on the Computer, in ${displayHostDir(hostDir)}; otherwise choose another model in the agent's settings.`
+          : `Model ${model} is not available for this runtime on this computer: it may have been renamed or removed in this runtime version, or its provider has no usable API key here. Choose another model, or fix the provider's key, in the agent's settings.`,
       };
     }
     case "runtime_not_found": {

@@ -7,13 +7,14 @@ import assert from "node:assert/strict";
 import type { Server as SocketServer } from "socket.io";
 import {
   AGENT_ACTIVITY_STATE_EVENT,
+  AGENT_ACTIVITY_STATE_MIN_INTERVAL_MS,
   AGENT_ACTIVITY_SUBSCRIBED_EVENT,
   agentActivityCapableServerRoom,
   agentActivityRoom,
   type AgentActivityStatePayload,
 } from "@botiverse/raft-shared";
 
-import { AgentActivityStateFanout } from "./agentActivityStateFanout";
+import { AgentActivityStateFanout, SENT_STATE_TRUST_MS } from "./agentActivityStateFanout";
 import { AgentOrchestrator } from "./agentOrchestrator";
 import { parseAgentActivitySubscriptionIds, subscribeSocketToAgentActivity } from "../socket/index";
 
@@ -89,6 +90,52 @@ test("a deleted agent's held coarse state is dropped, not sent", () => {
   assert.deepEqual(sent.map((p) => p.state), ["online", "busy"], "nothing left of it: a later state is sent as a first one");
 });
 
+test("a Computer moving between replicas: the replica it returns to sends the change, not its memory from before", () => {
+  // Two replicas on one clock; the agent's Computer m1 moves B -> A -> B.
+  const clock = fakeClock();
+  const sent: Array<[string, string]> = [];
+  const replicaA = new AgentActivityStateFanout((_room, payload) => sent.push(["A", payload.state]), clock);
+  const replicaB = new AgentActivityStateFanout((_room, payload) => sent.push(["B", payload.state]), clock);
+
+  replicaB.resetMachine("m1");
+  replicaB.observe("s1", "a", "working", 1, 1, "m1");
+  assert.deepEqual(sent, [["B", "busy"]], "on B: busy sent");
+
+  clock.advance(6_000);
+  replicaB.resetMachine("m1");
+  replicaA.resetMachine("m1");
+  replicaA.observe("s1", "a", "online", 2, 2, "m1");
+  assert.deepEqual(sent.at(-1), ["A", "online"], "moved to A: online sent, clients show online");
+
+  clock.advance(6_000);
+  replicaA.resetMachine("m1");
+  replicaB.resetMachine("m1");
+  replicaB.observe("s1", "a", "working", 3, 3, "m1");
+  assert.deepEqual(sent.at(-1), ["B", "busy"], "back on B: busy sent again, not held back by B's old busy");
+
+  replicaB.observe("s1", "a", "thinking", 4, 4, "m1");
+  assert.equal(sent.length, 3, "still deduped while connected here");
+  replicaB.resetMachine("other");
+  replicaB.observe("s1", "a", "working", 5, 5, "m1");
+  assert.equal(sent.length, 3, "another Computer connecting does not reset this agent");
+});
+
+test("a state sent SENT_STATE_TRUST_MS ago or longer no longer holds back the same state", () => {
+  const clock = fakeClock();
+  const sent: AgentActivityStatePayload[] = [];
+  const fanout = new AgentActivityStateFanout((_room, payload) => sent.push(payload), clock);
+
+  fanout.observe("s1", "a", "working", 1, 1, "m1");
+  clock.advance(SENT_STATE_TRUST_MS - 1);
+  fanout.observe("s1", "a", "working", 2, 2, "m1");
+  assert.equal(sent.length, 1, "within the cutoff: deduped");
+  clock.advance(1);
+  fanout.observe("s1", "a", "working", 3, 3, "m1");
+  assert.deepEqual(sent.map((p) => [p.state, p.serverSeq]), [["busy", 1], ["busy", 3]], "at the cutoff: sent again");
+  fanout.observe("s1", "a", "working", 4, 4, "m1");
+  assert.equal(sent.length, 2, "and trusted again from that send");
+});
+
 type Emitted = { to: string; except: string | null; event: string; payload: Record<string, unknown> };
 
 function recordingIo(emitted: Emitted[]): SocketServer {
@@ -143,6 +190,29 @@ test("forgetAgentActivity on the orchestrator drops the agent's held coarse stat
 
   orchestrator.forgetAgentActivity("a");
   assert.equal(forgotten, "a");
+});
+
+test("a Computer disconnecting from this replica resets its agents' sent coarse state", async () => {
+  const emitted: Emitted[] = [];
+  const clock = fakeClock();
+  class DisconnectOnlyOrchestrator extends EmitOnlyOrchestrator {
+    protected override observeComputerLifecycleDisconnect(): Promise<any> {
+      return Promise.resolve();
+    }
+  }
+  const orchestrator = new DisconnectOnlyOrchestrator(undefined, { ...clock, scheduleRepeated: () => null, cancelRepeated: () => undefined });
+  orchestrator.setIO(recordingIo(emitted));
+  (orchestrator as any).getCachedAgent = async (id: string) => ({ id, serverId: "s1", machineId: "m1" });
+  // closedAsDuplicate: the disconnect stays local (no projection, no replica store).
+  (orchestrator as any).machineConnections.set("m1", { ws: {}, machineId: "m1", serverId: "s1", connectionEpochId: null, replicaGeneration: null, closedAsDuplicate: true });
+
+  await (orchestrator as any).emitActivity("a", "working", "Editing file", "action", 100);
+  await orchestrator.handleMachineDisconnect("m1");
+  clock.advance(AGENT_ACTIVITY_STATE_MIN_INTERVAL_MS);
+  await (orchestrator as any).emitActivity("a", "working", "Running command", "action", 101);
+
+  const states = emitted.filter((e) => e.event === AGENT_ACTIVITY_STATE_EVENT);
+  assert.deepEqual(states.map((e) => e.payload.state), ["busy", "busy"], "the state after the disconnect is sent, not deduped");
 });
 
 function fakeSocket() {

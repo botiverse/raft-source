@@ -70,14 +70,14 @@ function stored(model: Record<string, unknown>, envVars: Record<string, string> 
 
 /** The edit form the server serves this client for this agent (old client, Computer that runs typed ids). */
 function oldClientEditForm(config: RuntimeConfig) {
-  const definition = withBuiltInEditVisibility(buildRuntimeFormV2("builtin"), [], NO_CAPS, config);
+  const definition = withBuiltInEditVisibility(buildRuntimeFormV2("builtin"), [], NO_CAPS, config, null);
   return parseRuntimeFormV2({ ...definition, values: runtimeFormValuesFromRuntimeConfig(config as unknown as Record<string, unknown>) })!;
 }
 
 /** The server side of an old client's edit save: the guard, the mapping, the parser. */
 function oldClientSave(config: RuntimeConfig, form: ReturnType<typeof oldClientEditForm>, values: RuntimeFormV2Values) {
   const submission = runtimeFormV2Submission(form, values, oldClientSources);
-  const guarded = guardBuiltInEditFromClient(submission, config, NO_CAPS);
+  const guarded = guardBuiltInEditFromClient(submission, config, NO_CAPS, null);
   if (!guarded.ok) return guarded;
   const built = buildRuntimeConfigFromFormValues("builtin", guarded.values, { editing: true, existing: config });
   assert.ok(built.ok, JSON.stringify(built));
@@ -176,11 +176,11 @@ test("an old client that switches the provider of an agent saved with a typed id
 
 test("a client WITH the capability is never guarded, and an agent without stored limits on an old Computer has the fields hidden", () => {
   const config = stored({ kind: "custom", name: KIMI, contextWindow: 131_072 });
-  const guarded = guardBuiltInEditFromClient({ providerId: "deepseek", model: "deepseek/deepseek-v4-pro" }, config, ["dependent_select.custom_value_with_options"]);
+  const guarded = guardBuiltInEditFromClient({ providerId: "deepseek", model: "deepseek/deepseek-v4-pro" }, config, ["dependent_select.custom_value_with_options"], null);
   assert.equal(guarded.ok, true);
   const preset = stored({ kind: "preset", id: KIMI });
   const capable = parseRuntimeFormV2({
-    ...withBuiltInEditVisibility(buildRuntimeFormV2("builtin"), [], ["dependent_select.custom_value_with_options"], preset),
+    ...withBuiltInEditVisibility(buildRuntimeFormV2("builtin"), [], ["dependent_select.custom_value_with_options"], preset, null),
     values: runtimeFormValuesFromRuntimeConfig(preset as unknown as Record<string, unknown>),
   })!;
   const limit = capable.fields.find((field) => field.key === "contextWindow")!;
@@ -189,7 +189,7 @@ test("a client WITH the capability is never guarded, and an agent without stored
 
 test("the stored model is filled back in only where its field was hidden; a visible Model sent blank is model_required", () => {
   const listed = stored({ kind: "custom", name: KIMI, contextWindow: 131_072 });
-  const blank = guardBuiltInEditFromClient({ providerId: "openrouter", model: "", contextWindow: "131072" }, listed, NO_CAPS);
+  const blank = guardBuiltInEditFromClient({ providerId: "openrouter", model: "", contextWindow: "131072" }, listed, NO_CAPS, null);
   assert.ok(blank.ok);
   if (!blank.ok) return;
   assert.equal((blank.values as { model: string }).model, "", "not filled: the field was visible");
@@ -198,7 +198,46 @@ test("the stored model is filled back in only where its field was hidden; a visi
   if (!built.ok) assert.equal(built.issue.code, "model_required");
 
   const typed = stored({ kind: "custom", name: "vendor/unlisted-2099", contextWindow: 4096 });
-  const hidden = guardBuiltInEditFromClient({ providerId: "openrouter", contextWindow: "4096" }, typed, NO_CAPS);
+  const hidden = guardBuiltInEditFromClient({ providerId: "openrouter", contextWindow: "4096" }, typed, NO_CAPS, null);
   assert.ok(hidden.ok);
   if (hidden.ok) assert.equal((hidden.values as { model: string }).model, "vendor/unlisted-2099", "filled: the field was hidden");
+});
+
+// The same protection for a typed id saved through a saved preset connection
+// (the route resolves the connection's provider): its limit fields stay shown
+// by that provider (a v2 client shows a connection's fields by its
+// underlyingProviderId), its Model field is hidden where the old list cannot
+// show it, an untouched save keeps the model, and a change is refused.
+test("an agent saved with a typed id through a saved preset connection gets the same old-client protection", () => {
+  const connectionConfig = {
+    version: 1,
+    runtime: "builtin",
+    provider: { kind: "connection", connectionId: "conn-1" },
+    model: { kind: "custom", name: "deepseek-v5-preview", contextWindow: 128_000 },
+    mode: { kind: "default" },
+    hostUserState: "forbidden",
+    reasoningEffort: null,
+    envVars: null,
+  } as unknown as RuntimeConfig;
+  const definition = withBuiltInEditVisibility(buildRuntimeFormV2("builtin"), [], NO_CAPS, connectionConfig, "deepseek");
+  const visibility = definition.uiSchema?.visibility ?? [];
+  for (const field of ["/contextWindow", "/maxOutputTokens"]) {
+    assert.ok(visibility.find((rule) => rule.pointer === field)?.when.in.includes("deepseek"), field);
+  }
+  const modelRule = visibility.filter((rule) => rule.pointer === "/model").at(-1);
+  assert.equal(modelRule?.when.in.includes("deepseek"), false, "the Model field is hidden for the connection's provider");
+
+  const kept = guardBuiltInEditFromClient({ providerId: "connection:conn-1", contextWindow: "128000" }, connectionConfig, NO_CAPS, "deepseek");
+  assert.deepEqual(kept, { ok: true, values: { providerId: "connection:conn-1", contextWindow: "128000", model: "deepseek-v5-preview" } });
+  for (const [values, pointer] of [
+    [{ providerId: "deepseek", model: "deepseek/deepseek-v4-pro", apiKey: "k" }, "/formValues/providerId"],
+    [{ providerId: "connection:conn-1", model: "deepseek/deepseek-v4-pro" }, "/formValues/model"],
+  ] as const) {
+    const refused = guardBuiltInEditFromClient(values, connectionConfig, NO_CAPS, "deepseek");
+    assert.equal(refused.ok, false);
+    if (!refused.ok) assert.equal(refused.issue.pointer, pointer);
+  }
+  // A gateway connection's custom model is a gateway's: not guarded.
+  const gateway = guardBuiltInEditFromClient({ providerId: "connection:conn-1", model: "other" }, connectionConfig, NO_CAPS, "openai-compatible");
+  assert.equal(gateway.ok, true);
 });

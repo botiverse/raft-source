@@ -34,7 +34,7 @@ test("the left corner comes from the overlay's geometry, only while the controls
 
 test("the right corner (caption buttons) comes from the overlay's geometry too, windowed only", async () => {
   const rules = await css();
-  assert.match(rules, /html\[data-title-bar="overlay"\]:not\(\[data-fullscreen\]\)\s*\{\s*--raft-frame-inset-end: calc\(100vw - env\(titlebar-area-x, 0px\) - env\(titlebar-area-width, calc\(100vw - 138px\)\)\);\s*--raft-frame-inset-top: env\(titlebar-area-height, 44px\);/);
+  assert.match(rules, /html\[data-title-bar="overlay"\]:not\(\[data-fullscreen\]\)\s*\{\s*--raft-frame-inset-end: max\(0px, calc\(100vw - env\(titlebar-area-x, 0px\) - env\(titlebar-area-width, calc\(100vw - 138px\)\)\)\);\s*--raft-frame-inset-top: env\(titlebar-area-height, 44px\);/);
   assert.match(rules, /html\[data-title-bar="overlay"\]:not\(\[data-fullscreen\]\) \[data-raft-titlebar\]\s*\{\s*padding-right: var\(--raft-frame-inset-end\);/);
   assert.match(rules, /html\[data-title-bar="overlay"\]:not\(\[data-fullscreen\]\) \[data-raft-overlay-titlebar\]\s*\{\s*--raft-titlebar-inset-end: var\(--raft-frame-inset-end\);/);
   assert.equal(/(^|\n)\[data-raft-titlebar\]\s*\{[^}]*padding-right/.test(rules), false, "no platform-blind right inset");

@@ -14,6 +14,19 @@
 //   providerConnectionResidual — provider-connection routes (manageExternalAuth; credentials/rotate under rotateServerSecrets); fix #proj-backend-general #165 (unified), audit #167, owner Ark
 //   nonHuman            — caller is not a human session (agent, Computer, machine key, OAuth client, webhook)
 //   notAgentMachine     — not membership or relationship authority over an Agent / Machine / Computer
+//
+// delegable (RFC 085 §4.1, the delegable-route registry): what an agent may get done on a human-session route.
+//   card       — an agent prepares it as a card, the named person confirms, the server runs it as them; only routes
+//                with an entry in services/delegableCardRoutes.ts (Phase 1: agent start and stop, lowering a
+//                channel member's role)
+//   assistant  — the person's own assistant runs it for them: exactly the writes of the owner-action table
+//                (services/assistantOwnerActions.ts)
+//   never      — neither; the default. Declared once per bucket in DELEGABLE_NEVER_ROWS, so a row names `delegable`
+//                only when it is something else. `nonHuman` rows have no person to act for and carry no `delegable`.
+// The structure test also holds the never-delegable list and the keyword and bucket rules that keep security-sensitive
+// routes `never` (RFC 085 §3.1, §5); changing any of it, or making a route `card` or `assistant`, is Warden's review.
+// This table is a test fixture: product code never imports it. At runtime only services/delegableCardRoutes.ts decides
+// what a card may run (Tenny, #proj-apps:#62 ab83c67e).
 
 import { appAgentApiRoutesOf, firstPartyAppAgentApis } from "@botiverse/raft-shared";
 
@@ -31,7 +44,39 @@ export type RouteAuthorityBucket =
   | "pure"
   | "readState93";
 
-export type RouteClassification = { route: string; bucket: RouteAuthorityBucket; reason: string };
+/** RFC 085 §4.1: whether an agent may hand this route to a person as a card, the person's assistant may run it, or neither. */
+export type RouteDelegable = "card" | "assistant" | "never";
+
+/** The buckets whose routes a person calls with their own session: every bucket but `nonHuman`. */
+export type HumanSessionBucket = Exclude<RouteAuthorityBucket, "nonHuman">;
+
+export type RouteClassification = { route: string; bucket: RouteAuthorityBucket; delegable?: RouteDelegable; reason: string };
+
+/**
+ * RFC 085 §4.1 `delegable: "never"`, declared once per human-session bucket with the exact number of its rows that take
+ * it (each row without a `delegable` of its own). A new or removed human-session route changes a number here, so the
+ * structure test stays red until its author has decided: leave the route `never` and change the number, or give its
+ * row its own `delegable` (`assistant` with an owner-action entry, `card` with a delegableCardRoutes.ts entry).
+ */
+export const DELEGABLE_NEVER_ROWS: Readonly<Record<HumanSessionBucket, number>> = {
+  authorityTransition: 3,
+  cat1: 17,
+  // -1: POST /api/agents/:id/migrate is `assistant` (the owner-action table's move_agent, confirm tier).
+  // -1: POST /api/agents/:id/start is `card` (RFC 085 Phase 1, agent:start).
+  cat2: 1,
+  // -1: POST /api/agents/:id/stop is `card` (agent:stop).
+  cat3: 27,
+  // -1: PATCH /api/channels/:id/members/:targetType/:memberId/role is `card`, its body held to role member (channel:remove_admin).
+  channelLane: 6,
+  integrationLane: 35,
+  lineG: 5,
+  // -4: `assistant`: conversation mute, notification level, sidebar order (move, pin, arrange), save a message.
+  // +2: DELETE /api/me/sessions/:familyId, POST /api/me/sessions/revoke-others (signing out one's own sign-ins: never delegable).
+  notAgentMachine: 281,
+  providerConnectionResidual: 7,
+  pure: 14,
+  readState93: 1,
+};
 
 /** The adjudicated #91a / #93 lists (#wg-rbac:c18cdc5f). Changing one of these counts is a scope decision. */
 export const PINNED_BUCKET_COUNTS: Readonly<Record<string, number>> = {
@@ -45,7 +90,9 @@ export const PINNED_BUCKET_COUNTS: Readonly<Record<string, number>> = {
   // membership row locks; one machine-row write and its audit row).
   // +1: PUT /api/agents/:id/external-setup-method (editAgents/creator; sets which connection instructions an
   // external agent's page shows first, one column, no credential or connection change; #wg-external-agent-ux:#2).
-  pure: 13,
+  // +1: PUT /api/agents/:id/voice-settings (Raft voice: editAgents/creator, never guest, under the fence;
+  // two columns, whether people may ask or call the agent).
+  pure: 14,
   // +1: POST /api/agents/:id/archive/workspace (agent archive; fenced deleteAgents/creator write on the
   // archived agent).
   // +3: PUT /api/raftbench and the dedicated RaftBench agent create/assignment routes use
@@ -75,7 +122,10 @@ export const PINNED_BUCKET_COUNTS: Readonly<Record<string, number>> = {
   // owner/admin, but a read with consent at the 5-hour limit, which can spend that reset, is the attaching
   // human only; reads which Claude limit resets the account holds on the Computer, no DB write; the rate
   // limiter keeps a counter).
-  cat3: 25,
+  // +3: POST /api/agents/:id/voice/calls, …/:callId/token, …/:callId/hang-up (Raft voice calls: flag, may DM
+  // the agent and read its status, voice_callable; token and hang-up the caller only; the effect is a holt-live
+  // call, the only write the call's own row).
+  cat3: 28,
   // +1: POST /api/servers/:id/assistant (RFC 075 v4; any member creates their own assistant, no
   // capability; the removal race is line G like POST /api/agents).
   // +1: staging-only owner creates hosted Cindy (#10495); same create admission as POST /api/agents.
@@ -88,6 +138,7 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "POST /api/integrations/antiproton/approvals", bucket: "nonHuman", reason: "antiproton signed raw-body hint (Ed25519 under a configured key id, 300 s window); ids only, it triggers a pull with Raft's own provider token and grants nothing" },
   { route: "POST /api/appsumo/redemption/bind", bucket: "notAgentMachine", reason: "Server billing: authenticated human, browser-bound claim and current owner membership locked in the binding transaction; no Agent/Machine authority write" },
   { route: "POST /internal/agent-api/assistant/owner-artifact", bucket: "nonHuman", reason: "#proj-assistant:#31: a personal assistant's own credential publishes an Artifact as itself, a new one only into its DM with its current owner and a new version only of one it published that still lives there; Artifacts' publish (its checks, quota, notices); the owner's membership re-checked per request; no Agent/Machine authority write" },
+  { route: "POST /internal/agent-api/assistant/owner-artifact/as-owner", bucket: "nonHuman", reason: "#proj-assistant:#33: a personal assistant's own credential publishes an Artifact as its owner (the owner from its own record), only while \"send as me\" is on, into a conversation the owner may post in now (not its own DM with the owner, a DM only while it may read DMs, never bridged) or a new version of one it published there; Artifacts' publish by the owner's rules; no Agent/Machine authority write" },
   { route: "POST /internal/agent-api/assistant/send-as-owner", bucket: "nonHuman", reason: "RFC 077: a personal assistant's own credential sends as its owner; the owner's live membership and post permission are re-checked per send; a dmWith DM is opened as the owner by the web's own Send DM rules (openDirectMessageForUser); no Agent/Machine authority write" },
   { route: "POST /internal/agent-api/assistant/forward-as-owner", bucket: "nonHuman", reason: "RFC 077: a personal assistant's own credential forwards as its owner by the web's forward rules (sources read, post and join re-checked as the owner, a new DM by Send DM's rules); no Agent/Machine authority write" },
   { route: "POST /internal/agent-api/assistant/check-state/import", bucket: "nonHuman", reason: "RFC 077 step 2c: a personal assistant's own credential reports its runtime's brief state; the live assistant link is re-resolved on every request" },
@@ -102,6 +153,10 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "DELETE /api/oauth/link-preview", bucket: "nonHuman", reason: "App client credentials select its own link renderer; domain verification and registry writes do not grant Agent/Machine authority" },
   { route: "PUT /oidc/:server/api/oauth/link-preview", bucket: "nonHuman", reason: "App client credentials select its own link renderer; domain verification and registry writes do not grant Agent/Machine authority" },
   { route: "DELETE /oidc/:server/api/oauth/link-preview", bucket: "nonHuman", reason: "App client credentials select its own link renderer; domain verification and registry writes do not grant Agent/Machine authority" },
+  { route: "PUT /api/oauth/link-preview/encryption-key", bucket: "nonHuman", reason: "RFC 086 §5.2: only the App's own Basic client credentials set or remove its card encryption public key on its own link-preview registration row (FOR UPDATE) and audit it; no session, Server admin or Agent/Machine authority" },
+  { route: "DELETE /api/oauth/link-preview/encryption-key", bucket: "nonHuman", reason: "RFC 086 §5.2: only the App's own Basic client credentials set or remove its card encryption public key on its own link-preview registration row (FOR UPDATE) and audit it; no session, Server admin or Agent/Machine authority" },
+  { route: "PUT /oidc/:server/api/oauth/link-preview/encryption-key", bucket: "nonHuman", reason: "registered by the server-scoped OAuth mount but refused there (not in OIDC_SCOPED_ROUTES, 404); the unscoped route sets or removes an App's own card encryption key; no Agent/Machine authority" },
+  { route: "DELETE /oidc/:server/api/oauth/link-preview/encryption-key", bucket: "nonHuman", reason: "registered by the server-scoped OAuth mount but refused there (not in OIDC_SCOPED_ROUTES, 404); the unscoped route sets or removes an App's own card encryption key; no Agent/Machine authority" },
   { route: "POST /api/oauth/link-preview/card-updates", bucket: "nonHuman", reason: "RFC 076 §6.5: an App's client credentials (enabled, re-read FOR SHARE) record one terminal update of its own interactive link card operation on the update token's bindings alone; writes only link_card_* rows; no Agent/Machine authority" },
   { route: "POST /oidc/:server/api/oauth/link-preview/card-updates", bucket: "nonHuman", reason: "registered by the server-scoped OAuth mount but refused there (not in OIDC_SCOPED_ROUTES, 404); the unscoped route records an App's terminal update; no Agent/Machine authority" },
   { route: "PUT /api/raftbench/readers/:agentId", bucket: "cat1", reason: "human server owner/admin fenced at commit; explicit agent finding reader grant, append-only audit" },
@@ -165,9 +220,9 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "PATCH /api/auth/me", bucket: "notAgentMachine", reason: "caller's own account, session or device login" },
   { route: "PUT /api/auth/me/avatar-recipe", bucket: "notAgentMachine", reason: "caller's own account, session or device login" },
   { route: "PATCH /api/channels/:id", bucket: "notAgentMachine", reason: "channel / thread / inbox state" },
-  { route: "PATCH /api/channels/:id/members/:targetType/:memberId/role", bucket: "channelLane", reason: "changeChannelMemberRoles evaluated under channel + membership row locks; out of scope: channel authority lane (lib/channelActorPermissions.ts, Guest RBAC foundation); channel capability, not Server membership or Agent relationship authority" },
+  { route: "PATCH /api/channels/:id/members/:targetType/:memberId/role", bucket: "channelLane", delegable: "card", reason: "changeChannelMemberRoles evaluated under channel + membership row locks; out of scope: channel authority lane (lib/channelActorPermissions.ts, Guest RBAC foundation); channel capability, not Server membership or Agent relationship authority" },
   { route: "PATCH /api/channels/:id/message-display-settings", bucket: "notAgentMachine", reason: "channel / thread / inbox state" },
-  { route: "PATCH /api/channels/:id/notification-settings", bucket: "notAgentMachine", reason: "channel / thread / inbox state" },
+  { route: "PATCH /api/channels/:id/notification-settings", bucket: "notAgentMachine", delegable: "assistant", reason: "channel / thread / inbox state" },
   { route: "PATCH /api/integrations/clients/:clientId", bucket: "integrationLane", reason: "confirmed membership race, fix #proj-backend-general task #168 (owner Ark), audit #167. Predicate: server capability manageIntegrations; no Agent-relation authority" },
   { route: "PATCH /api/mcp/apps/:appId", bucket: "notAgentMachine", reason: "manageIntegrations capability; MCP App profile, endpoint and on/off (Server-level config)" },
   { route: "PATCH /api/mcp/apps/:appId/connections/:connectionId", bucket: "notAgentMachine", reason: "manageIntegrations capability; renames or re-keys one MCP App Connection; Server-level config" },
@@ -181,17 +236,19 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "POST /api/me/account/deletion", bucket: "notAgentMachine", reason: "caller's own account: schedules its deletion after re-authentication; revokes the caller's own sessions and keys and stops the agents the caller created or owns as assistants (no membership or relationship authority over someone else's Agent / Machine)" },
   { route: "DELETE /api/me/account/deletion", bucket: "notAgentMachine", reason: "caller's own account: cancels its scheduled deletion" },
   { route: "DELETE /api/me/account/deletion/requests/:requestId", bucket: "notAgentMachine", reason: "caller’s own account: cancels only the identified deletion request; no Agent / Machine authority" },
+  { route: "DELETE /api/me/sessions/:familyId", bucket: "notAgentMachine", reason: "caller's own account: signs out one of the caller's own other full sign-ins (same 404 for any other id), after re-authentication and two-step step-up; reason lost_device also revokes what that sign-in itself approved or issued through the security-revoke cascade; no membership or relationship authority over someone else's Agent / Machine" },
   { route: "DELETE /api/me/app-logins/:clientId", bucket: "notAgentMachine", reason: "caller's own account (RFC 079 phase 3a per-app revoke): denies the caller's own open Login with Raft requests and revokes the caller's own tokens and consents for one App, on every Server and none; only removes access; no membership or relationship authority over an Agent / Machine" },
+  { route: "POST /api/me/sessions/revoke-others", bucket: "notAgentMachine", reason: "caller's own account: signs out every other full sign-in of the caller (device sign-ins kept), after re-authentication and two-step step-up; reason lost_device also revokes what the caller's revoked sign-ins approved or issued through the security-revoke cascade; no membership or relationship authority over someone else's Agent / Machine" },
   { route: "POST /api/me/account/deletion/email-code", bucket: "notAgentMachine", reason: "caller's own account: emails the code that confirms its deletion" },
   { route: "POST /api/me/account/deletion/notify-agent-owners", bucket: "notAgentMachine", reason: "caller's own account: posts a fixed system notice to the owners of other people's agents bound to the caller's own live Computers, asking them to move those agents; changes no agent, machine or binding (no membership or relationship authority over someone else's Agent / Machine)" },
   { route: "PATCH /api/push/registrations/:installationId", bucket: "notAgentMachine", reason: "caller's own push / notification device registration" },
-  { route: "PUT /api/notification-levels", bucket: "notAgentMachine", reason: "caller's own notification level (server / channel / thread follow); membership and read access re-checked" },
+  { route: "PUT /api/notification-levels", bucket: "notAgentMachine", delegable: "assistant", reason: "caller's own notification level (server / channel / thread follow); membership and read access re-checked" },
   { route: "PATCH /api/servers/:id/notification-settings", bucket: "notAgentMachine", reason: "Server settings, invites, join links, ordering" },
   { route: "PATCH /api/servers/:id/appearance-settings", bucket: "notAgentMachine", reason: "the member's own theme in this server" },
   { route: "PATCH /api/servers/:id/onboarding-settings", bucket: "notAgentMachine", reason: "Server settings, invites, join links, ordering" },
   { route: "PATCH /api/servers/:id/public-search", bucket: "notAgentMachine", reason: "Server settings, invites, join links, ordering" },
   { route: "PATCH /api/servers/:id/public-visibility", bucket: "notAgentMachine", reason: "Server settings, invites, join links, ordering" },
-  { route: "PATCH /api/servers/:id/sidebar-order", bucket: "notAgentMachine", reason: "Server settings, invites, join links, ordering" },
+  { route: "PATCH /api/servers/:id/sidebar-order", bucket: "notAgentMachine", delegable: "assistant", reason: "Server settings, invites, join links, ordering" },
   { route: "PATCH /api/servers/:id/product-analytics-settings", bucket: "notAgentMachine", reason: "Server settings, invites, join links, ordering" },
   { route: "PATCH /api/servers/:id/translation-settings", bucket: "notAgentMachine", reason: "Server settings, invites, join links, ordering" },
   { route: "PUT /api/servers/:id/sso/connection", bucket: "notAgentMachine", reason: "SSO settings (RFC 083): manageSso / editServerSettings, no Agent or Machine authority" },
@@ -236,15 +293,19 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "POST /api/agents/:id/avatar", bucket: "cat1", reason: "editAgents or creator; avatar row write fenced; cache/runtime effect open in #93" },
   { route: "POST /api/agents/:id/bootstrap-tokens", bucket: "pure", reason: "issueAgentCredentials or creator; bootstrap token mint" },
   { route: "POST /api/agents/:id/credentials", bucket: "pure", reason: "issueAgentCredentials or creator; agent credential mint" },
+  { route: "PUT /api/agents/:id/voice-settings", bucket: "pure", reason: "Raft voice: flag + editAgents or creator (a personal assistant: its owner), never guest; whether people may ask or call the agent (voice_askable / voice_callable); no credential or connection change" },
   { route: "PUT /api/agents/:id/external-setup-method", bucket: "pure", reason: "editAgents or creator; which connection instructions an external agent's page shows first (#wg-external-agent-ux:#2); no credential or connection change" },
   { route: "POST /api/agents/:id/archive/workspace", bucket: "cat1", reason: "deleteAgents or creator of the archived agent (plus controlComputers or Computer creator for a named Computer); op request fenced; Computer dispatch effect open in #93" },
-  { route: "POST /api/agents/:id/migrate", bucket: "cat2", reason: "migration admission and effect both not linearized; #93 line C" },
+  { route: "POST /api/agents/:id/migrate", bucket: "cat2", delegable: "assistant", reason: "migration admission and effect both not linearized; #93 line C" },
   { route: "POST /api/agents/:id/migration/confirm-hosted", bucket: "pure", reason: "migrateAgents or creator re-checked under the actor membership fence inside the hosted switch transaction (runtime -> external, provisioning row); provider call runs later in the provisioning worker" },
   { route: "POST /api/agents/:id/migration/cancel", bucket: "cat2", reason: "migration cancellation admission and effect both not linearized; #93 line C" },
   { route: "POST /api/agents/:id/onboarding-identity-adoption", bucket: "pure", reason: "editAgents or creator; official onboarding identity adoption write" },
   { route: "POST /api/agents/:id/reset", bucket: "cat3", reason: "controlAgentRuntime or creator (a personal assistant: its owner only); orchestrator reset only; #93 runtime command chain" },
-  { route: "POST /api/agents/:id/start", bucket: "cat2", reason: "auto-start migration completion admission and effect not linearized; #93 line C. A personal assistant: its owner only; lifting an admin pause is fenced (withFencedAgentAuthority)" },
-  { route: "POST /api/agents/:id/stop", bucket: "cat3", reason: "stopAgents (owner/admin) or creator; orchestrator stop only; #93 runtime command chain. A personal assistant: its owner stops the turn; a server owner/admin pauses it, the pause re-decided under the actor membership fence (stopAssistant), and the owner is told" },
+  { route: "POST /api/agents/:id/start", bucket: "cat2", delegable: "card", reason: "auto-start migration completion admission and effect not linearized; #93 line C. A personal assistant: its owner only; lifting an admin pause is fenced (withFencedAgentAuthority)" },
+  { route: "POST /api/agents/:id/stop", bucket: "cat3", delegable: "card", reason: "stopAgents (owner/admin) or creator; orchestrator stop only; #93 runtime command chain. A personal assistant: its owner stops the turn; a server owner/admin pauses it, the pause re-decided under the actor membership fence (stopAssistant), and the owner is told" },
+  { route: "POST /api/agents/:id/voice/calls", bucket: "cat3", reason: "Raft voice calls (agent_voice_v1): a non-guest who may DM the agent and read its status, voice_callable, re-read live; writes only the call's own row; the effect is a holt-live session speaking as the agent" },
+  { route: "POST /api/agents/:id/voice/calls/:callId/token", bucket: "cat3", reason: "Raft voice calls: the caller of a running call, with the start rule re-read; no DB write; a new holt-live room token" },
+  { route: "POST /api/agents/:id/voice/calls/:callId/hang-up", bucket: "cat3", reason: "Raft voice calls: the caller only; no DB write; asks holt-live to stop the session (its ended callback finishes the call)" },
   { route: "POST /api/agents/:id/interrupt-turn", bucket: "cat3", reason: "controlAgentRuntime or creator (a personal assistant: its owner only, no admin exception); turn interrupt only, agent keeps running; #10411" },
   { route: "POST /api/agents/:id/subagents/:taskId/interrupt", bucket: "cat3", reason: "controlAgentRuntime or creator (a personal assistant: its owner only); stops one sub-agent's turn, the agent keeps running; #proj-runtime:#41" },
   { route: "POST /api/announcements/:id/dismiss", bucket: "notAgentMachine", reason: "product announcements / release notes" },
@@ -353,7 +414,7 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "POST /api/channels/inbox/undone", bucket: "notAgentMachine", reason: "channel / thread / inbox state" },
   { route: "POST /api/channels/joint-invites/accept-many", bucket: "notAgentMachine", reason: "atomic human acceptance of joint server connections; not Agent/Machine authority" },
   { route: "POST /api/channels/joint-invites/:inviteId/accept", bucket: "notAgentMachine", reason: "channel / thread / inbox state" },
-  { route: "POST /api/channels/saved", bucket: "notAgentMachine", reason: "channel / thread / inbox state" },
+  { route: "POST /api/channels/saved", bucket: "notAgentMachine", delegable: "assistant", reason: "channel / thread / inbox state" },
   { route: "POST /api/channels/saved/check", bucket: "notAgentMachine", reason: "channel / thread / inbox state" },
   { route: "POST /api/channels/system/all/hide", bucket: "notAgentMachine", reason: "channel / thread / inbox state" },
   { route: "POST /api/channels/system/all/restore", bucket: "notAgentMachine", reason: "channel / thread / inbox state" },
@@ -417,6 +478,8 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "POST /api/messages/mention-actions/execute", bucket: "channelLane", reason: "addChannelMembers under channel row FOR UPDATE; message delivery only; out of scope: channel authority lane (lib/channelActorPermissions.ts, Guest RBAC foundation); channel capability, not Server membership or Agent relationship authority" },
   { route: "POST /api/notifications/test", bucket: "notAgentMachine", reason: "test notification to one of the caller's own devices; no authority write" },
   { route: "POST /api/notifications/test/:testId/ack", bucket: "notAgentMachine", reason: "the caller acks its own test notification (Redis status only)" },
+  { route: "POST /api/oauth/agents/:agentId/voice/ask", bucket: "nonHuman", reason: "Raft voice (agent_voice_v1): an App's Bearer token with agent:voice, a person's only; agentVoiceService re-reads that person's role and the agent's View Context / viewAgents rule live and only asks the agent's Computer (no DB write, no Agent/Machine authority granted)" },
+  { route: "POST /api/oauth/agents/:agentId/voice/status", bucket: "nonHuman", reason: "Raft voice (agent_voice_v1): an App's Bearer token with agent:voice, a person's only; agentVoiceService re-reads that person's role and the agent's View Context / viewAgents rule live and only asks the agent's Computer (no DB write, no Agent/Machine authority granted)" },
   { route: "POST /api/oauth/agent-events", bucket: "nonHuman", reason: "OAuth protocol endpoint (client credentials, bearer token or integration consent); no Agent/Machine relationship authority" },
   { route: "POST /api/oauth/authorize/account", bucket: "nonHuman", reason: "RFC 079 phase 3a: the signed-in person's own account-mode Login with Raft consent (approver's second step); issues a code naming no Server for an App whose audience holds them; no Agent/Machine relationship authority" },
   { route: "POST /api/oauth/authorize/human", bucket: "nonHuman", reason: "OAuth protocol endpoint (client credentials, bearer token or integration consent); no Agent/Machine relationship authority" },
@@ -488,6 +551,7 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "POST /api/v2/messages", bucket: "notAgentMachine", reason: "message content" },
   { route: "POST /api/ops/cpu-profile", bucket: "nonHuman", reason: "ops bearer token (OPS_PROFILE_TOKEN), no user session; captures a process CPU profile to the ops bucket, no Raft data write" },
   { route: "POST /api/webhooks/resend", bucket: "nonHuman", reason: "third-party webhook ingress (signature-authenticated)" },
+  { route: "POST /api/webhooks/holt-live/calls/:callId", bucket: "nonHuman", reason: "holt-live callbacks for one Raft voice call, signed with that call's own secret (Standard Webhooks); acts only on that call: its sentences, state, the caller's side questions under their own rules, and the agent's DM to the caller" },
   { route: "POST /api/webhooks/stripe", bucket: "nonHuman", reason: "third-party webhook ingress (signature-authenticated)" },
   { route: "POST /internal/agent-api/activity", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
   { route: "POST /internal/agent-api/app-sources/ack", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
@@ -542,6 +606,7 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "POST /internal/agent-api/feedback-locators", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
   { route: "POST /internal/agent-api/integrations/app/logo", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
   { route: "POST /internal/agent-api/integrations/app/manage", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
+  { route: "POST /internal/agent-api/integrations/app/card-buttons", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); RFC 076 §17: the agent's own manageIntegrations on its Server, checked before the write; changes only that Server's installation row of the App (FOR UPDATE), audited; no Agent-relation authority" },
   { route: "POST /internal/agent-api/integrations/app/prepare", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
   { route: "POST /internal/agent-api/integrations/app/rotate-secret", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
   { route: "POST /internal/agent-api/integrations/app/transfer-owner", bucket: "nonHuman", reason: "sk_agent principal (routeAuthPolicy registry); no human Server authority" },
@@ -640,6 +705,8 @@ export const ROUTE_AUTHORITY_CLASSIFICATION: readonly RouteClassification[] = [
   { route: "POST /oidc/:server/api/oauth/installations/:installationId/bot-token", bucket: "nonHuman", reason: "registered by the shared OAuth router but rejected by the OIDC scoped-mount allowlist" },
   { route: "PUT /oidc/:server/api/oauth/installations/:installationId/bot-status", bucket: "nonHuman", reason: "registered by the shared OAuth router but rejected by the OIDC scoped-mount allowlist" },
   { route: "POST /oidc/:server/api/oauth/requests/agent", bucket: "nonHuman", reason: "OAuth protocol endpoint (client credentials, bearer token or integration consent); no Agent/Machine relationship authority" },
+  { route: "POST /oidc/:server/api/oauth/agents/:agentId/voice/ask", bucket: "nonHuman", reason: "Raft voice (agent_voice_v1): an App's Bearer token with agent:voice, a person's only; agentVoiceService re-reads that person's role and the agent's View Context / viewAgents rule live and only asks the agent's Computer (no DB write, no Agent/Machine authority granted)" },
+  { route: "POST /oidc/:server/api/oauth/agents/:agentId/voice/status", bucket: "nonHuman", reason: "Raft voice (agent_voice_v1): an App's Bearer token with agent:voice, a person's only; agentVoiceService re-reads that person's role and the agent's View Context / viewAgents rule live and only asks the agent's Computer (no DB write, no Agent/Machine authority granted)" },
   { route: "POST /oidc/:server/api/oauth/token", bucket: "nonHuman", reason: "OAuth protocol endpoint (client credentials, bearer token or integration consent); no Agent/Machine relationship authority" },
   { route: "PUT /api/agents/:id/hosted-runtime/model", bucket: "cat3", reason: "editAgents or creator, never guest; no Raft authority write; the provider stores the pick, effective from the agent's next turn" },
   { route: "PUT /api/agents/:id/connections/:provider", bucket: "cat3", reason: "editAgents or creator of the agent AND creator or owner/admin of the connector, never guest; no Raft authority write (audit row only); the provider points the agent's mount at the connector" },

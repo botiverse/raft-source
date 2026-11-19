@@ -732,3 +732,16 @@ test("the cleanup revokes a Computer the person attached on someone else's machi
     .where(and(eq(integrationAuditEvents.eventType, "computer.key_revoked"), eq(integrationAuditEvents.targetId, borrowed)));
   assert.deepEqual({ actorType: audit!.actorType, via: audit!.metadata.via, departureReason: audit!.metadata.departureReason }, { actorType: "system", via: "member_removed", departureReason: "account_deleted" });
 });
+
+test("the scheduled onboarding email's send time goes to the cancel, so a Resend email past its time cannot block the deletion", async ({ seed }) => {
+  const human = await seed.human();
+  const scheduledAt = new Date(Date.now() - 20 * 60 * 60_000);
+  await getDb().insert(onboardingEmailJourneys).values({ userId: human.id, email: human.email, releaseMode: "all", qualifiedAt: new Date(), day1Status: "scheduled", day1EmailId: `email-${human.id}`, day1ScheduledAt: scheduledAt });
+  await dueRequest(human);
+  const seen: Array<{ emailId: string; scheduledAt: Date | null | undefined }> = [];
+  const { deps } = externalCalls();
+  deps.cancelScheduledEmail = async (emailId, options) => { seen.push({ emailId, scheduledAt: options?.scheduledAt }); };
+  await runUntilCompleted(human.id, { deps });
+  assert.deepEqual(seen, [{ emailId: `email-${human.id}`, scheduledAt }]);
+  assert.equal((await getDb().select().from(onboardingEmailJourneys).where(eq(onboardingEmailJourneys.userId, human.id))).length, 0);
+});

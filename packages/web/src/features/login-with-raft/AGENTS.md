@@ -42,7 +42,30 @@ view (RFC 079 phase 3a, design §4.1).
 - A lookup without `loginMode` keeps the page's server-mode flow unchanged.
   An account-mode App with nothing ready but install targets uses the page's
   Marketplace rows, then signs in through `useAccountAuthorization`.
-- Tests: ~~`tests/humanLoginAccountMode.behavior.test.tsx`~~ (removed in the [web DOM test prune](../../../../../docs/development/README.md#web-dom-test-prune-2026-11)) in this folder (account
+- `loginSetupHost.ts`: where the setup reads its request and sends its answer
+  (`LoginSetupHostContext`). The page's default is the address bar
+  (`window.location.search` in, `window.location.assign` out); the page and
+  `useAccountAuthorization` never touch `window.location` themselves. Raft
+  Desktop's sheet for a page of its built-in browser
+  (`features/desktopBrowserSignIn`, flag `desktop_browser_raft_sign_in_v0`;
+  rules in [apps/desktop/README.md](../../../../../apps/desktop/README.md#sign-in-with-raft-desktop_browser_raft_sign_in_v0))
+  provides another: the query Raft's server answered the authorize request
+  with, the answer handed to the shell, `embedded` (only the card: no page
+  header, side card or in-app link), the conversation's Server picked first
+  (`preferredServerId`, never over the person's own choice) and `source:
+  "desktop_browser"`, sent with POST `/oauth/authorize/human` and
+  `/authorize/account` for the audit event only (the server ignores any other
+  value and no check reads it), `registeredReturnOnly` (a Server whose lookup
+  names another return address than the request's reads as "not available")
+  and `approveAfterMs` (`useApproveLock.ts`: the one approving button the
+  setup shows is natively `disabled`, so no click, Enter or Space activates
+  it, for that long after it can first be pressed, which is after the
+  lookups and not when the sheet mounts, and again after the window regains
+  the focus).
+- `loginServerSelectItems.tsx`: the Server picker's rows.
+- Tests: `packages/web/tests/desktopBrowserSignIn.behavior.test.tsx` (the
+  sheet: what it shows, the press, cancel, step-up, the answer to the shell);
+  ~~`tests/humanLoginAccountMode.behavior.test.tsx`~~ (removed in the [web DOM test prune](../../../../../docs/development/README.md#web-dom-test-prune-2026-11)) in this folder (account
   mode and the unchanged server-mode body); in `packages/web/tests/`:
   `humanLoginAppNotAvailable`, `appAccessStepUp`, `connectedAppsIdentity`,
   `appBotInstallOption`.

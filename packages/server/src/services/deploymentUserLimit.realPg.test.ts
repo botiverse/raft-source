@@ -21,6 +21,7 @@ import { getDb } from "../db";
 import { isInTransaction } from "../db/ambientTransaction";
 import { serverMembers, users } from "../db/schema";
 import { HUMAN_USER_LIMIT } from "../edition";
+import { useEdition } from "../test/edition";
 import { closeTestDatabase, openTestDatabase } from "../test/integration/database";
 import { fixturePasswordHash } from "../test/integration/credentials";
 import { skipJointRealPg, withJointRealPgDatabase } from "../test/jointRealPgDatabase";
@@ -28,10 +29,8 @@ import { createChannel } from "./channelService";
 import { countHumanUserAccounts, DEPLOYMENT_USER_LIMIT_LOCK_NAMESPACE, DeploymentUserLimitError } from "./deploymentUserLimit";
 import { addMember, createServer } from "./serverService";
 
-vi.mock("../edition", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../edition")>();
-  return { ...actual, humanUserLimit: () => actual.humanUserLimit("source-available") };
-});
+// Runs as the source-available edition in either tree (src/test/edition.ts).
+useEdition("source-available");
 
 const outside = AsyncResource.bind(<T>(run: () => Promise<T>): Promise<T> => run());
 type Settled = { ok: true } | { ok: false; error: unknown };

@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 
 import { getDb } from "../db/index";
-import { actionCards, agentMigrations, agents, channelAgents, channelHumans, channels, messages, serverMembers, threadFollows, users } from "../db/schema";
+import { actionCards, agentMigrations, agents, channelAgents, channelHumans, channels, messages, productEvents, serverMembers, threadFollows, users } from "../db/schema";
 import { createAgent } from "../services/agentService";
 import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { addAgent, addHuman, createChannel, getOrCreateThread, removeHuman } from "../services/channelService";
@@ -161,6 +161,57 @@ test("action card execute and mark-executed cloak private carrier messages from 
     }),
   });
   assert.equal(markRes.status, 404, `expected outsider mark-executed 404, got ${markRes.status}`);
+});
+
+test("action card event answers an outsider the same 404 for an unknown id, a card, and a plain message they can't see", async ({ app }) => {
+  const db = getDb();
+  const owner = await seedUser("event-cloak-owner@slock.test", "event-cloak-owner");
+  const member = await seedUser("event-cloak-member@slock.test", "event-cloak-member");
+  const stranger = await seedUser("event-cloak-stranger@slock.test", "event-cloak-stranger");
+  const server = await createServer("Event Cloak Server", `event-cloak-${randomUUID()}`, owner.id);
+  // The stranger isn't in this server at all; they ask from their own.
+  const strangerServer = await createServer("Event Cloak Elsewhere", `event-cloak-elsewhere-${randomUUID()}`, stranger.id);
+  await db.insert(serverMembers).values({ serverId: server.id, userId: member.id, role: "member" }).onConflictDoNothing();
+  const agent = await createAgent(server.id, `event-cloak-agent-${randomUUID().slice(0, 8)}`, { runtime: "codex" });
+  const privateChannel = await createChannel(server.id, "event-cloak-private", undefined, "private");
+  await addHuman(privateChannel.id, owner.id);
+  await addAgent(privateChannel.id, agent.id);
+  const card = await prepareActionCard({
+    serverId: asServerId(server.id),
+    requesterAgentId: agent.id,
+    targetChannelId: privateChannel.id,
+    action: { type: "channel:create", name: "event-cloak-created", visibility: "public" },
+  });
+  const plain = await createMessage(privateChannel.id, "user", owner.id, "not a card");
+  const cases = { unknown: randomUUID(), card: card.messageId, plain: plain.id };
+  const eventBody = JSON.stringify({ eventType: "action_card.open" });
+
+  const outsiders = [
+    { who: "server member outside the private channel", headers: authHeaders(await tokenForHuman(member.email), server.id) },
+    { who: "user outside the server", headers: authHeaders(await tokenForHuman(stranger.email), strangerServer.id) },
+  ];
+  for (const { who, headers } of outsiders) {
+    const answers: Record<string, { status: number; body: string }> = {};
+    for (const [name, messageId] of Object.entries(cases)) {
+      const res = await fetch(`${app.baseUrl}/api/actions/${messageId}/event`, { method: "POST", headers, body: eventBody });
+      answers[name] = { status: res.status, body: await res.text() };
+    }
+    assert.equal(answers.unknown.status, 404, `${who}: unknown id ${JSON.stringify(answers.unknown)}`);
+    assert.deepEqual(answers.card, answers.unknown, `${who}: an invisible card must answer as an unknown id`);
+    assert.deepEqual(answers.plain, answers.unknown, `${who}: an invisible plain message must answer as an unknown id`);
+  }
+
+  // The owner can see both: the plain message is said not to be a card, and the card records the event.
+  const ownerHeaders = authHeaders(await tokenForHuman(owner.email), server.id);
+  const plainRes = await fetch(`${app.baseUrl}/api/actions/${plain.id}/event`, { method: "POST", headers: ownerHeaders, body: eventBody });
+  assert.equal(plainRes.status, 400);
+  assert.equal(((await plainRes.json()) as { errorCode?: string }).errorCode, "NOT_ACTION_CARD");
+  const cardRes = await fetch(`${app.baseUrl}/api/actions/${card.messageId}/event`, { method: "POST", headers: ownerHeaders, body: eventBody });
+  assert.equal(cardRes.status, 204, await cardRes.text());
+  const [cardRow] = await db.select({ id: actionCards.id }).from(actionCards).where(eq(actionCards.messageId, card.messageId));
+  const recorded = await db.select({ actorId: productEvents.actorId }).from(productEvents)
+    .where(and(eq(productEvents.subjectId, cardRow!.id), eq(productEvents.eventType, "action_card.open")));
+  assert.deepEqual(recorded, [{ actorId: owner.id }], "only the owner's event is recorded");
 });
 
 test("public channel read access does not grant action-card write authority", async ({ app }) => {

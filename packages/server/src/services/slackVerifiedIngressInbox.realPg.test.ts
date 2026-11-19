@@ -1,6 +1,4 @@
 import { enableTestSlackIngress, writeSlackFixture } from "../test/integration/slackIngressRollout";
-// This existing CI entry also runs the deletion-retirement PostgreSQL contract.
-import "../db/slackDeletionRetirement.realPgContract";
 /** Real PostgreSQL is required to exercise overlapping partition transactions. */
 import assert from "node:assert/strict";
 import { createHash, randomBytes, randomUUID } from "node:crypto";

@@ -1,4 +1,5 @@
 import { and, eq, isNull, sql } from "drizzle-orm";
+import type { MessageCardExecuteAction } from "@botiverse/raft-shared";
 import { appLinkReadUrls, matchesAppPreview, UNREVIEWED_APP_CAPABILITY, type LinkCardCapability } from "@botiverse/raft-shared/src/appLinkPreview";
 import { getDb, type DatabaseExecutor } from "../db";
 import { appHosts } from "../platform/links";
@@ -8,7 +9,11 @@ import { LINK_PREVIEW_PROOF_HARD_TTL_MS, LINK_PREVIEW_SCOPES, previewable, prove
 import { LINK_CARD_READ_MAX_URLS } from "./linkCardReadService";
 import { linkCardActionEndpointSha256, linkCardMessageContentSha256, linkCardUrlSha256, type LinkCardHandleClaims } from "./linkCardTokens";
 import { isApprovedOfficialAppClient } from "./officialAppAutoInstallService";
-import { ownServerActionsInForce } from "./linkCardExecuteEligibility";
+import { unreviewedActionsBasis, type UnreviewedActionsBasis } from "./linkCardExecuteEligibility";
+import {
+  messageCardSealingFailure, messageCardUrlIdentity, messageCardViewerIsMember, recheckMessageCardMessageInTransaction, verifyMessageCardActionAgainstLiveState,
+  type MessageCardOnRead,
+} from "./messageCardLiveState";
 import { oauthClientHasKey } from "./oauthClientKeys";
 
 // Interactive link cards: the ONE place an action compares a handle with live
@@ -30,9 +35,18 @@ import { oauthClientHasKey } from "./oauthClientKeys";
 // descriptor with a live card (it has none at click time): the descriptor
 // digest is bound, recorded and forwarded, and the App refuses anything stale
 // under its current policy (rule 4).
+//
+// A card message's acting buttons (RFC 086) are handles too: one carrying the
+// `messageCard` claim, or an operation on a card message, is compared in
+// messageCardLiveState.ts, behind the same entry points.
 
-/** The message as the viewer may read it now (routes/messages.ts readPreviewableMessage), or null. */
-export type LinkCardMessageReader = (messageId: string) => Promise<{ content: string } | null>;
+/**
+ * The message as the viewer may read it now (routes/messages.ts
+ * readCardActionMessage), or null: ordinary chat whose links a card reads,
+ * or (`messageCard`) a card message whose acting buttons act (RFC 086). A
+ * link's handle never matches a card message.
+ */
+export type LinkCardMessageReader = (messageId: string) => Promise<{ content: string; messageCard?: MessageCardOnRead } | null>;
 
 export type LinkCardLiveState = {
   /** The message's link the handle names, re-extracted from the current content (WHATWG href). */
@@ -43,16 +57,25 @@ export type LinkCardLiveState = {
   actionEndpoint: string;
   actionEndpointSha256: string;
   /**
-   * Why this App may act here: an approved official App (§4), or its own-Server
-   * confirmation on this Server (RFC 076 §17), which also needs the handle to
-   * carry unreviewed_app.v1 and spends the per-App execute budget.
+   * Why this App may act here: an approved official App (§4), or (RFC 076
+   * §17) its own Server's default or this Server's allow, either of which also
+   * needs the handle to carry unreviewed_app.v1 and spends the per-App
+   * execute budget.
    */
-  basis: "official" | "own_server";
+  basis: "official" | UnreviewedActionsBasis;
+  /**
+   * RFC 086: a card message's acting button (`url` is its fallback page), not
+   * a link's card, and its action as stored (its form fixed by the card
+   * revision the handle binds: what execute checks the form's values against).
+   */
+  messageCard?: { elementId: string; action: MessageCardExecuteAction };
 };
 
 /** Why a handle no longer matches; all of them are 410 to the client. */
 export type LinkCardLiveStateFailure =
-  | "identity" | "capabilities" | "message" | "url" | "provider" | "installation" | "revision" | "eligibility" | "consent" | "decline";
+  | "identity" | "capabilities" | "message" | "url" | "provider" | "installation" | "revision" | "eligibility" | "consent" | "decline"
+  /** RFC 086: a card message's acting button, and the viewer is not its `for`, or no longer a member (or a guest now). */
+  | "viewer";
 
 /** Which comparison ran: the live check of prepare or execute, or execute's in-transaction re-check of the viewer's side. */
 type ObservedCheck = "prepare" | "execute" | "execute_transaction";
@@ -71,8 +94,8 @@ export function linkCardActionCapabilities(requiresPrepare: boolean): LinkCardCa
  * Compares every bound field of a verified handle (MAC and expiry already
  * checked) with live state, then the pre-call checks every action-endpoint
  * call needs: an approved official App with an approved
- * action endpoint in force, or an App with its own-Server actions in force on
- * this Server (RFC 076 §17), its registration not suspended and proven within
+ * action endpoint in force, or an App whose installation here lets its card
+ * buttons act (RFC 076 §17), its registration not suspended and proven within
  * HARD_TTL. Writes nothing and calls no App.
  * - viewer and Server: the authenticated context (the handle's plain text only selects);
  * - provider and installation: the provider Raft matches for the URL now,
@@ -89,11 +112,12 @@ export async function verifyLinkCardActionAgainstLiveState(input: {
   observeForTests?.(input.phase);
   const { binding } = input.claims;
   if (binding.viewerId !== input.viewerId || binding.serverId !== input.serverId) return { ok: false, reason: "identity" };
+  if (input.claims.messageCard) return verifyMessageCardActionAgainstLiveState(input);
   // Native providers are not registered yet (RFC 076 §7): nothing native matches.
   if (binding.providerKind !== "app") return { ok: false, reason: "provider" };
   if (!linkCardActionCapabilities(input.claims.requiresPrepare).every((capability) => binding.capabilities.includes(capability))) return { ok: false, reason: "capabilities" };
   const message = await input.readMessage(binding.messageId);
-  if (!message || linkCardMessageContentSha256(message.content) !== input.claims.messageContentSha256) return { ok: false, reason: "message" };
+  if (!message || message.messageCard || linkCardMessageContentSha256(message.content) !== input.claims.messageContentSha256) return { ok: false, reason: "message" };
   const url = appLinkReadUrls(message.content, appHosts(), LINK_CARD_READ_MAX_URLS).find((link) => linkCardUrlSha256(link) === binding.urlSha256);
   if (!url) return { ok: false, reason: "url" };
   const apps = await registeredApps(input.serverId, input.viewerId, [new URL(url).origin]);
@@ -104,17 +128,17 @@ export async function verifyLinkCardActionAgainstLiveState(input: {
   if (entry.config.revision !== binding.registrationRevision) return { ok: false, reason: "revision" };
   // Before any action-endpoint call: not suspended, proven within HARD_TTL
   // (both also gate the match above; restated here as the pre-call rule),
-  // an action endpoint in force, and either the App's own-Server actions in
-  // force on this Server (RFC 076 §17) or an approved official App.
+  // an action endpoint in force, and either an approved official App or an
+  // installation here that lets its card buttons act (RFC 076 §17).
   const actionEndpoint = entry.config.actionEndpoint;
   if (actionEndpoint === null || entry.config.suspendedAt !== null || !provenWithin(entry.config.verifiedAt, LINK_PREVIEW_PROOF_HARD_TTL_MS, input.now)) return { ok: false, reason: "eligibility" };
   const basis: LinkCardLiveState["basis"] | null = await isApprovedOfficialAppClient(entry.app.id) ? "official"
-    : ownServerActionsInForce(entry, input.serverId) ? "own_server" : null;
+    : unreviewedActionsBasis(entry, input.serverId);
   if (basis === null) return { ok: false, reason: "eligibility" };
   // RFC 076 §17: only a client that shows Raft's not-reviewed confirmation
   // before every acting button may act for such an App; the read gave other
   // clients navigate buttons, and a handle without it is refused here.
-  if (basis === "own_server" && !binding.capabilities.includes(UNREVIEWED_APP_CAPABILITY)) return { ok: false, reason: "capabilities" };
+  if (basis !== "official" && !binding.capabilities.includes(UNREVIEWED_APP_CAPABILITY)) return { ok: false, reason: "capabilities" };
   return { ok: true, live: { url, entry, actionEndpoint, actionEndpointSha256: linkCardActionEndpointSha256(actionEndpoint), basis } };
 }
 
@@ -128,33 +152,47 @@ const HARD_TTL_SECONDS = LINK_PREVIEW_PROOF_HARD_TTL_MS / 1000;
  * execute. Then the registration must still be the one the handle names, not
  * suspended, proven within HARD_TTL by the database clock, and hold the same
  * approved action endpoint the live check saw; and the App must be an
- * approved official one, or have its own-Server actions in force on this
- * Server as the locked registration row has them (RFC 076 §17: withdrawing
- * the confirmation takes FOR UPDATE on that row).
+ * approved official one, or its locked installation row must let its card
+ * buttons act here (RFC 076 §17: switching off, allowing and withdrawing
+ * take FOR UPDATE on that row, an uninstall deletes it).
+ * For a card message's acting button, the card encryption key on the same
+ * locked registration row too (RFC 086 §5.2; setting or removing it takes the
+ * row FOR UPDATE): a SecretInput button still needs an official App with a
+ * key, and the `kid` the handle bound must still be the App's
+ * (messageCardSealingFailure, the live check's rule).
+ * Returns why it no longer holds (`eligibility`: 410 PROVIDER_NOT_ELIGIBLE;
+ * `revision`: the kid moved, 410 HANDLE_INVALID), or null.
  */
-export async function lockLinkCardActionEligibility(tx: DatabaseExecutor, input: { live: LinkCardLiveState; claims: LinkCardHandleClaims; serverId: string }): Promise<boolean> {
+export async function lockLinkCardActionEligibility(
+  tx: DatabaseExecutor, input: { live: LinkCardLiveState; claims: LinkCardHandleClaims; serverId: string },
+): Promise<"eligibility" | "revision" | null> {
   const { entry } = input.live;
   // FOR SHARE on the registry row when there is one; an App that is not
-  // official passes only on its own-Server confirmation, read below under the
-  // registration row's lock (a withdrawal takes FOR UPDATE on that row).
+  // official passes only on its installation row's card-button state, read
+  // below under that row's lock.
   const official = await isApprovedOfficialAppClient(entry.app.id, tx, { forShare: true });
   // The App's distribution is read in this statement too (RFC 076 §17: a
-  // publish ends own-Server actions), not taken from the earlier live check.
-  const [install] = await tx.select({ id: oauthClientInstalls.id, appType: oauthClients.appType }).from(oauthClientInstalls)
+  // share or publish ends the own-Server default), not taken from the earlier live check.
+  const [install] = await tx.select({
+    id: oauthClientInstalls.id, appType: oauthClients.appType,
+    allowedActionEndpoint: oauthClientInstalls.allowedActionEndpoint, actionsOffAt: oauthClientInstalls.actionsOffAt,
+  }).from(oauthClientInstalls)
     .innerJoin(oauthClients, and(eq(oauthClients.id, oauthClientInstalls.clientId), eq(oauthClients.enabled, true)))
     .where(and(eq(oauthClientInstalls.id, input.claims.binding.installationKey), eq(oauthClientInstalls.clientId, entry.app.id),
       eq(oauthClientInstalls.serverId, input.serverId), eq(oauthClientInstalls.status, "active")))
     .for("share", { of: oauthClientInstalls });
-  if (!install) return false;
+  if (!install) return "eligibility";
   const [registration] = await tx.select({
     revision: oauthAppLinkPreviews.revision, origin: oauthAppLinkPreviews.origin, actionEndpoint: oauthAppLinkPreviews.actionEndpoint,
-    suspendedAt: oauthAppLinkPreviews.suspendedAt, ownServerActionEndpoint: oauthAppLinkPreviews.ownServerActionEndpoint,
+    suspendedAt: oauthAppLinkPreviews.suspendedAt, cardEncryptionKey: oauthAppLinkPreviews.cardEncryptionKey, cardEncryptionKid: oauthAppLinkPreviews.cardEncryptionKid,
     proven: sql<boolean>`${oauthAppLinkPreviews.verifiedAt} > clock_timestamp() - make_interval(secs => ${HARD_TTL_SECONDS})`,
   }).from(oauthAppLinkPreviews).where(eq(oauthAppLinkPreviews.clientId, entry.app.id)).for("share");
-  return !!registration && registration.revision === input.claims.binding.registrationRevision && registration.suspendedAt === null && registration.proven === true
+  const eligible = !!registration && registration.revision === input.claims.binding.registrationRevision && registration.suspendedAt === null && registration.proven === true
     && registration.origin === entry.config.origin && registration.actionEndpoint !== null
     && linkCardActionEndpointSha256(registration.actionEndpoint) === input.live.actionEndpointSha256
-    && (official || ownServerActionsInForce({ app: { serverId: entry.app.serverId, appType: install.appType }, config: registration }, input.serverId));
+    && (official || unreviewedActionsBasis({ app: { serverId: entry.app.serverId, appType: install.appType }, config: registration, installation: install }, input.serverId) !== null);
+  if (!eligible) return "eligibility";
+  return input.live.messageCard ? messageCardSealingFailure({ action: input.live.messageCard.action, official, registration, claims: input.claims }) : null;
 }
 
 /**
@@ -183,6 +221,11 @@ export async function recheckLinkCardViewerInTransaction(tx: DatabaseExecutor, i
   viewerId: string; serverId: string; claims: LinkCardHandleClaims; live: LinkCardLiveState; readMessage: LinkCardMessageReader;
 }): Promise<LinkCardLiveStateFailure | null> {
   observeForTests?.("execute_transaction");
+  // RFC 086: a card message's acting button: the viewer's membership row FOR
+  // SHARE first (a demotion to guest or a leave takes it FOR UPDATE; a member
+  // removal and a consent grant take it before the consent row, so this
+  // order), then the same consent and decline re-check as a link's.
+  if (input.claims.messageCard && !await messageCardViewerIsMember(tx, { viewerId: input.viewerId, serverId: input.serverId, forShare: true })) return "viewer";
   const { entry } = input.live;
   const choice = { userId: input.viewerId, serverId: input.serverId, clientId: entry.app.id };
   if (entry.consentId === null) return "consent";
@@ -198,8 +241,9 @@ export async function recheckLinkCardViewerInTransaction(tx: DatabaseExecutor, i
       eq(oauthLinkPreviewDeclines.clientId, choice.clientId)))
     .limit(1);
   if (decline) return "decline";
+  if (input.claims.messageCard) return recheckMessageCardMessageInTransaction(input);
   const message = await input.readMessage(input.claims.binding.messageId);
-  if (!message || linkCardMessageContentSha256(message.content) !== input.claims.messageContentSha256) return "message";
+  if (!message || message.messageCard || linkCardMessageContentSha256(message.content) !== input.claims.messageContentSha256) return "message";
   return null;
 }
 
@@ -283,6 +327,7 @@ type LinkCardReceiptSubject = Pick<typeof linkCardOperations.$inferSelect, "view
  */
 export async function linkCardReceiptAccess(op: LinkCardReceiptSubject, readMessage: LinkCardMessageReader): Promise<{ serverRole: RegisteredApp["serverRole"] } | null> {
   // Native providers are not registered yet: nothing native is readable.
+  // An operation on a card message's acting button (RFC 086) is read on the same terms.
   if (op.providerKind !== "app") return null;
   const [row] = await getDb().select({ clientId: oauthClients.id, declineId: oauthLinkPreviewDeclines.id, serverRole: serverMembers.role }).from(oauthClients)
     .innerJoin(oauthClientInstalls, and(eq(oauthClientInstalls.id, op.installationKey), eq(oauthClientInstalls.clientId, oauthClients.id),
@@ -317,6 +362,7 @@ export async function matchLinkCardUrlIdentity(input: {
 }): Promise<LinkCardIdentityDomain | null> {
   const message = await input.readMessage(input.messageId);
   if (!message) return null;
+  if (message.messageCard) return messageCardUrlIdentity(message.messageCard, input);
   const url = appLinkReadUrls(message.content, appHosts(), LINK_CARD_READ_MAX_URLS).find((link) => linkCardUrlSha256(link) === input.urlSha256);
   if (!url) return null;
   const apps = await registeredApps(input.serverId, input.viewerId, [new URL(url).origin]);

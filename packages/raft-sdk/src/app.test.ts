@@ -378,6 +378,9 @@ test("./app is its own entry: the root and ./agent export none of it, and it exp
     assert.equal(name in root, false, `${name} not on the root`);
     assert.equal(name in agent, false, `${name} not on ./agent`);
   }
-  assert.deepEqual(Object.keys(app).sort(), ["RaftAppError", "createRaftAppClient"]);
+  for (const name of ["openSealedInputs", "sealInputs", "sealedInputsBinding", "createSealedInputsMemory"]) {
+    assert.equal(name in root || name in agent, false, `${name} stays off the root and ./agent`);
+  }
+  assert.deepEqual(Object.keys(app).sort(), ["RaftAppError", "createRaftAppClient", "createSealedInputsMemory", "openSealedInputs", "sealInputs", "sealedInputsBinding"]);
   assert.equal("asServerId" in app, false, "the unchecked brand cast stays internal");
 });

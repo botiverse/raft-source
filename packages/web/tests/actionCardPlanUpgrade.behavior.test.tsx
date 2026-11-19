@@ -176,7 +176,7 @@ test("without a gate the card has no note, and its button opens the general upgr
     cardMessageId: messageId,
   });
   await waitFor(() => assert.ok(screen.getByRole("dialog", { name: "Upgrade Acme to Pro" })));
-  assert.ok(screen.getByText("Pro lifts the Free limits on chat history, file uploads and Joint Channels."));
+  assert.ok(screen.getByText("Pro lifts the Free limits on chat history, file uploads and external channels."));
   assert.ok(screen.getByTestId("upgrade-dialog-checkout"));
 
   // `general` named outright reads the same as no gate.
@@ -185,7 +185,7 @@ test("without a gate the card has no note, and its button opens the general upgr
   assert.deepEqual(notices(named), []);
   assert.deepEqual(upgradeGateCopy(intl.formatMessage, "general", "Acme"), {
     title: "Upgrade Acme to Pro",
-    hint: "Pro lifts the Free limits on chat history, file uploads and Joint Channels.",
+    hint: "Pro lifts the Free limits on chat history, file uploads and external channels.",
   });
 });
 

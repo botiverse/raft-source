@@ -45,6 +45,28 @@ export interface AgentUsageAgent {
    * that reports none).
    */
   usage_reported: boolean;
+  /**
+   * Whether the agent's Computer is new enough to report usage (its
+   * `machines.computerVersion` at or above 1.25.0, #14578; only the release
+   * number is compared, so prereleases of 1.25.0 count):
+   * - true: it is; with `usage_reported` false the agent has not run (or
+   *   reported) yet.
+   * - false: the agent has a Computer, but its version is older, unknown or
+   *   not SemVer. A Computer that has reported no version counts as false
+   *   ("too old"), fail-closed.
+   * - null: the agent has no Computer (a hosted assistant, an external agent,
+   *   or one whose Computer was removed); upgrading cannot change this.
+   * Additive: older servers omit it.
+   */
+  computer_reports_usage?: boolean | null;
+  /**
+   * Whether the agent's runtime reports per-turn token counts at all
+   * (RUNTIMES_REPORTING_TURN_TOKENS). False for a runtime that does not (its
+   * turns carry only the model), and for an unknown or missing runtime: with
+   * `usage_reported` false, "shows after the next turn" would never come true.
+   * Additive: older servers omit it, and older clients ignore it.
+   */
+  runtime_reports_usage?: boolean;
 }
 
 export interface AgentUsageResponse {

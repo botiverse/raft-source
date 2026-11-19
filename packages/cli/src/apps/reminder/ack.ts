@@ -7,7 +7,7 @@ import { defineCommand, registerCliCommand } from "../../core/command";
 import type { CommandContext, CommandRuntimeOptions } from "../../core/context";
 import { cliError } from "../../core/errors";
 import { writeText, adoptCliReplyText } from "../../core/renderer";
-import { isReminderDueItem, matchesReminderId, readLocalReminderState } from "./sealGuard";
+import { isReminderDueItem, matchesReminderId, parseReminderIdInput, readLocalReminderState } from "./sealGuard";
 
 interface AckOpts {
   id: string;
@@ -25,10 +25,6 @@ type AcknowledgedAppSource = {
 
 const REMINDER_INBOX_APP_ID = "system.reminder";
 const REMINDER_DUE_NOTIFICATION_CLASS = "due";
-
-function matchesReminderItem(itemId: string, query: string): boolean {
-  return itemId === query || itemId.startsWith(query);
-}
 
 function isExactAcknowledgement(
   ack: AcknowledgedAppSource,
@@ -60,16 +56,30 @@ function ackFailure(ack: { status: number; error?: string | null; errorCode?: st
   );
 }
 
-function parseAckOptions(opts: AckOpts): { id: string; revision: string } {
-  const id = opts.id?.trim();
-  if (!id) {
-    throw cliError("INVALID_ARG", "--id is required");
+/**
+ * `--id` as the Inbox prints it may carry the revision (`reminder:<id>:<rev>`);
+ * it stands in for `--revision`, and a different `--revision` is refused.
+ */
+function parseIdAndRevision(opts: { id?: string; revision?: string }): { id: string; revision?: string } {
+  const parsed = parseReminderIdInput(opts.id);
+  if (!parsed.id) throw cliError("INVALID_ARG", "--id is required");
+  const flagRevision = opts.revision?.trim() || undefined;
+  if (flagRevision && parsed.revision && flagRevision !== parsed.revision) {
+    throw cliError(
+      "INVALID_ARG",
+      `--id names revision ${parsed.revision} but --revision is ${flagRevision}; pass the revision once`,
+    );
   }
-  const revision = opts.revision?.trim();
+  const revision = flagRevision ?? parsed.revision;
+  return { id: parsed.id, ...(revision ? { revision } : {}) };
+}
+
+function parseAckOptions(opts: AckOpts): { id: string; revision: string } {
+  const { id, revision } = parseIdAndRevision(opts);
   if (!/^[1-9][0-9]*$/.test(revision ?? "")) {
     throw cliError("INVALID_ARG", "--revision must be a positive integer");
   }
-  return { id, revision };
+  return { id, revision: revision! };
 }
 
 function findReminderSeal(
@@ -119,14 +129,14 @@ async function runReminderAck(ctx: CommandContext, opts: AckOpts): Promise<void>
     const reminderItems = items.filter((item): item is AgentInboxAppItem =>
       item.source === "app"
       && isReminderDueItem(item)
-      && (matchesReminderId(item.sourceRef.id, id) || matchesReminderItem(item.itemId, id)),
+      && matchesReminderId(item.sourceRef.id, id),
     );
     const reminderAcknowledgements = acknowledgedSources.filter((ack) =>
       ack.appId === REMINDER_INBOX_APP_ID
       && ack.notificationClass === REMINDER_DUE_NOTIFICATION_CLASS
       && ack.sourceRef.kind === "reminder"
       && ack.sourceRef.revision !== undefined
-      && (matchesReminderId(ack.sourceRef.id, id) || matchesReminderItem(ack.itemId, id)),
+      && matchesReminderId(ack.sourceRef.id, id),
     );
     const distinctReminderIds = new Set([
       ...reminderItems.map((item) => item.sourceRef.id),
@@ -198,8 +208,8 @@ async function runReminderAck(ctx: CommandContext, opts: AckOpts): Promise<void>
 }
 
 const reminderAckOptions = [
-  { flags: "--id <id>", description: "Reminder id (full uuid or short prefix)" },
-  { flags: "--revision <revision>", description: "Exact reminder source revision to acknowledge" },
+  { flags: "--id <id>", description: "Reminder id (full uuid, short prefix, or reminder:<id> as raft inbox check prints it)" },
+  { flags: "--revision <revision>", description: "Exact reminder source revision to acknowledge (not needed when --id ends in :<rev>)" },
 ];
 
 export const reminderAckCommand = defineCommand(
@@ -236,13 +246,14 @@ interface SealOpts {
 }
 
 function validateSealSelector(opts: SealOpts): { id: string; revision?: string; allPending: boolean } {
-  const id = opts.id?.trim();
-  if (!id) throw cliError("INVALID_ARG", "--id is required");
   const allPending = opts.allPending === true;
-  const revision = opts.revision?.trim();
-  if (allPending && revision) {
+  if (allPending && opts.revision?.trim()) {
     throw cliError("INVALID_ARG", "Pass at most one of --revision or --all-pending");
   }
+  const parsed = parseIdAndRevision(opts);
+  // --all-pending covers every revision, so a pasted `reminder:<id>:<rev>` only names the reminder.
+  const id = parsed.id;
+  const revision = allPending ? undefined : parsed.revision;
   if (revision && !/^[1-9][0-9]*$/.test(revision)) {
     throw cliError("INVALID_ARG", "--revision must be a positive integer");
   }
@@ -274,8 +285,8 @@ export const reminderSealCommand = defineCommand(
     name: "seal",
     description: "Seal a local reminder id against destructive actions",
     options: [
-      { flags: "--id <id>", description: "Reminder id (full uuid or short prefix)" },
-      { flags: "--revision <revision>", description: "Exact evidence revision (optional)" },
+      { flags: "--id <id>", description: "Reminder id (full uuid, short prefix, or reminder:<id> as raft inbox check prints it)" },
+      { flags: "--revision <revision>", description: "Exact evidence revision (optional; or end --id in :<rev>)" },
       { flags: "--all-pending", description: "Seal every pending revision for this reminder" },
       { flags: "--owner <owner>", description: "Accountable seal owner, e.g. @Stone" },
       { flags: "--until <condition>", description: "Explicit unseal condition" },
@@ -336,8 +347,8 @@ export const reminderUnsealCommand = defineCommand(
     name: "unseal",
     description: "Remove a local reminder Inbox seal",
     options: [
-      { flags: "--id <id>", description: "Reminder id (full uuid or short prefix)" },
-      { flags: "--revision <revision>", description: "Exact evidence revision (optional)" },
+      { flags: "--id <id>", description: "Reminder id (full uuid, short prefix, or reminder:<id> as raft inbox check prints it)" },
+      { flags: "--revision <revision>", description: "Exact evidence revision (optional; or end --id in :<rev>)" },
       { flags: "--all-pending", description: "Unseal every pending revision for this reminder" },
     ],
   },

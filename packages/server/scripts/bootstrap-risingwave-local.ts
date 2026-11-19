@@ -260,7 +260,7 @@ async function main(): Promise<void> {
   let restoreBarrierIntervalMs: number | null = null;
   try {
     // Loopback-only (checked above): this never touches a staging or
-    // production RisingWave. Set the restore target before shortening, so a
+    // production RisingWave. Set the restore target before changing, so a
     // failure in between still restores.
     restoreBarrierIntervalMs = barrierIntervalToRestore(await readBarrierIntervalMs(risingwave));
     await risingwave.query(`ALTER SYSTEM SET barrier_interval_ms = ${BOOTSTRAP_BARRIER_INTERVAL_MS}`);

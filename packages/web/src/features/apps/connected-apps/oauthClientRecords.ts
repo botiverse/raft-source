@@ -76,6 +76,13 @@ export interface MarketplaceOAuthClientRecord extends OAuthClientRecord {
   promptTextConfirmationRequired?: boolean;
   /** Added login/data permissions awaiting this Server's approval; absent on older servers. */
   permissionApprovalRequired?: boolean;
+  /**
+   * When a person on this Server last uninstalled this App (ISO time), or
+   * null if no one ever did (a system uninstall, such as the closed-server
+   * purge, doesn't count). Kept after a reinstall: compare with
+   * `installationId`. Absent from an older server.
+   */
+  uninstalledHereAt?: string | null;
 }
 
 export interface IntegrationOverviewItem {

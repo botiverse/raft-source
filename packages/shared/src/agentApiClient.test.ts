@@ -281,6 +281,10 @@ const coreSdkFixtures: Record<CoreAgentApiRouteKey, {
     input: [{ title: "Plan", files: [{ path: "index.html", content: "<h1>Plan</h1>" }] }],
     response: { artifact: { id: "pt_abc12345", url: "https://app.raft.build/artifacts/pt_abc12345", version: 1, unchanged: false, homeConversationId: "55555555-5555-4555-8555-555555555555" } },
   },
+  assistantOwnerArtifactPublishAsOwner: {
+    input: [{ home: "#design", title: "Plan", files: [{ path: "index.html", content: "<h1>Plan</h1>" }] }],
+    response: { artifact: { id: "pt_abc12345", url: "https://app.raft.build/artifacts/pt_abc12345", version: 1, unchanged: false }, home: { id: "55555555-5555-4555-8555-555555555555", ref: "#design" } },
+  },
   assistantOwnerActivity: {
     input: [{ since: "2026-10-20T00:00:00.000Z" }],
     response: { owner: { userId: "33333333-3333-4333-8333-333333333333" }, items: [], hasMore: false, nextSince: null },
@@ -945,6 +949,10 @@ const coreSdkFixtures: Record<CoreAgentApiRouteKey, {
     input: [],
     response: { apps: [] },
   },
+  integrationAppCardButtons: {
+    input: [{ clientKey: "drive9", action: "allow", actionEndpoint: "https://drive9.example/card-actions" }],
+    response: { clientId: "client-uuid-1", clientKey: "drive9", cardButtons: { mode: "allow", state: "allowed", inForce: true, actionEndpoint: "https://drive9.example/card-actions", pendingActionEndpoint: null, allowedActionEndpoint: "https://drive9.example/card-actions", changedAt: "2026-11-14T00:00:00.000Z", changedBy: { type: "agent", id: "agent-uuid-1", name: "box" } } },
+  },
   integrationAppStatus: {
     input: [{ client: "drive9" }],
     response: {
@@ -977,6 +985,10 @@ const coreSdkFixtures: Record<CoreAgentApiRouteKey, {
       messageId: "msg-action-1",
       metadata: { kind: "action-card" },
     },
+  },
+  actionOperations: {
+    input: [],
+    response: { enabled: false, operations: [] },
   },
   attachmentUpload: {
     input: [],

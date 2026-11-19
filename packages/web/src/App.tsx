@@ -28,12 +28,11 @@ import { findStoredChannel } from "./store/storedChannel";
 import { useThreadStore } from "./store/threadStore";
 import api from "./api/client";
 import ServerSetupProjectionGate from "./components/onboarding/ServerSetupProjectionGate";
-import { SignInPage } from "./components/auth/SignInPage";
 import InAppBrowserGuide from "./components/deeplinks/InAppBrowserGuide";
 import { OpenInAppOffers } from "./components/deeplinks/OpenInAppOffers";
 import { startServerFeatureFlagRefreshOnFocus } from "./store/serverFeatureFlags";
 import { landingAfterVerify } from "./components/auth/verificationLanding";
-import { PendingSecondFactorSignInStep, useSecondFactorSignInPending } from "./components/auth/SecondFactorSignInStep";
+import { useSecondFactorSignInPending } from "./components/auth/secondFactorSignIn";
 import { useRememberDesktopPasskeyAccount } from "./utils/desktopPasskeySignIn";
 import { RECOVERY_CANCEL_PARAM, RECOVERY_CONFIRM_PARAM, parseRecoveryLinkToken } from "./components/auth/secondFactorRecovery";
 import { takeAccountDeletionCancelLink } from "./pages/accountDeletionCancelLink";
@@ -42,6 +41,7 @@ import SignedInAs from "./components/auth/SignedInAs";
 import { ImageLightboxHost } from "./components/ImageLightboxHost";
 import DocumentPreviewHost from "./components/message/DocumentPreviewHost";
 import SecondFactorStepUpHost from "./components/settings/SecondFactorStepUpHost";
+import { DesktopBrowserSignInHost } from "./features/desktopBrowserSignIn/DesktopBrowserSignInHost";
 import { AccountDeletionGate } from "./pages/AccountDeletionGate";
 import MediaPreviewHost from "./components/message/MediaPreviewHost";
 import MainLayout from "./components/layout/MainLayout";
@@ -73,7 +73,7 @@ import {
 import { NavigationDepthTracker, useAppNavigate, useHasInAppPageBehind } from "./hooks/useAppNavigate";
 import { useJoinCommunityFlow } from "./hooks/useJoinCommunityFlow";
 import { bootRequestsServerListEarly, isAuthHandoffPage, opensServerFrame } from "./boot/serverFrame";
-import { ArtifactLinkLoading, artifactLinkLeaveServer, artifactPermalinkTargetOf, artifactShortAddressOf, loadArtifactPermalink, loadPublicArtifactPage } from "./apps/artifacts";
+import { ArtifactLinkLoading, artifactLinkLeaveServer, backPastArtifactFrame, artifactPermalinkTargetOf, artifactShortAddressOf, loadArtifactPermalink, loadPublicArtifactPage } from "./apps/artifacts";
 import {
   CHINESE_COMMUNITY_SERVER_SLUG,
   CHINESE_COMMUNITY_PAGE_PATH,
@@ -104,6 +104,7 @@ import { ServerOff, Settings, X } from "lucide-react";
 import { PendingServerLayout } from "./components/layout/PendingServerLayout";
 import { OfflineServerLayout } from "./components/layout/OfflineServerLayout";
 import { AuthBootstrapStatus, Landing } from "./components/auth/AuthBootstrapStatus";
+import { SecondFactorStepFrame } from "./components/auth/SignInPageFrame";
 import {
   MobileDownloadChooserPage,
   ChineseCommunityPage,
@@ -127,6 +128,7 @@ import {
   InviteAcceptPage,
   SocialAuthCallbackPage,
   SsoAuthCallbackPage,
+  SignInPage, PendingSecondFactorSignInStep,
   AccountDeletionCancelLinkPage,
   AccountBootstrapPreviewPage,
 } from "./pages/lazyLandingPages";
@@ -840,7 +842,7 @@ export function ArtifactPermalinkRoute() {
   // Raft's app owns the account (signing out here signs the app out): no Switch Account inside it.
   const switchAccount = useMemo(() => (isHostShell() ? undefined : () => logout()), [logout]);
   const pageBehind = useHasInAppPageBehind();
-  const goBack = useCallback(() => navigate(-1), [navigate]);
+  const goBack = useCallback(() => backPastArtifactFrame(() => navigate(-1)), [navigate]);
   // Outside the server layout, so its keeper isn't mounted: a version switch (`/v/<n>`) drops the query, and the
   // App's WebView must find the embed params in the URL after a reload, as the latch keeps them for the session.
   useEmbedParamsKeeper();
@@ -1214,12 +1216,15 @@ export function AppShell() {
   const deferServerBootstrap = appLoginHandoff || urlParamsRef.authCallback === "social" || urlParamsRef.authCallback === "sso";
 
   // Identity setup is account-global and must complete before any server data
-  // or pending invite side effects are loaded.
+  // or pending invite side effects are loaded. By person and verification, not
+  // the user object: a profile write (the boot's timezone observation) must not
+  // read the list, members and sidebar order again (boot-requests.md).
+  const userEmailVerified = user?.emailVerified ?? null;
   useEffect(() => {
-    if (user && !profileSetupRequired && !deferServerBootstrap) {
+    if (authenticatedUserId && !profileSetupRequired && !deferServerBootstrap) {
       loadServers();
     }
-  }, [user, profileSetupRequired, deferServerBootstrap, loadServers]);
+  }, [authenticatedUserId, userEmailVerified, profileSetupRequired, deferServerBootstrap, loadServers]);
 
   // Single boot entry for the cross-server unread summary. Components keep
   // only their event/interval triggers (LeftRail: prefs + local-unread edge;
@@ -1227,10 +1232,10 @@ export function AppShell() {
   // mount issued its own boot fetch (the unread-summary boot wave).
   const serversCount = useServerStore((s) => s.servers.length);
   const loadServerUnreadSummary = useServerStore((s) => s.loadServerUnreadSummary);
-  useEffect(() => {
-    if (!user || serversCount === 0 || deferServerBootstrap) return;
+  useEffect(() => { // by person, as above
+    if (!authenticatedUserId || serversCount === 0 || deferServerBootstrap) return;
     void loadServerUnreadSummary();
-  }, [user, serversCount, deferServerBootstrap, loadServerUnreadSummary]);
+  }, [authenticatedUserId, serversCount, deferServerBootstrap, loadServerUnreadSummary]);
 
   // Task #164: while the unread or Activity reads are stale or unavailable,
   // read them again with backoff until a clean answer (store/rwStaleCounts).
@@ -1333,7 +1338,7 @@ export function AppShell() {
 
   const hasUser = !!user;
   // Signed out: the sign-in page's next steps load in idle time (pages/landingPages.ts).
-  useEffect(() => { if (authBootstrapView === "signed_out" && !hasUser) preloadSignedOutSteps(); }, [authBootstrapView, hasUser]);
+  useEffect(() => { if (authBootstrapView === "signed_out" && !hasUser) preloadSignedOutSteps(window.location); }, [authBootstrapView, hasUser]);
   const leaveResetPassword = useCallback(() => {
     const url = new URL(window.location.href);
     url.searchParams.delete("reset");
@@ -1391,7 +1396,7 @@ export function AppShell() {
     if (secondFactorPending) {
       // A password or Raft Desktop sign-in waits on its second step, wherever
       // it started (sign-in, sign-up's provider buttons, an invite).
-      content = <PendingSecondFactorSignInStep />;
+      content = <Suspense fallback={<SecondFactorStepFrame />}><PendingSecondFactorSignInStep /></Suspense>;
     } else if (urlParams.inviteToken) {
       content = (
         <Landing>
@@ -1431,18 +1436,14 @@ export function AppShell() {
     } else if (authView === "forgot-password") {
       content = <Landing><ForgotPasswordPage onBack={showLogin} /></Landing>;
     } else {
-      content = (
-        <SignInPage
-          onSwitchToRegister={showRegister}
-          onForgotPassword={showForgotPassword}
-          // On a canonical Artifact link, why sign-in: back after #250 because it tells people what's happening
-          // (xxchan, Kirby). The same line whatever the link (private, deleted, never was, not an Artifact's
-          // address), so it can't tell a visitor whether the Artifact exists.
-          purpose={publicArtifactRoute
-            ? formatMessage({ id: "artifacts.permalink.signInPrompt" })
-            : externalLinkPurpose ? formatMessage({ id: externalLinkPurpose }) : undefined}
-        />
-      );
+      // On a canonical Artifact link, why sign-in: back after #250 because it tells people what's happening
+      // (xxchan, Kirby). The same line whatever the link (private, deleted, never was, not an Artifact's
+      // address), so it can't tell a visitor whether the Artifact exists.
+      const purpose = publicArtifactRoute
+        ? formatMessage({ id: "artifacts.permalink.signInPrompt" })
+        : externalLinkPurpose ? formatMessage({ id: externalLinkPurpose }) : undefined;
+      // Drawn as its own frame while its code loads (components/auth/SignInPageFrame.tsx).
+      content = <SignInPage onSwitchToRegister={showRegister} onForgotPassword={showForgotPassword} purpose={purpose} />;
     }
   } else if (urlParams.inviteToken && user.emailVerified && !profileSetupRequired) {
     // Joining needs a verified email and a finished profile (accept-invite
@@ -1521,6 +1522,8 @@ export function AppShell() {
       <ImageLightboxHost />
       <DocumentPreviewHost />
       <MediaPreviewHost />
+      {/* Raft Desktop only: Login with Raft for a page of the built-in browser (desktop_browser_raft_sign_in_v0). */}
+      <DesktopBrowserSignInHost />
       {/* "Verify it's you" before a sensitive action (secondFactorStepUp.ts). */}
       <SecondFactorStepUpHost />
     </>

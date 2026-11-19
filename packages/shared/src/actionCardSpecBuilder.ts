@@ -33,8 +33,13 @@ import {
 } from "./actionCardSpec";
 import { actionCardMsg, actionCardPluralMsg, type ActionCardMessageKey } from "./actionCardMessages";
 import { cardCodePoints } from "./cardElements";
+import { getRuntimeDisplayName } from "./runtimeCatalog";
 import { searchSnippetCharWidth } from "./searchSnippet";
 import { GENERAL_UPGRADE_GATE, type AgentUpgradeCardGate } from "./upgradeGates";
+import {
+  PREPARED_REQUEST_DECISION_FIELD, preparedRequestFormId,
+  type PreparedRequestAction, type PreparedRequestModelValue,
+} from "./preparedRequestCard";
 // Read at call time only (as feedbackMachineEvidence does): index re-exports this module.
 import {
   FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES, FREE_SINGLE_FILE_UPLOAD_LIMIT_BYTES, MAX_FREE_SERVER_HOSTED_JOINT_CHANNELS,
@@ -272,6 +277,10 @@ function agentCreate(action: Of<"agent:create">, names?: ActionCardSpecNames): B
         ...(computer
           ? entityFields("computer", action.requiredComputer ? "actionCard.field.requiredComputer" : "actionCard.field.suggestedComputer", "computer", [computer], names, { mono: true })
           : []),
+        // A suggestion only: the person picks the runtime in the dialog.
+        action.suggestedRuntime
+          ? field("runtime", "actionCard.field.suggestedRuntime", getRuntimeDisplayName(action.suggestedRuntime))
+          : null,
         action.hosting === "antiproton"
           ? field("hosting", "actionCard.field.hosting", action.model
             ? actionCardMsg("actionCard.hostedOnModel", { model: param(action.model) })
@@ -1285,6 +1294,71 @@ export function measureQuestionCard(action: QuestionAskAction, ctx: ActionCardSp
   };
 }
 
+/**
+ * `request:prepare` (RFC 085 §4.4): the route's template copy over its summary
+ * model. The title (verb plus object) takes every model entry by its name;
+ * each entity is an EntityRef, so each viewer's client names what it can see,
+ * and its fallback is what the server named it for everyone in the
+ * conversation (`ctx.names`). Who prepared it and for whom, a notice when it
+ * changed since it was prepared or the last try was refused (its code only),
+ * the template's fields, the agent's note as raw text under Reason, and the
+ * decision form's button with the template's verb.
+ */
+function preparedRequest(action: PreparedRequestAction, ctx: ActionCardSpecBuildContext): Built {
+  const names = ctx.names;
+  const value = (entry: PreparedRequestModelValue): ActionCardSpecEntityRef | string =>
+    entry.kind === "text" ? param(entry.text) : entityParam(entry.kind, entry.id, names);
+  const params = Object.fromEntries(Object.entries(action.summaryModel).map(([name, entry]) => [name, value(entry)]));
+  const fieldValue = (entry: PreparedRequestModelValue): string | ActionCardSpecEntityRef[] => {
+    const shown = value(entry);
+    return typeof shown === "string" ? shown : [shown];
+  };
+  return {
+    icon: "shield",
+    title: actionCardMsg(action.display.title as ActionCardMessageKey, params),
+    body: [
+      ctx.requesterAgentId ? text("preparedFor", actionCardMsg("actionCard.preparedRequest.preparedFor", {
+        agent: entityParam("agent", ctx.requesterAgentId, names),
+        person: entityRef("user", action.addressee.userId, names, action.addressee.handle) ?? param(action.addressee.handle),
+      }), "muted") : null,
+      action.changedAt ? notice("changed", actionCardMsg("actionCard.preparedRequest.changed"), "warning") : null,
+      action.refusal ? notice("refused", actionCardMsg("actionCard.preparedRequest.refused", { code: param(action.refusal.code) }), "warning") : null,
+      group("properties", action.display.fields.map((shown, index) => ({
+        id: `field${index}`,
+        node: { type: "Field", props: { label: actionCardMsg(shown.label as ActionCardMessageKey), value: fieldValue(action.summaryModel[shown.value]!) } },
+      }))),
+      ...reasonParts(action.note),
+      button("decide", action.display.verb as ActionCardMessageKey, { kind: "execute" }),
+    ],
+  };
+}
+
+/**
+ * The decision form of a `request:prepare` card, keyed by the digest the card
+ * shows (preparedRequestFormId): Confirm (the template's verb) or Decline,
+ * with no default. Its frame copy is the owner-action card's, which says the
+ * same: confirming runs it now, as you; declining runs nothing.
+ */
+export function buildPreparedRequestForms(action: PreparedRequestAction): Record<string, ActionCardSpecForm> {
+  const verb = actionCardMsg(action.display.verb as ActionCardMessageKey);
+  const decline = actionCardMsg("actionCard.assistantOwnerAction.form.decline");
+  return {
+    [preparedRequestFormId(action.digest)]: {
+      title: actionCardMsg("actionCard.assistantOwnerAction.form.title"),
+      submitLabel: actionCardMsg("actionCard.assistantOwnerAction.form.submit"),
+      submitLabels: { field: PREPARED_REQUEST_DECISION_FIELD, labels: { confirm: verb, decline } },
+      description: actionCardMsg("actionCard.assistantOwnerAction.form.description"),
+      fields: [{
+        type: "Select",
+        name: PREPARED_REQUEST_DECISION_FIELD,
+        label: actionCardMsg("actionCard.assistantOwnerAction.form.decision"),
+        required: true,
+        options: [{ value: "confirm", label: verb }, { value: "decline", label: decline }],
+      }],
+    },
+  };
+}
+
 function buildBody(action: StoredActionCardAction, ctx: ActionCardSpecBuildContext): Built {
   switch (action.type) {
     case "channel:create": return channelCreate(action, ctx.names);
@@ -1303,6 +1377,7 @@ function buildBody(action: StoredActionCardAction, ctx: ActionCardSpecBuildConte
     case "agent:approve_call": return agentApproveCall(action);
     case "assistant:owner_action": return assistantOwnerAction(action);
     case "question:ask": return questionAsk(action, ctx);
+    case "request:prepare": return preparedRequest(action, ctx);
     default: {
       const unknown: never = action;
       throw new Error(`No action-card.v1 builder for ${(unknown as { type?: unknown }).type}`);
@@ -1395,6 +1470,15 @@ function resultParts(action: StoredActionCardAction, result: ActionCardResult, n
       return questionAnswersResult(action, result);
     case "assistant-owner-action":
       return assistantOwnerActionResult(action, result);
+    case "prepared-request":
+      // Done: the frame's "Committed by" says it. Otherwise how it ended, never the route's answer.
+      switch (result.outcome) {
+        case "success": return null;
+        case "unknown": return [text("summary", actionCardMsg("actionCard.result.assistantOwnerAction.unknown"), "warning")];
+        case "declined": return [text("summary", actionCardMsg("actionCard.result.assistantOwnerAction.declined"))];
+        case "changed_since_prepared": return [text("summary", actionCardMsg("actionCard.preparedRequest.changedUnavailable"), "warning")];
+      }
+      return null;
     case "product-feedback":
       // Where it went, for every viewer, and the sender's way to follow it:
       // an `open` of the result intent feedback_ticket. The card carries no

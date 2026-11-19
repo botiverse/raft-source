@@ -59,7 +59,16 @@ export const FALLBACK_STYLE = {
   },
   summary: { fontFamily: 'var(--font-sans, "Space Grotesk", system-ui, sans-serif)', fontSize: 13, lineHeight: "18px", fontWeight: 600, cursor: "pointer" },
   pre: { margin: 0, whiteSpace: "pre-wrap", overflowWrap: "anywhere", font: "inherit" },
-  detailPre: { margin: "8px 0 0", maxHeight: 192, overflow: "auto", whiteSpace: "pre-wrap", overflowWrap: "anywhere", font: "inherit", color: "var(--foreground-muted, #141111ad)" },
+  detailPre: {
+    margin: "8px 0 0",
+    maxHeight: 192,
+    // raft-ui: native-scroll a <pre> on the root crash screen, which must scroll without the stylesheet or raft-ui loaded (as RootFallbackScroller); permanent, not ScrollArea debt
+    overflow: "auto",
+    whiteSpace: "pre-wrap",
+    overflowWrap: "anywhere",
+    font: "inherit",
+    color: "var(--foreground-muted, #141111ad)",
+  },
   actions: { display: "flex", flexWrap: "wrap", justifyContent: "flex-end", gap: 8, marginTop: 20 },
   // Raft Design System › Button: 44 tall, 8px radius, 15/20 700, never a shadow.
   // The one pink primary per screen…

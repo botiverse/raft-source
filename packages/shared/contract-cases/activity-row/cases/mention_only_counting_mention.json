@@ -1,0 +1,42 @@
+{
+  "formatVersion": 1,
+  "id": "mention_only_counting_mention",
+  "rule": "position",
+  "title": "A counted mention above a mention-only row makes it a normal unread row with the @",
+  "why": "On a conversation that is not muted the server counts a mention like any message (rw_inbox_normal_v5 unread_count has no mention term), so the row's unread_count is no longer NULL.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/shared/src/activityRowPosition.ts (reduceActivityRow; not wired yet, step 2)"
+    ],
+    "server": [
+      "packages/server/src/services/channelService.ts (latestActivitySeqSameSource; the row's latestActivitySeq)",
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (unread_count and latest_seq from one materialized row)"
+    ]
+  },
+  "given": {
+    "row": {
+      "unreadCount": 0,
+      "hasMention": true,
+      "position": "100",
+      "mentionOnly": true
+    }
+  },
+  "steps": [
+    {
+      "act": "liveMessage",
+      "seq": "101",
+      "counts": true,
+      "mentionsViewer": true
+    }
+  ],
+  "expect": {
+    "row": {
+      "unreadCount": 1,
+      "hasMention": true,
+      "position": "101",
+      "mentionOnly": false
+    },
+    "reread": false
+  }
+}

@@ -15,7 +15,14 @@
 //    reminded as untouched until its next real status change;
 //  - new session: the first ask of a new session lists every open task once.
 //
-// A task v2 task in todo / in_progress with no assignee is chased with its
+// Only tasks with activity since the server was first seen with task v2 on
+// (servers.task_v2_on_since, #wg-task-v2:#24): turning task v2 on, or the
+// backfill that makes every older task a task v2 task, must not chase every
+// open task at once. An older task joins when someone picks it up again (its
+// last_activity_at: a status, assignee, title or description change, or a
+// message in its conversation).
+//
+// A task in todo / in_progress with no assignee is chased with its
 // creator, when that is an agent (tygg, #wg-task-v2:4804a9c2). Only "untouched"
 // applies: first at 8h (todo: agents leave split work on the board to be
 // claimed) or 2h (in_progress) of no action by the creator, from its last action
@@ -39,7 +46,7 @@
 // messages of the task's conversation (its own, or a pre-v2 task's host
 // message thread) and of its source message's thread.
 
-import { and, eq, gt, inArray, lt, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, lt, sql } from "drizzle-orm";
 import {
   currentDate,
   formatAgentTaskRef,
@@ -57,7 +64,7 @@ import {
 } from "@botiverse/raft-shared";
 
 import { getDb, type DatabaseExecutor } from "../db/index";
-import { agents, agentTaskNudges, agentTaskNudgeSends, channels, users } from "../db/schema";
+import { agents, agentTaskNudges, agentTaskNudgeSends, channels, servers, users } from "../db/schema";
 import { addTraceEvent } from "../tracing/semanticTrace";
 import { resolveAgentTaskSurfaces, type AgentTaskSurface } from "./agentAssignedTaskSurfaces";
 import * as agentService from "./agentService";
@@ -315,13 +322,38 @@ function toReminderTasks(
   return out;
 }
 
+/**
+ * When this server was first seen with task v2 on (`servers.task_v2_on_since`):
+ * read, or on the first idle evaluation that finds the flag on, set to `now`.
+ * Written only while NULL, so concurrent first evaluations agree on one value
+ * and turning the flag off and on again keeps the first.
+ */
+export async function ensureTaskV2OnSince(serverId: string, now: Date): Promise<Date> {
+  const db = getDb();
+  const [row] = await db.select({ since: servers.taskV2OnSince }).from(servers).where(eq(servers.id, serverId));
+  if (row?.since) return new Date(row.since);
+  await db.update(servers).set({ taskV2OnSince: now }).where(and(eq(servers.id, serverId), isNull(servers.taskV2OnSince)));
+  const [after] = await db.select({ since: servers.taskV2OnSince }).from(servers).where(eq(servers.id, serverId));
+  return after?.since ? new Date(after.since) : now;
+}
+
+/**
+ * The agent's assigned tasks with activity since task v2 was turned on for
+ * this server (`activeSince`), as for the ones with no assignee: the reminder
+ * shares the task v2 flag, and turning it on must not chase every open task
+ * from before at once. An older task joins the first time someone picks it up
+ * again (a status, assignee, title or description change, or a message in its
+ * conversation: `last_activity_at`). By time, not by `isV2Task`, so it holds
+ * after the backfill that makes every older task a task v2 task.
+ */
 async function listAssignedTasks(
   surfaces: Map<string, AgentTaskSurface>,
   agentId: string,
+  activeSince: Date,
   status?: TaskStatus,
 ): Promise<ReminderTask[]> {
   if (surfaces.size === 0) return [];
-  return toReminderTasks(await taskService.listTasksAssignedToAgent([...surfaces.keys()], agentId, status), surfaces, false);
+  return toReminderTasks(await taskService.listTasksAssignedToAgent([...surfaces.keys()], agentId, status, { activeSince }), surfaces, false);
 }
 
 /**
@@ -335,6 +367,7 @@ async function listUnassignedTasks(
   surfaces: Map<string, AgentTaskSurface>,
   agentId: string,
   now: Date,
+  activeSince: Date,
   limit: number,
 ): Promise<ReminderTask[]> {
   if (surfaces.size === 0 || limit <= 0) return [];
@@ -345,6 +378,7 @@ async function listUnassignedTasks(
       todo: new Date(now.getTime() - IDLE_TASK_REMINDER_UNASSIGNED_FIRST_STALE_MS.todo),
       in_progress: new Date(now.getTime() - IDLE_TASK_REMINDER_UNASSIGNED_FIRST_STALE_MS.in_progress),
     },
+    activeSince,
     limit,
   });
   if (rows.length === 0) return [];
@@ -697,8 +731,9 @@ export async function computeIdleTaskReminder(input: {
   if (!(await isIdleTaskReminderEnabled(input.serverId))) return trace(skipped("disabled"), { openTasks: 0 });
 
   const now = input.now ?? currentDate();
+  const activeSince = await ensureTaskV2OnSince(input.serverId, now);
   const surfaces = await resolveAgentTaskSurfaces(input.serverId, input.agentId);
-  const assigned = (await listAssignedTasks(surfaces, input.agentId))
+  const assigned = (await listAssignedTasks(surfaces, input.agentId, activeSince))
     .filter((task) => isOpenStatus(task.status))
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
     .slice(0, IDLE_TASK_REMINDER_MAX_TASKS);
@@ -707,7 +742,7 @@ export async function computeIdleTaskReminder(input: {
   const assignedIds = new Set(assigned.map((task) => task.id));
   const candidates = [
     ...assigned,
-    ...(await listUnassignedTasks(surfaces, input.agentId, now, IDLE_TASK_REMINDER_MAX_TASKS - assigned.length))
+    ...(await listUnassignedTasks(surfaces, input.agentId, now, activeSince, IDLE_TASK_REMINDER_MAX_TASKS - assigned.length))
       .filter((task) => !assignedIds.has(task.id)),
   ];
   if (candidates.length === 0) return trace(skipped("no_open_tasks"), { openTasks: 0 });
@@ -785,7 +820,7 @@ export async function computeIdleTaskReminder(input: {
     reason: decision.reason,
     why: formatIdleTaskReminderWhy(decision.why),
   }));
-  const backlog: AgentApiTaskIdleNudgeBacklogItem[] = (await listAssignedTasks(surfaces, input.agentId, BACKLOG_STATUS))
+  const backlog: AgentApiTaskIdleNudgeBacklogItem[] = (await listAssignedTasks(surfaces, input.agentId, activeSince, BACKLOG_STATUS))
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
     .slice(0, IDLE_TASK_REMINDER_MAX_BACKLOG)
     .map((task) => ({ ref: task.ref, taskNumber: task.taskNumber, channel: task.channelRef, title: task.title }));

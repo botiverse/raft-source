@@ -15,7 +15,10 @@
  * default on) narrows `thread` alone: off, a followed-thread or
  * task-conversation reply notifies only when it @mentions the receiver
  * (normally such a reply is already category `mention`). Following, Activity
- * and its unread count are not decided here and stay as they are.
+ * and its unread count are not decided here and stay as they are. The switch
+ * counts only where its flag (notification_followed_thread_replies_switch,
+ * followedThreadRepliesSwitch.ts) is on for the receiver: off, the default,
+ * it is on for everyone whatever is stored.
  *
  * Quiet (paused, or inside the daily quiet hours) overrides every level: no
  * alert anywhere, only the badge sync. `test` skips the policy.
@@ -55,6 +58,11 @@ export interface NotificationPolicyInput {
   /** The receiver is @mentioned in the message (a DM row with personal_mention). */
   mentioned?: boolean;
   account: Pick<NotificationAccountSettings, "pausedUntil" | "quietHours"> & Partial<Pick<NotificationAccountSettings, "followedThreadReplies">>;
+  /**
+   * The followed-thread switch's flag is on for the receiver. Absent / false:
+   * `account.followedThreadReplies` is ignored and reads as on.
+   */
+  followedThreadRepliesSwitch?: boolean;
   /** A security notice (file comment): notifies past the level and quiet hours. Honored only for `system_notice`. */
   securityNotice?: boolean;
 }
@@ -98,7 +106,9 @@ export function decideNotification(input: NotificationPolicyInput, now: Date): N
     thread: null,
     muted: false,
   });
-  const options = { followedThreadReplies: input.account.followedThreadReplies, mentioned: input.mentioned };
+  // The switch is not offered while its flag is off: a stored off is kept, not obeyed.
+  const followedThreadReplies = input.followedThreadRepliesSwitch === true ? input.account.followedThreadReplies : true;
+  const options = { followedThreadReplies, mentioned: input.mentioned };
   if (!categoryNotifiesAt(input.category, input.personal, level, options)) {
     // The level would notify; only the followed-thread switch held it back.
     if (categoryNotifiesAt(input.category, input.personal, level)) return { kind: "suppressed", reason: "followed_thread_replies_off" };
@@ -116,6 +126,8 @@ export interface NotificationPolicyPrefs {
   serverLevel: ReadonlyMap<string, NotificationLevel>;
   channelLevel: ReadonlyMap<string, NotificationLevel>;
   mutedFromSeq: ReadonlyMap<string, number | null>;
+  /** Receivers for whom the followed-thread switch's flag is on (only asked for those who stored it off). */
+  followedThreadRepliesSwitch: ReadonlySet<string>;
 }
 
 /** The parts of one outbox row (and its event) the decision reads. */
@@ -160,6 +172,7 @@ export function decide(
     muted: row.levelChannelId ? isMutedFor(prefs.mutedFromSeq.get(userKey(row.levelChannelId)), row.levelChannelSeq) : false,
     mentioned: row.mentioned,
     account: prefs.account.get(row.receiverId) ?? defaults,
+    followedThreadRepliesSwitch: prefs.followedThreadRepliesSwitch.has(row.receiverId),
     securityNotice: row.securityNotice,
   }, now);
 }

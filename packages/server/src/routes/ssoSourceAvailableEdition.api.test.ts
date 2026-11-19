@@ -9,6 +9,7 @@ import { EnterpriseSsoUnavailableError } from "../services/sso/ssoEdition";
 import { forgetSsoRequirementCache } from "../services/sso/ssoEnforcement";
 import { completeSsoSignIn, finishSsoSecondStep } from "../services/sso/ssoSignIn";
 import type { SessionIssueProof } from "../services/sessionIssueGate";
+import { setEditionForTest } from "../test/edition";
 import { createApiTest } from "../test/integration/apiTest";
 import { fixturePasswordHash } from "../test/integration/credentials";
 
@@ -19,15 +20,7 @@ import { fixturePasswordHash } from "../test/integration/credentials";
 
 const test = createApiTest();
 
-// The edition line export-snapshot rewrites (edition.ts), switched per test.
-const edition = vi.hoisted(() => ({ value: "cloud" as "cloud" | "source-available" }));
-vi.mock("../edition", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../edition")>();
-  return { ...actual, enterpriseSsoAllowed: () => actual.enterpriseSsoAllowed(edition.value) };
-});
-
 afterEach(() => {
-  edition.value = "cloud";
   forgetSsoRequirementCache();
 });
 
@@ -148,7 +141,7 @@ async function me(baseUrl: string, token: string): Promise<Probe> {
 
 test("the source-available edition offers no SSO, refuses every SSO route, and enforces no requirement", async ({ app }) => {
   const s = await setup();
-  edition.value = "source-available";
+  setEditionForTest("source-available");
 
   assert.equal(await ssoOffered(app.baseUrl), false);
 

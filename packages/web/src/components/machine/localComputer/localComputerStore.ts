@@ -37,6 +37,11 @@ export interface LocalComputerSnapshot {
    * (refreshLocalComputerHost) and when the window regains focus.
    */
   host: DesktopComputerHostState | null;
+  /**
+   * The last host-state read failed (the shell has it, the read rejected):
+   * its status is unknown, never guessed from the service status.
+   */
+  hostReadFailed: boolean;
   /** An Add This Mac (install, attach, start) is in flight from this app, on any surface. */
   enabling: boolean;
   /** The last failed operation (a code only an operation reveals, e.g. a duplicate key), until one succeeds. */
@@ -47,13 +52,15 @@ export interface LocalComputerSnapshot {
   ready: boolean;
 }
 
-const EMPTY: LocalComputerSnapshot = { status: null, hostname: null, host: null, enabling: false, lastError: null, machineIds: [], ready: false };
+const EMPTY: LocalComputerSnapshot = { status: null, hostname: null, host: null, hostReadFailed: false, enabling: false, lastError: null, machineIds: [], ready: false };
 
 let snapshot: LocalComputerSnapshot = EMPTY;
 const listeners = new Set<() => void>();
 let disconnect: (() => void) | null = null;
 /** Read the host state again now; a no-op while nothing reads the store. */
 let refreshNow: (() => void) | null = null;
+/** Read everything again (Retry): the host state, the status and, if it is missing, the local info. */
+let rereadAll: (() => Promise<void>) | null = null;
 
 /** The bridge's computer capability: what reports the local identity (any desktop build). */
 export function getLocalComputerBridge(): DesktopComputerBridge | null {
@@ -93,15 +100,19 @@ function connect(computer: DesktopComputerBridge): () => void {
   };
   const fail = (read: BridgeRead) => (error: unknown) => {
     reportReadFailure(read, error);
-    // Answered, with the value unknown (host null: no host controls).
-    answer(read, {});
+    // Answered, with the value unknown (host null: no host controls; This
+    // device says it could not read it, with Try again).
+    answer(read, read === "getHostState" ? { hostReadFailed: true } : {});
   };
-  const applyHost = (host: DesktopComputerHostState | null) => answer("getHostState", { host: host ?? null });
-  const readHost = () => {
-    if (typeof computer.getHostState !== "function") return answer("getHostState", {});
-    void computer.getHostState().then(applyHost, fail("getHostState"));
+  const applyHost = (host: DesktopComputerHostState | null) => answer("getHostState", { host: host ?? null, hostReadFailed: false });
+  const readHost = (): Promise<void> => {
+    if (typeof computer.getHostState !== "function") {
+      answer("getHostState", {});
+      return Promise.resolve();
+    }
+    return computer.getHostState().then(applyHost, fail("getHostState"));
   };
-  refreshNow = readHost;
+  refreshNow = () => { void readHost(); };
   const applyStatus = (status: DesktopComputerStatus | null) => {
     if (!alive) return;
     const machineIds = machineIdsOf(status ?? null);
@@ -113,28 +124,41 @@ function connect(computer: DesktopComputerBridge): () => void {
     const running = status?.service?.running;
     if (running !== lastRunning) {
       lastRunning = running;
-      readHost();
+      void readHost();
     }
   };
-  if (typeof computer.getLocalInfo === "function") {
-    void computer.getLocalInfo().then(
+  const readLocalInfo = (): Promise<void> => {
+    if (typeof computer.getLocalInfo !== "function") {
+      answer("getLocalInfo", {});
+      return Promise.resolve();
+    }
+    return computer.getLocalInfo().then(
       (info) => answer("getLocalInfo", { hostname: info?.hostname ?? null }),
       fail("getLocalInfo"),
     );
-  } else {
-    answer("getLocalInfo", {});
-  }
-  if (typeof computer.getStatus === "function") void computer.getStatus().then(applyStatus, fail("getStatus"));
-  else answer("getStatus", {});
-  readHost();
+  };
+  const readStatus = (): Promise<void> => {
+    if (typeof computer.getStatus !== "function") {
+      answer("getStatus", {});
+      return Promise.resolve();
+    }
+    return computer.getStatus().then(applyStatus, fail("getStatus"));
+  };
+  rereadAll = async () => {
+    await Promise.all([readHost(), readStatus(), snapshot.hostname === null ? readLocalInfo() : Promise.resolve()]);
+  };
+  void readLocalInfo();
+  void readStatus();
+  void readHost();
   const unsubscribe = typeof computer.onStatus === "function" ? computer.onStatus(applyStatus) : () => {};
   const unsubscribeHost = typeof computer.onHostState === "function" ? computer.onHostState(applyHost) : () => {};
   // Installed or updated from a terminal meanwhile: it shows once the window is back.
-  const onFocus = () => readHost();
+  const onFocus = () => { void readHost(); };
   if (typeof window !== "undefined") window.addEventListener("focus", onFocus);
   return () => {
     alive = false;
     refreshNow = null;
+    rereadAll = null;
     unsubscribe();
     unsubscribeHost();
     if (typeof window !== "undefined") window.removeEventListener("focus", onFocus);
@@ -185,6 +209,11 @@ export function getLocalComputerSnapshot(): LocalComputerSnapshot {
 /** Read the host state again (after an operation). */
 export function refreshLocalComputerHost(): void {
   refreshNow?.();
+}
+
+/** Try again: read the host state, the status (and the local info, if missing) again; settles once each answered. */
+export function rereadLocalComputer(): Promise<void> {
+  return rereadAll?.() ?? Promise.resolve();
 }
 
 /**

@@ -101,7 +101,7 @@ test("a reply behind the window opens its thread, focused on it, and the channel
     await flushAsyncWork();
 
     assert.deepEqual(openRequests, [{ parentChannelId: CHANNEL_ID, parentMessageId: "p-old", focusedMessageId: "r-old" }]);
-    assert.deepEqual(h.getCalls(), [`/messages/context/r-old`, `/messages/channel/${CHANNEL_ID}?limit=50`]);
+    assert.deepEqual(h.getCalls(), [`/messages/context/r-old`, `/messages/channel/${CHANNEL_ID}?limit=50&threadPreviewChars=200`]);
     assert.notEqual(h.snapshot(CHANNEL_ID).contextLoadError, CONTEXT_BEYOND_HISTORY_ERROR, "the channel is not the reply's paywall");
     assert.equal(useHiddenHistoryStore.getState().targetByChannel[CHANNEL_ID], undefined);
   } finally {
@@ -140,7 +140,7 @@ test("a remembered position that is gone opens at the latest messages, not an em
     await h.loadMessageWindowSilent(CHANNEL_ID, "m-aged-out");
     await flushAsyncWork();
 
-    assert.deepEqual(h.getCalls(), [`/messages/context/m-aged-out`, `/messages/channel/${CHANNEL_ID}?limit=50`]);
+    assert.deepEqual(h.getCalls(), [`/messages/context/m-aged-out`, `/messages/channel/${CHANNEL_ID}?limit=50&threadPreviewChars=200`]);
     assert.deepEqual(h.snapshot(CHANNEL_ID).messageIds, ["m-40", "m-41"]);
     assert.equal(useMessageStore.getState().loading, false);
   } finally {

@@ -5,8 +5,8 @@
 //
 // Raft Design System: a dialog with several fields, a sheet on a phone
 // (raft-ui Dialog + DialogSheetContent: the commit moves to the head, × is
-// Cancel); labels above, help or the error under each field; required fields
-// take the asterisk, optional ones "(optional)". Checks run on submit, not
+// Cancel); labels above, help or the error under each field; optional fields
+// say "(optional)", required ones carry no mark. Checks run on submit, not
 // while typing (Forms › Validation): the client's are only required and
 // lengths (checkActionCardFormValues), the server's come back as 422 issues
 // under their field, or in an orange banner for the whole form, as does any
@@ -37,14 +37,6 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
 import type { ChangeEvent, FormEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
 import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogBody,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
   Banner,
   Button,
   Card,
@@ -53,6 +45,7 @@ import {
   DialogBody,
   DialogClose,
   DialogCommit,
+  DialogContent,
   DialogDescription,
   DialogFooter,
   DialogHeader,
@@ -66,7 +59,6 @@ import {
   FieldLabel,
   Input,
   Label,
-  LabelAsterisk,
   ScrollArea,
   Select,
   SelectContent,
@@ -377,20 +369,21 @@ export function ActionCardFormSheet({ formId, form, channelId, canSubmit, submit
             )}
           </DialogFooter>
         </form>
-        <AlertDialog open={confirmDiscard} onOpenChange={handleDiscardOpenChange}>
-          <AlertDialogContent data-action-card-form-discard="">
-            <AlertDialogHeader>
-              <AlertDialogTitle>{formatMessage({ id: "message.chatPanel.overflow.unsavedTitle" })}</AlertDialogTitle>
-            </AlertDialogHeader>
-            <AlertDialogBody>{formatMessage({ id: "agent.detail.editProfile.discardBody" })}</AlertDialogBody>
-            <AlertDialogFooter>
-              <AlertDialogCancel size="lg">{formatMessage({ id: "message.chatPanel.overflow.keepEditing" })}</AlertDialogCancel>
-              <AlertDialogAction variant="danger" size="lg" onClick={handleDiscard}>
-                {formatMessage({ id: "message.chatPanel.overflow.discardChanges" })}
-              </AlertDialogAction>
-            </AlertDialogFooter>
-          </AlertDialogContent>
-        </AlertDialog>
+        <Dialog open={confirmDiscard} onOpenChange={handleDiscardOpenChange}>
+          <DialogContent size="sm" data-action-card-form-discard="">
+            <DialogHeader>
+              <DialogTitle>{formatMessage({ id: "agent.detail.editProfile.discardTitle" })}</DialogTitle>
+              <DialogClose aria-label={formatMessage({ id: "common.confirm.closeDialog" })} />
+            </DialogHeader>
+            <DialogBody>{formatMessage({ id: "agent.detail.editProfile.discardBody" })}</DialogBody>
+            <DialogFooter>
+              <DialogClose render={<Button variant="ghost" size="lg" />}>{formatMessage({ id: "message.chatPanel.overflow.keepEditing" })}</DialogClose>
+              <Button variant="danger" size="lg" onClick={handleDiscard}>
+                {formatMessage({ id: "agent.detail.editProfile.discard" })}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </DialogSheetContent>
     </Dialog>
   );
@@ -424,7 +417,7 @@ interface ControlProps {
   attempted: boolean;
 }
 
-/** One field: its label (asterisk or "(optional)"), the control, then its help or its error. */
+/** One field: its label ("(optional)" unless required), the control, then its help or its error. */
 function FormFieldControl({ id, field, value, issue, channelId, disabled, onChange, advance, attempted }: ControlProps) {
   const invalid = issue !== null;
   const helpId = `${id}-help`;
@@ -489,7 +482,7 @@ interface TextControlProps {
 /** No native maxLength: an over-long value stays visible and its error says the limit. */
 function TextFieldControl({ id, field, value, placeholder, invalid, disabled, describedBy, onChange }: TextControlProps) {
   const change = useCallback((event: ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => onChange(field.name, event.target.value), [field.name, onChange]);
-  const common = { id, value, onChange: change, placeholder, readOnly: disabled, "aria-describedby": describedBy, "data-invalid": invalid || undefined };
+  const common = { id, value, onChange: change, placeholder, readOnly: disabled, "aria-describedby": describedBy, "aria-required": field.required || undefined, "data-invalid": invalid || undefined };
   return field.type === "TextInput"
     ? <Input {...common} autoComplete="off" />
     : <Textarea {...common} rows={field.rows ?? 4} />;
@@ -509,7 +502,7 @@ function ToggleFieldControl({ id, name, checked, disabled, describedBy, onChange
 
 function FormFieldLabel({ htmlFor, label, required }: { htmlFor: string; label: ActionCardSpecMsg; required: boolean | undefined }) {
   return (
-    <FieldLabel htmlFor={htmlFor} required={required === true || undefined}>
+    <FieldLabel htmlFor={htmlFor}>
       <ActionCardPlainText value={label} />
       {required === false ? <OptionalMark /> : null}
     </FieldLabel>
@@ -568,6 +561,7 @@ function SelectFieldControl({ id, field, value, placeholder, invalid, disabled, 
         status={invalid ? "error" : undefined}
         aria-describedby={describedBy}
         aria-invalid={invalid || undefined}
+        aria-required={field.required || undefined}
         emptyContent={formatMessage({ id: "ui.selectionPopover.emptyLabel" })}
         messages={comboboxMessages}
         showArrow
@@ -583,7 +577,7 @@ function SelectFieldControl({ id, field, value, placeholder, invalid, disabled, 
       items={items}
       disabled={disabled}
     >
-      <SelectTrigger id={id} aria-describedby={describedBy} data-invalid={invalid || undefined}>
+      <SelectTrigger id={id} aria-describedby={describedBy} aria-required={field.required || undefined} data-invalid={invalid || undefined}>
         {/* An optional Select shows None when empty; a required one asks to choose. */}
         <SelectValue placeholder={optional ? noneLabel : placeholderText} />
         <SelectIcon />
@@ -634,7 +628,7 @@ function PickerFieldControl({ id, field, value, issue, channelId, disabled, onCh
     <div className={`flex flex-col gap-1.5 ${PROBLEM_SCROLL_MARGIN}`} data-action-card-form-field={field.name} data-invalid={invalid || undefined}>
       <Label render={<span id={labelId} />} className="block cursor-auto">
         <ActionCardPlainText value={field.label} />
-        {field.required ? <LabelAsterisk className="ml-1" /> : <OptionalMark />}
+        {field.required ? null : <OptionalMark />}
       </Label>
       {field.type === "ChannelPicker" ? (
         <ChannelPickerField field={field} value={value} invalid={invalid} disabled={disabled} labelId={labelId} describedBy={describedBy} onChange={change} />

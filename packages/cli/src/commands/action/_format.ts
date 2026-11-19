@@ -1,5 +1,5 @@
-import type { RaftQuestionWithdrawal } from "@botiverse/raft-shared";
-import { formatAgentQuestionAnsweredFirst, formatAgentQuestionWithdrawn } from "@botiverse/raft-shared/src/agentCliSurface";
+import type { AgentApiActionOperationsResponse, RaftQuestionWithdrawal } from "@botiverse/raft-shared";
+import { formatAgentQuestionAnsweredFirst, formatAgentQuestionWithdrawn, formatPreparableOperations } from "@botiverse/raft-shared/src/agentCliSurface";
 
 import { axSurface } from "../../core/renderer";
 
@@ -48,5 +48,41 @@ export const formatQuestionCardAnsweredFirst = axSurface(
         },
       }],
     }],
+  },
+);
+
+const OPERATIONS: AgentApiActionOperationsResponse = {
+  enabled: true,
+  operations: [
+    {
+      operation: "agent:start",
+      summary: "Start a stopped agent on the Computer it is assigned to.",
+      args: [{ name: "agent", description: "the agent's handle, as `raft server info --agents` lists it", required: true }],
+      confirmer: "any server member except a guest",
+      personSees: { title: "Start <agent>", button: "Start agent" },
+      example: { agent: "@builder" },
+    },
+    {
+      operation: "channel:remove_admin",
+      summary: "Make a channel admin an ordinary member of the channel (never the other way).",
+      args: [
+        { name: "channel", description: "the channel, as #name", required: true },
+        { name: "member", description: "the channel admin's handle (@name; @name~human or @name~agent when a person and an agent share it)", required: true },
+      ],
+      confirmer: "a server owner or admin, or a channel admin of that channel",
+      personSees: { title: "Remove channel admin from <member> in <channel>", button: "Remove channel admin" },
+      example: { channel: "#ops", member: "@alice" },
+    },
+  ],
+};
+
+export const formatPreparableOperationsList = axSurface(
+  "Output of `raft action prepare --list`: the operations this agent may prepare as a request card (request:prepare) on its server, their args, whom to ask and what the person sees, ending with the command that prepares one; or, with none, what to do instead.",
+  (data: AgentApiActionOperationsResponse): string => formatPreparableOperations(data),
+  {
+    examples: [
+      { title: "listed", args: [OPERATIONS] },
+      { title: "request cards off", args: [{ enabled: false, operations: [] }] },
+    ],
   },
 );

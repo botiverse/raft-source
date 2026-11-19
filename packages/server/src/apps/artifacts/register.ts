@@ -19,7 +19,7 @@ import { pruneUnreferencedArtifactBlobs } from "./blobs";
 import { receiveArtifactObjectStorage } from "./blobStore";
 import { checkShotReadable } from "./checks";
 import { expireStaleChecks } from "./checkTask";
-import { ARTIFACT_OBJECT_EVENTS, ARTIFACT_OBJECT_KIND, ARTIFACT_OBJECT_TABLES } from "./kinds";
+import { ARTIFACT_OBJECT_EVENTS, ARTIFACT_OBJECT_KIND, ARTIFACT_OBJECT_TABLES, ARTIFACTS_SYSTEM_APP } from "./kinds";
 import { mountArtifactAgentApi, mountArtifactInternals, mountArtifactPublicWebApi, mountArtifactWebApi } from "./mount";
 import { mountArtifactPublicPage } from "./publicPage";
 import { artifactNoticeDeliveryVerdicts, flushDueArtifactNotices } from "./notices";
@@ -65,7 +65,7 @@ export const artifactsApp: FirstPartyApp = {
     // A channel's announcement (channel_announcement_v0): one Artifact homed in the channel; core shows its title, version and last change.
     channelAnnouncement: { headlines: (ids, reader) => artifactHeadlines(ids, reader) },
   }],
-  systemApp: "system.artifacts",
+  systemApp: ARTIFACTS_SYSTEM_APP,
   agentNotice: {
     schema: artifactAgentNoticeSchema,
     // An agent that can no longer see the Artifact (or whose server has the flag off) gets nothing.

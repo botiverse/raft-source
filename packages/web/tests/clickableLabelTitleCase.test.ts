@@ -46,6 +46,8 @@ const NAMES = new Set([
   // Product, brand and platform names (the rule's list, and those labels use)
   "Raft", "Stamp", "Porthole", "Slack", "Google", "Apple", "Claude", "Codex", "Pi", "Markdown",
   "Stripe", "Alipay", "Android", "Windows", "Mac", "Linux", "Intel", "Chinese", "Cindy",
+  // "How did you hear about Raft?" options
+  "Reddit",
   // Plans
   "Pro", "Free",
   // Feature, destination and view names registered in raft-design's
@@ -64,6 +66,7 @@ const PHRASES = [
   "Agent Lounge", "Raft Computer", "Raft Desktop", "Claude Code", "Kimi Code", "Google Play", "App Store", "Google Cloud",
   "Home Screen", "Boring Gray", "Raft Yellow", "Microsoft Entra", "Slock Manual", "System Settings",
   "AppSumo Lifetime Pro",
+  "Hacker News",
   // Key names, as the keyboard shortcuts panel spells them
   "Up Arrow", "Down Arrow", "Left Arrow", "Right Arrow", "Left Bracket", "Right Bracket", "Single Quote",
 ].map((phrase) => phrase.split(" "));
@@ -170,6 +173,7 @@ function isTitleCased(label: string): boolean {
 }
 
 const CLICKABLE_LABEL_IDS = [
+  "members.page.editAgentMenu",
   "avatar.edit.upload",
   "avatar.edit.build",
   "avatar.builder.shuffle",
@@ -309,6 +313,7 @@ const CLICKABLE_LABEL_IDS = [
   "agent.detail.copySetup",
   "agent.detail.copyStep",
   "agent.detail.deleteAgent",
+  "agent.detail.editProfile.discard",
   "agent.detail.diagnosticInfoCopied",
   "agent.detail.externalTokenConfirmRevoke",
   "agent.detail.externalTokenCopy",
@@ -564,6 +569,8 @@ const CLICKABLE_LABEL_IDS = [
   "layout.systemNotifications.feedbackRepliesView",
   "layout.systemNotifications.seatJoinAddSeats",
   "layout.systemNotifications.seatJoinAskOwner",
+  "layout.referralPrompt.skip",
+  "layout.referralPrompt.submit",
   "machine.add.upgradeForMore",
   "machine.add.yourComputer",
   "machine.commandGuide.windowsX64",
@@ -799,6 +806,7 @@ const CLICKABLE_LABEL_IDS = [
   "settings.account.saveProfile",
   "settings.account.sendSetupEmail",
   "settings.account.setPasswordByEmail",
+  "settings.account.signedInDevices.leftoversButton",
   "settings.admins.removeAdmin",
   "settings.admins.removeOwner",
   "settings.admins.updateRole",
@@ -810,6 +818,10 @@ const CLICKABLE_LABEL_IDS = [
   "settings.connectedApps.appIdentity.viewProfile",
   "settings.connectedApps.appNotifications.approveUpdate",
   "settings.connectedApps.appNotifications.rotateSecret",
+  "settings.connectedApps.cardButtons.allow",
+  "settings.connectedApps.cardButtons.allowAgain",
+  "settings.connectedApps.cardButtons.allowDialog.confirm",
+  "settings.connectedApps.cardButtons.revoke",
   "settings.connectedApps.createLink",
   "settings.connectedApps.deleteApp",
   "settings.connectedApps.editor.regenerateClientSecret",
@@ -869,6 +881,11 @@ const CLICKABLE_LABEL_IDS = [
   "settings.twoStep.downloadCodes",
   "settings.twoStep.regenerate",
   "settings.twoStep.signInAgainButton",
+  // Can't verify? on a lost device's step-up (#triage:#386).
+  "settings.twoStep.resetPasswordByEmail",
+  "settings.twoStep.setPasswordByEmail",
+  "settings.twoStep.signOutAllWithPassword",
+  "settings.twoStep.signOutWithPassword",
   "settings.twoStep.turnOff",
   "settings.twoStep.turnOn",
   "settings.twoStep.useAuthenticatorCode",

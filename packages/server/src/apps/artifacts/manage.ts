@@ -670,6 +670,7 @@ async function agentRefusal(agent: ArtifactAgent, item: ArtifactItemRow, refusal
     case "name_taken": return fail(409, {
       code: "NAME_TAKEN",
       error: "Another artifact visible to the whole server already has this artifact's name, so it can't move there: ask the other one's author or a server admin whether it can be deleted, then move this one again.",
+      next: RAFT_HINTS.artifactMove({ artifact: item.id }),
       details: { name: refusal.name },
     });
     // Making a public Artifact private again, or moving one to a smaller home, is a person's step: no agent route reaches unpublishArtifact or narrowArtifactHome.

@@ -170,6 +170,10 @@ test("task v2: the task conversations flag teaches raft task reply/read/view; of
   // asked, answer people where they spoke, hand the task to whoever it waits on.
   expect(on).toContain("first reply in that message's thread to confirm it, in a line or two: what you understood the ask to be and what you will do");
   expect(on).toContain("**Answer people where they spoke.**");
+  // Same work asked about in several places: result once, a link in each other place (Hands fdab1018).
+  expect(on).toContain("Say each thing in one place per person.");
+  expect(on).toContain("If you are doing the work or handed it to someone, and it was also asked about");
+  expect(on).toContain("make sure the result is posted in one place and a one-line link to it in each other place someone asked");
   expect(on).toContain("**The assignee is who the task waits on now**");
   expect(on).not.toContain("**Claim rule:**");
   expect(baseline).not.toContain("**Answer people where they spoke.**");

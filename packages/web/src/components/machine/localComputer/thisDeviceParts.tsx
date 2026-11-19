@@ -8,18 +8,18 @@ import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogBody,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
+  Button,
   CopyableCode,
   CopyableCodeAction,
   CopyableCodeRoot,
+  Dialog,
+  DialogBody,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
 } from "@botiverse/raft-ui";
 import type { ButtonProps } from "@botiverse/raft-ui";
 import SectionEyebrow from "../../ui/SectionEyebrow";
@@ -74,7 +74,8 @@ export function TechnicalDetails({ text }: { text: string }) {
 }
 
 /**
- * A confirmation (raft-ui AlertDialog): the commit button's colour says the
+ * A confirmation (raft-ui Dialog at size sm; AlertDialog is only for the
+ * confirmations Raft Chat lists): the commit button's colour says the
  * consequence (warning: interrupts but can be recovered). `secondary` is a
  * second way to go on (Stop now beside Stop when finished).
  */
@@ -91,26 +92,27 @@ export function ThisDeviceConfirm({ title, body, confirmLabel, confirmVariant = 
   const { formatMessage } = useIntl();
   const onOpenChange = useCallback((open: boolean) => { if (!open) onClose(); }, [onClose]);
   return (
-    <AlertDialog open onOpenChange={onOpenChange}>
-      <AlertDialogContent data-testid={testId}>
-        <AlertDialogHeader>
-          <AlertDialogTitle>{title}</AlertDialogTitle>
-        </AlertDialogHeader>
-        <AlertDialogBody>
-          <AlertDialogDescription>{body}</AlertDialogDescription>
-        </AlertDialogBody>
-        <AlertDialogFooter>
-          <AlertDialogCancel size="md">{formatMessage({ id: "common.confirm.cancel" })}</AlertDialogCancel>
+    <Dialog open onOpenChange={onOpenChange}>
+      <DialogContent size="sm" data-testid={testId}>
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+          <DialogClose aria-label={formatMessage({ id: "common.confirm.closeDialog" })} />
+        </DialogHeader>
+        <DialogBody>
+          <DialogDescription>{body}</DialogDescription>
+        </DialogBody>
+        <DialogFooter>
+          <DialogClose render={<Button variant="ghost" size="md" />}>{formatMessage({ id: "common.confirm.cancel" })}</DialogClose>
           {secondary ? (
-            <AlertDialogAction size="md" variant={secondary.variant ?? "outline"} onClick={secondary.onClick} data-testid={testId ? `${testId}-secondary` : undefined}>
+            <Button size="md" variant={secondary.variant ?? "outline"} onClick={secondary.onClick} data-testid={testId ? `${testId}-secondary` : undefined}>
               {secondary.label}
-            </AlertDialogAction>
+            </Button>
           ) : null}
-          <AlertDialogAction size="md" variant={confirmVariant} onClick={onConfirm} data-testid={testId ? `${testId}-confirm` : undefined}>
+          <Button size="md" variant={confirmVariant} onClick={onConfirm} data-testid={testId ? `${testId}-confirm` : undefined}>
             {confirmLabel}
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

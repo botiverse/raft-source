@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import {
   CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY,
   type RuntimeAccountUsageProvider,
@@ -382,4 +382,87 @@ test("Claude reads and redeems are rate-limited per person and Computer; over th
   assert.equal(await codeOf(redeemLimited), "rate_limited");
   assert.equal(fake.redeems.length, 10);
   assert.equal((await api.redeem(tokens.attacher, { idempotencyKey: KEY }, "codex")).status, 200, "Codex is not counted");
+});
+
+// #otter-lounge:#1: CloudFront closes a request that sends nothing for 30 s;
+// a Claude read took ~34 s. With `respondAsync` the route answers 202 at once
+// and the answer it would have had is read from GET …/machine-operations/:id.
+test("respondAsync: read and redeem answer 202 at once; the operation gives the same status and body, to the starter only", async ({ app }) => {
+  const { server, machine, tokens } = await seedComputer("clr-async");
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const fake = fakeOrchestrator({
+    read: async () => {
+      await held;
+      return { type: "machine:runtime_account_usage:limit_resets:read:result", requestId: "r", result: { kind: "unsupported", reason: "consent_required" } };
+    },
+  });
+  app.app.set("agentOrchestrator", fake.orchestrator);
+  const api = routes(app.baseUrl, server.id, machine.id);
+  const headers = (token: string) => ({ Authorization: `Bearer ${token}`, "X-Server-Id": server.id });
+  const operation = (token: string, id: string) => fetch(`${app.baseUrl}/api/servers/${server.id}/machine-operations/${id}`, { headers: headers(token) });
+
+  const started = await api.read(tokens.attacher, { respondAsync: true });
+  assert.equal(started.status, 202, "answered while the Computer is still reading");
+  const { operationId } = await started.json() as { operationId: string };
+  assert.deepEqual(await (await operation(tokens.attacher, operationId)).json(), { state: "pending" });
+  assert.equal((await operation(tokens.owner, operationId)).status, 404, "only the person who started it");
+  assert.equal((await operation(tokens.attacher, "00000000-0000-4000-8000-000000000000")).status, 404);
+
+  release();
+  let view: { state: string; status?: number; body?: unknown } = { state: "pending" };
+  for (let i = 0; i < 50 && view.state === "pending"; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    view = await (await operation(tokens.attacher, operationId)).json() as typeof view;
+  }
+  assert.deepEqual(view, { state: "done", status: 200, body: { result: { kind: "unsupported", reason: "consent_required" } } });
+
+  // A redeem's timeout is kept as the 504 the direct request answers.
+  app.app.set("agentOrchestrator", fakeOrchestrator({ redeem: async () => { throw new RouteFailureError("daemon_timeout", "timed out"); } }).orchestrator);
+  const redeem = await api.redeem(tokens.attacher, { idempotencyKey: KEY, kind: "weekly", respondAsync: true });
+  assert.equal(redeem.status, 202);
+  const redeemId = (await redeem.json() as { operationId: string }).operationId;
+  let done: { state: string; status?: number; body?: { code?: string } } = { state: "pending" };
+  for (let i = 0; i < 50 && done.state === "pending"; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    done = await (await operation(tokens.attacher, redeemId)).json() as typeof done;
+  }
+  assert.equal(done.status, 504);
+  assert.equal(done.body?.code, "computer_timeout");
+
+  // A request's own refusals still answer at once, never as an operation.
+  const refused = await api.redeem(tokens.attacher, { idempotencyKey: KEY, respondAsync: true });
+  assert.equal(refused.status, 400);
+  assert.equal(await codeOf(refused), "kind_required");
+});
+
+test("a completed machine operation stays bound to its original Server after the starter leaves", async ({ app }) => {
+  const slug = `operation-tenant-${randomUUID().slice(0, 8)}`;
+  const { server, machine, tokens } = await seedComputer(slug);
+  app.app.set("agentOrchestrator", fakeOrchestrator().orchestrator);
+  const api = routes(app.baseUrl, server.id, machine.id);
+  const started = await api.read(tokens.attacher, { respondAsync: true });
+  assert.equal(started.status, 202);
+  const { operationId } = await started.json() as { operationId: string };
+  const read = (serverId: string) => fetch(`${app.baseUrl}/api/servers/${serverId}/machine-operations/${operationId}`, {
+    headers: { Authorization: `Bearer ${tokens.attacher}`, "X-Server-Id": serverId },
+  });
+  let view: { state?: string; status?: number } = {};
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const own = await read(server.id);
+    assert.equal(own.status, 200, "the authorized starter can read the originating operation");
+    view = await own.json() as typeof view;
+    if (view.state === "done") break;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.equal(view.state, "done");
+  assert.equal(view.status, 200);
+  assert.equal((await read(server.id.toUpperCase())).status, 200, "the same Server UUID may use another letter case");
+  const [starter] = await getDb().select({ id: users.id }).from(users).where(eq(users.email, `attacher-${slug}@slock.test`));
+  const other = await createServer("Another Server", `${slug}-other`, starter!.id);
+  await getDb().delete(serverMembers).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, starter!.id)));
+  assert.equal((await read(server.id)).status, 403, "the original Server's membership gate now rejects this person");
+  const throughOther = await read(other.id);
+  assert.equal(throughOther.status, 404, "another Server must not recover the original Server's private operation result");
+  assert.equal((await throughOther.json() as { code: string }).code, "operation_not_found");
 });

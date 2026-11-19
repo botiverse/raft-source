@@ -11,7 +11,6 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import {
-  SERVER_GUEST_FEATURE_FLAG_KEY,
   artifactWebPaths,
   asArtifactId,
   asServerId,
@@ -19,7 +18,7 @@ import {
   type MentionAudienceCandidates,
 } from "@botiverse/raft-shared";
 import { getDb } from "../../db/index";
-import { agents, featureFlagRules } from "../../db/schema";
+import { agents } from "../../db/schema";
 import { accessTokenForTest } from "../../test/integration/credentials";
 import { mentionAudience } from "../../platform/mentions";
 import { createAgent } from "../../services/agentService";
@@ -98,9 +97,6 @@ async function seedWorld(seed: ReturnType<typeof createSeed>, app: { baseUrl: st
   const peer = await seed.server({ owner: peerUser });
   const db = getDb();
   __answerFlagForTests(WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY, true);
-  await db.insert(featureFlagRules).values([
-    { flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [server.id] },
-  ]);
   const agentA = await createAgent(server.id, `mau-a-${label()}`, { runtime: "claude", model: "sonnet" });
   const agentZ = await createAgent(server.id, `mau-z-${label()}`, { runtime: "claude", model: "sonnet" });
   const room = await createChannel(server.id, `mau-room-${label()}`, undefined, "private");

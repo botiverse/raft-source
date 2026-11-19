@@ -447,7 +447,7 @@ test("full Postgres Docker args enable bounded logical replication on the shared
   );
 });
 
-test("CDC manifest covers the exact 16-table publication and deliberate versioned aliases", () => {
+test("CDC manifest covers the exact 20-table publication and deliberate versioned aliases", () => {
   assert.deepEqual([...RISINGWAVE_PUBLICATION_TABLES], [
     "channels",
     "messages",
@@ -461,12 +461,16 @@ test("CDC manifest covers the exact 16-table publication and deliberate versione
     "server_members",
     "joint_channels",
     "joint_channel_servers",
+    "joint_channel_members",
+    "joint_channel_admissions",
+    "joint_membership_departures",
+    "joint_membership_removals",
     "inbox_suppression_states",
     "inbox_target_mute_states",
     "servers",
     "tasks",
   ]);
-  assert.equal(new Set(RISINGWAVE_PUBLICATION_TABLES).size, 16);
+  assert.equal(new Set(RISINGWAVE_PUBLICATION_TABLES).size, 20);
   assert.deepEqual(RISINGWAVE_CDC_TABLES.map((table) => table.name), [
     "rw_channels",
     "rw_messages",
@@ -755,6 +759,9 @@ test("release-QA uses production CDC columns while retaining the raftdev view gr
     "rw_messages", "rw_read_mutation_authorities_v1", "rw_server_members",
     "rw_servers", "rw_tasks", "rw_thread_follows", "rw_user_channel_inbox_states",
     "rw_user_channel_read_cursors", "rw_user_channel_read_cursors_v2",
+    "rw_joint_channel_members_v1", "rw_joint_channel_admissions_v1",
+    "rw_joint_membership_departures_v1", "rw_joint_membership_removals_v1",
+    "rw_joint_entry_server_members_v1", "rw_joint_entry_projections_v1",
   ];
   assert.deepEqual([...rendered.contract.publication_tables].sort(),
     [...RISINGWAVE_PUBLICATION_TABLES, "read_mutation_authorities"].sort());
@@ -907,4 +914,20 @@ test("local/external conflict fails before tooling and never prints the external
   assert.match(child.stdout, /cannot be combined/);
   assert.doesNotMatch(child.stdout + child.stderr, /secret-user|secret-password|example\.invalid/);
   assert.doesNotMatch(child.stdout, /requires POSIX dev tools/);
+});
+
+// The new membership generation is built beside the serving one. It cannot
+// silently read an old arm that still relies on channel_humans.
+test("computed joint generation has complete ordered dependencies and keeps the old serving graph", { skip: inSourceSnapshot }, () => {
+  const statements = buildRisingWaveBootstrapStatements(loadActualBootstrapArtifacts());
+  const names = statements.map(createdRelationName);
+  for (const name of ["rw_inbox_serving_v9", "rw_conversation_unread_v4", "rw_inbox_serving_jcm_v1", "rw_conversation_unread_jcm_v1"]) assert.ok(names.includes(name), name);
+  const membership = names.indexOf("rw_human_channel_members_v1");
+  for (const name of ["rw_subs_jcm_v1", "rw_muted_subs_jcm_v1", "rw_inbox_mention_jcm_v1", "rw_conversation_unread_jcm_v1"]) {
+    assert.ok(names.indexOf(name) > membership, `${name} follows shared membership`);
+    const ddl = statements.find((s) => createdRelationName(s) === name)!;
+    assert.doesNotMatch(ddl, /\brw_channel_humans\b/);
+  }
+  assert.ok(names.indexOf("rw_joint_channel_members_v1") < membership);
+  assert.ok(names.indexOf("rw_joint_membership_removals_v1") < membership);
 });

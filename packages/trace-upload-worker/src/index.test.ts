@@ -2164,6 +2164,52 @@ test("web trace endpoint forwards event only batches to OTLP logs", async () => 
     attr.value.stringValue === "web-batch-events:0"));
 });
 
+test("web trace endpoint keeps agent-activity launch_id/client_seq only when shaped right; the event and *_present stay", async () => {
+  const { env } = baseEnv();
+  const fetchCalls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+  env.TRACE_INGEST_OTLP_ENDPOINT = "https://telescope.test/v1/traces";
+  env.TRACE_INGEST_FETCH = async (input, init) => {
+    fetchCalls.push({ input, init });
+    return new Response(null, { status: 200 });
+  };
+  const launchId = "3f2b8c1e-9a4d-4e6f-8b7a-1c2d3e4f5a6b";
+  const event = (name: string, attrs: Record<string, unknown>) => ({
+    type: "event", schema_version: 1, name, surface: "web", time: "2026-05-07T08:00:00.000Z",
+    attrs: { launch_id_present: true, client_seq_present: true, ...attrs },
+  });
+
+  const res = await handleRequest(new Request("https://trace-worker.test/api/web-traces", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      attestation: signAttestation(webTraceClaims()),
+      batchId: "web-batch-activity",
+      events: [
+        event("slock.agent_activity.socket_received", { launch_id: launchId, client_seq: 7 }),
+        event("slock.agent_activity.store_decision", { launch_id: "agent-123", client_seq: -1 }),
+        event("slock.agent_activity.socket_received", { launch_id: "user@example.com", client_seq: 1.5 }),
+        event("slock.agent_activity.store_decision", { launch_id: 42, client_seq: "7" }),
+      ],
+    }),
+  }), env);
+
+  assert.equal(res.status, 200);
+  const body = await res.json() as Record<string, unknown>;
+  assert.equal(body.eventsIngested, 4, "an ill-shaped join key never costs the event");
+  const payload = JSON.parse(fetchCalls[0].init?.body as string);
+  const logRecords = payload.resourceLogs[0].scopeLogs[0].logRecords as Array<{ attributes: Array<{ key: string; value: Record<string, unknown> }> }>;
+  const keysOf = (i: number) => logRecords[i].attributes.map((attr) => attr.key);
+  const attr = (i: number, key: string) => logRecords[i].attributes.find((a) => a.key === key)?.value;
+  assert.equal(attr(0, "launch_id")?.stringValue, launchId);
+  assert.equal(Number(attr(0, "client_seq")?.intValue ?? attr(0, "client_seq")?.doubleValue), 7);
+  for (const i of [1, 2, 3]) {
+    assert.equal(keysOf(i).includes("launch_id"), false, `record ${i}: bad launch_id dropped`);
+    assert.equal(keysOf(i).includes("client_seq"), false, `record ${i}: bad client_seq dropped`);
+    assert.equal(attr(i, "launch_id_present")?.boolValue, true, `record ${i}: presence boolean kept`);
+    assert.equal(attr(i, "client_seq_present")?.boolValue, true, `record ${i}: presence boolean kept`);
+  }
+});
+
 test("trace bundle create is refused with 429 once the machine's hourly budget is spent (enforce mode)", async () => {
   resetTraceUploadBudgetsForTest();
   const { env, bucket } = baseEnv();

@@ -145,7 +145,7 @@ import { useAgentReadProgress } from "../../hooks/useAgentReadProgress";
 import { AgentReadProgressContext } from "../../components/message/agentReadProgressContext";
 import { AgentReadSystemRow } from "../../components/message/AgentReadFaces";
 import { useMediaQuery } from "../../hooks/effectPrimitives";
-import { useArtifactClosed, useArtifactHeaderBack, useArtifactHost, useArtifactSideCard } from "../../apps/artifacts";
+import { ArtifactConversationProvider, useArtifactClosed, useArtifactHeaderBack, useArtifactHost, useArtifactSideCard } from "../../apps/artifacts";
 import { useArtifactPlaceCard } from "../webPreview/useArtifactPlaceCard";
 import { WEB_PREVIEW_HOST_ATTRIBUTE } from "../webPreview/webPreviewStore";
 import { installArtifactShareHost } from "../../components/message/artifactShareHost";
@@ -180,6 +180,7 @@ import { ChannelSlackSyncBadge } from "./ChannelSlackSyncBadge";
 import { AgentDMStatus } from "./AgentDMStatus";
 import ChannelDescription from "../../components/channel/ChannelDescription";
 import { useShortcutLayer } from "../../features/shortcuts/useShortcutLayer";
+import { copyTextToClipboard } from "../../utils/selectMarkdown";
 
 const ForwardComposerDialog = deferredDialog(() => import("../../components/message/ForwardComposerDialog"));
 const TasksPanel = deferredPanel<TasksPanelProps>(() => import("../../components/task/TasksPanel"));
@@ -1107,6 +1108,8 @@ export function ChatPanel({
     if (filesCardOpen) closeCard("files");
     else setSideCardOpen("files", true);
   }, [closeCard, filesCardOpen, setSideCardOpen]);
+  // The Artifact's recent menu: "All Artifacts in …" opens (or brings forward) the Files card, as the header's paperclip.
+  const showFilesCard = useCallback(() => setSideCardOpen("files", true), [setSideCardOpen]);
 
   // Load tasks for the channel to show claim badges on messages.
   const channelTasks = useTaskStore((s) => selectChannelTaskBucket(s, channel?.id));
@@ -1583,20 +1586,22 @@ export function ChatPanel({
     setForwardComposer({ messages: forwardable, skippedCount: 0, nestedForwardCount });
   }, []);
 
-  const copySelectedLinks = useCallback(() => {
-    if (!channel || !serverSlug) return;
+  const copySelectedLinks = useCallback((): Promise<boolean> => {
+    if (!channel || !serverSlug) return Promise.resolve(false);
     const { messages: selected, unresolvedCount } = gatherSelectedMessagesWithMeta({
       channelMessages: messagesBelongToChannel ? messages : [],
     });
     if (unresolvedCount > 0) {
       showUnresolvedSelectionToast(unresolvedCount);
-      return;
+      return Promise.resolve(false);
     }
     const links = buildSelectedMessagePermalinks({ serverSlug, channel, messages: selected });
-    void navigator.clipboard.writeText(links.join("\n")).then(() => {
+    return copyTextToClipboard(links.join("\n"), formatMessageRef.current).then(() => {
       toast.success(formatCopyLinksToast(links.length, formatMessageRef.current), SELECTION_TOAST_OPTIONS);
+      return true;
     }).catch(() => {
       toast.error(formatMessageRef.current({ id: "message.chatPanel.clipboardBlocked" }), SELECTION_TOAST_OPTIONS);
+      return false;
     });
   }, [channel, serverSlug, messagesBelongToChannel, messages, showUnresolvedSelectionToast]);
 
@@ -1717,6 +1722,7 @@ export function ChatPanel({
   // server does it) and no channel management; it is named after its agent.
   const isLounge = isRegularChannel && !isThread && !!channel.loungeAgentId;
   const loungeTitle = isLounge ? formatMessage({ id: "agent.lounge.title" }, { name: loungeAgentName }) : "";
+  const conversationName = isDM ? `@${displayName}` : isLounge ? loungeTitle : `#${channel.name}`;
   const loungeReadOnly = isLounge && channel.canPost === false;
   // Joinable = a surface whose membership is gated by join/leave. DM and thread
   // share the "implicitly composable" axis; only true regular channels have a
@@ -2162,7 +2168,7 @@ export function ChatPanel({
                 <MessageInput
                   channelId={channel.id}
                   deferUntilFirstPage
-                  channelName={isDM ? `@${displayName}` : isLounge ? loungeTitle : `#${channel.name}`}
+                  channelName={conversationName}
                   // Task v2 too: a task is a message sent As task, in a channel or a DM (never a thread's composer).
                   showTaskButton={supportsChannelTasks && allowTasks}
                   asTaskShortcutDisabled={taskV2 && !(supportsChannelTasks && allowTasks)}
@@ -2204,7 +2210,9 @@ export function ChatPanel({
         <AgentContextViewSectionSlot channelId={channel.id} />
         {/* The open Artifact (F41): a section of the side area for now, never of the stored layout. */}
         {artifactSideCard && artifactSection ? (
-          <SideArtifactPortal title={artifactSideCard.label} artifact={artifactSection} render={artifactSideCard.render} />
+          <ArtifactConversationProvider conversationId={channel.id} name={conversationName} onShowAll={taskV2 && supportsChannelTasks ? showFilesCard : undefined}>
+            <SideArtifactPortal title={artifactSideCard.label} artifact={artifactSection} render={artifactSideCard.render} />
+          </ArtifactConversationProvider>
         ) : null}
         {sideColumnOpen ? <ChannelSideFloatSlot /> : null}
         </div>

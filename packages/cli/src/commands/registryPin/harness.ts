@@ -143,7 +143,9 @@ async function runInCurrentState(
         const route = routes.find((r) => (!r.method || r.method === method) && r.path.test(requestPath));
         if (!route) return { ok: false, status: 404, body: null, error: `no fake route for ${method} ${requestPath}`, errorCode: null } as never;
         if (route.response && !route.response.ok) {
-          return { ok: false, status: route.response.status, body: null, error: route.response.error, errorCode: route.response.errorCode ?? null } as never;
+          // As the client's requestBinary: a JSON refusal's body and step reach the operations (#14352).
+          const { status, error, errorCode, errorBody, suggestedNextAction } = route.response;
+          return { ok: false, status, body: null, error, errorCode: errorCode ?? null, ...(suggestedNextAction ? { suggestedNextAction } : {}), ...(errorBody === undefined ? {} : { errorBody }) } as never;
         }
         return { ok: true, status: 200, body: route.bytes ?? new Uint8Array(), error: null };
       },

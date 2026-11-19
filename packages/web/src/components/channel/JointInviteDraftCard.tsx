@@ -65,7 +65,7 @@ export function JointInviteDraftCard({
           </Button>
         )}
       </div>
-      <FormField label={formatMessage({ id: "channel.edit.serverSlugLabel" })} required>
+      <FormField label={formatMessage({ id: "channel.edit.serverSlugLabel" })}>
         <SlugInput
           type="text"
           value={draft.targetServerSlug}
@@ -76,7 +76,6 @@ export function JointInviteDraftCard({
       </FormField>
       <FormField
         label={formatMessage({ id: "channel.edit.invitedPeopleLabel" })}
-        required
         // Kept (access): only the target server's owners or admins can accept; without it people enter the wrong handles.
         hint={formatMessage({ id: "channel.edit.invitedPeopleHint" })}
       >

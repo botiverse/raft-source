@@ -88,6 +88,17 @@ test("Next makes the agent, records an existing agent, makes the one credential;
   assert.match(screen.getByTestId("create-external-agent-status").textContent ?? "", /Waiting for Nathan to connect/);
 });
 
+test("Show full prompt opens the prompt in place and says so to assistive technology", async () => {
+  mockApi({ connected: false });
+  renderDialog(() => undefined);
+  await next("Nathan");
+  const toggle = screen.getByTestId("create-external-agent-prompt-toggle");
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(toggle.getAttribute("aria-controls"), screen.getByTestId("create-external-agent-prompt").id);
+  await act(async () => { fireEvent.click(toggle); });
+  assert.equal(screen.getByTestId("create-external-agent-prompt-toggle").getAttribute("aria-expanded"), "true");
+});
+
 test("switching to the SDK keeps the same credential, records the way, and makes nothing new", async () => {
   const calls = mockApi({ connected: false });
   renderDialog(() => undefined);
@@ -143,4 +154,28 @@ test("a failed credential leaves nothing: the agent made before it is discarded 
   await screen.findByTestId("create-external-agent-error");
   assert.ok(screen.queryByTestId("create-external-agent-setup") === null);
   assert.ok(calls.some((call) => call.method === "delete" && call.url.startsWith(`/agents/${AGENT_ID}`)), "the half-made agent is deleted");
+});
+
+test("while Next runs nothing closes the dialog: Cancel is disabled and Escape is ignored, then step 2 shows the credential", async () => {
+  mockApi({ connected: false });
+  const post = api.post;
+  let release: () => void = () => undefined;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  api.post = (async (url: string, body?: unknown) => {
+    if (url === `/agents/${AGENT_ID}/credentials`) await held;
+    return post(url, body as never);
+  }) as typeof api.post;
+  let closed = false;
+  renderDialog(() => { closed = true; });
+  fireEvent.change(screen.getByTestId("create-external-agent-name"), { target: { value: "Nathan" } });
+  await act(async () => { fireEvent.click(screen.getByTestId("create-external-agent-next")); });
+  const cancel = screen.getByTestId("create-external-agent-form-cancel") as HTMLButtonElement;
+  assert.equal(cancel.disabled, true);
+  fireEvent.click(cancel);
+  fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+  assert.equal(closed, false);
+  await act(async () => { release(); });
+  await screen.findByTestId("create-external-agent-setup");
+  assert.equal(closed, false);
+  assert.equal(screen.getByTestId("create-external-agent-credential").textContent, KEY);
 });

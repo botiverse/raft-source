@@ -1,15 +1,19 @@
 import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm";
 import { getDb, type DatabaseExecutor } from "../db";
-import { integrationAuditEvents, oauthClients, oauthClientInstalls, oauthAppLinkPreviews, oauthLinkPreviewDeclines, oauthUserConsents, servers, serverMembers, users, type AppLinkPreviewSuspendReason } from "../db/schema";
+import { agents, integrationAuditEvents, oauthClients, oauthClientInstalls, oauthAppLinkPreviews, oauthLinkPreviewDeclines, oauthUserConsents, servers, serverMembers, users, type AppLinkPreviewSuspendReason } from "../db/schema";
+import { isOwnServerOfLocalApp } from "./linkCardExecuteEligibility";
+import { isApprovedOfficialAppClient } from "./officialAppAutoInstallService";
 import { appHosts } from "../platform/links";
 import { appLinkPreviewRegistrationSchema, appLinkPreviewResponseSchema, appLinkReadUrls, matchesAppPreview, DEFAULT_APP_LINK_PREVIEW_VERSIONS, type AppLinkPreview, type AppLinkPreviewPrompt, type AppLinkPreviewRevision, type AppLinkPreviewVersion } from "@botiverse/raft-shared/src/appLinkPreview";
 import { previewHttp, type PreviewHttp } from "./appLinkPreviewHttp";
 import { validateOAuthScopesForClient } from "./oauthService";
 import { marketplaceReviewApplies, nextActionEndpointState } from "./appActionEndpointPolicy";
+import { hasOfficialAppRegistryEntry } from "./officialAppAutoInstallService";
 import { oidcIssuer, signAppLinkPreviewAssertion } from "./oidcService";
 import { currentDate } from "@botiverse/raft-shared";
 import { recordIntegrationAuditEvent } from "./integrationAuditService";
+import { auditCardEncryptionKeyRemoved } from "./appCardEncryptionKeyService";
 import { recordTraceEvent } from "../tracing/semanticTrace";
 import { listOAuthClientKeys } from "./oauthClientKeys";
 import { UUID_RE } from "../lib/messageId";
@@ -115,6 +119,9 @@ async function saveRegistration(client: RegisteringClient, config: RegistrationC
     const [app] = await tx.select({ appType: oauthClients.appType, publishStatus: oauthClients.publishStatus })
       .from(oauthClients).where(eq(oauthClients.id, client.id)).for("no key update");
     if (!app) throw new AppLinkPreviewConfigError("App not found", 404);
+    // Reviewed when published, or once the App has an official registry
+    // entry: official no longer needs the App published (#proj-apps:#71).
+    const reviewed = marketplaceReviewApplies(app) || await hasOfficialAppRegistryEntry(client.id, tx);
     let [existing] = await tx.select().from(oauthAppLinkPreviews).where(eq(oauthAppLinkPreviews.clientId, client.id)).for("update");
     const now = currentDate();
     // This request just proved the origin.
@@ -126,7 +133,7 @@ async function saveRegistration(client: RegisteringClient, config: RegistrationC
       // insert waits for it and does nothing, and that row is then locked and
       // compared below like any repeat registration.
       const [inserted] = await tx.insert(oauthAppLinkPreviews)
-        .values({ clientId: client.id, ...config, ...firstActionColumns(requestedActionEndpoint, config.origin, marketplaceReviewApplies(app)), ...proven })
+        .values({ clientId: client.id, ...config, ...firstActionColumns(requestedActionEndpoint, config.origin, reviewed), ...proven })
         .onConflictDoNothing({ target: oauthAppLinkPreviews.clientId }).returning();
       if (inserted) {
         await auditRegistration(tx, client, inserted.pendingActionEndpoint !== null, { takeover });
@@ -140,7 +147,7 @@ async function saveRegistration(client: RegisteringClient, config: RegistrationC
       requested: requestedActionEndpoint,
       live: canonicalUrl(existing.actionEndpoint),
       pending: canonicalUrl(existing.pendingActionEndpoint),
-      reviewed: marketplaceReviewApplies(app),
+      reviewed,
     });
     const actionColumns = {
       actionEndpoint: action.live,
@@ -203,10 +210,14 @@ async function takeOverOrigin(tx: DatabaseExecutor, client: RegisteringClient, o
     .for("update", { of: oauthAppLinkPreviews });
   if (!holder) return null;
   const correlationId = randomUUID();
-  await tx.delete(oauthAppLinkPreviews).where(eq(oauthAppLinkPreviews.clientId, holder.clientId));
+  const [deleted] = await tx.delete(oauthAppLinkPreviews).where(eq(oauthAppLinkPreviews.clientId, holder.clientId)).returning({ kid: oauthAppLinkPreviews.cardEncryptionKid });
   await recordIntegrationAuditEvent({ serverId: holder.serverId, clientId: holder.clientId, eventType: "app.updated", outcome: "success", source: "api",
     actor: { type: "system" }, target: { type: "app", id: holder.clientId }, correlationId,
     metadata: { changedFields: ["linkPreview"], clientKey: holder.clientKey, linkPreview: "taken_over" } }, tx);
+  // Its card encryption key (RFC 086 §5.2) went with the registration.
+  if (deleted?.kid) {
+    await auditCardEncryptionKeyRemoved(tx, { client: { id: holder.clientId, clientId: holder.clientKey, serverId: holder.serverId }, kid: deleted.kid, reason: "taken_over", byApp: false, correlationId });
+  }
   return correlationId;
 }
 
@@ -252,134 +263,272 @@ async function auditRegistration(tx: DatabaseExecutor, client: RegisteringClient
 
 export async function deleteAppLinkPreview(client: Pick<typeof oauthClients.$inferSelect, "id" | "clientId" | "serverId">) {
   await getDb().transaction(async (tx) => {
-    await tx.delete(oauthAppLinkPreviews).where(eq(oauthAppLinkPreviews.clientId, client.id));
+    const [deleted] = await tx.delete(oauthAppLinkPreviews).where(eq(oauthAppLinkPreviews.clientId, client.id)).returning({ kid: oauthAppLinkPreviews.cardEncryptionKid });
     await recordIntegrationAuditEvent({ serverId: client.serverId, clientId: client.id, eventType: "app.updated", outcome: "success", source: "api",
       actor: { type: "system" }, requester: { type: "app", id: client.id }, target: { type: "app", id: client.id }, metadata: { changedFields: ["linkPreview"], clientKey: client.clientId } }, tx);
+    // The card encryption key (RFC 086 §5.2) lives on the registration.
+    if (deleted?.kid) await auditCardEncryptionKeyRemoved(tx, { client, kid: deleted.kid, reason: "registration_deleted", byApp: true });
   });
 }
 
 /**
- * The App's action endpoint review state, as its own Server's admins read it.
- * The review itself is decided in App Admin, through the database function
- * public.app_admin_decide_action_endpoint_review (#proj-apps task #19).
+ * The App's action endpoint as a Server's admins read it (RFC 076 §4, §17):
+ * on the App's own Server, its review state too (the review itself is decided
+ * in App Admin, through public.app_admin_decide_action_endpoint_review,
+ * #proj-apps task #19); on a Server it is actively installed on, the endpoint
+ * and that installation's card-button state. Null for an App with no
+ * link-preview registration, or one neither from nor installed on `serverId`.
  */
-export async function getActionEndpointReviewState(clientId: string) {
-  if (!UUID_RE.test(clientId)) return null;
-  const [row] = await getDb().select({ preview: oauthAppLinkPreviews, serverId: oauthClients.serverId, appType: oauthClients.appType })
-    .from(oauthAppLinkPreviews)
+export async function getActionEndpointState(clientId: string, serverId: string) {
+  if (!UUID_RE.test(clientId) || !UUID_RE.test(serverId)) return null;
+  const [row] = await getDb().select({
+    preview: oauthAppLinkPreviews, appServerId: oauthClients.serverId, appType: oauthClients.appType, clientKey: oauthClients.clientId,
+    installation: {
+      id: oauthClientInstalls.id, allowedActionEndpoint: oauthClientInstalls.allowedActionEndpoint,
+      actionsAllowedAt: oauthClientInstalls.actionsAllowedAt, actionsOffAt: oauthClientInstalls.actionsOffAt,
+    },
+  }).from(oauthAppLinkPreviews)
     .innerJoin(oauthClients, eq(oauthClients.id, oauthAppLinkPreviews.clientId))
+    .leftJoin(oauthClientInstalls, and(eq(oauthClientInstalls.clientId, oauthClients.id), eq(oauthClientInstalls.serverId, serverId),
+      eq(oauthClientInstalls.status, "active")))
     .where(eq(oauthAppLinkPreviews.clientId, clientId));
   if (!row) return null;
+  const source = row.appServerId.toLowerCase() === serverId.toLowerCase();
+  if (!source && !row.installation) return null;
+  const app = { serverId: row.appServerId, appType: row.appType };
+  const ownServer = isOwnServerOfLocalApp(app, serverId);
+  const lastSwitch = await latestCardButtonsChange(clientId, serverId,
+    ownServer ? ["app.link_card_actions_on", "app.link_card_actions_off", "app.link_card_actions_confirmed"] : ["app.link_card_actions_allowed"]);
   return {
-    serverId: row.serverId,
+    source,
     appType: row.appType,
+    official: await isApprovedOfficialAppClient(clientId),
     origin: row.preview.origin,
     live: row.preview.actionEndpoint,
     pending: row.preview.pendingActionEndpoint,
     requestedAt: row.preview.pendingActionEndpointRequestedAt,
     rejectReason: row.preview.actionEndpointRejectReason,
-    ownServerActionEndpoint: row.preview.ownServerActionEndpoint,
-    ownServerActionsConfirmedAt: row.preview.ownServerActionsConfirmedAt,
-    ownServerActionsConfirmedBy: row.preview.ownServerActionEndpoint === null ? null : await ownServerActionsConfirmer(clientId),
     suspended: row.preview.suspendedAt !== null,
+    /** When the registration last changed (the default-on own-Server buttons' legacy `confirmed_at`, absent a switch). */
+    updatedAt: row.preview.updatedAt,
+    /** Which §17 rule decides here: a server_local App's own Server, or an allow on this Server's installation. */
+    mode: ownServer ? "own_server" as const : "allow" as const,
+    installation: row.installation,
+    /** The latest switch (own Server: on, off, or the old confirmation) or allow (elsewhere) here, and who made it. */
+    lastChange: lastSwitch,
   };
 }
 
+/** Who did something to an App's card buttons, as the admin read names them. */
+export type CardButtonsPerson = { type: "human" | "agent"; id: string; name: string };
+type CardButtonsEvent = "app.link_card_actions_confirmed" | "app.link_card_actions_allowed" | "app.link_card_actions_withdrawn" | "app.link_card_actions_on" | "app.link_card_actions_off";
+
 /**
- * Who allowed the confirmation in force (RFC 076 §17): the person on the
- * latest `app.link_card_actions_confirmed` event (a confirmation is written
- * only with one, and confirming the same endpoint again writes neither). No
- * column: the audit is the record. Null when the person's account is gone.
+ * The latest of these card-button events for the App on this Server: the
+ * audit is the record of who changed them, no column. `by` is null when the
+ * person's or agent's account is gone.
  */
-async function ownServerActionsConfirmer(clientId: string): Promise<{ id: string; name: string } | null> {
-  const [event] = await getDb().select({ actorId: integrationAuditEvents.actorId }).from(integrationAuditEvents)
-    .where(and(eq(integrationAuditEvents.clientId, clientId), eq(integrationAuditEvents.eventType, "app.link_card_actions_confirmed")))
+async function latestCardButtonsChange(clientId: string, serverId: string, eventTypes: CardButtonsEvent[]):
+  Promise<{ eventType: CardButtonsEvent; at: Date; by: CardButtonsPerson | null } | null> {
+  const [event] = await getDb().select({ eventType: integrationAuditEvents.eventType, at: integrationAuditEvents.createdAt, actorType: integrationAuditEvents.actorType, actorId: integrationAuditEvents.actorId })
+    .from(integrationAuditEvents)
+    .where(and(eq(integrationAuditEvents.clientId, clientId), eq(integrationAuditEvents.serverId, serverId), inArray(integrationAuditEvents.eventType, eventTypes)))
     .orderBy(desc(integrationAuditEvents.createdAt))
     .limit(1);
-  if (!event?.actorId) return null;
-  const [person] = await getDb().select({ id: users.id, name: users.name, displayName: users.displayName }).from(users)
-    .where(eq(users.id, event.actorId)).limit(1);
-  return person ? { id: person.id, name: person.displayName || person.name } : null;
+  if (!event) return null;
+  return { eventType: event.eventType as CardButtonsEvent, at: event.at, by: await cardButtonsPerson(event.actorType, event.actorId) };
 }
 
-export type OwnServerLinkCardActionsResult =
-  | { kind: "confirmed"; actionEndpoint: string; confirmedAt: Date }
-  | { kind: "withdrawn" }
+async function cardButtonsPerson(actorType: string, actorId: string | null): Promise<CardButtonsPerson | null> {
+  if (!actorId) return null;
+  if (actorType === "human") {
+    const [person] = await getDb().select({ name: users.name, displayName: users.displayName }).from(users).where(eq(users.id, actorId)).limit(1);
+    return person ? { type: "human", id: actorId, name: person.displayName || person.name } : null;
+  }
+  if (actorType === "agent") {
+    const [agent] = await getDb().select({ name: agents.name, displayName: agents.displayName }).from(agents)
+      .where(and(eq(agents.id, actorId), isNull(agents.deletedAt))).limit(1);
+    return agent ? { type: "agent", id: actorId, name: agent.displayName || agent.name } : null;
+  }
+  return null;
+}
+
+export type ActionEndpointState = NonNullable<Awaited<ReturnType<typeof getActionEndpointState>>>;
+
+/**
+ * An App's card buttons on the reading Server (RFC 076 §17), for the Card
+ * buttons section of its page; null for an approved official App (§4 decides,
+ * nothing to switch) or one with no active installation here. `state`, so a
+ * screen draws one case without inferring it:
+ * - `own_server` (a server_local App on its own Server; on by default):
+ *   `no_endpoint`, `off` (switched off), `suspended` (on, but the
+ *   registration is suspended: its domain proof failed or names another App),
+ *   `on`;
+ * - `allow` (any other Server it is installed on, or a shared or published
+ *   App's own): `no_endpoint`, `pending_review` (its only endpoint waits for
+ *   marketplace review: nothing to allow yet), `not_allowed`,
+ *   `endpoint_changed` (the allowed endpoint is not the one in force: allow
+ *   again), `suspended`, `allowed`.
+ * `changedAt` / `changedBy`: own_server, when and by whom it was last
+ * switched (null: never, it is on by default); allow, when and by whom the
+ * allow in place was made.
+ */
+export type CardButtonsView = {
+  mode: "own_server" | "allow";
+  state: "no_endpoint" | "off" | "suspended" | "on" | "pending_review" | "not_allowed" | "endpoint_changed" | "allowed";
+  inForce: boolean;
+  actionEndpoint: string | null;
+  pendingActionEndpoint: string | null;
+  allowedActionEndpoint: string | null;
+  changedAt: Date | null;
+  changedBy: CardButtonsPerson | null;
+};
+
+export function cardButtonsView(state: ActionEndpointState): CardButtonsView | null {
+  const { installation, live, pending, suspended, lastChange } = state;
+  if (state.official || !installation) return null;
+  if (state.mode === "own_server") {
+    const off = installation.actionsOffAt !== null;
+    const view = live === null ? "no_endpoint" as const : off ? "off" as const : suspended ? "suspended" as const : "on" as const;
+    const switched = lastChange && lastChange.eventType !== "app.link_card_actions_confirmed" ? lastChange : null;
+    return {
+      mode: "own_server", state: view, inForce: view === "on", actionEndpoint: live, pendingActionEndpoint: pending, allowedActionEndpoint: null,
+      changedAt: off ? installation.actionsOffAt : switched?.at ?? null, changedBy: switched?.by ?? null,
+    };
+  }
+  const allowed = installation.allowedActionEndpoint;
+  const view = live === null ? (pending === null ? "no_endpoint" as const : "pending_review" as const)
+    : allowed === null ? "not_allowed" as const
+      : allowed !== live ? "endpoint_changed" as const
+        : suspended ? "suspended" as const : "allowed" as const;
+  return {
+    mode: "allow", state: view, inForce: view === "allowed", actionEndpoint: live, pendingActionEndpoint: pending, allowedActionEndpoint: allowed,
+    changedAt: allowed === null ? null : installation.actionsAllowedAt, changedBy: allowed === null ? null : lastChange?.by ?? null,
+  };
+}
+
+/** Who changes a Server's card-button setting: a person or an agent the caller found to hold manageIntegrations there. */
+export type CardButtonsActor = { type: "human" | "agent"; id: string };
+
+export type CardButtonsChangeResult =
+  | { kind: "changed"; mode: "own_server" | "allow" }
   | { kind: "not_found" }
-  | { kind: "not_server_local" }
   | { kind: "no_action_endpoint" }
-  | { kind: "endpoint_changed"; actionEndpoint: string | null };
+  | { kind: "endpoint_changed"; actionEndpoint: string | null }
+  /** The endpoint sent is a change still waiting for marketplace review: only the reviewed one in force can be allowed. */
+  | { kind: "pending_review" }
+  /**
+   * An approved official App: §4 decides its buttons everywhere, so an allow
+   * here would do nothing now and would start working, undecided, the day it
+   * stopped being official. Refused, nothing written.
+   */
+  | { kind: "official" };
 
 /**
- * RFC 076 §17: a person with manageIntegrations on a server_local App's own
- * Server lets its card buttons call `actionEndpoint` there, sending the
- * endpoint exactly as they were shown it: anything other than the one in force
- * now is `endpoint_changed` (nothing written), so what is confirmed is what
- * was seen. The caller checks the person (routes/integrations.ts); this checks
- * the App is on `serverId`. One transaction: the registration row FOR UPDATE
- * (execute holds it FOR SHARE while it decides), the confirmation, the audit.
- * Confirming the endpoint already confirmed writes nothing and returns it.
+ * Lets the App's card buttons act on `serverId` (RFC 076 §17), sending the
+ * endpoint in force exactly as the caller was shown it: anything else is
+ * `endpoint_changed` (or `pending_review`, for a change waiting for review),
+ * nothing written, so what is allowed is what was seen.
+ * - On a server_local App's own Server: switches them back on (clears
+ *   `actions_off_at`); from then on they follow the App's endpoint.
+ * - Anywhere else it is actively installed: binds this installation's allow
+ *   to that endpoint.
+ * The caller checks the actor holds manageIntegrations on `serverId`. One
+ * transaction: the installation row FOR UPDATE (execute holds it FOR SHARE
+ * while it decides), the change, the audit. Allowing what is allowed (or
+ * switching on what is on) writes nothing.
  */
-export async function confirmOwnServerLinkCardActions(input: { clientId: string; serverId: string; userId: string; actionEndpoint: string }): Promise<OwnServerLinkCardActionsResult> {
+export async function allowCardButtons(input: { clientId: string; serverId: string; actor: CardButtonsActor; actionEndpoint: string }): Promise<CardButtonsChangeResult> {
   return getDb().transaction(async (tx) => {
-    const row = await lockOwnServerRegistration(tx, input.clientId, input.serverId);
+    const row = await lockCardButtonsInstallation(tx, input.clientId, input.serverId);
     if (!row) return { kind: "not_found" } as const;
-    if (row.appType !== "server_local") return { kind: "not_server_local" } as const;
-    const live = row.preview.actionEndpoint;
-    if (live === null) return { kind: "no_action_endpoint" } as const;
-    if (live !== input.actionEndpoint) return { kind: "endpoint_changed", actionEndpoint: live } as const;
-    if (row.preview.ownServerActionEndpoint === live && row.preview.ownServerActionsConfirmedAt) {
-      return { kind: "confirmed", actionEndpoint: live, confirmedAt: row.preview.ownServerActionsConfirmedAt } as const;
+    if (await isApprovedOfficialAppClient(input.clientId, tx, { forShare: true })) return { kind: "official" } as const;
+    const { live, pending } = row;
+    if (live !== input.actionEndpoint) {
+      if (pending !== null && pending === input.actionEndpoint) return { kind: "pending_review" } as const;
+      return live === null ? { kind: "no_action_endpoint" } as const : { kind: "endpoint_changed", actionEndpoint: live } as const;
     }
-    const [updated] = await tx.update(oauthAppLinkPreviews)
-      .set({ ownServerActionEndpoint: live, ownServerActionsConfirmedAt: sql`clock_timestamp()` })
-      .where(eq(oauthAppLinkPreviews.clientId, row.preview.clientId))
-      .returning({ confirmedAt: oauthAppLinkPreviews.ownServerActionsConfirmedAt });
-    await recordOwnServerActionsAudit(tx, row, input.userId, "app.link_card_actions_confirmed", live);
-    return { kind: "confirmed", actionEndpoint: live, confirmedAt: updated!.confirmedAt! } as const;
+    if (row.mode === "own_server") {
+      if (row.installation.actionsOffAt !== null) {
+        await tx.update(oauthClientInstalls).set({ actionsOffAt: null, updatedAt: sql`clock_timestamp()` }).where(eq(oauthClientInstalls.id, row.installation.id));
+        await recordCardButtonsAudit(tx, row, input, "app.link_card_actions_on");
+      }
+      return { kind: "changed", mode: row.mode } as const;
+    }
+    if (row.installation.allowedActionEndpoint !== live) {
+      await tx.update(oauthClientInstalls).set({ allowedActionEndpoint: live, actionsAllowedAt: sql`clock_timestamp()`, updatedAt: sql`clock_timestamp()` })
+        .where(eq(oauthClientInstalls.id, row.installation.id));
+      await recordCardButtonsAudit(tx, row, input, "app.link_card_actions_allowed", live);
+    }
+    return { kind: "changed", mode: row.mode } as const;
   });
 }
 
 /**
- * Withdraws that confirmation (same caller rules, same lock, audited): the
- * App's buttons on its own Server only navigate again, on cards already shown
- * too. Nothing confirmed: writes nothing and still answers `withdrawn`.
+ * The reverse (same caller rules, same lock, audited): on a server_local
+ * App's own Server, switches its card buttons off (`actions_off_at`, a time,
+ * never a URL); anywhere else, withdraws this installation's allow. Its
+ * buttons only open links again, on cards already shown too. Nothing to undo:
+ * writes nothing.
  */
-export async function withdrawOwnServerLinkCardActions(input: { clientId: string; serverId: string; userId: string }): Promise<OwnServerLinkCardActionsResult> {
+export async function withdrawCardButtons(input: { clientId: string; serverId: string; actor: CardButtonsActor }): Promise<CardButtonsChangeResult> {
   return getDb().transaction(async (tx) => {
-    const row = await lockOwnServerRegistration(tx, input.clientId, input.serverId);
+    const row = await lockCardButtonsInstallation(tx, input.clientId, input.serverId);
     if (!row) return { kind: "not_found" } as const;
-    const confirmed = row.preview.ownServerActionEndpoint;
-    if (confirmed === null) return { kind: "withdrawn" } as const;
-    await tx.update(oauthAppLinkPreviews)
-      .set({ ownServerActionEndpoint: null, ownServerActionsConfirmedAt: null })
-      .where(eq(oauthAppLinkPreviews.clientId, row.preview.clientId));
-    await recordOwnServerActionsAudit(tx, row, input.userId, "app.link_card_actions_withdrawn", confirmed);
-    return { kind: "withdrawn" } as const;
+    if (row.mode === "own_server") {
+      if (row.installation.actionsOffAt === null) {
+        await tx.update(oauthClientInstalls).set({ actionsOffAt: sql`clock_timestamp()`, updatedAt: sql`clock_timestamp()` }).where(eq(oauthClientInstalls.id, row.installation.id));
+        await recordCardButtonsAudit(tx, row, input, "app.link_card_actions_off");
+      }
+      return { kind: "changed", mode: row.mode } as const;
+    }
+    const allowed = row.installation.allowedActionEndpoint;
+    if (allowed !== null) {
+      await tx.update(oauthClientInstalls).set({ allowedActionEndpoint: null, actionsAllowedAt: null, updatedAt: sql`clock_timestamp()` })
+        .where(eq(oauthClientInstalls.id, row.installation.id));
+      await recordCardButtonsAudit(tx, row, input, "app.link_card_actions_withdrawn", allowed);
+    }
+    return { kind: "changed", mode: row.mode } as const;
   });
 }
 
-async function lockOwnServerRegistration(tx: DatabaseExecutor, clientId: string, serverId: string) {
-  if (!UUID_RE.test(clientId)) return null;
-  const [row] = await tx.select({ preview: oauthAppLinkPreviews, appType: oauthClients.appType, clientKey: oauthClients.clientId, serverId: oauthClients.serverId })
-    .from(oauthAppLinkPreviews)
-    .innerJoin(oauthClients, and(eq(oauthClients.id, oauthAppLinkPreviews.clientId), eq(oauthClients.serverId, serverId)))
+/**
+ * The App's active installation on `serverId` FOR UPDATE (its own Server's
+ * row for a server_local App: the source installation), with the App and its
+ * registration's endpoints. Null when the App has no link-preview
+ * registration or no active installation there.
+ */
+async function lockCardButtonsInstallation(tx: DatabaseExecutor, clientId: string, serverId: string) {
+  if (!UUID_RE.test(clientId) || !UUID_RE.test(serverId)) return null;
+  const [installation] = await tx.select({
+    id: oauthClientInstalls.id, allowedActionEndpoint: oauthClientInstalls.allowedActionEndpoint, actionsOffAt: oauthClientInstalls.actionsOffAt,
+  }).from(oauthClientInstalls)
+    .where(and(eq(oauthClientInstalls.clientId, clientId), eq(oauthClientInstalls.serverId, serverId), eq(oauthClientInstalls.status, "active")))
+    .for("update");
+  if (!installation) return null;
+  const [registration] = await tx.select({
+    live: oauthAppLinkPreviews.actionEndpoint, pending: oauthAppLinkPreviews.pendingActionEndpoint,
+    appServerId: oauthClients.serverId, appType: oauthClients.appType, clientKey: oauthClients.clientId,
+  }).from(oauthAppLinkPreviews)
+    .innerJoin(oauthClients, eq(oauthClients.id, oauthAppLinkPreviews.clientId))
     .where(eq(oauthAppLinkPreviews.clientId, clientId))
-    .for("update", { of: oauthAppLinkPreviews });
-  return row ?? null;
+    .for("share", { of: oauthAppLinkPreviews });
+  if (!registration) return null;
+  const mode = isOwnServerOfLocalApp({ serverId: registration.appServerId, appType: registration.appType }, serverId) ? "own_server" as const : "allow" as const;
+  return { clientId, clientKey: registration.clientKey, live: registration.live, pending: registration.pending, mode, installation };
 }
 
-async function recordOwnServerActionsAudit(
+async function recordCardButtonsAudit(
   tx: DatabaseExecutor,
-  row: { preview: { clientId: string }; clientKey: string; serverId: string },
-  userId: string,
-  eventType: "app.link_card_actions_confirmed" | "app.link_card_actions_withdrawn",
-  actionEndpoint: string,
+  row: { clientId: string; clientKey: string },
+  input: { serverId: string; actor: CardButtonsActor },
+  eventType: Exclude<CardButtonsEvent, "app.link_card_actions_confirmed">,
+  actionEndpoint?: string,
 ) {
   await recordIntegrationAuditEvent({
-    serverId: row.serverId, clientId: row.preview.clientId, eventType, outcome: "success", source: "web",
-    actor: { type: "human", id: userId }, target: { type: "app", id: row.preview.clientId },
-    metadata: { clientKey: row.clientKey, actionEndpoint },
+    serverId: input.serverId, clientId: row.clientId, eventType, outcome: "success", source: input.actor.type === "agent" ? "cli" : "web",
+    actor: input.actor, target: { type: "app", id: row.clientId },
+    metadata: { clientKey: row.clientKey, ...(actionEndpoint === undefined ? {} : { actionEndpoint }) },
   }, tx);
 }
 
@@ -529,6 +678,8 @@ export type RegisteredApp = {
     serverId: OAuthClientRow["serverId"]; appType: OAuthClientRow["appType"];
   };
   installationId: (typeof oauthClientInstalls.$inferSelect)["id"];
+  /** The installation's card-button state on this Server (RFC 076 §17; unreviewedActionsBasis). */
+  installation: Pick<typeof oauthClientInstalls.$inferSelect, "allowedActionEndpoint" | "actionsOffAt">;
   serverSlug: (typeof servers.$inferSelect)["slug"];
   serverRole: (typeof serverMembers.$inferSelect)["role"];
   consentId: (typeof oauthUserConsents.$inferSelect)["id"] | null;
@@ -541,7 +692,9 @@ export async function registeredApps(serverId: string, userId: string, origins: 
     config: oauthAppLinkPreviews,
     app: { id: oauthClients.id, name: oauthClients.name, key: oauthClients.clientId, icon: oauthClients.logoUrl, allowedScopes: oauthClients.allowedScopes,
       serverId: oauthClients.serverId, appType: oauthClients.appType },
-    installationId: oauthClientInstalls.id, serverSlug: servers.slug, serverRole: serverMembers.role,
+    installationId: oauthClientInstalls.id,
+    installation: { allowedActionEndpoint: oauthClientInstalls.allowedActionEndpoint, actionsOffAt: oauthClientInstalls.actionsOffAt },
+    serverSlug: servers.slug, serverRole: serverMembers.role,
     consentId: oauthUserConsents.id, declineId: oauthLinkPreviewDeclines.id,
   }).from(oauthAppLinkPreviews)
     .innerJoin(oauthClients, and(eq(oauthClients.id, oauthAppLinkPreviews.clientId), eq(oauthClients.enabled, true)))

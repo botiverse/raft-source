@@ -56,6 +56,7 @@ import {
   type SyncResetReason,
   type SyncRowEntity,
   type SyncScopeChange,
+  type SyncTaskResnapshot,
 } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
 import { channelHumans, channels, jointChannels, jointChannelServers } from "../db/schema";
@@ -78,7 +79,12 @@ function scopedRowsCap(): number {
 export function __setSyncScopedRowsCapForTests(cap: number | null): void {
   scopedRowsCapOverrideForTests = cap;
 }
-/** The scope_id of the guest_access reset row (0458_change_log_visibility_followups). */
+/**
+ * The scope_id of the guest_access reset row (0458_change_log_visibility_followups).
+ * Nothing writes these any more (server_guest_v0 is retired and its trigger
+ * dropped); kept so rows already in change_log still reset guest viewers until
+ * retention (CHANGE_LOG_RETENTION_DAYS) drops them. Removable after that.
+ */
 const GUEST_ACCESS_RESET_SCOPE = "00000000-0000-0000-0000-000000000000";
 /** change_log keeps 8 daily partitions (change_log_maintain keep_days). */
 const CHANGE_LOG_RETENTION_DAYS = 8;
@@ -119,9 +125,11 @@ export type PendingRowChange = {
    * where a delete would name an entity the viewer was never shown.
    */
   ifMissing: "delete" | "drop";
+  /** A task's channel (the viewer's local id): the list it is in, and the one its delete names. */
+  channelId?: string;
 };
 
-export type PendingSyncChange = PendingRowChange | SyncConversationChange | SyncScopeChange;
+export type PendingSyncChange = PendingRowChange | SyncConversationChange | SyncScopeChange | SyncTaskResnapshot;
 
 export type SyncChangesRead = {
   cursor: SyncChangesCursor;
@@ -136,6 +144,7 @@ type StatementRow = {
   horizon: unknown;
   server_id: string | null;
   scope_kind: string | null;
+  scope_id: string | null;
   parent_id: string | null;
   xmax: unknown;
   min_seq: unknown;
@@ -159,6 +168,7 @@ type ChangeRow = {
   refSeq: number | null;
   serverId: string | null;
   scopeKind: string;
+  scopeId: string;
   parentId: string | null;
 };
 
@@ -239,7 +249,7 @@ function syncChangesStatement(input: {
   }
   const { since, viewer, visibleIds, peerProjectionIds, limit, lateCap } = input;
   const sinceSeq = since.seq.toString();
-  const columns = sql`c.seq, c.entity, c.entity_id, c.op, c.ref_seq, c.server_id, c.scope_kind, c.parent_id`;
+  const columns = sql`c.seq, c.entity, c.entity_id, c.op, c.ref_seq, c.server_id, c.scope_kind, c.scope_id, c.parent_id`;
   return sql`
     WITH sync_horizon AS MATERIALIZED (
       SELECT pg_snapshot_xmin(s.snap) AS h, pg_snapshot_xmax(s.snap) AS xmax
@@ -277,7 +287,8 @@ function syncChangesStatement(input: {
             AND f.op = 'reset' AND f.seq > ${sinceSeq}::bigint AND f.xid < (SELECT h FROM sync_horizon)
         ) OR (${viewer.isGuest} AND EXISTS (
           -- The guest feature flag changed (0458): who it affects is decided by
-          -- rule evaluation, so every guest viewer resnapshots.
+          -- rule evaluation, so every guest viewer resnapshots. Historical rows
+          -- only: the flag is retired and its trigger dropped.
           SELECT 1 FROM public.change_log f
           WHERE f.scope_kind = 'server' AND f.scope_id = ${GUEST_ACCESS_RESET_SCOPE}::uuid AND f.op = 'reset'
             -- Also a row that committed after the previous read passed its seq:
@@ -295,7 +306,7 @@ function syncChangesStatement(input: {
     SELECT h.h::text AS horizon, h.xmax::text AS xmax,
       head.min_seq::text AS min_seq, head.min_xid AS min_xid, head.high_seq::text AS high_seq, head.forced, head.scoped_count::text AS scoped_count,
       r.seq::text AS seq, r.entity, r.entity_id, r.op, r.ref_seq::text AS ref_seq, r.late,
-      r.server_id::text AS server_id, r.scope_kind, r.parent_id::text AS parent_id
+      r.server_id::text AS server_id, r.scope_kind, r.scope_id::text AS scope_id, r.parent_id::text AS parent_id
     FROM sync_horizon h
     CROSS JOIN sync_head head
     LEFT JOIN (SELECT * FROM sync_page UNION ALL SELECT * FROM sync_late) r ON TRUE
@@ -338,7 +349,7 @@ const CONVERSATION_KINDS: ReadonlyMap<string, ConversationKind> = new Map([
   ["followed_thread", "follow"],
 ]);
 type ConversationKind = "read" | "done" | "follow";
-const ROW_ENTITIES = new Set<string>(["channel", "channel_member", "server_member", "agent", "machine", "sidebar_order", "server_order", "message"]);
+const ROW_ENTITIES = new Set<string>(["channel", "channel_member", "server_member", "agent", "machine", "sidebar_order", "server_order", "message", "task"]);
 /**
  * An upsert the viewer's list does not hold is dropped, not deleted: the
  * server-wide rows, and a message (RFC 082 §4.4) the viewer cannot read (its
@@ -406,6 +417,12 @@ function mapChangeRow(
       channel: { id: row.entityId, local: true, serverId: viewer.serverId },
     };
   }
+  // A bulk task change (the status cleanup, 0710): re-read the channel's task list.
+  if (row.entity === "task_channel") {
+    if (row.op !== "upsert" || row.scopeKind !== "channel") return null;
+    const channel = channelRef(row.entityId);
+    return { change: { seq, entity: "task", id: channel.id, op: "resnapshot" }, channel };
+  }
   if (!ROW_ENTITIES.has(row.entity) || (row.op !== "upsert" && row.op !== "delete")) return null;
   const entity = row.entity as SyncRowEntity;
   const ifMissing = DROP_IF_MISSING_ENTITIES.has(entity) ? "drop" : "delete";
@@ -422,6 +439,12 @@ function mapChangeRow(
     const peerLocal = row.scopeKind === "channel" && member[0] === "agent" ? localByPeerProjection.get(channelId!) : undefined;
     const channel = peerLocal ? { id: peerLocal, local: true, serverId: viewer.serverId } : channelRef(channelId!);
     return { change: { seq, entity, id: [channel.id, ...member].join(":"), op: row.op, ifMissing }, channel };
+  }
+  if (entity === "task") {
+    // Logged in its (storage) channel's scope (0710): named in the viewer's projection.
+    if (row.scopeKind !== "channel") return null;
+    const channel = channelRef(row.scopeId);
+    return { change: { seq, entity, id: row.entityId, op: row.op, ifMissing, channelId: channel.id }, channel };
   }
   return { change: { seq, entity, id: row.entityId, op: row.op, ifMissing } };
 }
@@ -476,7 +499,7 @@ async function channelIdsInServer(ids: readonly string[], serverId: ServerId): P
 }
 
 /**
- * Group by (entity, id), keep each group's last row, in that row's seq order.
+ * Group by (entity, id; a task also by its channel), keep each group's last row, in that row's seq order.
  * A conversation keeps the last read position of its group as refSeq: an
  * inbox or follow change after a read move does not hide where the read went.
  * Its kinds are the union of its group's (`kinds`, by the conversation's
@@ -486,7 +509,9 @@ function coalesce(rows: readonly MappedRow[]): { changes: PendingSyncChange[]; k
   const last = new Map<string, PendingSyncChange>();
   const kinds = new Map<string, ConversationKinds>();
   for (const { change, conversation } of [...rows].sort((a, b) => a.change.seq - b.change.seq)) {
-    const key = `${change.entity}\u0000${change.id}`;
+    // A task is keyed by its channel too: moved, its delete from the old
+    // channel and its upsert in the new one both stay.
+    const key = `${change.entity}\u0000${change.id}${"channelId" in change && change.channelId ? `\u0000${change.channelId}` : ""}`;
     const previous = last.get(key);
     const value = change.entity === "conversation" && change.refSeq === null && previous?.entity === "conversation"
       ? { ...change, refSeq: previous.refSeq }
@@ -677,6 +702,7 @@ export async function readSyncChanges(input: {
       refSeq: row.ref_seq === null || row.ref_seq === undefined ? null : Number(row.ref_seq),
       serverId: row.server_id,
       scopeKind: row.scope_kind!,
+      scopeId: row.scope_id!,
       parentId: row.parent_id,
     };
     (isTrue(row.late) ? late : page).push(change);

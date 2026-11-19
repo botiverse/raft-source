@@ -37,6 +37,48 @@ export interface WebHttpClientTerminalInput {
   requestUrl?: string;
   responseData?: unknown;
   responseHeaders?: unknown;
+  /** What the request failed with (an Axios error, or what `fetch` threw); read only for `error_code` when no response came. */
+  failure?: unknown;
+}
+
+/** `error_code` of a request that got no HTTP response: the Axios error code, from a closed set. */
+export type WebHttpNetworkErrorCode =
+  | "ERR_NETWORK"
+  | "ECONNABORTED"
+  | "ETIMEDOUT"
+  | "ERR_CANCELED"
+  | "ERR_FR_TOO_MANY_REDIRECTS"
+  | "ERR_INVALID_URL"
+  | "other";
+
+const NETWORK_ERROR_CODES = new Set<string>([
+  "ERR_NETWORK",
+  "ECONNABORTED",
+  "ETIMEDOUT",
+  "ERR_CANCELED",
+  "ERR_FR_TOO_MANY_REDIRECTS",
+  "ERR_INVALID_URL",
+]);
+
+/**
+ * The bounded code of a failure that got no HTTP response. An Axios error's
+ * `code` when it is in the closed set; what `fetch` throws is read by its kind
+ * (`AbortError` -> ERR_CANCELED, `TimeoutError` -> ETIMEDOUT, a `TypeError` ->
+ * ERR_NETWORK). Anything else is `other`. The error's message is never read.
+ */
+export function webHttpNetworkErrorCode(failure: unknown): WebHttpNetworkErrorCode {
+  try {
+    if (!failure || typeof failure !== "object") return "other";
+    const code = (failure as { code?: unknown }).code;
+    if (typeof code === "string" && NETWORK_ERROR_CODES.has(code)) return code as WebHttpNetworkErrorCode;
+    const name = (failure as { name?: unknown }).name;
+    if (name === "AbortError") return "ERR_CANCELED";
+    if (name === "TimeoutError") return "ETIMEDOUT";
+    if (failure instanceof TypeError) return "ERR_NETWORK";
+    return "other";
+  } catch {
+    return "other";
+  }
 }
 
 const FORWARD_STABLE_CODES = new Set([
@@ -187,6 +229,9 @@ export function startWebHttpClientSpan(
           status_bucket: bucket,
           status_code: input.statusCode,
           ...(bytes !== undefined ? { response_bytes: bytes } : {}),
+          ...(input.statusCode === undefined && input.failure !== undefined
+            ? { error_code: webHttpNetworkErrorCode(input.failure) }
+            : {}),
           ...timing?.segments,
           ...forwardHttpDiagnosticAttrs(input),
         },

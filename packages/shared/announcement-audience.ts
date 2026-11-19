@@ -25,9 +25,10 @@ export interface AnnouncementClient {
 /**
  * Where an announcement pops up. `desktop` = a computer browser or the desktop
  * app; `mobile` = the iOS / Android / HarmonyOS App or a phone or tablet
- * browser (cindyz, 2026-11-04, #wg-announcement). Absent = both, which is how
- * every announcement behaved before the choice existed; publishing a new one
- * requires it (feature-flag-admin publishDraft).
+ * browser (cindyz, 2026-11-04, #wg-announcement). Legacy only: the editor no
+ * longer sets it (#14753), and a draft's `devices` become an equivalent
+ * `platform` condition when it is opened. Absent = no device restriction;
+ * publishing does not require it (#14812).
  */
 export const ANNOUNCEMENT_DEVICES = ["desktop", "mobile"] as const;
 export type AnnouncementDevice = (typeof ANNOUNCEMENT_DEVICES)[number];
@@ -253,7 +254,13 @@ export type AnnouncementCondition =
   /** On for this user in the current Server; negated = off. */
   | (Negatable & { field: "feature_flag"; key: string })
   | (Negatable & { field: "locale"; values: DisplayLocale[] })
-  | (Negatable & { field: "platform"; values: AnnouncementRulePlatform[] });
+  | (Negatable & { field: "platform"; values: AnnouncementRulePlatform[] })
+  /**
+   * The open Server has a Computer in use (connected within
+   * ANNOUNCEMENT_COMPUTER_ACTIVE_DAYS) whose Computer version is below `below`
+   * (MAJOR.MINOR.PATCH) or unknown (Tenny, #raft-operations:431aa0ae).
+   */
+  | (Negatable & { field: "computer_version"; below: string });
 export interface AnnouncementConditionGroup { match: AnnouncementRuleMatch; conditions: AnnouncementCondition[] }
 export interface AnnouncementAudienceRules { match: AnnouncementRuleMatch; groups: AnnouncementConditionGroup[] }
 
@@ -263,10 +270,41 @@ export interface AnnouncementRuleContext {
   accountCreatedAt: Date;
   locale: DisplayLocale | null;
   platform: AnnouncementRulePlatform | null;
-  /** The Server the user has open, with their non-Guest role there. */
-  server: { createdAt: Date; plan: string; role: string } | null;
+  /**
+   * The Server the user has open, with their non-Guest role there.
+   * `computerVersions`: the reported Computer version (null = never reported) of each
+   * of its Computers connected within ANNOUNCEMENT_COMPUTER_ACTIVE_DAYS; absent when
+   * not loaded, which a computer_version condition reads as unknown.
+   */
+  server: { createdAt: Date; plan: string; role: string; computerVersions?: ReadonlyArray<string | null> } | null;
   /** Every key `announcementRuleFlagKeys` names, evaluated for this user and Server. */
   flags: ReadonlyMap<string, boolean>;
+}
+
+/** "In use" for computer_version: connected within this many days. Fixed, not a parameter. */
+export const ANNOUNCEMENT_COMPUTER_ACTIVE_DAYS = 30;
+const PLAIN_VERSION = /^(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})$/;
+const REPORTED_VERSION = /^v?(\d{1,9})\.(\d{1,9})\.(\d{1,9})(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/;
+
+/**
+ * Whether a reported Computer version is below `target` (plain MAJOR.MINOR.PATCH).
+ * Release part only, like the version floor (computer-version-floor.md): a
+ * pre-release counts as its release (`1.0.53-rc.1` is not below 1.0.53), so
+ * this audience is exactly who the floor holds; build metadata is ignored. A version that is missing or does not
+ * parse counts as below (an old or unknown Computer). Mirrored in SQL by
+ * announcement_rules_reach; a test keeps the two in step.
+ */
+export function computerVersionBelow(reported: string | null, target: string): boolean {
+  const want = PLAIN_VERSION.exec(target);
+  if (!want) throw new Error("computer_version target must be MAJOR.MINOR.PATCH");
+  const got = reported === null ? null : REPORTED_VERSION.exec(reported.trim());
+  if (!got) return true;
+  for (let i = 1; i <= 3; i++) {
+    const a = Number(got[i]);
+    const b = Number(want[i]);
+    if (a !== b) return a < b;
+  }
+  return false;
 }
 
 const FLAG_KEY = /^[a-z0-9_.-]{1,64}$/;
@@ -328,6 +366,10 @@ function condition(value: unknown): AnnouncementCondition {
     case "platform":
       keys(["values"]);
       return { field: "platform", values: oneOf(input.values, ANNOUNCEMENT_RULE_PLATFORMS, "platform values"), ...negate };
+    case "computer_version":
+      keys(["below"]);
+      if (typeof input.below !== "string" || !PLAIN_VERSION.test(input.below)) throw new Error("computer_version below must be a version MAJOR.MINOR.PATCH, like 1.0.53");
+      return { field: "computer_version", below: input.below, ...negate };
     default:
       throw new Error("unknown announcement condition field");
   }
@@ -352,6 +394,11 @@ export function validateAnnouncementAudienceRules(value: unknown): AnnouncementA
     return { match: match(item.match, "group match"), conditions: item.conditions.map(condition) };
   });
   return { match: match(input.match, "rules match"), groups };
+}
+
+/** Whether a request must load the open Server's Computer versions before `matchesAnnouncementRules`. */
+export function announcementRulesNeedComputers(rules: AnnouncementAudienceRules | undefined): boolean {
+  return !!rules?.groups.some((group) => group.conditions.some((item) => item.field === "computer_version"));
 }
 
 /** The flag keys a request must evaluate before `matchesAnnouncementRules`. */
@@ -379,6 +426,10 @@ function conditionHolds(item: AnnouncementCondition, ctx: AnnouncementRuleContex
     case "feature_flag": return ctx.flags.get(item.key) ?? false;
     case "locale": return ctx.locale ? item.values.includes(ctx.locale) : null;
     case "platform": return ctx.platform ? item.values.includes(ctx.platform) : null;
+    case "computer_version": {
+      const versions = ctx.server?.computerVersions;
+      return versions ? versions.some((version) => computerVersionBelow(version, item.below)) : null;
+    }
   }
 }
 

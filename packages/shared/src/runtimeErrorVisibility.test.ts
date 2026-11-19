@@ -13,6 +13,7 @@ import {
   memberRuntimeErrorMessage,
   scrubRuntimeErrorText,
 } from "./runtimeErrorVisibility";
+import { DIAGNOSTIC_REDACTION_CREDENTIAL_SAMPLES } from "./test/diagnosticRedactionCredentialSamples";
 
 const POISONED = [
   "Request failed: Authorization: Bearer abcdefghijklmnop1234",
@@ -64,6 +65,8 @@ test("the scrubber's work grows with the text, not its square: hostile runs with
     "a.".repeat(60_000),
     `x@${"a.".repeat(60_000)}`,
     `${"/home/".repeat(20_000)}`,
+    "--a-".repeat(30_000),
+    "Basic ".repeat(20_000),
   ]) {
     const started = performance.now();
     scrubRuntimeErrorText(hostile);
@@ -111,6 +114,160 @@ test("a value with no closing quote, or one the bare form excludes, is redacted 
   assert.equal(scrubRuntimeErrorText("password: hunter22"), "password=[REDACTED_TOKEN]");
   assert.equal(scrubRuntimeErrorText('say "hello world'), 'say "hello world', "a stray quote outside an assignment is left alone");
   assert.equal(scrubRuntimeErrorText('key: "x"; other'), 'key: "x"; other');
+});
+
+// Security review (2026-11): the telemetry excerpt and the manager-visible
+// detail both come from this scrubber, which let these shapes through. One
+// case per shape: the value goes, the status code / key / scheme / flag stays.
+const AKIA_ID = "AK" + "IA" + "IOSFODNN7EXAMPLE";
+const ASIA_ID = "AS" + "IA" + "IOSFODNN7EXAMPLEABCD";
+const GOOGLE_KEY = "AI" + "za" + "SyA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q";
+const GOOGLE_OAUTH = "ya" + "29." + "a0AfB_byC1d2E3f4G5h6I7j8K9";
+const BARE_JWT = "ey" + "JhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIn0.c2ln";
+const RUNTIME_SHAPES: readonly { shape: string; input: string; secret: string; scrubbed: string }[] = [
+  {
+    shape: "JSON-quoted api_key",
+    input: 'Error: 401 from https://api.example.test/v1/messages {"type":"error","api_key": "Zq81mNw2Lp0x"}',
+    secret: "Zq81mNw2Lp0x",
+    scrubbed: 'Error: 401 from https://api.example.test/v1/messages {"type":"error","api_key": "[REDACTED_TOKEN]"}',
+  },
+  { shape: "JSON-quoted token, no space", input: '400 {"token":"tq.82Hd-1x"}', secret: "tq.82Hd-1x", scrubbed: '400 {"token":"[REDACTED_TOKEN]"}' },
+  { shape: "JSON-quoted password with spaces", input: '{"password": "correct horse battery", "user": "x"}', secret: "horse", scrubbed: '{"password": "[REDACTED_TOKEN]", "user": "x"}' },
+  { shape: "JSON-quoted secret", input: '{"secret": "s3cr3tValue"} rejected', secret: "s3cr3tValue", scrubbed: '{"secret": "[REDACTED_TOKEN]"} rejected' },
+  { shape: "JSON-quoted access_token", input: '{"access_token": "at-9f8e7d6c"}', secret: "at-9f8e7d6c", scrubbed: '{"access_token": "[REDACTED_TOKEN]"}' },
+  { shape: "JSON-quoted refresh_token", input: '{"refresh_token": "rt-1a2b3c4d"}', secret: "rt-1a2b3c4d", scrubbed: '{"refresh_token": "[REDACTED_TOKEN]"}' },
+  { shape: "JSON-escaped client_secret", input: String.raw`{\"client_secret\":\"cs-5e6f7a8b\"}`, secret: "cs-5e6f7a8b", scrubbed: String.raw`{\"client_secret\":\"[REDACTED_TOKEN]\"}` },
+  { shape: "Authorization: Basic", input: "401 Unauthorized; Authorization: Basic dXNlcjpodW50ZXIy", secret: "dXNlcjpodW50ZXIy", scrubbed: "401 Unauthorized; Authorization: Basic [REDACTED_TOKEN]" },
+  { shape: "Basic outside a header", input: "curl: (22) 401 with Basic dXNlcjpwYXNz", secret: "dXNlcjpwYXNz", scrubbed: "curl: (22) 401 with Basic [REDACTED_TOKEN]" },
+  { shape: "bare JWT", input: `401: jwt ${BARE_JWT} expired`, secret: BARE_JWT, scrubbed: "401: jwt [REDACTED_TOKEN] expired" },
+  { shape: "AWS access key id", input: `403 InvalidClientTokenId for ${AKIA_ID}`, secret: AKIA_ID, scrubbed: "403 InvalidClientTokenId for [REDACTED_TOKEN]" },
+  { shape: "AWS STS key id", input: `403 for ${ASIA_ID}`, secret: ASIA_ID, scrubbed: "403 for [REDACTED_TOKEN]" },
+  { shape: "AWS secret access key, JSON", input: '403 {"SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}', secret: "wJalrXUtnFEMI", scrubbed: '403 {"SecretAccessKey": "[REDACTED_TOKEN]"}' },
+  { shape: "Google API key", input: `400 API key not valid: ${GOOGLE_KEY}.`, secret: GOOGLE_KEY, scrubbed: "400 API key not valid: [REDACTED_TOKEN]." },
+  { shape: "Google OAuth token", input: `401 token ${GOOGLE_OAUTH} rejected`, secret: GOOGLE_OAUTH, scrubbed: "401 token [REDACTED_TOKEN] rejected" },
+  { shape: "--api-key <v>", input: "exit 1: claude --api-key Zq81mNw2Lp0x --verbose", secret: "Zq81mNw2Lp0x", scrubbed: "exit 1: claude --api-key [REDACTED_TOKEN] --verbose" },
+  { shape: "--token <v>", input: "gh --token abcdEFGH1234 failed", secret: "abcdEFGH1234", scrubbed: "gh --token [REDACTED_TOKEN] failed" },
+  { shape: "--password \"<v>\"", input: 'db --password "correct horse" refused', secret: "horse", scrubbed: "db --password [REDACTED_TOKEN] refused" },
+  { shape: "--secret <v>", input: "run --secret s3c --x", secret: "s3c", scrubbed: "run --secret [REDACTED_TOKEN] --x" },
+  { shape: "--auth <v>", input: "proxy --auth u1:p2 up", secret: "u1:p2", scrubbed: "proxy --auth [REDACTED_TOKEN] up" },
+];
+
+for (const { shape, input, secret, scrubbed } of RUNTIME_SHAPES) {
+  test(`runtime error text, ${shape}: the value goes, the text around it stays`, () => {
+    assert.equal(scrubRuntimeErrorText(input), scrubbed);
+    assert.ok(!scrubbed.includes(secret));
+    assert.equal(scrubRuntimeErrorText(scrubbed), scrubbed, "idempotent");
+  });
+}
+
+test("runtime error text masks every shared credential sample (one catalogue with the feedback log tail)", () => {
+  for (const { label, sample, mustNotContain } of DIAGNOSTIC_REDACTION_CREDENTIAL_SAMPLES) {
+    const once = scrubRuntimeErrorText(sample);
+    assert.ok(!once.includes(mustNotContain), `${label} leaked: ${once}`);
+    assert.equal(scrubRuntimeErrorText(once), once, `${label} not idempotent`);
+  }
+});
+
+test("runtime error text: ordinary text, commit SHAs included, is not masked", () => {
+  for (const line of [
+    "model claude-sonnet-4-5-20250929 not found; try gpt-5.1-codex or gemini-2.5-pro",
+    "request 123e4567-e89b-12d3-a456-426614174000 failed",
+    "ENOENT: no such file or directory, open 'src/tokenizer.ts' (secret_store.json)",
+    "claude --verbose --model opus --max-tokens 4096 --token-budget 2000 --output-format stream-json --secret-file x",
+    "raft-daemon 0.98.1 on node v22.11.0",
+    "fatal: bad object 3c0f7bab8e1d2f3a4b5c6d7e8f90123456789abc",
+    "Basic Authentication failed; Authorization header missing; password reset required",
+    "disk_usage_bytes=1234 task_list_x",
+  ]) {
+    assert.equal(scrubRuntimeErrorText(line), line);
+  }
+});
+
+// Adversarial review of #14933: the escape, quoting and prose cases on the
+// runtime surface (every new sample is also in the shared-sample test above).
+test("runtime error text: keys after escapes and quoted values with escapes are masked, labels kept", () => {
+  assert.equal(scrubRuntimeErrorText(String.raw`{"msg":"line1\nsk_agent_ABCDEF123456"}`), String.raw`{"msg":"line1\n[REDACTED_TOKEN]"}`);
+  assert.equal(scrubRuntimeErrorText("key%3Dsk_agent_ABCDEF123456"), "key%3D[REDACTED_TOKEN]");
+  assert.equal(scrubRuntimeErrorText(String.raw`\n--password hunter2!`), String.raw`\n--password [REDACTED_TOKEN]`);
+  assert.equal(scrubRuntimeErrorText(`{"password": "it's secret value", "user": "bob"}`), `{"password": "[REDACTED_TOKEN]", "user": "bob"}`);
+  assert.equal(scrubRuntimeErrorText(String.raw`{"password":"p\"ass", "user": "bob"}`), `{"password":"[REDACTED_TOKEN]", "user": "bob"}`);
+  assert.equal(scrubRuntimeErrorText('{"api_key":"xxxxx\\u0022SECRETAFTERESCAPE"}'), '{"api_key":"[REDACTED_TOKEN]"}');
+  assert.equal(scrubRuntimeErrorText(`{"password": 1234, "pin": 482913}`), `{"password": [REDACTED_TOKEN], "pin": [REDACTED_TOKEN]}`);
+  assert.equal(scrubRuntimeErrorText(String.raw`{"client_secret":"ab\/cd\\ef\/SECRETTAIL"}`), '{"client_secret":"[REDACTED_TOKEN]"}');
+});
+
+test("runtime error text: prose after secret flags and Authorization, JSON literals and in-word lookalikes stay readable", () => {
+  for (const line of [
+    "missing --token flag; use --api-key or set X; pass --token to cli",
+    "Authorization: required; authorization: denied; Authorization=none",
+    `{"secret": true, "api_key": null, "has_secret": false}`,
+    "pin: 3.11 spin=1234",
+    "auth: login required; oauth: refresh failed",
+    "disk_usage_bytes task_sk_test_1",
+  ]) {
+    assert.equal(scrubRuntimeErrorText(line), line);
+  }
+});
+
+test("runtime error text: connection-string passwords are masked", () => {
+  for (const [input, password] of [
+    ["connect ECONNREFUSED postgres://app:hunter2@db:5432/x", "hunter2"], ["mysql://root:s3cret@127.0.0.1:3306/db", "s3cret"],
+    ["redis://:pw42@host:6379", "pw42"], ["mongodb+srv://u:p4ss@cluster0.example.net/db", "p4ss"], ["amqps://u:pa55@mq:5671", "pa55"],
+  ] as const) {
+    const scrubbed = scrubRuntimeErrorText(input);
+    assert.ok(!scrubbed.includes(password), scrubbed);
+    assert.equal(scrubRuntimeErrorText(scrubbed), scrubbed);
+  }
+  assert.equal(scrubRuntimeErrorText("connect ECONNREFUSED postgres://app:hunter2@db:5432/x"), "connect ECONNREFUSED postgres://app:[REDACTED_TOKEN]@db:5432/x");
+  for (const line of ["http://host:8080/path", "ssh://git@host/x", "postgres://db:5432/x"]) assert.equal(scrubRuntimeErrorText(line), line);
+});
+
+// Tenny's review of #14933: cookies, more token prefixes, YAML block values and
+// passwords with an unencoded `/`, on the runtime surface. The connection
+// string and the YAML block are read before this scrubber's own passes, which
+// would otherwise mask `cd@db.example.com` as an email (leaving `ab/`) and
+// rewrite `password: |` before the block under it is seen.
+test("runtime error text: cookies, hf/glpat/npm/rk tokens, YAML block secrets and slash passwords are masked", () => {
+  const cases: readonly [string, string][] = [
+    ["401 Cookie: session=abc123; theme=dark", "401 Cookie: [REDACTED_TOKEN]"],
+    ["Set-Cookie: sid=zz9; Path=/; HttpOnly", "Set-Cookie: [REDACTED_TOKEN]"],
+    [`{"cookie": "sid=abc123", "set-cookie": ["a=b", "c=d"]}`, `{"cookie": "[REDACTED_TOKEN]", "set-cookie": [[REDACTED_TOKEN]]}`],
+    [`pull ${"h" + "f_"}AbCdEfGhIjKlMnOpQrStUvWxYzAbCdEfGh failed`, "pull [REDACTED_TOKEN] failed"],
+    [`remote: ${"gl" + "pat-"}AbCdEf0123456789_-xy rejected`, "remote: [REDACTED_TOKEN] rejected"],
+    [`using ${"np" + "m_"}AbCdEfGhIjKlMnOpQrStUvWxYz0123456789`, "using [REDACTED_TOKEN]"],
+    [`stripe ${"r" + "k_live_"}51HqAbCdEfGhIjKlMnOpQrStUv`, "stripe [REDACTED_TOKEN]"],
+    ["connect postgres://app:ab/cd@db.example.com:5432/x", "connect postgres://app:[REDACTED_TOKEN]@db.example.com:5432/x"],
+    ["postgres://u:ab/cd@host:5432/db", "postgres://u:[REDACTED_TOKEN]@host:5432/db"],
+    ["config:\n  private_key: |\n    line1\n    line2\n  user: bob", "config:\n  private_key=[REDACTED_TOKEN]\n    [REDACTED_TOKEN]\n  user: bob"],
+    ["db:\n  password: >-\n    pw1\n  host: db", "db:\n  password: [REDACTED_TOKEN]\n    [REDACTED_TOKEN]\n  host: db"],
+    // Adversarial review of #14963.
+    ["postgres://u:pw@db/x?notify=alice@corp.example.com", "postgres://u:[REDACTED_TOKEN]@db/x?notify=[REDACTED_EMAIL]"],
+    ["postgres://u:pw@db/x,alice@corp.example.com", "postgres://u:[REDACTED_TOKEN]@db/x,[REDACTED_EMAIL]"],
+    ["http://u:SECRET/WITHSLASH@10.0.0.1/x", "http://%5BREDACTED_USER%5D:%5BREDACTED_PASSWORD%5D@10.0.0.1/x"],
+    ["https://u:ab/cd@db/x", "https://%5BREDACTED_USER%5D:%5BREDACTED_PASSWORD%5D@db/x"],
+    ["https://u:ab/cd@host.example.com/x", "https://%5BREDACTED_USER%5D:%5BREDACTED_PASSWORD%5D@host.example.com/x"],
+    ["Cookie: sid=abc123", "Cookie: [REDACTED_TOKEN]"],
+    ["users:\n- password: |\n    LIST1\n  name: bob", "users:\n- password=[REDACTED_TOKEN]\n    [REDACTED_TOKEN]\n  name: bob"],
+    [`deploy ${"gl" + "dt-"}AbCdEf0123456789_-xy`, "deploy [REDACTED_TOKEN]"],
+  ];
+  for (const [input, scrubbed] of cases) {
+    assert.equal(scrubRuntimeErrorText(input), scrubbed);
+    assert.equal(scrubRuntimeErrorText(scrubbed), scrubbed, "idempotent");
+  }
+  for (const line of [
+    "Set-Cookie: header missing; cookie: none",
+    "hf_hub_download npm_config_cache rk_test",
+    "description: |\n  not a secret\nnext: 1",
+    "http://host:8080/path ssh://git@host/x postgres://db:5432/x",
+  ]) {
+    assert.equal(scrubRuntimeErrorText(line), line);
+  }
+});
+
+test("runtime error text: a value the generic pass masked reads back unchanged", () => {
+  const once = scrubRuntimeErrorText("password: <hunter2> next");
+  assert.equal(once, "password: [REDACTED_TOKEN] next");
+  assert.equal(scrubRuntimeErrorText(once), once);
 });
 
 test("a typed class or required action decides the code", () => {

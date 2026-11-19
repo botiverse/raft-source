@@ -1,15 +1,15 @@
 import { useIntl } from "react-intl";
 import { ArrowRight } from "lucide-react";
 import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogBody,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
+  Button,
+  Dialog,
+  DialogBody,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
 } from "@botiverse/raft-ui";
 import type { KeyboardPlatform } from "@botiverse/raft-ui/wip";
 import type { ShortcutCombo } from "../../utils/keyboardShortcuts";
@@ -23,8 +23,9 @@ export interface ShortcutResetItem {
 }
 
 /**
- * Reset all (Artea's mock, frame 5): the DS AlertDialog (400px) listing what goes back, now → default, so nothing
- * is a surprise. Its confirm is orange (warning): a reset interrupts but can be redone by hand; red is for what
+ * Reset all (Artea's mock, frame 5): a DS Dialog at size sm (400px; AlertDialog is only for the confirmations Raft
+ * Chat lists) listing what goes back, now → default, so nothing is a surprise. Its confirm is orange (warning): a
+ * reset interrupts but can be redone by hand; red is for what
  * can't be undone.
  */
 export function ShortcutResetAllDialog({
@@ -42,13 +43,14 @@ export function ShortcutResetAllDialog({
 }) {
   const { formatMessage } = useIntl();
   return (
-    <AlertDialog open={open} onOpenChange={onOpenChange}>
-      <AlertDialogContent data-testid="shortcut-reset-all-dialog">
-        <AlertDialogHeader>
-          <AlertDialogTitle>{formatMessage({ id: "keyboardShortcuts.edit.resetAllTitle" })}</AlertDialogTitle>
-        </AlertDialogHeader>
-        <AlertDialogBody>
-          <AlertDialogDescription>{formatMessage({ id: "keyboardShortcuts.edit.resetAllBody" }, { count: items.length })}</AlertDialogDescription>
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent size="sm" data-testid="shortcut-reset-all-dialog">
+        <DialogHeader>
+          <DialogTitle>{formatMessage({ id: "keyboardShortcuts.edit.resetAllTitle" })}</DialogTitle>
+          <DialogClose aria-label={formatMessage({ id: "common.confirm.closeDialog" })} />
+        </DialogHeader>
+        <DialogBody>
+          <DialogDescription>{formatMessage({ id: "keyboardShortcuts.edit.resetAllBody" }, { count: items.length })}</DialogDescription>
           <ul className="mt-3 grid gap-2">
             {items.map((item) => (
               <li key={item.id} className="flex items-center justify-between gap-3" data-shortcut-reset-item={item.id}>
@@ -64,14 +66,14 @@ export function ShortcutResetAllDialog({
               </li>
             ))}
           </ul>
-        </AlertDialogBody>
-        <AlertDialogFooter>
-          <AlertDialogCancel size="lg">{formatMessage({ id: "keyboardShortcuts.edit.cancel" })}</AlertDialogCancel>
-          <AlertDialogAction variant="warning" size="lg" onClick={onConfirm} data-testid="shortcut-reset-all-confirm">
+        </DialogBody>
+        <DialogFooter>
+          <DialogClose render={<Button variant="ghost" size="lg" />}>{formatMessage({ id: "keyboardShortcuts.edit.cancel" })}</DialogClose>
+          <Button variant="warning" size="lg" onClick={onConfirm} data-testid="shortcut-reset-all-confirm">
             {formatMessage({ id: "keyboardShortcuts.edit.resetAllConfirm" })}
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

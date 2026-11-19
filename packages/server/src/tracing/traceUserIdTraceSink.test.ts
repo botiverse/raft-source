@@ -70,6 +70,65 @@ test("entries expire, and forgetting one (rotation) drops it at once", () => {
   assert.equal(cachedTraceUserId(USER_ID), undefined);
 });
 
+test("a user still producing spans is reloaded before expiry, so no span loses the key", async () => {
+  let clock = 1_000;
+  cache.setNow(() => clock);
+  rememberTraceUserId(USER_ID, TRACE_USER_ID);
+  clock += 4 * 60_000;
+  assert.equal(cachedTraceUserId(USER_ID), TRACE_USER_ID);
+  await cache.flush();
+  assert.deepEqual(loads, [], "no reload in the first half of the TTL");
+  clock += 2 * 60_000; // 6 minutes old: past half
+  assert.equal(cachedTraceUserId(USER_ID), TRACE_USER_ID, "still served while the reload runs");
+  await cache.flush();
+  assert.deepEqual(loads, [[USER_ID]]);
+  clock += 5 * 60_000; // 11 minutes after the first remember: expired without the reload
+  assert.deepEqual(exportedSpan({ user_id: USER_ID }).attrs, { trace_user_id: TRACE_USER_ID });
+});
+
+test("a load in flight when the user is forgotten does not write its old value back", async () => {
+  // The rotation: the load reads the old trace id, then the account is retired
+  // (new trace id committed, forgetTraceUserId), then the load resolves.
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  cache.setLoader(async (ids) => {
+    loads.push([...ids]);
+    await gate;
+    return new Map(ids.map((id) => [id, TRACE_USER_ID]));
+  });
+  assert.equal(cachedTraceUserId(USER_ID), undefined, "a miss queues the load");
+  const inFlight = cache.flush();
+  forgetTraceUserId(USER_ID);
+  release();
+  await inFlight;
+  assert.equal(cachedTraceUserId(USER_ID), undefined, "the stale value was discarded");
+
+  // A load asked for after the forget is kept: it reads the rotated value.
+  const ROTATED = "5a4b3c2d-1e0f-4a9b-8c7d-6e5f4a3b2c1d";
+  cache.setLoader(async (ids) => new Map(ids.map((id) => [id, ROTATED])));
+  await cache.flush();
+  assert.equal(cachedTraceUserId(USER_ID), ROTATED);
+});
+
+test("forgetting one user does not discard another user's load in the same batch", async () => {
+  const OTHER = "11111111-2222-4333-8444-555555555555";
+  const OTHER_TRACE = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  cache.setLoader(async (ids) => {
+    await gate;
+    return new Map(ids.map((id) => [id, id === OTHER ? OTHER_TRACE : TRACE_USER_ID]));
+  });
+  cachedTraceUserId(USER_ID);
+  cachedTraceUserId(OTHER);
+  const inFlight = cache.flush();
+  forgetTraceUserId(USER_ID);
+  release();
+  await inFlight;
+  assert.equal(cachedTraceUserId(OTHER), OTHER_TRACE);
+  assert.equal(cachedTraceUserId(USER_ID), undefined);
+});
+
 test("log events are rewritten too", () => {
   rememberTraceUserId(USER_ID, TRACE_USER_ID);
   const logs: TraceLogEvent[] = [];

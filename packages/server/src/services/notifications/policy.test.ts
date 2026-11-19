@@ -31,6 +31,8 @@ const account = (overrides: Partial<NotificationAccountSettings> = {}): Notifica
   quietHours: { ...DEFAULT_NOTIFICATION_ACCOUNT_SETTINGS.quietHours, ...overrides.quietHours },
 });
 
+const outerInput = (overrides: Partial<NotificationPolicyInput>) => input(overrides);
+
 function input(overrides: Partial<NotificationPolicyInput>): NotificationPolicyInput {
   return {
     category: "channel",
@@ -82,8 +84,8 @@ describe("contract §1.2: category x effective level", () => {
   });
 });
 
-describe("the shared level fixture (docs/contracts/fixtures/notification-levels.json)", () => {
-  const fixture = JSON.parse(readFileSync(new URL("../../../../../docs/contracts/fixtures/notification-levels.json", import.meta.url), "utf8")) as {
+describe("the shared level fixture (packages/shared/src/notification-levels.json)", () => {
+  const fixture = JSON.parse(readFileSync(new URL("../../../../shared/src/notification-levels.json", import.meta.url), "utf8")) as {
     cases: Array<{ name: string; server: NotificationLevel; channel: NotificationLevelSetting | null; thread: NotificationLevelSetting | null; muted: boolean; effective: NotificationLevel }>;
     categoryDecisions: Record<"personal" | "thread" | "follower_task_status" | "channel", Record<NotificationLevel, boolean>>;
   };
@@ -302,6 +304,7 @@ describe("decide(row, prefs, now, defaults)", () => {
       serverLevel: new Map(overrides.serverLevel ?? [[`${SERVER}:${USER}`, "all"]]),
       channelLevel: new Map(overrides.channelLevel ?? []),
       mutedFromSeq: new Map(overrides.mutedFromSeq ?? []),
+      followedThreadRepliesSwitch: new Set(),
     };
   }
 
@@ -402,6 +405,8 @@ describe("a security notice (two-step verification recovery started)", () => {
 describe("followedThreadReplies: off, a followed-thread reply alerts only when it @mentions the receiver", () => {
   const off = account({ followedThreadReplies: false });
   const on = account({ followedThreadReplies: true });
+  // These cases are with the switch's flag on for the receiver (the flag-off cases follow).
+  const input = (overrides: Partial<NotificationPolicyInput>) => outerInput({ followedThreadRepliesSwitch: true, ...overrides });
 
   // A reply's category as enqueue gives it, for a thread and a task conversation.
   const reply = (kind: "thread" | "task", mentioned: boolean) => {
@@ -476,6 +481,7 @@ describe("followedThreadReplies: off, a followed-thread reply alerts only when i
       serverLevel: new Map([[`${SERVER}:${USER}`, "all"]]),
       channelLevel: new Map(),
       mutedFromSeq: new Map(),
+      followedThreadRepliesSwitch: new Set([USER]),
     });
     const threadRow: NotificationPolicyRow = {
       receiverId: USER,
@@ -497,5 +503,50 @@ describe("followedThreadReplies: off, a followed-thread reply alerts only when i
     assert.deepEqual(decideNotification(input({ ...reply("thread", true), muted: true, account: off }), NOW), suppressed("muted"));
     const pausedOff = account({ followedThreadReplies: false, pausedUntil: "2099-01-01T00:00:00.000Z" });
     assert.deepEqual(decideNotification(input({ ...reply("task", true), account: pausedOff }), NOW), QUIET);
+  });
+});
+
+describe("followedThreadReplies while its flag (notification_followed_thread_replies_switch) is off: on for everyone", () => {
+  const off = account({ followedThreadReplies: false });
+  const thread = { category: "thread" as const, personal: false, mentioned: false };
+
+  test("a stored off is ignored: a followed-thread or task-conversation reply notifies", () => {
+    for (const followedThreadRepliesSwitch of [undefined, false]) {
+      for (const level of ["all", "mentions"] as const) {
+        assert.deepEqual(decideNotification(input({ ...thread, serverLevel: level, account: off, followedThreadRepliesSwitch }), NOW), NOTIFY, `${level} switch=${followedThreadRepliesSwitch}`);
+      }
+    }
+    // The same input with the flag on is held back: only the flag decides.
+    assert.deepEqual(decideNotification(input({ ...thread, account: off, followedThreadRepliesSwitch: true }), NOW), suppressed("followed_thread_replies_off"));
+  });
+
+  test("the level, the mute and quiet still apply as before", () => {
+    assert.deepEqual(decideNotification(input({ ...thread, serverLevel: "none", account: off }), NOW), suppressed("server_none"));
+    assert.deepEqual(decideNotification(input({ ...thread, muted: true, account: off }), NOW), suppressed("muted"));
+    assert.deepEqual(decideNotification(input({ ...thread, account: { ...off, pausedUntil: "2099-01-01T00:00:00.000Z" } }), NOW), QUIET);
+  });
+
+  test("decide(): a receiver missing from the loaded flag set reads as on whatever they stored", () => {
+    const USER = "user-1";
+    const SERVER = "server-1";
+    const prefs: NotificationPolicyPrefs = {
+      account: new Map([[USER, off]]),
+      serverLevel: new Map([[`${SERVER}:${USER}`, "all"]]),
+      channelLevel: new Map(),
+      mutedFromSeq: new Map(),
+      followedThreadRepliesSwitch: new Set(),
+    };
+    const threadRow: NotificationPolicyRow = {
+      receiverId: USER,
+      serverId: SERVER,
+      category: "thread",
+      personal: false,
+      levelChannelId: "channel-1",
+      threadChannelId: "thread-1",
+      levelChannelSeq: null,
+      mentioned: false,
+    };
+    assert.deepEqual(decide(threadRow, prefs, NOW, account()), NOTIFY);
+    assert.deepEqual(decide(threadRow, { ...prefs, followedThreadRepliesSwitch: new Set([USER]) }, NOW, account()), suppressed("followed_thread_replies_off"));
   });
 });

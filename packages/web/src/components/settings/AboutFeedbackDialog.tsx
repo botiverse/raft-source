@@ -29,7 +29,7 @@ import {
 import { useIntl } from "react-intl";
 import { useLocation, useNavigate } from "react-router-dom";
 import api from "../../api/client";
-import { handsFeedbackTransport } from "../../feedback/handsFeedbackTransport";
+import { feedbackCurrentClient, handsFeedbackTransport } from "../../feedback/handsFeedbackTransport";
 import { useFeedbackListDegraded } from "../../feedback/feedbackListDegradedState";
 import { useAgentFeedbackSent } from "../../feedback/agentFeedbackSentFlag";
 import { useMediaQuery } from "../../hooks/effectPrimitives";
@@ -272,7 +272,11 @@ export default function AboutFeedbackPanel() {
   );
 
   return (
-    <div className="slock-feedback-panel flex h-full min-h-0 flex-col bg-layer-canvas">
+    // The inbox is a column of list cells: its head and the hands list share one edge
+    // (raft-design patterns/lists.md "One edge"), 20px in the phone layout, where --column-margin
+    // would otherwise be 16. Only the inbox: the ticket and New feedback pages keep the 16px phone
+    // margin of the hands package. From 768px the variable is already right (16 mouse, 20 touch).
+    <div className={isInbox ? "slock-feedback-panel flex h-full min-h-0 flex-col bg-layer-canvas max-md:[--column-margin:20px]" : "slock-feedback-panel flex h-full min-h-0 flex-col bg-layer-canvas"}>
       {showPageHeader && (
         <PanelHeader
           title={formatMessage({ id: "settings.about.feedbackTitle" })}
@@ -282,7 +286,7 @@ export default function AboutFeedbackPanel() {
         />
       )}
       {attachmentError && (
-        <div className="px-4 pt-3">
+        <div className="px-(--column-margin) pt-3">
           <Banner intent="warning" density="sm" role="alert">
             {formatMessage({ id: "settings.about.feedbackAttachmentOpenError" })}
           </Banner>
@@ -291,6 +295,7 @@ export default function AboutFeedbackPanel() {
       <div className="min-h-0 flex-1" ref={workspaceRootRef}>
         <FeedbackProvider
           transport={handsFeedbackTransport}
+          currentClient={feedbackCurrentClient()}
           // The feedback SDK ships en and zh-CN; a Traditional Chinese reader gets Chinese.
           locale={locale === "zh-cn" || locale === "zh-tw" ? "zh-CN" : "en"}
         >

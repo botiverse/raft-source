@@ -4,7 +4,8 @@
 // (raft-docs content/developers/gateway-model-limits): field names, value
 // rules, when Raft reads and how it fails. Keep the two in step.
 // A typed OpenRouter model (task #10) reads OpenRouter's own list through the
-// same reader, as an OpenAI-compatible list (readBuiltInPresetCustomModelLimits).
+// same reader, as an OpenAI-compatible list (readBuiltInPresetCustomModelLimits);
+// a typed model on any other preset provider reads no list.
 //
 // The list is read with the connection's own Base URL and API key, through an
 // HTTP client that routes like the session's model calls. Nothing here logs or

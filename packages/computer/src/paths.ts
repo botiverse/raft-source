@@ -14,7 +14,8 @@
 //       service.log                  # service stdout/stderr capture
 //     servers/<serverId>/
 //       runner.state.json            # sk_computer_* + serverMachineId (per server)
-//       runner.pid                   # this server's runner child
+//       runner.pid                   # this server's runner child (once connected)
+//       runner.spawned.json          # the runner child the service spawned, until it exits
 //       runner.log
 //
 // Per-server isolation is a HARD contract invariant (§5, my axis):
@@ -220,6 +221,16 @@ export function serverRunnerLogPath(slockHome: string, serverId: string): string
 
 export function serverRunnerVersionPath(slockHome: string, serverId: string): string {
   return path.join(serverDir(slockHome, serverId), "runner-version.json");
+}
+
+/**
+ * The runner child the service spawned and has not seen exit yet
+ * (runnerSpawnRecord.ts). Unlike `runner.pid`, which the service writes only
+ * once the runner has connected, this exists from spawn, so readiness can tell
+ * a live runner that has not connected from no runner at all.
+ */
+export function serverRunnerSpawnedPath(slockHome: string, serverId: string): string {
+  return path.join(serverDir(slockHome, serverId), "runner.spawned.json");
 }
 
 export function legacyServerRunnerPidPath(slockHome: string, serverId: string): string {

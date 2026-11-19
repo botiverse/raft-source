@@ -4,6 +4,7 @@
 // own helpers (agentUsage.ts), and the list's sort. Pure: no React, no store.
 
 import type { AgentUsageResponse, AgentUsageRow } from "@botiverse/raft-shared";
+import type { MessageId } from "../../i18n/messages/en";
 import {
   chartTokens,
   relativeChange,
@@ -12,17 +13,20 @@ import {
   usageContext,
   usageReported,
   usageSince,
+  usageUnreportedReason,
 } from "../agent/agentUsage";
-import type { AgentUsageView, UsageFigures } from "../agent/agentUsage";
+import type { AgentUsageView, UsageFigures, UsageUnreportedReason } from "../agent/agentUsage";
 
 /** One agent's row of the usage view; null is "—" (not reported, or before its data starts). */
 export interface AgentUsageListRow {
   /**
-   * False: no turn of the agent has reported usage yet (the server's
-   * `usage_reported`): it hasn't run since usage was recorded, or its Computer
-   * doesn't send usage; nothing here tells which. Every figure is null.
+   * Not null: no turn of the agent has reported usage yet (the server's
+   * `usage_reported`), and why (its `computer_reports_usage`): it hasn't run
+   * since usage was recorded, its Computer is too old to send usage, or it
+   * runs on no Computer; "unknown" from an older server that doesn't say.
+   * Every figure is null.
    */
-  hasUsage: boolean;
+  noUsage: UsageUnreportedReason | null;
   /** New input + cache write + output, plus cache reads when asked. */
   tokens: number | null;
   perTurn: number | null;
@@ -33,6 +37,18 @@ export interface AgentUsageListRow {
   /** The range's days, oldest first, for the trend line: null before the data starts. */
   trend: (number | null)[];
 }
+
+/**
+ * A row's note for each reason it has no usage, and its test id. An older
+ * server's "unknown" reads "No usage yet", as before it told them apart.
+ */
+export const USAGE_NOTE: Record<UsageUnreportedReason, { labelId: MessageId; testId: string }> = {
+  computer_too_old: { labelId: "members.usage.computerTooOld", testId: "members-usage-computer-too-old" },
+  no_computer: { labelId: "members.usage.noComputer", testId: "members-usage-no-computer" },
+  runtime_no_usage: { labelId: "members.usage.runtimeNoUsage", testId: "members-usage-runtime-no-usage" },
+  not_run: { labelId: "members.usage.noUsageYet", testId: "members-usage-no-usage" },
+  unknown: { labelId: "members.usage.noUsageYet", testId: "members-usage-no-usage" },
+};
 
 /** Some agents together: their figures from the earliest of their `since`. */
 export interface UsageGroupFigures {
@@ -109,12 +125,12 @@ export function summarizeMembersUsage(
   const rows = new Map<string, AgentUsageListRow>();
   for (const { agent_id: agentId } of agents) {
     if (!usageReported(response, agentId)) {
-      rows.set(agentId, { hasUsage: false, tokens: null, perTurn: null, context: null, change: null, trend: whole.total.days.map(() => null) });
+      rows.set(agentId, { noUsage: usageUnreportedReason(response, agentId), tokens: null, perTurn: null, context: null, change: null, trend: whole.total.days.map(() => null) });
       continue;
     }
     const figures = summarizeUsageRows(response, rowsByAgent.get(agentId)!, usageSince(response, agentId), view, withCacheReads);
     rows.set(agentId, {
-      hasUsage: true,
+      noUsage: null,
       tokens: figures.noData ? null : chartTokens(figures.sums, withCacheReads),
       perTurn: figures.noData ? null : tokensPerTurn(figures.sums),
       context: pickedPast ? null : usageContext(response, agentId),

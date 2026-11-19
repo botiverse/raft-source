@@ -15,14 +15,19 @@ import { useProfileStore } from "../../store/profileStore";
 import { useThreadStore } from "../../store/threadStore";
 import { agentRuntimePermissions } from "../../utils/agentVisibility";
 import { isMachineOfflineError, startRefusalText } from "../../utils/machineOfflineError";
+import { lazyDialog } from "../../boot/deferredUi";
 import { canMessageEntry } from "./memberActionsContext";
 import type { MemberActions } from "./memberActionsContext";
 import type { MemberEntry } from "./membersPageModel";
 
+// The agent's Edit runtime config dialog (the profile's), loaded when Edit agent first opens it.
+const AgentRuntimeConfigEditor = lazyDialog(() => import("../agent/AgentRuntimeConfigEditor").then((module) => ({ default: module.AgentRuntimeConfigEditor })));
+
 /**
  * The Members page's member actions (MemberActionsContext) and the dialogs
- * they open: Stop's confirmation and the Restart / reset chooser, the same
- * ones the agent's profile opens, with its words.
+ * they open: Stop's confirmation, the Restart / reset chooser and Edit
+ * agent's Edit runtime config dialog, the same ones the agent's profile
+ * opens, with its words.
  */
 export function useMemberActions(): { actions: MemberActions; dialogs: ReactNode } {
   const { formatMessage } = useIntl();
@@ -33,6 +38,11 @@ export function useMemberActions(): { actions: MemberActions; dialogs: ReactNode
   roleRef.current = role;
   const [stopTarget, setStopTarget] = useState<Agent | null>(null);
   const [resetTarget, setResetTarget] = useState<Agent | null>(null);
+  // Edit agent: its id, the agent read live from the store (a save updates it there).
+  const [editTargetId, setEditTargetId] = useState<string | null>(null);
+  const editTarget = useAgentStore((s) => (editTargetId ? s.agents.find((a) => a.id === editTargetId) ?? null : null));
+  const requestEdit = useCallback((agent: Agent) => setEditTargetId(agent.id), []);
+  const closeEdit = useCallback(() => setEditTargetId(null), []);
 
   const openDm = useCallback((entry: MemberEntry) => {
     if (!canMessageEntry(entry, roleRef.current)) return;
@@ -61,7 +71,8 @@ export function useMemberActions(): { actions: MemberActions; dialogs: ReactNode
     startAgent,
     requestStop: setStopTarget,
     requestReset: setResetTarget,
-  }), [openDm, role, startAgent]);
+    requestEdit,
+  }), [openDm, requestEdit, role, startAgent]);
 
   const closeStop = useCallback(() => setStopTarget(null), []);
   const closeReset = useCallback(() => setResetTarget(null), []);
@@ -73,12 +84,18 @@ export function useMemberActions(): { actions: MemberActions; dialogs: ReactNode
       isExternalAgent: resetTarget.external === true || isExternalAgentRuntime(resetTarget.runtime),
     })
     : null;
+  // Restart now in the saved toast: whoever may restart it (as the profile's canRestartAgent).
+  const editCanRestart = editTarget
+    ? agentRuntimePermissions(editTarget, userId, capabilities, {
+      isExternalAgent: editTarget.external === true || isExternalAgentRuntime(editTarget.runtime),
+    }).canControlAgentRuntime && !editTarget.deletedAt
+    : false;
 
   const dialogs = (
     <>
       {stopTarget ? (
         <ConfirmDialog
-          title={formatMessage({ id: "agent.detail.stopAgent" })}
+          title={formatMessage({ id: "agent.detail.stopAgentTitle" })}
           message={formatMessage({ id: "agent.detail.stopAgentConfirmMessage" }, { name: stopTarget.displayName || stopTarget.name })}
           confirmLabel={formatMessage({ id: "agent.detail.stopAgentConfirm" })}
           loadingLabel={formatMessage({ id: "agent.detail.stopping" })}
@@ -96,6 +113,9 @@ export function useMemberActions(): { actions: MemberActions; dialogs: ReactNode
           memberRuntimeOnly={role === "member"}
           onClose={closeReset}
         />
+      ) : null}
+      {editTarget ? (
+        <AgentRuntimeConfigEditor key={editTarget.id} agent={editTarget} canRestartAgent={editCanRestart} onClose={closeEdit} />
       ) : null}
     </>
   );

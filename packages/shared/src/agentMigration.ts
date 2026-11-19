@@ -77,6 +77,12 @@ export const agentMigrationTransferSummarySchema = lazySchema("agentMigrationTra
     }).strict()).max(5),
   }).strict().optional(),
   excludedIgnoredBySource: agentMigrationIgnoredBySourceSchema.optional(),
+  // The source stopped sizing the ignored paths before it was done (out of
+  // time or at the count bound): `excludedIgnored` (and its by-source split)
+  // is then a lower bound. Only a Computer that saw the Server advertise
+  // SERVER_CAPABILITY_MIGRATION_IGNORED_PARTIAL_V1, for a target that
+  // advertises AGENT_MIGRATION_TARGET_IGNORED_PARTIAL_CAPABILITY, sends it.
+  excludedIgnoredPartial: z.literal(true).optional(),
 }).strict().superRefine((summary, ctx) => {
   const categorized = Object.values(summary.excludedRegenerableByCategory)
     .reduce((total, count) => total + count, 0);
@@ -85,6 +91,13 @@ export const agentMigrationTransferSummarySchema = lazySchema("agentMigrationTra
       code: "custom",
       path: ["excludedRegenerableByCategory"],
       message: "excluded regenerable category counts must sum to excludedRegenerableCount",
+    });
+  }
+  if (summary.excludedIgnoredPartial && !summary.excludedIgnored) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["excludedIgnoredPartial"],
+      message: "excludedIgnoredPartial requires excludedIgnored",
     });
   }
   const bySource = summary.excludedIgnoredBySource;

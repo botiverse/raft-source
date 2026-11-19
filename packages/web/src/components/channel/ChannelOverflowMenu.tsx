@@ -5,14 +5,15 @@ import { Children, Suspense, useCallback, useEffect, useMemo, useRef, useState }
 import { useIntl } from "react-intl";
 import { Search, Settings } from "lucide-react";
 import {
-  AlertDialog,
-  AlertDialogBody,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
   Button,
+  Dialog,
+  DialogBody,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
   PanelToggleAction,
 } from "@botiverse/raft-ui";
 import { ChannelPreferencesSection } from "./ChannelPreferencesSection";
@@ -41,10 +42,6 @@ const ChannelMembers = deferredPanel(() => import("../../features/channel/Channe
 const NO_CHANNEL_AGENTS: ChannelAgent[] = [];
 const NO_CHANNEL_HUMANS: ChannelHuman[] = [];
 const NO_CHANNEL_EXTERNAL_MEMBERS: ChannelExternalMember[] = [];
-// The unsaved prompt stacks over the details on z-dialog-layer, the
-// layer the old `Modal layer={1}` and ConfirmDialog's `layer={1}` use.
-const UNSAVED_PROMPT_OVERLAY = { className: "z-dialog-layer" };
-
 /**
  * The channel header's own buttons and the channel details (raft-design channel.md, Kirby's redesign that stdrc
  * approved, task #proj-raft-ui:#232, #proj-raft-ui:dae8db07).
@@ -449,34 +446,40 @@ export default function ChannelOverflowMenu({
       </ChannelDetailsSurface>
 
       {/* Closing the details with unsaved settings asks first. Only name/description drafts can be saved here; an
-          invitation draft must be sent from its own form or explicitly discarded. Three actions, so the raft-ui
-          AlertDialog directly instead of the two-action ConfirmDialog. Escape dismisses it like Keep editing (gated
-          while a save is in flight); a backdrop press never does. Keep is ghost, Discard (loses the draft,
-          reversible) orange, Save pink. */}
-      <AlertDialog
+          invitation draft must be sent from its own form or explicitly discarded. Three actions, so a raft-ui Dialog
+          at size="sm" directly instead of the two-action ConfirmDialog (a confirmation is a small Dialog; AlertDialog
+          is only for the cases Raft Chat lists). Escape, × and a backdrop press dismiss it like Keep editing (gated
+          while a save is in flight). Keep is ghost, Discard (loses the draft,
+          reversible) orange, Save pink. With Save it is a choice, titled Unsaved changes with Discard changes; the
+          invitation-only prompt has two buttons, so it is a question, Discard changes? with Discard (DS Writing ›
+          Actions and their dialogs). */}
+      <Dialog
         open={showUnsavedPrompt}
         onOpenChange={handleUnsavedPromptOpenChange}
       >
-        <AlertDialogContent
-          className="z-dialog-layer"
-          overlay={UNSAVED_PROMPT_OVERLAY}
+        <DialogContent
+          size="sm"
+          layer={1}
+          aria-busy={unsavedBusy || undefined}
           data-testid="channel-overflow-unsaved-prompt"
+          // layer={1}: stacks over the details on z-dialog-layer, as ConfirmDialog's `layer={1}` does.
         >
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              {formatMessage({ id: "message.chatPanel.overflow.unsavedTitle" })}
-            </AlertDialogTitle>
-          </AlertDialogHeader>
-          <AlertDialogBody>
-            <AlertDialogDescription>
+          <DialogHeader>
+            <DialogTitle>
+              {formatMessage({ id: unsavedCanSave ? "message.chatPanel.overflow.unsavedTitle" : "agent.detail.editProfile.discardTitle" })}
+            </DialogTitle>
+            <DialogClose disabled={unsavedBusy} aria-label={formatMessage({ id: "common.confirm.closeDialog" })} />
+          </DialogHeader>
+          <DialogBody>
+            <DialogDescription>
               {formatMessage({
                 id: unsavedCanSave
                   ? "message.chatPanel.overflow.unsavedMessage"
                   : "message.chatPanel.overflow.unsavedInvitationMessage",
               })}
-            </AlertDialogDescription>
-          </AlertDialogBody>
-          <AlertDialogFooter>
+            </DialogDescription>
+          </DialogBody>
+          <DialogFooter>
             <Button
               onClick={handleKeepEditing}
               disabled={unsavedBusy}
@@ -492,7 +495,7 @@ export default function ChannelOverflowMenu({
               variant="warning"
               data-testid="channel-overflow-unsaved-discard"
             >
-              {formatMessage({ id: "message.chatPanel.overflow.discardChanges" })}
+              {formatMessage({ id: unsavedCanSave ? "message.chatPanel.overflow.discardChanges" : "agent.detail.editProfile.discard" })}
             </Button>
             {unsavedCanSave && (
               <Button
@@ -507,9 +510,9 @@ export default function ChannelOverflowMenu({
                   : formatMessage({ id: "message.chatPanel.overflow.saveAndClose" })}
               </Button>
             )}
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </>
   );
 }

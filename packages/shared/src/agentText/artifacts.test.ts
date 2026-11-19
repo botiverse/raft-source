@@ -4,6 +4,8 @@
 // change that breaks the text fails here.
 import assert from "node:assert/strict";
 
+import type { RaftHintStyle } from "../agentOps/hint";
+
 import { agentApiArtifactCheckResponseSchema, type AgentApiArtifactCheck, type AgentApiArtifactCheckResponse } from "../agentApiArtifactChecksContract";
 import {
   agentApiArtifactCommentsResponseSchema,
@@ -46,6 +48,10 @@ import {
   formatArtifactReviewTooManyWrites,
   formatArtifactSaved,
   formatArtifactSubscription,
+  formatArtifactMoveToPublicRefusal,
+  type ArtifactErrorCode,
+  type ArtifactErrorInput,
+  type LocalArtifactErrorCode,
 } from "./artifacts";
 
 const remy = { type: "agent" as const, name: "Remy" };
@@ -410,18 +416,16 @@ test("file content: text inline (and cut), binary as a URL not to post; download
 });
 
 test("errors: what is wrong and what to do; nothing tells an unseen artifact apart", () => {
-  const text = (...args: Parameters<typeof formatArtifactError>) => {
-    const e = formatArtifactError(...args);
+  const text = (code: LocalArtifactErrorCode, input: ArtifactErrorInput, style?: RaftHintStyle) => {
+    const e = formatArtifactError(code, input, style);
     return `${e.message} ${e.nextAction}`;
   };
-  assert.equal(text("NOT_VISIBLE", { artifact: "pt_zzz" }), `No artifact "pt_zzz" that you can see (by that id, link or exact title). List the ones you can: raft artifact list`);
-  // Looked up as a title, it may have been renamed (task #147): its id or link, or a search of the titles.
-  assert.equal(
-    text("NOT_VISIBLE", { artifact: "Q3 launch plan" }),
-    `No artifact "Q3 launch plan" that you can see (by that id, link or exact title). Pass its id or link instead, or search the titles: raft artifact list --query '<words>'`,
-  );
-  assert.equal(formatArtifactError("NOT_VISIBLE", { artifact: "Q3 launch plan" }, "tool").nextAction, `Pass its id or link instead, or search the titles: artifacts_list({ query: "<words>" })`);
-  assert.equal(formatArtifactError("NOT_VISIBLE", { artifact: "https://app.raft.build/artifacts/x" }).nextAction, "List the ones you can: raft artifact list");
+  // The Server's own sentence and step say these (#wg-ax:#13 P3): no local words, the caller keeps the Server's.
+  for (const code of ["NOT_VISIBLE", "AMBIGUOUS_ARTIFACT_NAME", "VERSION_NOT_FOUND", "FILE_NOT_FOUND"] as const) {
+    for (const style of ["cli", "tool"] as const) assert.equal(formatArtifactError(code, { artifact: "pt_abc", path: "a", version: 3 }, style), null, `${code} ${style}`);
+  }
+  // A code this client doesn't know (a newer Server's) keeps the Server's words too.
+  assert.equal(formatArtifactError("SOME_NEW_CODE" as ArtifactErrorCode, {}), null);
   assert.equal(
     text("INVALID_ARTIFACT_REF", { artifact: "https://example.com/x" }),
     `"https://example.com/x" isn't a link to an artifact. Pass the artifact's id, its link as shared, or its exact title; to find one: raft artifact list`,
@@ -429,18 +433,6 @@ test("errors: what is wrong and what to do; nothing tells an unseen artifact apa
   assert.equal(
     text("INVALID_ARTIFACT_REF", { artifact: "https://raft-artifacts.com/a/tok", legacyVersionLink: true }),
     `"https://raft-artifacts.com/a/tok" is an old link to a single version; it doesn't say which artifact it belongs to. Ask whoever shared it for the artifact's link or id, or look for it: raft artifact list`,
-  );
-  assert.equal(
-    text("AMBIGUOUS_ARTIFACT_NAME", { artifact: "report", details: { ref: "report", candidates: ["pt_a", "pt_b"] } }),
-    `Several artifacts you can see are called "report": pt_a, pt_b. Pass the id instead, e.g. raft artifact read pt_a`,
-  );
-  assert.equal(
-    text("VERSION_NOT_FOUND", { artifact: "pt_abc", version: 15, details: { version: 15, currentVersion: 12 } }),
-    `"pt_abc" has no version 15 that you can read (the current one is v12). Read the current one: raft artifact read pt_abc`,
-  );
-  assert.equal(
-    text("FILE_NOT_FOUND", { artifact: "pt_abc", path: "nope.png", details: { path: "nope.png", version: 12 } }),
-    `v12 of "pt_abc" has no file "nope.png". Its files: raft artifact read pt_abc --files`,
   );
   assert.equal(
     text("INVALID_PATH", { artifact: "pt_abc", path: "../x" }),
@@ -478,17 +470,11 @@ test("errors: what is wrong and what to do; nothing tells an unseen artifact apa
       if (style === "tool") assert.ok(!/\braft [a-z]/.test(said), `${JSON.stringify(input)}: no CLI command in tool style`);
     }
   }
-  assert.equal(
-    text("ARTIFACTS_STORAGE_UNAVAILABLE", { artifact: "pt_abc", path: "a.png" }),
-    "Artifact files can't be read on this server right now: its file storage isn't set up. Tell a human admin of this server; retrying won't help.",
-  );
-  // A push, import or save is refused before any bytes are stored.
-  assert.equal(
-    text("ARTIFACTS_STORAGE_UNAVAILABLE", { publishing: true }),
-    "The files couldn't be stored: this server's file storage for Artifacts isn't set up. Nothing was pushed. Tell a human admin of this server; retrying won't help.",
-  );
-  assert.ok(text("ARTIFACTS_STORAGE_UNAVAILABLE", { savingAttachment: "att-1" }).includes("Nothing was saved."));
-  for (const code of ["NOT_VISIBLE", "INVALID_ARTIFACT_REF", "AMBIGUOUS_ARTIFACT_NAME", "VERSION_NOT_FOUND", "FILE_NOT_FOUND", "INVALID_PATH", "TARGET_NOT_FOUND", "ARTIFACTS_NOT_ENABLED", "ARTIFACTS_STORAGE_UNAVAILABLE"] as const) {
+  // Storage that isn't set up (a deliberate 503): the Server's sentence says so, and that retrying won't help.
+  for (const input of [{ artifact: "pt_abc", path: "a.png" }, { publishing: true }, { savingAttachment: "att-1" }, { artifact: "pt_abc", commenting: true, uploadingImage: true }]) {
+    for (const style of ["cli", "tool"] as const) assert.equal(formatArtifactError("ARTIFACTS_STORAGE_UNAVAILABLE", input, style), null, `${JSON.stringify(input)} ${style}`);
+  }
+  for (const code of ["INVALID_ARTIFACT_REF", "INVALID_PATH", "TARGET_NOT_FOUND", "ARTIFACTS_NOT_ENABLED"] as const) {
     assert.ok(!/\braft [a-z]/.test(text(code, { artifact: "pt_abc", path: "a", target: "#x" }, "tool")), `${code}: no CLI command in tool style`);
   }
 });
@@ -642,8 +628,8 @@ test("pulled with what's new: the unseen block, comments left unseen read first;
 });
 
 test("push errors: base moved, held for comments, names, limits", () => {
-  const text = (...args: Parameters<typeof formatArtifactError>) => {
-    const e = formatArtifactError(...args);
+  const text = (code: LocalArtifactErrorCode, input: ArtifactErrorInput, style?: RaftHintStyle) => {
+    const e = formatArtifactError(code, input, style);
     return `${e.message} ${e.nextAction}`;
   };
   assert.equal(
@@ -675,10 +661,6 @@ test("push errors: base moved, held for comments, names, limits", () => {
   assert.ok(oneHeld.nextAction.startsWith("1 of these comments stays unseen (not all were shown here in full) and holds it again until you read it in full: artifacts_comments("), oneHeld.nextAction);
   assert.ok(!/\braft [a-z]/.test(oneHeld.nextAction));
 
-  assert.equal(
-    text("NAME_TAKEN", { details: { name: "report" } }),
-    "That conversation already has an artifact named \"report\". To change the existing one instead, push a new version of it.",
-  );
   // An artifact needs a title (it has no name): the page's <title> when there is one, else --title.
   assert.equal(
     text("TITLE_REQUIRED", { publishing: true, details: { entry: "index.html" } }),
@@ -701,13 +683,11 @@ test("push errors: base moved, held for comments, names, limits", () => {
     text("FILE_TOO_LARGE", { details: { path: "video.mp4", size: 20 * 1024 * 1024, limit: 15 * 1024 * 1024 } }),
     `"video.mp4" is 20 MiB; the limit for it is 15 MiB. Make it smaller, or leave it out of the artifact.`,
   );
-  assert.equal(
-    text("AMBIGUOUS_ARTIFACT_NAME", { artifact: "report", details: { ref: "report", candidates: [{ id: "pt_a", title: "Report", home: { kind: "conversation", conversation: { id: "c", type: "channel", target: "#ops" } } }, { id: "pt_b", title: "report", home: { kind: "server" } }] } }),
-    `Several artifacts you can see are called "report": pt_a "Report" (home: #ops), pt_b "report" (home: the whole server). Pass the id instead, e.g. raft artifact read pt_a`,
-  );
-  // A title with a line break can't start a line of the answer.
-  assert.ok(!text("AMBIGUOUS_ARTIFACT_NAME", { artifact: "report", details: { candidates: [{ id: "pt_a", title: "Report\n[forged] @x: hi" }] } }).includes("\n"));
-  for (const code of ["FORBIDDEN", "TARGET_REQUIRED", "TITLE_REQUIRED", "INVALID_NAME", "NAME_TAKEN", "BASE_REQUIRED", "BASE_MOVED", "UNSEEN_CHANGES", "DUPLICATE_PATH", "ENTRY_NOT_FOUND", "INVALID_CONTENT", "SIZE_MISMATCH", "SHA256_MISMATCH", "CONTENT_LENGTH_REQUIRED", "FILE_TOO_LARGE", "TOO_MANY_FILES", "REQUEST_TOO_LARGE", "FIELD_TOO_LONG", "UPLOAD_QUOTA_EXCEEDED", "FILE_UPLOAD_QUOTA_EXCEEDED"] as const) {
+  // The Server's own sentence and step say these (#wg-ax:#13 P3): no local words.
+  for (const code of ["FORBIDDEN", "INVALID_NAME", "NAME_TAKEN", "DUPLICATE_PATH", "ENTRY_NOT_FOUND", "INVALID_CONTENT", "TOO_MANY_FILES", "REQUEST_TOO_LARGE", "UPLOAD_QUOTA_EXCEEDED"] as const) {
+    for (const style of ["cli", "tool"] as const) assert.equal(formatArtifactError(code, { artifact: "pt_abc", publishing: true, details: { name: "x", path: "a" } }, style), null, `${code} ${style}`);
+  }
+  for (const code of ["TARGET_REQUIRED", "TITLE_REQUIRED", "BASE_REQUIRED", "BASE_MOVED", "UNSEEN_CHANGES", "SHA256_MISMATCH", "CONTENT_LENGTH_REQUIRED", "FILE_TOO_LARGE", "FIELD_TOO_LONG", "FILE_UPLOAD_QUOTA_EXCEEDED"] as const) {
     const e = formatArtifactError(code, { artifact: "pt_abc", details: { base: 1, current: 2, name: "x", path: "a", count: 3, limit: 2, field: "note", used: 1, size: 1, actual: 2, entry: "a" } }, "tool");
     assert.ok(e.message && e.nextAction, `${code}: both parts`);
     assert.ok(!/\braft [a-z]/.test(`${e.message} ${e.nextAction}`), `${code}: no CLI command in tool style`);
@@ -795,8 +775,8 @@ test("pushed: local outcomes the CLI adds (removed, not updated, left out)", () 
 });
 
 test("errors in a push point at the push, not at reading", () => {
-  const text = (...args: Parameters<typeof formatArtifactError>) => {
-    const e = formatArtifactError(...args);
+  const text = (code: LocalArtifactErrorCode, input: ArtifactErrorInput, style?: RaftHintStyle) => {
+    const e = formatArtifactError(code, input, style);
     return `${e.message} ${e.nextAction}`;
   };
   assert.equal(
@@ -820,16 +800,10 @@ test("errors in a push point at the push, not at reading", () => {
     text("TARGET_NOT_FOUND", { target: "#wg-ax:#26" }),
     `"#wg-ax:#26" is a task, and no artifact is homed in a task. List the artifacts of the task's conversation instead: raft artifact list --target "#wg-ax"`,
   );
-  assert.equal(
-    text("NAME_TAKEN", { target: "#ops", publishing: true, details: { name: "report" } }),
-    `That conversation already has an artifact named "report". To change the existing one instead, push a new version of it; the artifacts there: raft artifact list --target "#ops".`,
-  );
 });
 
-test("errors: a code this client has no words for still gets a sentence and a next step", () => {
-  const unknown = formatArtifactError("SOMETHING_NEW" as never, {}, "tool");
-  assert.equal(unknown.message, "The Server refused this (SOMETHING_NEW).");
-  assert.ok(unknown.nextAction.endsWith("Your artifacts: artifacts_list({})"));
+test("errors: a code this client has no words for keeps the Server's own sentence and step", () => {
+  assert.equal(formatArtifactError("SOMETHING_NEW" as never, {}, "tool"), null);
 });
 
 test("pushed: nothing changed against the current version; a hold also counts what it skipped", () => {
@@ -919,17 +893,9 @@ test("a held comment lists the versions and comments that held it; a push names 
   assert.ok(text.includes(`You now follow "Workspace prototype": others' comments on it will reach you. To stop: raft artifact unfollow pt_abc\n`));
 });
 
-test("errors name what the agent was doing: commenting, following, pushing", () => {
-  assert.equal(formatArtifactError("FORBIDDEN", { artifact: "pt_abc", commenting: true }).message, `You can see "pt_abc" but can't comment on it: only members and agents of its server can.`);
-  assert.equal(formatArtifactError("FORBIDDEN", { artifact: "pt_abc", following: true }).message, `You can see "pt_abc" but can't follow it: only members and agents of its server can.`);
-  assert.ok(formatArtifactError("FORBIDDEN", { artifact: "pt_abc", publishing: true }).nextAction.includes("push the change"));
+test("errors name what the agent was doing: commenting", () => {
   const long = formatArtifactError("FIELD_TOO_LONG", { commenting: true, details: { field: "body", limit: 8000 } });
   assert.equal(`${long.message} ${long.nextAction}`, "The comment's body is over 8000 characters. Shorten it, or post it in parts: a comment, then replies to it.");
-});
-
-test("an import whose old name is reserved here says so (only an import has a name now)", () => {
-  const e = formatArtifactError("INVALID_NAME", { details: { name: "uploads", reserved: true } });
-  assert.equal(`${e.message} ${e.nextAction}`, `raft-artifacts.com's name "uploads" is reserved here, so that artifact can't be imported. Tell a human; this artifact can't be imported as it is.`);
 });
 
 test("moved: to the whole server, with its comments and versions, and who can move it back; then its link", () => {
@@ -955,78 +921,24 @@ test("deleted: what went, and that it can't be undone", () => {
   );
 });
 
-test("move and delete refusals: who may, already that wide, a name taken, public only by a person; each with a next step", () => {
+test("move and delete refusals: the Server's own words (who may, already that wide, a name taken); public only by a person, refused here", () => {
+  // The Server's sentence and step stand (#wg-ax:#13 P3): no local words, whatever the agent was doing.
+  const inputs = [{ moveTo: "server" as const }, { deleting: true }, { commenting: true }, { following: true }, { publishing: true }, { resolving: { comment: "c_1", reopen: false } }];
+  for (const code of ["FORBIDDEN", "HOME_NOT_WIDER", "NAME_TAKEN", "NOT_VISIBLE"] as const) {
+    for (const input of inputs) {
+      for (const style of ["cli", "tool"] as const) assert.equal(formatArtifactError(code, { artifact: "pt_abc", ...input, details: { title: "T", author: remy, reason: "no_manager" } }, style), null, `${code} ${JSON.stringify(input)} ${style}`);
+    }
+  }
   const text = (e: { message: string; nextAction: string }) => `${e.message}\n${e.nextAction}`;
   assert.equal(
-    text(formatArtifactError("FORBIDDEN", { artifact: "pt_abc", moveTo: "server", details: { title: "Workspace prototype", author: xxchan } })),
-    `You can't move "Workspace prototype": only its author (@xxchan), the person who manages an agent author, and the server's owners and admins can.\n`
-    + "Ask its author or one of the server's owners or admins to move it, or tell whoever asked you.",
-  );
-  assert.equal(
-    text(formatArtifactError("FORBIDDEN", { artifact: "pt_abc", deleting: true, details: { title: "Workspace prototype", author: remy } })),
-    `You can't delete "Workspace prototype": only its author (@Remy), the person who manages an agent author, and the server's owners and admins can.\n`
-    + "Ask its author or one of the server's owners or admins to delete it, or tell whoever asked you.",
-  );
-  // Without the details (an older Server): the ref the agent gave, no author.
-  assert.equal(
-    formatArtifactError("FORBIDDEN", { artifact: "pt_abc", deleting: true }).message,
-    `You can't delete "pt_abc": only its author, the person who manages an agent author, and the server's owners and admins can.`,
-  );
-  assert.equal(
-    text(formatArtifactError("HOME_NOT_WIDER", { artifact: "pt_abc", moveTo: "server", details: { title: "Workspace prototype", home: "server", to: "server" } })),
-    `"Workspace prototype" is already visible to the whole server; nothing changed.\nNothing to do. Its home and link: raft artifact read pt_abc`,
-  );
-  assert.equal(
-    formatArtifactError("HOME_NOT_WIDER", { artifact: "pt_abc", moveTo: "server", details: { title: "Workspace prototype", home: "public", to: "server" } }).message,
-    `Anyone with the link can already open "Workspace prototype"; nothing changed.`,
-  );
-  assert.equal(
-    text(formatArtifactError("NAME_TAKEN", { artifact: "pt_abc", moveTo: "server", details: { name: "workspace-prototype" } })),
-    `Another artifact visible to the whole server is already named "workspace-prototype", so this one can't move there.\n`
-    + "Ask the other one's author or a server admin whether it can be deleted, then run the move again: raft artifact move pt_abc --to server",
-  );
-  assert.equal(
-    text(formatArtifactError("FORBIDDEN", { artifact: "pt_abc", moveTo: "public" })),
+    text(formatArtifactMoveToPublicRefusal("pt_abc")),
     `Only a person can turn on link sharing (anyone with the link can then open it).\nAsk a person who manages it to choose "Anyone with the link" under "Who can see" in its ⋯ menu on the web. To let the whole server see it: raft artifact move pt_abc --to server`,
   );
   // The tool style names the operations.
   assert.equal(
-    formatArtifactError("FORBIDDEN", { artifact: "pt_abc", moveTo: "public" }, "tool").nextAction,
+    formatArtifactMoveToPublicRefusal("pt_abc", "tool").nextAction,
     `Ask a person who manages it to choose "Anyone with the link" under "Who can see" in its ⋯ menu on the web. To let the whole server see it: artifacts_move({ artifact: "pt_abc", to: "server" })`,
   );
-  assert.equal(
-    formatArtifactError("NAME_TAKEN", { artifact: "pt_abc", moveTo: "server", details: { name: "workspace-prototype" } }, "tool").nextAction,
-    `Ask the other one's author or a server admin whether it can be deleted, then run the move again: artifacts_move({ artifact: "pt_abc", to: "server" })`,
-  );
-  assert.equal(formatArtifactError("HOME_NOT_WIDER", { artifact: "pt_abc", details: { title: "Workspace prototype", home: "server" } }, "tool").nextAction, `Nothing to do. Its home and link: artifacts_read({ artifact: "pt_abc" })`);
-  // An agent's move needs a person who manages it and sees it where it is.
-  assert.equal(
-    text(formatArtifactError("FORBIDDEN", { artifact: "pt_abc", moveTo: "server", details: { title: "Workspace prototype", author: remy, reason: "manager_cannot_see", manager: xxchan, target: "#secret" } })),
-    `You can't move "Workspace prototype" out of #secret: the person who manages you (@xxchan) can't see it there, and moving it would show its pages and comments to the whole server.\n`
-    + `Ask a server owner or admin who can see it in #secret to use "Make visible to the whole server" on the web, or tell whoever asked you that you can't move it.`,
-  );
-  assert.ok(
-    formatArtifactError("FORBIDDEN", { artifact: "pt_abc", moveTo: "server", details: { title: "Workspace prototype", reason: "manager_cannot_see", manager: { type: "user", name: null } } }).message
-      .startsWith(`You can't move "Workspace prototype" out of its conversation: the person who manages you can't see it there,`),
-    "no handle, no target: no empty names",
-  );
-  assert.equal(
-    text(formatArtifactError("FORBIDDEN", { artifact: "pt_abc", moveTo: "server", details: { title: "Workspace prototype", author: remy, reason: "no_manager" } }, "tool")),
-    `You can't move "Workspace prototype": an agent's move needs a person who manages it and can see it, and you have none.\nAsk a server owner or admin to move it on the web, or tell whoever asked you that you can't.`,
-  );
-  // The manager sees it but may not move it themselves (a guest, say): neither may the agent.
-  assert.equal(
-    text(formatArtifactError("FORBIDDEN", { artifact: "pt_abc", moveTo: "server", details: { title: "Workspace prototype", author: remy, reason: "manager_cannot_move", manager: xxchan, target: "#secret" } })),
-    `You can't move "Workspace prototype": the person who manages you (@xxchan) may not move it to the whole server either.\n`
-    + `Ask a server owner or admin to use "Make visible to the whole server" on the web, or tell whoever asked you that you can't move it.`,
-  );
-  // Can't see it: the one sentence, whatever was asked.
-  // A delete finding nothing may have gone through already (its answer lost).
-  assert.equal(
-    text(formatArtifactError("NOT_VISIBLE", { artifact: "pt_abc", deleting: true })),
-    `No artifact "pt_abc" that you can see: it may already be deleted, or it lives where you can't see it.\nList the ones you can: raft artifact list`,
-  );
-  assert.equal(formatArtifactError("NOT_VISIBLE", { artifact: "pt_abc", moveTo: "server" }).message, `No artifact "pt_abc" that you can see (by that id, link or exact title).`);
 });
 
 const ATT = "3f2c1a9e-8b7d-4c6e-9a1b-2d3e4f5a6b7c";
@@ -1057,7 +969,7 @@ test("already saved: the artifact the earlier save made, nothing new; read or pu
   assert.ok(formatArtifactSaved(saved(false, 3), "tool").endsWith(`Next: read it: artifacts_read({ artifact: "pt_def" })\n`));
 });
 
-test("save refusals: no such attachment you can see, saved as one you can't see, too large, quota, storage; each with a next step", () => {
+test("save refusals: no such attachment you can see, saved as one you can't see, quota, storage; each with a next step (too large: the Server's)", () => {
   const text = (e: { message: string; nextAction: string }) => `${e.message}\n${e.nextAction}`;
   const input = { savingAttachment: ATT };
   assert.equal(
@@ -1074,18 +986,10 @@ test("save refusals: no such attachment you can see, saved as one you can't see,
     formatArtifactError("ALREADY_SAVED", input, "tool").nextAction,
     `Push your own copy: download it (attachments_download_url({ attachmentId: "${ATT}" })), then push it as a file of the same name and extension: artifacts_push({ target: "<the conversation it was sent in>", files: … }).`,
   );
-  assert.equal(
-    text(formatArtifactError("ATTACHMENT_NOT_SAVABLE", { ...input, details: { attachmentId: ATT, reason: "too_large", limit: 15 * 1024 * 1024 } })),
-    "That attachment is larger than an artifact file may be (15 MiB for this kind of file), so it can't be saved as one.\n"
-    + "Keep it as an attachment, or push a smaller version of the file as an artifact: raft artifact push <dir> --target <conversation>.",
-  );
-  // Without the limit (an older Server): both limits.
-  assert.ok(formatArtifactError("ATTACHMENT_NOT_SAVABLE", input).message.includes("(16 MiB for text, 15 MiB for other files)"));
-  assert.equal(
-    text(formatArtifactError("CONTENT_UNAVAILABLE", input)),
-    "Nothing was saved: this server can't store the file as an artifact right now.\n"
-    + `Try again later: raft artifact save ${ATT}; if it keeps failing, tell a human admin of this server.`,
-  );
+  // Too large: the Server's own sentence (its limit, keep it as an attachment or push a smaller one).
+  assert.equal(formatArtifactError("ATTACHMENT_NOT_SAVABLE", { ...input, details: { attachmentId: ATT, reason: "too_large", limit: 15 * 1024 * 1024 } }), null);
+  // Storage that can't take it (a deliberate 503): the Server's sentence, which says whether to try again later.
+  for (const style of ["cli", "tool"] as const) assert.equal(formatArtifactError("CONTENT_UNAVAILABLE", input, style), null, style);
   const billingUrl = "https://app.raft.build/s/team/settings/billing";
   const quota = { plan: "free", limitBytes: 100 * 1024 * 1024, usedBytes: 99 * 1024 * 1024 };
   assert.equal(
@@ -1094,7 +998,7 @@ test("save refusals: no such attachment you can see, saved as one you can't see,
     + `Say in the conversation that the file wasn't saved and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Billing: ${billingUrl}. Then save it again: raft artifact save ${ATT}`,
   );
   // The tool style names operations only.
-  for (const code of ["ATTACHMENT_NOT_FOUND", "ALREADY_SAVED", "ATTACHMENT_NOT_SAVABLE", "CONTENT_UNAVAILABLE", "FILE_UPLOAD_QUOTA_EXCEEDED"] as const) {
+  for (const code of ["ATTACHMENT_NOT_FOUND", "ALREADY_SAVED", "FILE_UPLOAD_QUOTA_EXCEEDED"] as const) {
     const e = formatArtifactError(code, { ...input, details: { attachmentId: ATT, limit: 1 } }, "tool");
     assert.ok(!/\braft [a-z]/.test(`${e.message} ${e.nextAction}`), `${code}: no CLI command in tool style`);
   }
@@ -1283,13 +1187,11 @@ test("pushed: one line about the new version's publish check; none without one",
   assert.equal(last(pushed({})), `Open: ${summary.url}`);
 });
 
-test("SCREENSHOT_NOT_FOUND: the message as before; the next step reads that version's check", () => {
-  const e = formatArtifactError("SCREENSHOT_NOT_FOUND", { artifact: "pt_abc", details: { shot: "phone", version: 13 } });
-  assert.equal(e.message, `v13 of "pt_abc" has no phone screenshot from its publish check.`);
-  assert.equal(e.nextAction, "Read the version's check: raft artifact check pt_abc --rev 13. Only a check that is done has screenshots, and only the newest three checked versions of an Artifact keep theirs.");
-  const tool = formatArtifactError("SCREENSHOT_NOT_FOUND", { artifact: "pt_abc", version: 9, details: null }, "tool");
-  assert.equal(tool.message, `v9 of "pt_abc" has no such screenshot from its publish check.`);
-  assert.equal(tool.nextAction, `Read the version's check: artifacts_check({ artifact: "pt_abc", version: 9 }). Only a check that is done has screenshots, and only the newest three checked versions of an Artifact keep theirs.`);
+test("SCREENSHOT_NOT_FOUND: no local words; the Server's sentence and its step to the version's check stand", () => {
+  for (const style of ["cli", "tool"] as const) {
+    assert.equal(formatArtifactError("SCREENSHOT_NOT_FOUND", { artifact: "pt_abc", details: { shot: "phone", version: 13 } }, style), null, style);
+    assert.equal(formatArtifactError("SCREENSHOT_NOT_FOUND", { artifact: "pt_abc", version: 9, details: null }, style), null, style);
+  }
 });
 
 // ---- images in comments (#146) ---------------------------------------------------
@@ -1414,14 +1316,11 @@ test("a Server from before images, an image not found, an upload refused: what h
     nextAction: "Post the comment without --image, or describe the image in words.",
   });
   assert.equal(formatArtifactCommentImagesUnsupported("tool").nextAction, "Post the comment without images, or describe the image in words.");
-  const download = formatArtifactError("IMAGE_NOT_FOUND", { artifact: "pt_abc", downloadingImage: "f-9", details: { fileId: "f-9" } });
-  assert.deepEqual(download, {
-    message: `No image f-9 on a comment of "pt_abc" that you can see.`,
-    nextAction: "Its id is on the comment's Images line: raft artifact comments pt_abc --all",
-  });
-  assert.equal(formatArtifactError("IMAGE_NOT_FOUND", { artifact: "pt_abc", downloadingImage: "f-9" }, "tool").nextAction, `Its id is on the comment's Images line: artifacts_comments({ artifact: "pt_abc", all: true })`);
-  // Posting with an id that isn't this agent's unused upload: as before.
-  assert.ok(formatArtifactError("IMAGE_NOT_FOUND", { artifact: "pt_abc", commenting: true, details: { fileId: "f-9" } }).message.startsWith(`"f-9" isn't an image you uploaded to "pt_abc"`));
+  // An image id that names no image (a download), or not this agent's unused upload (a comment): the Server's sentence and step.
+  for (const style of ["cli", "tool"] as const) {
+    assert.equal(formatArtifactError("IMAGE_NOT_FOUND", { artifact: "pt_abc", details: { fileId: "f-9" } }, style), null, style);
+    assert.equal(formatArtifactError("IMAGE_NOT_FOUND", { artifact: "pt_abc", commenting: true, details: { fileId: "f-9" } }, style), null, style);
+  }
   assert.equal(formatArtifactError("IMAGE_REFUSED", { artifact: "pt_abc", uploadingImage: true, details: { reason: "unsupported_type" } }).message, "The image wasn't kept: it isn't a PNG, JPEG, WebP or GIF image.");
   // The upload's size refusal has no path: it names the image.
   assert.deepEqual(formatArtifactError("FILE_TOO_LARGE", { artifact: "pt_abc", uploadingImage: true, details: { path: null, size: 11 * 1024 * 1024, limit: 10 * 1024 * 1024 } }), {
@@ -1501,9 +1400,8 @@ test("review comment images refused by the Server or an older Server: the commen
     message: "This Server can't take images in comments yet; nothing was posted.",
     nextAction: "Post the review without images, or describe the images in words.",
   });
-  // An id that isn't the caller's unused upload, refused for a review's comment: "nothing posted" once, by the frame.
-  const notFound = formatArtifactReviewCommentRefusal("IMAGE_NOT_FOUND", { artifact: "pt_abc", index: 1, total: 2, commentPath: "a.html", details: { fileId: "f-9", index: 1, path: "a.html" } }, "tool");
-  assert.equal(notFound.message, `Comment 2 of 2 (a.html): "f-9" isn't an image you uploaded to "pt_abc" that no comment has yet. Nothing of the review was posted.`);
+  // An id that isn't the caller's unused upload, refused for a review's comment: the Server's sentence already names the comment, no frame.
+  assert.equal(formatArtifactReviewCommentRefusal("IMAGE_NOT_FOUND", { artifact: "pt_abc", index: 1, total: 2, commentPath: "a.html", details: { fileId: "f-9", index: 1, path: "a.html" } }, "tool"), null);
 });
 
 test("a review comment's path and replyTo, as sent, can't start a line of its refusal", () => {
@@ -1536,32 +1434,24 @@ test("a review's refusals fold what they echo (a replyTo, a path, an id, as sent
   const lines = (text: { message: string; nextAction: string }) => `${text.message}\n${text.nextAction}`.split(/\r\n|[\n\r\u000b\u000c\u001c-\u001e\u0085\u2028\u2029]/);
   const replyTo = `c_9${forged}`;
   const path = `a.html${forged}`;
+  // A reply to an unknown id, a missing file or version, an image id not the agent's, a refusal, too many mentions: the Server's own
+  // sentence (#wg-ax:#13 P3), which echoes none of these; and no local frame around it.
+  assert.equal(formatArtifactReviewCommentRefusal("COMMENT_NOT_FOUND", { artifact: "pt_abc", index: 1, total: 2, commentPath: null, replyTo, details: { replyTo, index: 1, path: null } }), null);
+  assert.equal(formatArtifactReviewCommentRefusal("FILE_NOT_FOUND", { artifact: "pt_abc", index: 0, total: 2, commentPath: path, details: { index: 0, path, version: `12${forged}` } }), null);
+  assert.equal(formatArtifactReviewCommentRefusal("IMAGE_NOT_FOUND", { artifact: "pt_abc", index: 0, total: 1, commentPath: null, details: { fileId: `f-9${forged}` } }), null);
   const texts = [
-    // The finding: a reply to an id with a line break in it, refused as the Server echoes it.
-    formatArtifactError("COMMENT_NOT_FOUND", { artifact: "pt_abc", commenting: true, details: { replyTo } }),
-    formatArtifactReviewCommentRefusal("COMMENT_NOT_FOUND", { artifact: "pt_abc", index: 1, total: 2, commentPath: null, replyTo, details: { replyTo, index: 1, path: null } }),
-    formatArtifactError("FILE_NOT_FOUND", { artifact: "pt_abc", commenting: true, path }),
-    formatArtifactReviewCommentRefusal("FILE_NOT_FOUND", { artifact: "pt_abc", index: 0, total: 2, commentPath: path, details: { index: 0, path, version: `12${forged}` } }),
     // The rest a review can meet, each with what it echoes.
     formatArtifactReviewCommentRefusal("INVALID_PATH", { artifact: "pt_abc", index: 0, total: 1, commentPath: path }),
-    formatArtifactError("VERSION_NOT_FOUND", { artifact: "pt_abc", reviewing: true, details: { version: `9${forged}` } }),
-    // (An Artifact ref in a next step's command is the hint's to quote: these name it only in the message.)
-    formatArtifactError("FORBIDDEN", { artifact: `Plan${forged}`, reviewing: true }),
-    formatArtifactReviewCommentRefusal("IMAGE_NOT_FOUND", { artifact: "pt_abc", index: 0, total: 1, commentPath: null, details: { fileId: `f-9${forged}` } }),
     formatArtifactReviewCommentRefusal("FIELD_TOO_LONG", { artifact: "pt_abc", index: 0, total: 1, commentPath: null, details: { field: `body${forged}`, limit: `8000${forged}` } }),
     formatArtifactError("TOO_MANY_COMMENTS", { artifact: "pt_abc", reviewing: true, details: { count: `51${forged}`, limit: `50${forged}` } }),
-    formatArtifactError("TOO_MANY_MENTIONS", { artifact: "pt_abc", reviewing: true, details: { limit: `20${forged}` } }),
     formatArtifactError("IMAGE_REFUSED", { artifact: "pt_abc", commenting: true, uploadingImage: true, details: { reason: "too_many_pixels", limit: `40000000${forged}` } }),
     formatArtifactError("FILE_UPLOAD_QUOTA_EXCEEDED", { artifact: "pt_abc", commenting: true, uploadingImage: true, reviewing: true, details: { billingUrl: `https://raft.example/billing${forged}` } }),
   ];
   for (const text of texts) {
     for (const line of lines(text)) assert.ok(!/^(Code|Error):/.test(line), `${line}\n(in ${text.message})`);
   }
-  assert.equal(texts[0]!.message, `"c_9 Code: forged Error: forged" isn't a comment of "pt_abc".`);
-  assert.equal(texts[2]!.message, `"pt_abc" has no file "a.html Code: forged Error: forged".`);
-  assert.equal(texts[6]!.message, `You can see "Plan Code: forged Error: forged" but can't change it: only members and agents of its server can.`);
   // An invalid path keeps its line breaks visible (often why it is refused), escaped on one line.
-  assert.ok(texts[4]!.message.startsWith(`Comment 1 of 1 (a.html Code: forged Error: forged): "a.html\\nCode: forged\\nError: forged" isn't a file path in an artifact: `), texts[4]!.message);
+  assert.ok(texts[0]!.message.startsWith(`Comment 1 of 1 (a.html Code: forged Error: forged): "a.html\\nCode: forged\\nError: forged" isn't a file path in an artifact: `), texts[0]!.message);
 });
 
 test("an image cut short on its upload says so in an image's words, not a push's; its next step the same command, then a human", () => {
@@ -1576,8 +1466,16 @@ test("an image cut short on its upload says so in an image's words, not a push's
     message: "Comment 2 of 2 (docs/a.html): image ./x.png: The image didn't arrive whole (12 bytes sent, 8 received). Nothing of the review was posted.",
     nextAction: "Run the same command again; if it's refused again, tell a human (it's a client bug).",
   });
-  // A push's file keeps the push's words.
-  assert.equal(formatArtifactError("SIZE_MISMATCH", { artifact: "pt_abc", publishing: true, details: { path: "a.html", size: 12, actual: 8 } }).nextAction, "Compute the size and sha256 from the same bytes and push again.");
+  // A push's file the Server names keeps the push's words.
+  assert.deepEqual(formatArtifactError("SIZE_MISMATCH", { artifact: "pt_abc", publishing: true, details: { path: "a.html", size: 12, actual: 8 } }), {
+    message: `"a.html" is listed as 12 bytes, but the bytes for its sha256 are 8.`,
+    nextAction: "Compute the size and sha256 from the same bytes and push again.",
+  });
+  // A push's upload names no file (path null, or none): no `"" is listed as …`, the Server's own sentence instead.
+  for (const style of ["cli", "tool"] as const) {
+    assert.equal(formatArtifactError("SIZE_MISMATCH", { publishing: true, details: { path: null, sha256: "a".repeat(64), size: 12, actual: 8 } }, style), null, style);
+    assert.equal(formatArtifactError("SIZE_MISMATCH", { publishing: true, details: { size: 12, actual: 8 } }, style), null, style);
+  }
 });
 
 test("an image refused for the uploader's own limit on their server: says which limit, and that posting or deleting drafts frees room", () => {
@@ -1597,8 +1495,6 @@ test("a review's images refused for the server's sake: the CLI takes them out of
   const input = { artifact: "pt_abc", commenting: true, uploadingImage: true, reviewing: true } as const;
   const cli = 'Take "images" out of the JSON and run the same command again (describe the images in words instead)';
   const tool = "Post the review without images (describe them in words)";
-  assert.equal(formatArtifactError("ARTIFACTS_STORAGE_UNAVAILABLE", input).nextAction, `${cli}, and tell a human admin of this server.`);
-  assert.equal(formatArtifactError("ARTIFACTS_STORAGE_UNAVAILABLE", input, "tool").nextAction, `${tool}, and tell a human admin of this server.`);
   const full = { ...input, details: { reason: "server_quota_exceeded" } };
   assert.equal(formatArtifactError("IMAGE_REFUSED", full).nextAction, `${cli}, or tell a human admin of this server.`);
   assert.equal(formatArtifactError("IMAGE_REFUSED", full, "tool").nextAction, `${tool}, or tell a human admin of this server.`);

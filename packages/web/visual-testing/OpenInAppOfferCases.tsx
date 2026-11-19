@@ -9,7 +9,8 @@ import fixtureData from "../../visual-testing/shared/fixtureData.json";
 
 // Deep links v1: the Raft Desktop offer in the strip across the window
 // (ShellFrame's topStrip), on the real MainLayout at desktop width. The page is opened fresh by
-// the capture, with no referrer, so the app's own boot capture
+// the capture and reads as followed from another site's page (a page with no referrer is a
+// bookmark: no offer, utils/pageLanding.ts isComingBackToWeb), so the app's own boot capture
 // (captureMessageLinkLanding) records it as a landing from outside; the flag
 // is seeded on. `desktop-used`: the account used Raft Desktop lately.
 // `desktop-download`: no such sign, so the lead-in and this computer's
@@ -37,6 +38,7 @@ function prime(caseId: OpenInAppOfferCaseId, primeShell: () => void) {
   if (caseId.endsWith(".desktop-used")) {
     useAuthStore.setState((state) => ({ user: state.user ? { ...state.user, usedDesktopAppRecently: true } : state.user }));
   }
+  Object.defineProperty(document, "referrer", { value: "https://mail.example.com/", configurable: true });
   captureMessageLinkLanding();
 }
 

@@ -1,5 +1,5 @@
 import { serializeErrorForLog } from "../tracing/safeErrorLog";
-import { errorClassOf, safeAddTraceEvent } from "../tracing/semanticTrace";
+import { errorClassOf, recordTraceEvent, safeAddTraceEvent } from "../tracing/semanticTrace";
 import type http from "node:http";
 import {
   AGENT_ACTIVITY_SUBSCRIBE_EVENT,
@@ -33,6 +33,7 @@ import { attachPresenceActivityHandler } from "./presenceEvents";
 import { registerNotificationSocketServer } from "../services/notifications/dispatcher";
 import { onSocketAccessRevoked, type SocketAccessRevocation } from "./accessRevocation";
 import { socketsFailingSso, SSO_SOCKET_RECHECK_MS } from "../services/sso/ssoEnforcement";
+import { isDraining, recordDrainRefusal } from "../services/drainState";
 import { publishLocalChannelUpdate } from "../services/channelRealtimeEvents";
 import { getActorServerRoleInServer } from "../lib/actorPermissions";
 import {
@@ -208,6 +209,48 @@ export async function subscribeSocketToAgentActivity(
   return joined;
 }
 
+export const SOCKET_DISCONNECTED_EVENT = "server.socket.disconnected";
+
+// Every reason Socket.IO's server gives a "disconnect" listener. Anything else
+// is reported as "other", so the attribute stays a short fixed set.
+const SOCKET_DISCONNECT_REASONS: ReadonlySet<string> = new Set([
+  "transport error",
+  "transport close",
+  "forced close",
+  "ping timeout",
+  "parse error",
+  "server shutting down",
+  "forced server close",
+  "client namespace disconnect",
+  "server namespace disconnect",
+]);
+
+/**
+ * Attributes of the trace event for one browser or app socket disconnecting:
+ * why, how long it had been connected, and what kind of client it was. No
+ * user, server or socket id. The Prometheus counter beside it has the totals
+ * by reason; this adds the time and the task, so drops can be set against a
+ * deploy's drain (`slock.server.drain_started`) per old task.
+ */
+export function socketDisconnectTraceAttrs(input: {
+  reason: unknown;
+  transport: unknown;
+  clientKind: unknown;
+  connectedAtMs: number;
+  nowMs: number;
+}): Record<string, string | number> {
+  const reason = typeof input.reason === "string" && SOCKET_DISCONNECT_REASONS.has(input.reason)
+    ? input.reason.replaceAll(" ", "_")
+    : "other";
+  return {
+    event_kind: "socket_disconnect",
+    reason,
+    transport: input.transport === "websocket" || input.transport === "polling" ? input.transport : "other",
+    client_kind: isSocketClientKind(input.clientKind) ? input.clientKind : "other",
+    connected_ms: Math.max(0, Math.round(input.nowMs - input.connectedAtMs)),
+  };
+}
+
 /** Sockets this process holds right now, by client kind, as flat trace attributes. */
 export function countSocketClients(sockets: Iterable<{ data: { clientKind?: unknown } }>): Record<string, number> {
   const counts: Record<string, number> = {};
@@ -219,6 +262,48 @@ export function countSocketClients(sockets: Iterable<{ data: { clientKind?: unkn
   return counts;
 }
 
+/**
+ * Engine.IO middleware: once this task is draining, a NEW session (a request
+ * without a `sid`) is refused with 503 at the handshake. The going-away
+ * spread only closes the sockets open at drain start, and for a few seconds
+ * after it the ALB still routes reconnecting tabs here; a tab accepted then
+ * was hard-cut ~190 s later at deregistration expiry, a second drop
+ * (deployment thread 3f292dc3). Requests of sessions that already exist keep
+ * working until the spread closes them.
+ *
+ * Refused at the engine level, not with an `io.use` error: socket.io-client
+ * does not reconnect after a middleware error, but a failed handshake is a
+ * transport connect failure, so the client's reconnection backoff applies
+ * and keeps growing (the client never reached "connected", so it does not
+ * reset): no connect/close loop against the draining task.
+ */
+export function refuseSocketHandshakeWhileDraining(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  next: (err?: unknown) => void,
+): void {
+  if (!isDraining() || new URL(req.url ?? "", "http://localhost").searchParams.has("sid")) {
+    next();
+    return;
+  }
+  recordDrainRefusal("socketio");
+  const isUpgrade = (req as http.IncomingMessage & { upgrade?: boolean }).upgrade === true
+    || req.headers.upgrade?.toLowerCase() === "websocket";
+  if (isUpgrade) {
+    // WebSocket-first handshake: Engine.IO hands middlewares a stand-in
+    // response whose writeHead is a no-op, so the 503 goes on the raw socket.
+    const socket = res.socket;
+    if (socket) {
+      socket.on("error", () => {});
+      if (socket.writable) socket.write("HTTP/1.1 503 Service Unavailable\r\nSlock-Reason: server_draining\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+      socket.destroy();
+    }
+    return;
+  }
+  res.writeHead(503, { "Content-Type": "application/json", Connection: "close" });
+  res.end(JSON.stringify({ code: "server_draining", message: "This server is restarting; reconnect" }));
+}
+
 export function setupSocket(server: http.Server, corsOrigin: string | string[]) {
   const io = new Server(server, {
     cors: {
@@ -226,6 +311,7 @@ export function setupSocket(server: http.Server, corsOrigin: string | string[]) 
       credentials: true,
     },
   });
+  io.engine.use(refuseSocketHandshakeWhileDraining);
 
   // Use Redis adapter for multi-replica broadcast when Redis is available
   if (isRedisAvailable()) {
@@ -398,6 +484,7 @@ export function setupSocket(server: http.Server, corsOrigin: string | string[]) 
       next();
     });
 
+    const connectedAtMs = Date.now();
     const transport = socket.conn.transport.name; // "websocket" or "polling"
     socketConnectedClients.labels(transport).inc();
 
@@ -519,6 +606,19 @@ export function setupSocket(server: http.Server, corsOrigin: string | string[]) 
       if (ssoTimer) clearTimeout(ssoTimer);
       socketConnectedClients.labels(socket.conn.transport.name).dec();
       socketDisconnects.labels(reason).inc();
+      // Handlers here run outside a request's trace root, so this is recorded
+      // as an event of its own. It must never throw into the cleanup below.
+      try {
+        recordTraceEvent(SOCKET_DISCONNECTED_EVENT, socketDisconnectTraceAttrs({
+          reason,
+          transport: socket.conn.transport.name,
+          clientKind,
+          connectedAtMs,
+          nowMs: Date.now(),
+        }));
+      } catch (error) {
+        console.warn("[Socket] Failed to record disconnect trace event:", serializeErrorForLog(error));
+      }
       if (heartbeatTimer) {
         clearInterval(heartbeatTimer);
         heartbeatTimer = null;

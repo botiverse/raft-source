@@ -28,7 +28,7 @@ type LevelCase = {
 };
 
 const fixture = JSON.parse(
-  readFileSync(path.resolve(import.meta.dirname, "../../../docs/contracts/fixtures/notification-levels.json"), "utf8"),
+  readFileSync(path.resolve(import.meta.dirname, "notification-levels.json"), "utf8"),
 ) as { cases: LevelCase[] };
 
 describe("resolveEffectiveLevel", () => {

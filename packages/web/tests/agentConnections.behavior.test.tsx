@@ -551,7 +551,7 @@ test("Disconnect for All Agents confirms with the connection's account, creator 
 
   await chooseMenuItem(en["agent.detail.connections.disconnectConnector"]!);
   const confirm = await screen.findByTestId("agent-connection-disconnect-connector-confirm");
-  const dialog = screen.getByRole("dialog");
+  const dialog = screen.getByRole("dialog", { name: en["agent.detail.connections.disconnectConnectorTitle"] });
   assert.match(dialog.textContent ?? "", /octocat \(created by alice on .+\) is disconnected for every agent on this server that uses it, not only Atlas/);
   assert.ok(within(dialog).getByRole("button", { name: en["common.confirm.cancel"] }));
   assert.equal(confirm.textContent, en["agent.detail.connections.disconnectConnector"]);

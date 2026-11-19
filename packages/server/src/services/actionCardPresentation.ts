@@ -33,6 +33,7 @@ import {
   type ActionCardSpecNames,
   type StoredActionCardAction,
   withActionCardForms,
+  withServedActionCardState,
 } from "@botiverse/raft-shared";
 import { ACTION_CARD_FORM_LEGACY_WARNING, actionCardFormHandlerFor } from "./actionCardForms";
 
@@ -121,8 +122,16 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
  * client goes through here: the message reads (enrichWithSenderNames: a
  * channel, a thread, around a message, by activity, sync, by ids, and the
  * socket payloads built from them) and the card routes' answers.
+ *
+ * So it is also where a state some clients don't know is served as one they
+ * do (shared ACTION_CARD_STATES_SERVED_AS: a declined request card as
+ * `expired`, RFC 085 §4.4); what is stored keeps the real state.
  */
 export function withStoredActionCardSpec<T>(metadata: T): T {
+  return withServedActionCardState(withStoredActionCardSpecOnly(metadata));
+}
+
+function withStoredActionCardSpecOnly<T>(metadata: T): T {
   if (!isRecord(metadata) || metadata.kind !== "action-card") return metadata;
   const presentation = metadata.presentation;
   if (isRecord(presentation) && presentation.card !== undefined) {

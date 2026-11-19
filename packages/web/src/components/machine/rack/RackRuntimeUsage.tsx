@@ -14,7 +14,6 @@ import { currentTimeMs, getRuntimeDisplayName, RUNTIME_ACCOUNT_USAGE_PROVIDERS }
 // the text's, in either theme.
 import antigravityMark from "@botiverse/oar/assets/brands/antigravity.svg";
 import claudeMark from "@botiverse/oar/assets/brands/claude.svg";
-import codebuddyMark from "@botiverse/oar/assets/brands/codebuddy.svg";
 import codexMark from "@botiverse/oar/assets/brands/codex.svg";
 import cursorMark from "@botiverse/oar/assets/brands/cursor.svg";
 import grokMark from "@botiverse/oar/assets/brands/grok.svg";
@@ -50,7 +49,6 @@ const RUNTIME_MARKS: Record<string, string> = {
   pi: piMark,
   qwen: qwenMark,
   qoder: qoderMark,
-  codebuddy: codebuddyMark,
 };
 
 /** A runtime's mark, 12px, in the text's colour; a terminal for one with none. */
@@ -178,7 +176,7 @@ type ResetText = ReturnType<typeof rackResetText>;
 /**
  * The words for a cell: what a screen reader says and the tooltip shows. A
  * used-up cell with a known reset says it in full, as the cell shows it
- * ("Used up · back in 3 hours" for "Back in 3h").
+ * ("Used up · resets in 3 hours" for "Back in 3h").
  */
 function cellLabel(cell: Exclude<RackRuntimeCell, { kind: "absent" | "pending" }>, reset: ResetText, { formatMessage, locale }: IntlShape): string {
   const runtime = getRuntimeDisplayName(cell.runtimeId);
@@ -203,7 +201,7 @@ function intlNow(intl: Pick<IntlShape, "formatMessage" | "locale">): IntlNow {
   return { ...intl, nowMs: currentTimeMs() };
 }
 
-/** The model line in words, for the cell's name: "Opus: 40% used", "Opus: Used up · back in 6 days". */
+/** The model line in words, for the cell's name: "Opus: 40% used", "Opus: Used up · resets in 6 days". */
 function modelLabel(model: RackModelLine, { formatMessage, locale, nowMs }: IntlNow): string {
   const usage = model.usedUp
     ? rackResetText(model.resetsAt, { formatMessage, locale }, nowMs)?.full ?? formatMessage({ id: "machine.rack.usedUp" })

@@ -23,7 +23,11 @@
 //     "name": "scout",
 //     "description": "...",
 //     "requiredComputer": "tygg-ec2",
+//     "suggestedRuntime": "codex",
 //     "draftHint": "..." }
+// ("suggestedRuntime" only starts the dialog on that runtime, marked as the
+// agent's suggestion; the person picks. The Server refuses an id it does not
+// offer for new agents and lists the ones it does.)
 // or
 //   { "type": "channel:add_member",
 //     "channel": "#existing-channel",
@@ -76,20 +80,22 @@ import type { Readable } from "node:stream";
 import type { Command } from "commander";
 
 import type { AgentApiActionCardWire, RaftFailure } from "@botiverse/raft-shared";
-import { agentApiActionCardWireSchema, prepareActionCard } from "@botiverse/raft-shared/src/agentCliSurface";
+import { agentApiActionCardWireSchema, formatHint, listPreparableOperations, prepareActionCard, RAFT_HINTS } from "@botiverse/raft-shared/src/agentCliSurface";
 
 import { createAgentApiContractSurfaceClient, createCliOperationFailures } from "../../agentApiPath";
 import type { ApiResponse } from "../../client";
 import { defineCommand, registerCliCommand } from "../../core/command";
-import type { CommandRuntimeOptions } from "../../core/context";
+import type { CommandContext, CommandRuntimeOptions } from "../../core/context";
 import { rateLimitedCliError } from "../../core/apiFailure";
 import { CliError, cliError } from "../../core/errors";
 import { writeText, adoptCliReplyText } from "../../core/renderer";
 import { applyDmPeerKind, PEER_KIND_OPTION } from "../_target";
+import { formatPreparableOperationsList } from "./_format";
 
 interface PrepareOpts {
   target: string;
   peerKind?: string;
+  list?: boolean;
 }
 
 const ACTION_HEREDOC_DELIMITER = "RAFTACTION";
@@ -191,7 +197,8 @@ answer comes back as a reply that @mentions you (don't poll for it):
   RAFTACTION
 Up to 4 questions in one card. "single" and "multiple" take 1-4 options;
 with 2 or more Raft adds Other… itself (don't add one). "text" takes a
-short answer.
+short answer. Every question must be answered unless you set
+"required": false on it (e.g. an optional comment).
 One option makes a confirm card: the person sees one button with your label
 and presses it to confirm (no Other…). The answer is that option's value:
   raft action prepare --target "#ops" <<'RAFTACTION'
@@ -202,7 +209,36 @@ agent's), or "anyone".
 Use a card when the answer decides what you do next: concrete choices, or a
 short answer you will act on. Ask in a message when you are already talking
 it through, and don't ask what you can decide yourself.
+Ask a person to run an operation you can't (request:prepare): they confirm
+it on the card and it runs as them. List what you can prepare here, with each
+operation's args and whom to ask:
+  raft action prepare --list
 Every card type and its fields: the \`action-cards\` Manual topic.`;
+
+/**
+ * `--list`: the operations this agent may prepare as a request card on its
+ * server (RFC 085 §4.2 discovery), as the Server lists them. A Server too old
+ * to list them answers 404 without a code: said so, with what to do instead.
+ */
+async function listOperations(ctx: CommandContext): Promise<void> {
+  const agentContext = ctx.loadAgentContext();
+  const api = createAgentApiContractSurfaceClient(ctx.createApiClient(agentContext));
+  const failures = createCliOperationFailures();
+  const outcome = await listPreparableOperations({ actions: { ...api.actions, operations: () => failures.observe(api.actions.operations()) } });
+  if (outcome.ok) {
+    writeText(ctx.io, formatPreparableOperationsList(outcome.data));
+    return;
+  }
+  const response = failures.last();
+  if (response && response.status >= 500) throw new CliError({ code: "SERVER_5XX", message: response.error ?? `HTTP ${response.status}` });
+  if (outcome.error.status === 404 && !outcome.error.serverCode) {
+    throw cliError("LIST_UNAVAILABLE", "This Raft Server can't list the operations you can prepare as a request card (it is older than this command).", {
+      suggestedNextAction: `Ask the person in a message to do it themselves in Raft: ${formatHint(RAFT_HINTS.messageReply({ target: "dm:@<person>" }))}`,
+      retryable: false,
+    });
+  }
+  throw cliError(outcome.error.serverCode ?? "LIST_FAILED", outcome.error.message, { suggestedNextAction: outcome.error.nextAction, retryable: outcome.error.retryable });
+}
 
 export const actionPrepareCommand = defineCommand(
   {
@@ -214,10 +250,18 @@ export const actionPrepareCommand = defineCommand(
         description: "Channel/DM/thread target to post the card. Same format as raft message send: '#channel', 'dm:@peer', '#channel:shortid', 'dm:@peer:shortid'",
       },
       PEER_KIND_OPTION,
+      {
+        flags: "--list",
+        description: "List the operations you can prepare as a request card (request:prepare) on this server, with their args and whom to ask; posts nothing",
+      },
     ],
     helpAfter: QUESTION_CARD_HELP,
   },
   async (ctx, opts: PrepareOpts) => {
+      if (opts.list) {
+        await listOperations(ctx);
+        return;
+      }
       if (!opts.target?.trim()) {
         throw cliError("INVALID_ARG", "--target is required");
       }

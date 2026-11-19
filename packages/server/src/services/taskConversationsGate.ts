@@ -1,9 +1,10 @@
 import { eq } from "drizzle-orm";
-import { RAFT_HINTS, TASK_V2_CONVERSATIONS_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
+import { compareComputerVersions, isComputerSemver, RAFT_HINTS, TASK_V2_CONVERSATIONS_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
 
 import { getDb, type DatabaseExecutor } from "../db";
 import { channels } from "../db/schema";
 import { evaluateFeatureFlag } from "./featureFlagService";
+import { agentComputerVersionAtLeast } from "./machineService";
 
 /**
  * Task v2 conversations gate (`task_v2_conversations_v0`, server-scoped,
@@ -18,7 +19,8 @@ import { evaluateFeatureFlag } from "./featureFlagService";
  *    conversation (channels.type = 'task', taskConversationService); a
  *    `sourceMessageId` is accepted and, for agents, required (a task always
  *    has a source, #wg-task-v2:#23: `task_source_required`; the web's create
- *    without one posts the creator's message first, routes/tasks.ts); a reply
+ *    without one posts the creator's message first, routes/tasks.ts, and so
+ *    does an agent's from a CLI too old to send one, isPreTaskSourceCli); a reply
  *    in one of the channel's threads resolves to its root message
  *    (taskService.resolveTaskSourceMessage); a pre-v2 task gets its
  *    conversation on the first write; `task convert` / `task claim --message-id` / the web convert
@@ -107,7 +109,9 @@ export const INVALID_TASK_SOURCE_STEP = "a task's source is a message in the con
  * The refusal of an agent's task create without a source on a server with task
  * v2 conversations (#wg-task-v2:#23: "A task must always have a source"). The
  * sentence carries the rule for clients that print only `error` (CLIs from
- * before it); the create with its source left to fill is `next`.
+ * before it); the create with its source left to fill is `next`. A CLI too old
+ * to send a source never gets it (isPreTaskSourceCli): its create gets a
+ * posted source instead.
  */
 export function taskSourceRequiredRefusal(target: string) {
   return {
@@ -115,4 +119,49 @@ export function taskSourceRequiredRefusal(target: string) {
     error: "A task needs a source: the id of the message that asked for it, in the conversation the task goes on; a reply in one of its threads works too (the task goes under that thread's first message). If the request came in a DM or another channel, make the task there. If it is your own idea, or must live here, post a message here saying what is needed in your own words (not copied from a private conversation), then create the task from it.",
     next: RAFT_HINTS.taskCreateWithSource({ target }),
   };
+}
+
+/**
+ * The oldest `raft` CLI that sends a task's source: computer-v1.0.53 (its
+ * bundled CLI 0.0.41) added `raft task create --message-id`. Since 1.0.55 the
+ * CLI shares the Computer's version.
+ */
+export const TASK_SOURCE_MIN_CLI_VERSION = "1.0.53";
+
+/**
+ * Whether an agent's task create came from a `raft` CLI too old to send a
+ * source (before TASK_SOURCE_MIN_CLI_VERSION). Such a create without one is
+ * not refused with `task_source_required`: the agent could not do what the
+ * refusal asks until its Computer is upgraded, so the Server posts the agent's
+ * own message as the source, as the web's New task does (#wg-task-v2:#25).
+ *
+ * `client` is what the request says it is (internalAgentApi agentApiClientOf).
+ * Only a request that says it is the CLI (`X-Raft-Client: cli`, or the older
+ * `X-Slock-Client: cli`; a Computer's agent proxy sets it on all it forwards)
+ * can be old: the SDK and any other client knows the source and is refused as
+ * before. A CLI is current when its own `X-Raft-Client-Version` (sent since
+ * 1.0.55) is at or above the floor, else when the agent's Computer last
+ * reported such a version (agentComputerVersionAtLeast, the check the
+ * upgrade-card hint uses: 1.0.53 and 1.0.54 send a source but no version).
+ * Neither known (no Computer, a daemon that reports none, an external agent's
+ * npm CLI from before 1.0.55) counts as old, as an unknown version does for
+ * the Artifacts CLI floor and the upgrade card: each such CLI predates the
+ * source, and a create that is let through still gets one.
+ *
+ * Not a security boundary: `client` is headers any caller can send, so any
+ * agent client can claim to be an old CLI. That only picks between refusing
+ * a sourceless create and posting the agent's own message as its source; the
+ * post gets nothing a message send would not: the route checks the agent's
+ * posting rights first and charges its message budget, and the message is
+ * the task titles, mentioning no one (internalAgentApi taskCreate).
+ */
+export async function isPreTaskSourceCli(
+  client: { kind: string | null; version: string | null },
+  agentId: string,
+  executor: DatabaseExecutor = getDb(),
+): Promise<boolean> {
+  if (client.kind?.toLowerCase() !== "cli") return false;
+  if (client.version !== null && isComputerSemver(client.version)
+    && compareComputerVersions(client.version, TASK_SOURCE_MIN_CLI_VERSION) >= 0) return false;
+  return !await agentComputerVersionAtLeast(agentId, TASK_SOURCE_MIN_CLI_VERSION, executor);
 }

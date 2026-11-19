@@ -7,6 +7,7 @@
  * history-read bookkeeping) still happens at mount.
  */
 import { createHeldRead } from "./heldRead";
+import { latestPagePath } from "./channelPageQuery";
 import type { HeldReadRequest, TakenRead } from "./heldRead";
 import { noteMessageHistoryRequest } from "./messageStore";
 import type { Message } from "./messageStore";
@@ -15,7 +16,7 @@ const slot = createHeldRead();
 
 /** loadMessages' latest page. */
 export function latestPageRequest(channelId: string): HeldReadRequest {
-  return { url: `/messages/channel/${channelId}?limit=50` };
+  return { url: latestPagePath(channelId) };
 }
 
 /** loadMessageContext's and loadMessageWindowSilent's window around a message. */

@@ -1,6 +1,6 @@
 {
   "schema": "raft-sdk-operations.v1",
-  "version": "2fcbe0b9d41ba23f",
+  "version": "157026020ae49424",
   "operations": [
     {
       "name": "identity.whoami",
@@ -1904,6 +1904,12 @@
                 "minLength": 1,
                 "maxLength": 120,
                 "description": "Only for type agent:create."
+              },
+              "suggestedRuntime": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 40,
+                "description": "Runtime id to start the Create Agent dialog on (for example \"claude\" or \"codex\"), only when the person named that runtime; the person still picks, and sees it was your suggestion. An id this server does not offer for new agents is refused, and the refusal lists the offered ids. Not with hosting: \"antiproton\". Only for type agent:create."
               },
               "hosting": {
                 "type": "string",

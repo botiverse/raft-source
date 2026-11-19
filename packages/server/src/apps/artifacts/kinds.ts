@@ -4,6 +4,8 @@
 // registry reads these while loading, through an import cycle.
 
 export const ARTIFACT_OBJECT_KIND = "artifact";
+/** The app's key in core's agent event queue (`third_party_agent_events.system_app`). */
+export const ARTIFACTS_SYSTEM_APP = "system.artifacts";
 /**
  * Recorded: `version` (publish.ts), `comment` (comments.ts insertComment,
  * from the agent API and the web), `review` (several comments posted at

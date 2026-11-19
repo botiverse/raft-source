@@ -1,5 +1,5 @@
-import { getModelLabel, getRuntimeDisplayName, isClaudeOAuthAppsWindow } from "@botiverse/raft-shared";
-import type { ReasoningEffort, RuntimeAccountUsageAccount, RuntimeAccountUsageSnapshot, RuntimeAccountUsageWindow, RuntimeConfig } from "@botiverse/raft-shared";
+import { allModelsUsageAccount, getModelLabel, getRuntimeDisplayName } from "@botiverse/raft-shared";
+import type { ReasoningEffort, RuntimeAccountUsageSnapshot, RuntimeConfig } from "@botiverse/raft-shared";
 import {
   buildRuntimeConfig,
   supportsRuntimeFastMode,
@@ -212,68 +212,6 @@ export type BulkRuntimeUsageSummary =
   | { kind: "limit"; plan: string | null; resetsAt: string | null }
   | { kind: "used"; plan: string | null; percent: number }
   | { kind: "attention"; plan: string | null };
-
-/** A window the runtime ties to one model or a group of models (OAR's `scope`), not the whole account. */
-export function isModelScopedUsageWindow(window: RuntimeAccountUsageWindow): boolean {
-  return window.scope?.kind === "model" || window.scope?.kind === "models";
-}
-
-/** How used a window is, to compare windows: a reached limit above any share; null when unreadable. */
-function windowTightness(window: RuntimeAccountUsageWindow): number | null {
-  if (window.status === "limit_reached") return 2;
-  return window.status === "ok" && typeof window.usedRatio === "number" ? window.usedRatio : null;
-}
-
-/**
- * An account whose every window is a group of models' (Antigravity: "Gemini
- * Models", "Claude and GPT models", OAR 0.103), with two groups or more: it
- * runs while any group has quota left (OAR reports it rate limited only once
- * every group is used up), so it counts as its group with the most left. Null
- * for any other account.
- */
-function roomiestModelGroup(windows: readonly RuntimeAccountUsageWindow[]): RuntimeAccountUsageWindow[] | null {
-  const groups = new Map<string, RuntimeAccountUsageWindow[]>();
-  for (const window of windows) {
-    if (window.scope?.kind !== "models") return null;
-    const key = window.scope.name.toLowerCase();
-    groups.set(key, [...(groups.get(key) ?? []), window]);
-  }
-  if (groups.size < 2) return null;
-  let roomiest: { windows: RuntimeAccountUsageWindow[]; tightness: number } | null = null;
-  for (const group of groups.values()) {
-    const readings = group.map(windowTightness).filter((value): value is number => value !== null);
-    if (readings.length === 0) continue;
-    const tightness = Math.max(...readings);
-    if (roomiest === null || tightness < roomiest.tightness) roomiest = { windows: group, tightness };
-  }
-  return roomiest?.windows ?? null;
-}
-
-/**
- * The account as every usage summary counts it (the rack's cell and its
- * first line, the rack's sort, the bulk dialog): never Claude's OAuth apps'
- * window (third-party apps' use), and a model's or a group of models' own
- * window (OAR's `scope`) only when the account reports nothing else; then
- * `modelLine` is false, so the same model is never shown twice. An account
- * of model groups only (Antigravity) counts as its group with the most left,
- * and its model line shows the others. A limit reached only on a window left
- * out leaves the account its percentage: OAR marks the whole account rate
- * limited only when the runtime says it cannot run, and the model line says
- * it (agent blocking still follows the account's own health on the server,
- * never this).
- */
-export function allModelsUsageAccount(account: RuntimeAccountUsageAccount): { account: RuntimeAccountUsageAccount; modelLine: boolean } {
-  const counted = account.windows.filter((window) => !isClaudeOAuthAppsWindow(window));
-  const allModels = counted.filter((window) => !isModelScopedUsageWindow(window));
-  const roomiestGroup = allModels.length === 0 ? roomiestModelGroup(counted) : null;
-  const modelLine = roomiestGroup !== null || (allModels.length > 0 && counted.some(isModelScopedUsageWindow));
-  const kept = roomiestGroup ?? (allModels.length > 0 ? allModels : counted);
-  if (kept.length === account.windows.length) return { account, modelLine };
-  const limitOnlyLeftOut = account.health === "rate_limited"
-    && !kept.some((window) => window.status === "limit_reached")
-    && account.windows.some((window) => !kept.includes(window) && window.status === "limit_reached");
-  return { account: { ...account, ...(limitOnlyLeftOut ? { health: "ok" as const } : {}), windows: kept }, modelLine };
-}
 
 export function summarizeRuntimeUsage(snapshot: RuntimeAccountUsageSnapshot | null): BulkRuntimeUsageSummary | null {
   const first = snapshot?.accounts[0];

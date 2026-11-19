@@ -29,7 +29,9 @@ export const MAX_LEGACY_READ_ROUTES = 85;
  * The exact number of `none` entries, pinned so a new `none` label (a claim that a read returns no
  * conversation objects) shows up in diff review rather than slipping in with a new route.
  */
-export const EXPECTED_NONE_READ_ROUTES = 239;
+// +1: GET /internal/agent-api/prepare-action/operations (RFC 085 `raft action prepare --list`: the list's own docs, no conversation objects).
+// +1: GET /api/me/sessions (the caller's own sign-ins, services/mySessions.ts).
+export const EXPECTED_NONE_READ_ROUTES = 248;
 
 export const READ_ROUTE_VISIBILITY_CLASSIFICATION: readonly ReadRouteClassification[] = [
   // Messages: history, context, sync, reactions, search.
@@ -163,6 +165,7 @@ export const READ_ROUTE_VISIBILITY_CLASSIFICATION: readonly ReadRouteClassificat
   { route: "GET /internal/agent-api/knowledge", entry: "none", reason: "knowledge topic docs" },
   { route: "GET /internal/agent-api/knowledge/search", entry: "none", reason: "knowledge docs search" },
   { route: "GET /internal/agent-api/labs", entry: "none", reason: "server labs settings" },
+  { route: "GET /internal/agent-api/prepare-action/operations", entry: "none", reason: "the server's delegable operations (RFC 085 request:prepare): the list's own server-written docs, no data of the server; empty while the flag is off" },
   { route: "GET /internal/agent-api/mcp/tools", entry: "none", reason: "managed MCP tool list" },
   { route: "GET /internal/agent-api/mention-actions/pending", entry: "legacy:listPendingMentionActionsForSender", reason: "sender-authored withheld mentions; filtered by senderId, no channel access recheck" },
   { route: "GET /internal/agent-api/mentions", entry: "legacy:routeLocalMentionsQuery", reason: "inline query on messageMentions targetId=self; no channel access recheck" },
@@ -229,6 +232,8 @@ export const READ_ROUTE_VISIBILITY_CLASSIFICATION: readonly ReadRouteClassificat
   { route: "GET /api/agents/:id/external-diagnostics", entry: "none", reason: "external agent diagnostics; no conversation objects" },
   { route: "GET /api/agents/:id/context-view/status", entry: "none", reason: "View Context availability (Computer, owner, retention); no conversation objects" },
   { route: "GET /api/agents/:id/messages/:messageId/context", entry: "none", reason: "View Context: the agent's model context restored by its Computer (canViewAgentContext: the private-surface rule, never a Guest); like the session transcript, runtime state, not channel-homed rows" },
+  { route: "GET /api/agents/:id/voice-settings", entry: "none", reason: "Raft voice: whether the agent may be asked or called, to its editors; no conversation objects" },
+  { route: "GET /api/agents/:id/voice-questions", entry: "none", reason: "Raft voice: who asked the agent side questions (audit metadata: asker, time, App; never the question or answer; flag + the question rule, View Context's); no conversation objects" },
   { route: "GET /api/agents/:id/context-views", entry: "none", reason: "View Context: who viewed the agent's context (audit metadata: viewer, time, outcome; canViewAgentContext); no conversation objects" },
   { route: "GET /api/agents/:id/external-status", entry: "none", reason: "external agent status; no conversation objects" },
   { route: "GET /api/agents/:id/hosted-runtime", entry: "none", reason: "hosted runtime config; no conversation objects" },
@@ -259,6 +264,7 @@ export const READ_ROUTE_VISIBILITY_CLASSIFICATION: readonly ReadRouteClassificat
   { route: "GET /api/servers/:id/machines", entry: "none", reason: "server machines; no conversation objects" },
   { route: "GET /api/servers/:id/machines/:machineId/agents/:agentId/diagnostic/mention-delivery/:messageId", entry: "legacy:authorizeMentionDeliveryDiagnostic", reason: "mention delivery of a message; canInspectAgentPrivateSurfaces only, no channel access check" },
   { route: "GET /api/servers/:id/machines/:machineId/agents/:agentId/diagnostic/session-transcript", entry: "none", reason: "agent runtime session transcript (canInspectAgentPrivateSurfaces); not channel-homed" },
+  { route: "GET /api/servers/:id/machine-operations/:operationId", entry: "none", reason: "a Computer wait's answer (limit-reset read/redeem result) to the person who started it; no conversation objects" },
   { route: "GET /api/servers/:id/machines/:machineId/runtime-account-usage/:provider", entry: "none", reason: "runtime account usage; no conversation objects" },
   { route: "GET /api/servers/:id/machines/:machineId/runtime-auth", entry: "none", reason: "runtime auth state; no conversation objects" },
   { route: "GET /api/servers/:id/machines/:machineId/runtime-auth/:runtime/providers", entry: "none", reason: "a runtime's model providers on the Computer; no conversation objects" },
@@ -277,6 +283,7 @@ export const READ_ROUTE_VISIBILITY_CLASSIFICATION: readonly ReadRouteClassificat
   { route: "GET /api/servers/:id/agent-usage", entry: "none", reason: "agent token usage per day, agent and model (counts and model names), for agents the reader may inspect (roleCanInspectAgentPrivateSurfaces); no conversation objects" },
   { route: "GET /api/me/notification-settings", entry: "none", reason: "caller's own account notification settings and server levels; no conversation objects" },
   { route: "GET /api/me/account/deletion", entry: "none", reason: "caller's own account deletion and billing-cancellation confirmation status; no conversation objects" },
+  { route: "GET /api/me/sessions", entry: "none", reason: "caller's own live full sign-ins (session family ids, the clients' own platform/version claims, dates, the current flag, counts of live Computers and agent keys each approved or issued); a person's full session only; no conversation objects" },
   { route: "GET /api/me/app-logins", entry: "none", reason: "caller's own account-mode Login with Raft consents (App key, name, logo, scopes, date); no conversation objects" },
   { route: "GET /api/notification-levels", entry: "none", reason: "caller's own explicit levels in one server: conversation ids only, no content" },
   { route: "GET /api/servers/:id/notification-settings", entry: "none", reason: "server notification prefs; no conversation objects" },
@@ -372,7 +379,9 @@ export const READ_ROUTE_VISIBILITY_CLASSIFICATION: readonly ReadRouteClassificat
   { route: "GET /api/mobile-download", entry: "none", reason: "mobile download redirect; no conversation objects" },
   { route: "GET /api/notifications/test/:testId", entry: "none", reason: "status of the caller's own test notification; no conversation objects" },
   { route: "GET /api/oauth/.well-known/openid-configuration", entry: "none", reason: "OIDC discovery metadata; no conversation objects" },
+  { route: "GET /api/oauth/agents/:agentId/voice/operations/:operationId", entry: "none", reason: "Raft voice: a side ask's answer to the token's person who started it (machineOperations); no conversation objects" },
   { route: "GET /api/oauth/agents", entry: "none", reason: "OAuth agent directory; no conversation objects" },
+  { route: "GET /api/oauth/apps", entry: "none", reason: "App directory (app:read): the Marketplace Apps installed on the token's Server (client_id, name, picture, homepage_url); no conversation objects" },
   { route: "GET /api/oauth/authorize", entry: "none", reason: "OAuth authorize endpoint; no conversation objects" },
   { route: "GET /api/oauth/clients/lookup", entry: "none", reason: "OAuth client lookup; no conversation objects" },
   { route: "GET /api/oauth/jwks", entry: "none", reason: "OAuth JWKS; no conversation objects" },
@@ -416,7 +425,9 @@ export const READ_ROUTE_VISIBILITY_CLASSIFICATION: readonly ReadRouteClassificat
   { route: "GET /livez", entry: "none", reason: "liveness probe" },
   { route: "GET /oidc/:server/.well-known/openid-configuration", entry: "none", reason: "OIDC discovery metadata" },
   { route: "GET /oidc/:server/api/oauth/.well-known/openid-configuration", entry: "none", reason: "OIDC discovery metadata" },
+  { route: "GET /oidc/:server/api/oauth/agents/:agentId/voice/operations/:operationId", entry: "none", reason: "Raft voice: a side ask's answer (Server-scoped issuer)" },
   { route: "GET /oidc/:server/api/oauth/agents", entry: "none", reason: "OAuth agent directory" },
+  { route: "GET /oidc/:server/api/oauth/apps", entry: "none", reason: "App directory (app:read)" },
   { route: "GET /oidc/:server/api/oauth/authorize", entry: "none", reason: "OAuth authorize flow" },
   { route: "GET /oidc/:server/api/oauth/clients/lookup", entry: "none", reason: "OAuth client lookup" },
   { route: "GET /oidc/:server/api/oauth/jwks", entry: "none", reason: "JWKS" },

@@ -52,15 +52,70 @@ export const RUNTIMES: RuntimeInfo[] = [
   { id: "opencode", displayName: "OpenCode", abbreviation: "OC", binary: "opencode", supported: true },
   { id: "pi", displayName: "Pi", abbreviation: "PI", binary: "pi", supported: true },
   // Run only on the Computer's OAR host (daemon drivers/oarOnly.ts). Creating or
-  // switching an agent to them needs a Computer that reports the runtime (no
-  // server flag: server runtimeAdmissionService.ts).
+  // switching an agent to them also needs the server's per-runtime flag
+  // (`agent_runtime_oar_<id>`) and a Computer that reports the runtime.
   { id: "qwen", displayName: "Qwen Code", abbreviation: "QW", binary: "qwen", supported: true, experimental: true },
   { id: "qoder", displayName: "Qoder", abbreviation: "QD", binary: "qodercli", supported: true, experimental: true },
-  { id: "codebuddy", displayName: "CodeBuddy Code", abbreviation: "CB", binary: "codebuddy", supported: true, experimental: true },
 ];
 
 /** Runtimes that run only on the Computer's OAR host: there is no legacy driver to fall back to. */
-export const OAR_ONLY_RUNTIME_IDS: readonly string[] = ["qwen", "qoder", "codebuddy"];
+export const OAR_ONLY_RUNTIME_IDS: readonly string[] = ["qwen", "qoder"];
+
+/**
+ * Runtimes whose own telemetry the daemon folds into per-turn token counts:
+ * the `token_usage` sources in packages/daemon/src/runtimeTurnTokens.ts
+ * (`noteTurnTokenUsage`'s fold branches, mapped to runtimes in
+ * `TURN_TOKEN_USAGE_SOURCE_RUNTIMES`). A daemon test keeps the two equal.
+ */
+export const RUNTIMES_REPORTING_TURN_TOKENS_FROM_TELEMETRY: readonly string[] = ["claude", "codex", "pi", "builtin", "kimi-sdk"];
+
+/**
+ * Runtimes whose turn tokens come from the OAR host's `usage` events
+ * (`trace.noteUsage` in packages/daemon/src/agentHost/oarAgentHost.ts) because
+ * they run only on the OAR host (OAR_ONLY_RUNTIME_IDS) and emit `usage`.
+ */
+export const RUNTIMES_REPORTING_TURN_TOKENS_FROM_OAR_USAGE: readonly string[] = ["qwen", "qoder"];
+
+/**
+ * Runtimes whose finished turns carry token counts, counted by the host the
+ * runtime actually runs on; for any other runtime a turn summary carries at
+ * most `tokens.model`, so "no usage yet" never resolves. Not reporting:
+ * antigravity, grok, opencode, cursor (its OAR flag is off by default and the
+ * legacy driver does not fold its tokens; add it here if Cursor moves fully to
+ * the OAR host), and the deprecated kimi, gemini and copilot. Grok can also
+ * run on OAR behind a per-server flag (off by default); grok's OAR session may
+ * emit `usage`, so revisit grok here if its OAR route becomes the default.
+ * OpenCode stays off on the OAR host too (`agent_runtime_oar_opencode`): its
+ * context use shows from OAR's `usage` context events, as for the other OAR
+ * runtimes, but per-turn token totals are not offered for it (agreed with the
+ * OAR maintainer for the move); do not add it here without revisiting that.
+ * Antigravity runs on OAR for every server (`agent_runtime_oar_antigravity`
+ * has been on everywhere since 2026-11-13), but its OAR session does not emit
+ * `usage` yet; add it here once it does.
+ */
+export const RUNTIMES_REPORTING_TURN_TOKENS: readonly string[] = [
+  ...RUNTIMES_REPORTING_TURN_TOKENS_FROM_TELEMETRY,
+  ...RUNTIMES_REPORTING_TURN_TOKENS_FROM_OAR_USAGE,
+];
+
+export function runtimeReportsTurnTokens(runtime: string | null | undefined): boolean {
+  return typeof runtime === "string" && RUNTIMES_REPORTING_TURN_TOKENS.includes(runtime);
+}
+
+/**
+ * Runtimes whose agents can start sub-agents that Activity lists: Claude Code,
+ * Codex and Kimi Code report them from their own events (daemon
+ * claudeEventNormalizer, codexEventNormalizer, drivers/kimi-sdk), Qwen Code and
+ * Qoder as OAR tasks of type `agent` (agentHost/oarTaskActivity). Grok reports
+ * them only on its OAR route, behind a per-server flag that is off by default:
+ * add it here when that route is the default. An agent of one of these shows
+ * the Sub-agents view at all times, with 0 when it has none (stdrc, 2026-11-14).
+ */
+export const RUNTIMES_WITH_SUBAGENTS: readonly string[] = ["claude", "codex", "kimi-sdk", "qwen", "qoder"];
+
+export function runtimeHasSubagents(runtime: string | null | undefined): boolean {
+  return typeof runtime === "string" && RUNTIMES_WITH_SUBAGENTS.includes(runtime);
+}
 
 export function isOarOnlyRuntime(runtime: string | null | undefined): boolean {
   return typeof runtime === "string" && OAR_ONLY_RUNTIME_IDS.includes(runtime);

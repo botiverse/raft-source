@@ -62,6 +62,7 @@ export const ASSISTANT_ROUTE_DECISIONS = {
   assistantOwnerMessages: { allow: true, reason: "Reads a conversation the owner can see; pure read, moves no read position.", pairsWith: ["assistantOwnerInbox"] },
   assistantOwnerArtifact: { allow: true, reason: "Reads an Artifact the owner can open, by the web's own checks with the owner as reader (one in a DM only while the owner lets it read DMs, its own DM with the owner always); pure read: moves no read position, follows nothing (#proj-assistant:#31)." },
   assistantOwnerArtifactPublish: { allow: true, reason: "Publishes an Artifact as itself into its DM with its owner, or a new version of one it published (marked; anything else is NOT_PUBLISHED_BY_ASSISTANT); Artifacts' own publish, its checks, quota and notices (#proj-assistant:#31).", pairsWith: ["assistantOwnerArtifact", "messageSendV2"] },
+  assistantOwnerArtifactPublishAsOwner: { allow: true, reason: "Publishes an Artifact as its owner (the owner is the author) only while the owner has \"send as me\" on, into a conversation the owner may post in, under send-as-owner's rules (not its own DM with the owner, a DM only while it may read DMs, never bridged); a new version only of one it published (marked); a receipt in its DM with the owner (#proj-assistant:#33).", pairsWith: ["assistantOwnerArtifact", "assistantOwnerArtifactPublish"] },
   // What the owner did themself (RFC 077 owner actions)
   assistantOwnerActivity: { allow: true, reason: "What the owner did themself, so it does not tell them." },
   assistantOwnerResolve: { allow: true, reason: "Names a person or channel the owner can see." },
@@ -102,6 +103,7 @@ export const ASSISTANT_ROUTE_DECISIONS = {
   integrationAppManage: { allow: false, reason: NO_APP_MANAGEMENT },
   integrationAppLogoUpdate: { allow: false, reason: NO_APP_MANAGEMENT },
   integrationAppList: { allow: false, reason: NO_APP_MANAGEMENT },
+  integrationAppCardButtons: { allow: false, reason: NO_APP_MANAGEMENT },
   integrationAppStatus: { allow: false, reason: NO_APP_MANAGEMENT },
   // Everything else: denied
   messageResolve: { allow: false, reason: OUTSIDE_OWNER_DM },
@@ -152,6 +154,7 @@ export const ASSISTANT_ROUTE_DECISIONS = {
   feedbackLocatorList: { allow: false, reason: NOT_FOR_ASSISTANTS },
   actionPrepare: { allow: false, reason: "Action cards for channel work; an assistant talks to its owner in plain messages." },
   actionWithdraw: { allow: false, reason: "Withdraws a question card, which an assistant never prepares." },
+  actionOperations: { allow: false, reason: "Lists request cards to prepare, which an assistant never prepares (RFC 085 §8.2)." },
   taskClaim: { allow: false, reason: NO_TASKS },
   taskList: { allow: false, reason: NO_TASKS },
   taskCreate: { allow: false, reason: NO_TASKS },

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { countSocketClients, joinMemberConversationRooms, MEMBER_ROOM_JOIN_RETRY_MAX_MS, memberRoomJoinRetryDelayMs, parseSocketHandshakeAuth, requiresSocketChannelAccessCheck, SOCKET_ROOMS_JOIN_FAILED_EVENT } from "./index";
+import { countSocketClients, joinMemberConversationRooms, MEMBER_ROOM_JOIN_RETRY_MAX_MS, memberRoomJoinRetryDelayMs, parseSocketHandshakeAuth, requiresSocketChannelAccessCheck, socketDisconnectTraceAttrs, SOCKET_ROOMS_JOIN_FAILED_EVENT } from "./index";
 import { SOCKET_CLIENT_KINDS } from "./platformScope";
 
 test("socket join access check treats joint channels as explicit-membership surfaces", () => {
@@ -174,4 +174,18 @@ test("member room join stops quietly when the socket left during the lookup", as
   assert.equal(result, "gone");
   assert.deepEqual(left.joined, []);
   assert.deepEqual(left.emitted, []);
+});
+
+test("socket disconnect trace attrs carry the reason, client kind and connected time, and nothing that identifies anyone", () => {
+  assert.deepEqual(
+    socketDisconnectTraceAttrs({ reason: "transport close", transport: "websocket", clientKind: "desktop", connectedAtMs: 1_000, nowMs: 61_250.4 }),
+    { event_kind: "socket_disconnect", reason: "transport_close", transport: "websocket", client_kind: "desktop", connected_ms: 60_250 },
+  );
+  assert.equal(socketDisconnectTraceAttrs({ reason: "ping timeout", transport: "polling", clientKind: "web", connectedAtMs: 0, nowMs: 5 }).reason, "ping_timeout");
+});
+
+test("socket disconnect trace attrs keep every value inside a fixed set", () => {
+  const attrs = socketDisconnectTraceAttrs({ reason: "user 42 said goodbye", transport: "webtransport", clientKind: "toaster", connectedAtMs: 10, nowMs: 5 });
+  assert.deepEqual(attrs, { event_kind: "socket_disconnect", reason: "other", transport: "other", client_kind: "other", connected_ms: 0 });
+  assert.equal(socketDisconnectTraceAttrs({ reason: undefined, transport: undefined, clientKind: undefined, connectedAtMs: 0, nowMs: 0 }).reason, "other");
 });

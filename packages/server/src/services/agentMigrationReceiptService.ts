@@ -220,8 +220,11 @@ function formatCompletedReceiptBody(input: {
   const ignoredLargest = ignored?.largest.map((entry) => `${entry.path} (${formatReceiptBytes(entry.bytes)})`).join(", ");
   const ignoredSources = ignored ? describeIgnoredSources(summary.excludedIgnoredBySource) : null;
   // The source stops counting at the schema bound, so a count at the bound
-  // (and the bytes counted with it) is a lower bound.
-  const ignoredAtBound = ignored ? ignored.fileCount >= MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT : false;
+  // (and the bytes counted with it) is a lower bound; so is one it marks
+  // partial (it stopped sizing before it was done).
+  const ignoredAtBound = ignored
+    ? ignored.fileCount >= MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT || summary.excludedIgnoredPartial === true
+    : false;
   const ignoredLines = ignored && ignoredSources
     ? [
       `Not moved, as listed in ${ignoredSources.files}: ${countNoun(ignored.count, "path")}${ignoredSources.breakdown}, ${ignoredAtBound ? "at least " : ""}${countNoun(ignored.fileCount, "file")} (${formatReceiptBytes(ignored.bytes)}${ignoredAtBound ? " or more" : ""})${ignoredLargest ? `; largest: ${ignoredLargest}` : ""}. The old workspace is archived on ${input.sourceMachineName} and kept for up to 7 days, so anything missing can be recovered from there.`,

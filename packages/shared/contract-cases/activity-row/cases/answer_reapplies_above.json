@@ -1,0 +1,55 @@
+{
+  "formatVersion": 1,
+  "id": "answer_reapplies_above",
+  "rule": "position",
+  "title": "An answer between the delivered position and the applied seqs is taken, and the seqs above it are applied again",
+  "why": "Seqs at or below the answer are trusted as counted in it; those above are not in it yet.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/shared/src/activityRowPosition.ts (reduceActivityRow; not wired yet, step 2)"
+    ],
+    "server": [
+      "packages/server/src/services/channelService.ts (latestActivitySeqSameSource; the row's latestActivitySeq)",
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (unread_count and latest_seq from one materialized row)"
+    ]
+  },
+  "given": {
+    "row": {
+      "unreadCount": 0,
+      "hasMention": false,
+      "position": "99",
+      "mentionOnly": false
+    }
+  },
+  "steps": [
+    {
+      "act": "liveMessage",
+      "seq": "100",
+      "counts": true,
+      "mentionsViewer": false
+    },
+    {
+      "act": "liveMessage",
+      "seq": "101",
+      "counts": true,
+      "mentionsViewer": false
+    },
+    {
+      "act": "answer",
+      "row": {
+        "unreadCount": 1,
+        "hasMention": false,
+        "position": "100",
+        "mentionOnly": false
+      }
+    }
+  ],
+  "expect": {
+    "row": {
+      "unreadCount": 2,
+      "position": "101"
+    },
+    "reread": false
+  }
+}

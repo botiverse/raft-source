@@ -4,7 +4,7 @@ import type { Server as SocketServer } from "socket.io";
 import { LINK_CARD_OPERATION_CHANGED_EVENT } from "@botiverse/raft-shared/src/appLinkPreview";
 import type { Database } from "../db/index";
 import {
-  channels, featureFlagRules, linkCardOperations, oauthAppLinkPreviews, oauthClientInstalls, oauthUserConsents, officialAppRegistry, servers, users,
+  channels, featureFlagRules, linkCardOperations, oauthAppLinkPreviews, oauthClientInstalls, oauthClients, oauthUserConsents, officialAppRegistry, servers, users,
 } from "../db/schema";
 import { canonicalJsonSha256 } from "../lib/canonicalJson";
 import { __setPreviewHttpForTests } from "../services/appLinkPreviewService";
@@ -13,11 +13,16 @@ import {
   linkCardActionEndpointSha256, linkCardMessageContentSha256, linkCardUrlSha256, newLinkCardViewNonce, signLinkCardHandle, type LinkCardHandleClaims,
 } from "../services/linkCardTokens";
 import { createOAuthClient } from "../services/oauthService";
+import { mintAgentCredential, MANAGED_APP_BOT_CAPABILITIES } from "../services/agentCredentialService";
+import { createManagedAppBot } from "../services/appBotIdentityService";
+import { addAgent } from "../services/channelService";
 import { tokenForHuman } from "./integration/credentials";
 import type { createSeed } from "./integration/seed";
 
 // Shared setup for the interactive link card action tests (prepare, execute,
 // sweeps): a viewer, a message with one preview link, an approved official App
+// (shared, not server_local: with the registry disabled it has no card buttons
+// until a Server allows them, RFC 076 §17)
 // with a consented installation and an approved action endpoint, the flag on,
 // and a substitute App behind the preview transport.
 
@@ -43,7 +48,7 @@ export async function cardFixture(db: Database, seed: Seed, options: { content?:
   const server = await seed.server({ owner });
   const channel = await seed.channel({ server, members: [owner] });
   const message = await seed.message({ channel, author: owner, content });
-  const { client, clientSecret } = await createOAuthClient({ serverId: server.id, createdByUserId: owner.id, clientId: `cards-${suffix}`, name: `Cards ${suffix}` });
+  const { client, clientSecret } = await createOAuthClient({ serverId: server.id, createdByUserId: owner.id, clientId: `cards-${suffix}`, name: `Cards ${suffix}`, appType: "third_party_global" });
   const [install] = await db.insert(oauthClientInstalls).values({ clientId: client.id, serverId: server.id, installedByUserId: owner.id }).returning();
   await db.insert(oauthUserConsents).values({ serverId: server.id, userId: owner.id, clientId: client.id, scopes: ["openid", "profile"] });
   const actionEndpoint = `${origin}/card-actions`;
@@ -200,4 +205,20 @@ export async function executedOperation(baseUrl: string, fx: CardFixture, execut
   const call = calls.find((item) => item.body.phase === "execute");
   if (res.status !== 200 || !call) throw new Error(`execute failed: ${res.status} ${JSON.stringify(res.body)}`);
   return { operationId: res.body.operation_id as string, state: res.body.state as string, updateToken: call.body.update_token as string, clientRequestId: requestId, executeClaims: call.claims, ...made };
+}
+
+/**
+ * RFC 086: the card fixture's App with its bot (the install's bot grant
+ * granted, the bot bound and in the fixture's channel) and the bot's agent
+ * API key, to send card messages with acting buttons.
+ */
+export type AppBotFixture = CardFixture & { botId: string; botName: string; botKey: string };
+export async function appBotFixture(db: Database, seed: Seed): Promise<AppBotFixture> {
+  const fx = await cardFixture(db, seed);
+  await db.update(oauthClients).set({ enableBot: true }).where(eq(oauthClients.id, fx.client.id));
+  await db.update(oauthClientInstalls).set({ botGrant: "granted" }).where(eq(oauthClientInstalls.id, fx.install.id));
+  const bot = await db.transaction((tx) => createManagedAppBot(tx, { installId: fx.install.id, serverId: fx.server.id }));
+  await addAgent(fx.channel.id, bot.agentId);
+  const credential = await mintAgentCredential({ agentId: bot.agentId, scopes: [...MANAGED_APP_BOT_CAPABILITIES], name: "app-cards", issuedVia: "app", createdByUserId: null });
+  return { ...fx, botId: bot.agentId, botName: credential.agentName, botKey: credential.apiKey };
 }

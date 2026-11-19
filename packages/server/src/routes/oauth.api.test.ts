@@ -9,6 +9,7 @@ import { and, eq } from "drizzle-orm";
 import { getDb } from "../db/index";
 import { externalAppRegistrations, integrationAuditEvents, messageMentions, oauthAccessRequests, oauthAccessTokens, oauthAppInstallationTokens, oauthAppPermissionRevisions, oauthClientInstalls, oauthClients, oauthGrants, serverAgentMembers, servers, thirdPartyAgentEvents, threadFollows, users } from "../db/schema";
 import { openTestApp } from "../test/integration/app";
+import { getAppUrl } from "../config/appUrl";
 import { createServer, addMember, removeMember } from "../services/serverService";
 import { createAgent } from "../services/agentService";
 import {
@@ -225,6 +226,7 @@ test("OAuth discovery exposes public Raft scopes but hides reserved and legacy s
     "email",
     "identity",
     "agent:read",
+    "app:read",
     "agent:event:write",
     "agent:notification:write",
   ]);
@@ -766,12 +768,47 @@ test("App client credentials discover only their active installation on an exact
   });
   assert.equal(discovered.status, 200);
   assert.equal(discovered.headers.get("cache-control"), "private, no-store");
+  // The Apps page link names the App by its row id (oauth_clients.id), which
+  // the web matches as `installed_app`, never by the public client_id.
+  const appPageUrl = (slug: string) => `${getAppUrl()}/s/${slug}/apps?installed_app=${client.id}`;
+  const serverRow = async () => (await getDb().select({ id: servers.id, slug: servers.slug, name: servers.name })
+    .from(servers).where(eq(servers.id, targetServer.id)))[0];
+  const targetRow = await serverRow();
+  assert.deepEqual(targetRow, { id: targetServer.id, slug: `oauth-discovery-target-${suffix}`, name: "OAuth Discovery Target" });
   assert.deepEqual(await discovered.json(), {
     installation_id: installation.id,
     server_id: targetServer.id,
+    server: targetRow,
+    app_page_url: appPageUrl(targetRow.slug),
     setup: { status: "not_required", url: null, description: null, revision: 1, completedAt: null },
     bot: null,
   });
+  assert.match(appPageUrl(targetRow.slug), /^https?:\/\/[^/]+\/s\/oauth-discovery-target-[0-9a-f-]{36}\/apps\?installed_app=[0-9a-f-]{36}$/);
+  assert.notEqual(client.id, client.clientId);
+
+  // Read with each lookup, not kept: a rename (name and slug) shows at once.
+  await getDb().update(servers).set({ name: "Renamed Target", slug: `oauth-discovery-renamed-${suffix}` })
+    .where(eq(servers.id, targetServer.id));
+  const renamed = await lookup({ clientKey: client.clientId, secret: clientSecret, serverId: targetServer.id });
+  assert.equal(renamed.status, 200);
+  const renamedBody = await renamed.json() as { server: unknown; app_page_url: string };
+  assert.deepEqual(renamedBody.server, await serverRow());
+  assert.deepEqual(renamedBody.server, { id: targetServer.id, slug: `oauth-discovery-renamed-${suffix}`, name: "Renamed Target" });
+  assert.equal(renamedBody.app_page_url, appPageUrl(`oauth-discovery-renamed-${suffix}`));
+
+  // The origin is this deployment's web origin (APP_URL), as for the bot's add_url.
+  const savedAppUrl = process.env.APP_URL;
+  process.env.APP_URL = "https://staging.raft.example.test";
+  try {
+    const onStaging = await lookup({ clientKey: client.clientId, secret: clientSecret, serverId: targetServer.id });
+    assert.equal(
+      (await onStaging.json() as { app_page_url: string }).app_page_url,
+      `https://staging.raft.example.test/s/oauth-discovery-renamed-${suffix}/apps?installed_app=${client.id}`,
+    );
+  } finally {
+    if (savedAppUrl === undefined) delete process.env.APP_URL;
+    else process.env.APP_URL = savedAppUrl;
+  }
 
   const scopedAlias = await fetch(`${app.baseUrl}/oidc/${targetServer.id}/api/oauth/installations/lookup`, {
     method: "POST",
@@ -800,7 +837,7 @@ test("App client credentials discover only their active installation on an exact
     serverId: otherServer.id,
   });
   assert.equal(crossServer.status, 404);
-  assert.equal((await crossServer.json() as { error?: string }).error, "Active installation not found");
+  assert.deepEqual(await crossServer.json(), { error: "Active installation not found" });
 
   const crossClient = await lookup({
     clientKey: otherClient.clientId,
@@ -809,7 +846,8 @@ test("App client credentials discover only their active installation on an exact
     extra: { client_id: client.clientId },
   });
   assert.equal(crossClient.status, 404, "an untrusted client_id must not override the authenticated App");
-  assert.equal((await crossClient.json() as { error?: string }).error, "Active installation not found");
+  // Another App learns nothing of a Server it isn't installed on: no name, slug or link.
+  assert.deepEqual(await crossClient.json(), { error: "Active installation not found" });
 
   await getDb().update(oauthClientInstalls).set({ status: "suspended" })
     .where(eq(oauthClientInstalls.id, installation.id));
@@ -956,6 +994,48 @@ test("human OAuth userinfo requires the user to remain a current server member",
     headers: { Authorization: `Bearer ${tokenBody.access_token}` },
   });
   assert.equal(afterRemoval.status, 401);
+});
+
+// The approving client may say where the person approved (Raft Desktop's sheet
+// for a page of its built-in browser sends `source: "desktop_browser"`). It is
+// a label on the audit event and nothing else: any other value is ignored, and
+// the answer is the same with or without it.
+test("human authorization: `source: desktop_browser` is recorded on the audit event, and only that value", async ({ app }) => {
+  const suffix = randomUUID();
+  const owner = await seedUser(`oauth-source-owner-${suffix}@slock.test`, `oauth-source-owner-${suffix}`);
+  const server = await createServer("OAuth Approval Source", `oauth-approval-source-${suffix}`, owner.id);
+  const { client } = await createOAuthClient({
+    serverId: server.id,
+    createdByUserId: owner.id,
+    name: "OAuth Approval Source Client",
+    clientId: `oauth-source-${suffix.slice(0, 8)}`,
+  });
+  const token = await login(app.baseUrl, owner.email);
+  const authorize = async (extra: Record<string, unknown>) => {
+    const response = await fetch(`${app.baseUrl}/api/oauth/authorize/human`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ clientId: client.clientId, serverId: server.id, scopes: ["openid", "profile"], ...extra }),
+    });
+    assert.equal(response.status, 200, `authorize failed (${response.status})`);
+    const body = await response.json() as Record<string, unknown>;
+    return Object.keys(body).sort();
+  };
+  const plain = await authorize({});
+  assert.deepEqual(await authorize({ source: "desktop_browser" }), plain, "the answer does not change with the label");
+  assert.deepEqual(await authorize({ source: "admin" }), plain);
+  assert.deepEqual(await authorize({ source: { $ne: null } }), plain);
+
+  const events = await getDb().select({ metadata: integrationAuditEvents.metadata, source: integrationAuditEvents.source })
+    .from(integrationAuditEvents)
+    .where(and(eq(integrationAuditEvents.clientId, client.id), eq(integrationAuditEvents.eventType, "oauth.lifecycle")));
+  const issued = { clientKey: client.clientId, stage: "authorization", result: "issued", grantType: "authorization_code", principalType: "human" };
+  const sortKey = (metadata: unknown) => JSON.stringify(metadata).length;
+  assert.deepEqual(
+    events.map((event) => event.metadata).sort((left, right) => sortKey(left) - sortKey(right)),
+    [issued, issued, issued, { ...issued, source: "desktop_browser" }],
+  );
+  assert.ok(events.every((event) => event.source === "api"), "the event's own source column is unchanged");
 });
 
 test("human OAuth userinfo picture only exposes Raft-uploaded avatars", async ({ app }) => {

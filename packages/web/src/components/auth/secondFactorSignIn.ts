@@ -178,6 +178,15 @@ export interface PendingSecondFactorSignIn {
  */
 export const useSecondFactorSignIn = create<{ pending: PendingSecondFactorSignIn | null }>(() => ({ pending: null }));
 
+/**
+ * Whether a second step is pending (the signed-out screens step aside for it).
+ * Here beside the store, not in SecondFactorSignInStep.tsx, so App.tsx asks it
+ * every render without taking the step's page into the first download.
+ */
+export function useSecondFactorSignInPending(): boolean {
+  return useSecondFactorSignIn((state) => state.pending !== null);
+}
+
 export function startSecondFactorSignIn(pending: PendingSecondFactorSignIn): void {
   useSecondFactorSignIn.setState({ pending });
 }

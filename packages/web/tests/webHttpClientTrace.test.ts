@@ -10,6 +10,7 @@ import {
   finishWebHttpClientTrace,
   forwardHttpDiagnosticAttrs,
   startWebHttpClientSpan,
+  webHttpNetworkErrorCode,
 } from "../src/utils/webHttpClientTrace";
 import {
   __resetAuthTraceForTest,
@@ -465,6 +466,9 @@ test("shared web API client closes a network-error attempt and preserves the ori
     assert.equal(record.attrs.outcome, "error");
     assert.equal(record.attrs.status_bucket, "network_error");
     assert.equal("status_code" in record.attrs, false);
+    assert.equal(record.attrs.error_code, "ERR_NETWORK");
+    assert.equal(record.attrs["http.route"], "/api/agents");
+    assert.equal(JSON.stringify(record).includes("network failed"), false, "the error message never reaches the span");
   } finally {
     storage.restore();
     setAuthTraceFetchForTest(null);
@@ -504,6 +508,65 @@ test("shared web API client closes a cancelled attempt without converting the ca
     assert.equal(record.status, "cancelled");
     assert.equal(record.attrs.outcome, "cancelled");
     assert.equal(record.attrs.status_bucket, "network_error");
+    assert.equal(record.attrs.error_code, "ERR_CANCELED");
+  } finally {
+    storage.restore();
+    setAuthTraceFetchForTest(null);
+    setAuthTraceServerIdGetter(() => undefined);
+    __resetAuthTraceForTest();
+  }
+});
+
+test("a request with no HTTP response maps its failure to a closed error_code; the message is never read", () => {
+  const config = { headers: {} } as InternalAxiosRequestConfig;
+  const cases: Array<[unknown, string]> = [
+    [new AxiosError("Network Error", "ERR_NETWORK", config), "ERR_NETWORK"],
+    [new AxiosError("timeout of 10000ms exceeded", "ECONNABORTED", config), "ECONNABORTED"],
+    [new AxiosError("timeout", "ETIMEDOUT", config), "ETIMEDOUT"],
+    [new CanceledError("cancelled", config), "ERR_CANCELED"],
+    [new AxiosError("Maximum redirects", "ERR_FR_TOO_MANY_REDIRECTS", config), "ERR_FR_TOO_MANY_REDIRECTS"],
+    [new AxiosError("Invalid URL", "ERR_INVALID_URL", config), "ERR_INVALID_URL"],
+    // Codes outside the closed set, and anything that carries its own text as a code.
+    [new AxiosError("bad option", "ERR_BAD_OPTION", config), "other"],
+    [Object.assign(new Error("x"), { code: "ECONNRESET /api/channels/c-123" }), "other"],
+    // What fetch throws (the keepalive Action Card path).
+    [new TypeError("Failed to fetch"), "ERR_NETWORK"],
+    [new DOMException("The operation was aborted.", "AbortError"), "ERR_CANCELED"],
+    [new DOMException("signal timed out", "TimeoutError"), "ETIMEDOUT"],
+    [new Error("boom"), "other"],
+    ["ERR_NETWORK", "other"],
+    [null, "other"],
+  ];
+  for (const [failure, code] of cases) assert.equal(webHttpNetworkErrorCode(failure), code, String(failure));
+});
+
+test("error_code is only on a request that got no response, and only when the failure is known", async () => {
+  __resetAuthTraceForTest({ traceUrl: "https://trace.example.test" });
+  setTraceTestIdentity();
+  const storage = stubLocalStorage({ slock_access_token: "token" });
+  const requests: Array<{ body: unknown }> = [];
+
+  try {
+    setAuthTraceFetchForTest(async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      requests.push({ body: init?.body ? JSON.parse(String(init.body)) : null });
+      return url.endsWith("/scope-attestation")
+        ? jsonResponse({ attestation: "att" })
+        : jsonResponse({ ok: true });
+    });
+
+    const config = { headers: {} } as InternalAxiosRequestConfig;
+    startWebHttpClientSpan("post", "/actions/m-1/execute").end({ failure: new TypeError("Failed to fetch") });
+    startWebHttpClientSpan("get", "/agents").end({ statusCode: 503, failure: axiosError(config, 503) });
+    startWebHttpClientSpan("get", "/agents").end({});
+    await flushAuthTraces();
+
+    const [noResponse, withResponse, unknownFailure] = webHttpRecords(requests);
+    assert.equal(noResponse!.attrs.error_code, "ERR_NETWORK");
+    assert.equal(noResponse!.attrs["http.route"], "/api/actions/:id/execute");
+    assert.equal("error_code" in withResponse!.attrs, false);
+    assert.equal(withResponse!.attrs.status_code, 503);
+    assert.equal("error_code" in unknownFailure!.attrs, false);
   } finally {
     storage.restore();
     setAuthTraceFetchForTest(null);

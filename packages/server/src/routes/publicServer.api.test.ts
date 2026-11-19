@@ -31,19 +31,12 @@ import { tokenForHuman } from "../test/integration/credentials";
 import { addMember } from "../services/serverService";
 import { seedBoundGuest } from "../test/guestFixture";
 import { createMessage } from "../services/messageService";
-import { PUBLIC_SERVER_FEATURE_FLAG_KEY, SERVER_GUEST_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
+import { PUBLIC_SERVER_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
 
 async function enablePublicServerFeature() {
   await getDb().update(featureFlags)
     .set({ enabled: true, killSwitch: false, defaultEnabled: true })
     .where(eq(featureFlags.key, PUBLIC_SERVER_FEATURE_FLAG_KEY));
-}
-
-async function enablePublicAndGuestFeatures() {
-  await enablePublicServerFeature();
-  await getDb().update(featureFlags)
-    .set({ enabled: true, killSwitch: false, defaultEnabled: true })
-    .where(eq(featureFlags.key, SERVER_GUEST_FEATURE_FLAG_KEY));
 }
 
 /**
@@ -654,7 +647,7 @@ test("public Guest join is gone: its owner switch and its join route 404, and se
   const app = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true });
   try {
     const db = getDb();
-    await enablePublicAndGuestFeatures();
+    await enablePublicServerFeature();
     const owner = await seedUser("public-join-owner@slock.test", "public-join-owner");
     const visitor = await seedUser("public-join-visitor@slock.test", "public-join-visitor");
     const server = await createServer("Join Retired", "public-join-retired-47", owner.id);

@@ -14,6 +14,8 @@ import { getDb } from "../../db/index";
 import { messages, objectEvents, thirdPartyAgentEvents } from "../../db/schema";
 import { AgentOrchestrator } from "../../services/agentOrchestrator";
 import { createAgent } from "../../services/agentService";
+import { openOrCreateAgentLounge } from "../../services/agentLoungeService";
+import { AGENT_LOUNGE_PLACEMENT_REFUSAL } from "../../platform/conversations";
 import { AGENT_API_KEY_HMAC_SECRET_ENV, mintAgentCredential } from "../../services/agentCredentialService";
 import { addAgent, addHuman, createChannel, findOrCreateDM } from "../../services/channelService";
 import { WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY } from "../../services/featureFlagService";
@@ -22,7 +24,7 @@ import { appOperationsTotal } from "../../metrics";
 import { refusalBody, type RefusalInput } from "../../platform/refusals";
 import { createApiTest } from "../../test/integration/apiTest";
 import type { createSeed } from "../../test/integration/seed";
-import { ARTIFACTS_NOT_ENABLED, notVisible as notVisibleRefusal, storageUnavailable, takePartForbiddenError, TARGET_IS_TASK_ERROR, TARGET_NOT_FOUND_ERROR, targetNotFound, versionNotFound } from "./apiCommon";
+import { ARTIFACTS_NOT_ENABLED, notVisible as notVisibleRefusal, notVisibleTitle, storageUnavailable, takePartForbiddenError, TARGET_IS_TASK_ERROR, TARGET_NOT_FOUND_ERROR, targetNotFound, versionNotFound } from "./apiCommon";
 import { pruneUnreferencedArtifactBlobs, storeBlob } from "./blobs";
 import { __setArtifactR2StoreForTests, type ArtifactR2Store } from "./blobStore";
 import { TITLE_REQUIRED_ERROR } from "./publish";
@@ -69,7 +71,7 @@ const BLANK_TITLE = refusal({
 });
 const entryNotFound = (entry: string) => refusal({
   code: "ENTRY_NOT_FOUND",
-  error: "The entry file isn't in the version this push would make: push that file too, or name an entry file that is in it.",
+  error: `The entry file ${JSON.stringify(entry)} isn't in the version this push would make: push that file too, or name an entry file that is in it.`,
   details: { entry },
 });
 
@@ -450,7 +452,9 @@ test("addressing: by exact title in any case among the artifacts the agent sees,
     assert.equal(first.status, 201);
     // Unique among what A sees: trimmed, any case. Only the whole title matches.
     assert.equal((await read(app, world.keys.a, "  q3 REPORT ")).body.artifact.id, first.body.artifact.id);
-    assert.deepEqual(await read(app, world.keys.a, "Q3"), { status: 404, body: wire(notVisibleRefusal().body) });
+    // Words that can only be a title: the one sentence, and a search for them as the step.
+    assert.deepEqual(await read(app, world.keys.a, "Q3"), { status: 404, body: wire(notVisibleTitle("Q3").body) });
+    assert.deepEqual((await read(app, world.keys.a, "Q3")).body.next, wire(RAFT_HINTS.artifactList({ query: "Q3" })));
     // Not one of its server's own, by title: never anything but the one 404.
     assert.equal((await read(app, world.keys.peer, "Q3 report")).status, 404);
 
@@ -459,7 +463,9 @@ test("addressing: by exact title in any case among the artifacts the agent sees,
     const ambiguous = await read(app, world.keys.a, "Q3 report");
     assert.equal(ambiguous.status, 409);
     assert.equal(ambiguous.body.code, "AMBIGUOUS_ARTIFACT_NAME");
-    assert.equal(ambiguous.body.error, `2 artifacts you can see are called that: pass the id of the one you mean instead (${ambiguous.body.details.candidates.map((c: { id: string }) => c.id).join(", ")}).`);
+    const listed = ambiguous.body.details.candidates.map((c: { id: string; home: { conversation: { target: string } } }) => `${c.id} (home: ${c.home.conversation.target})`).join(", ");
+    assert.equal(ambiguous.body.error, `2 artifacts you can see are called that, so pass the id of the one you mean instead: ${listed}.`);
+    assert.ok(ambiguous.body.error.includes(`(home: ${priv})`), ambiguous.body.error);
     assert.deepEqual(ambiguous.body.next, wire(RAFT_HINTS.artifactRead({ artifact: ambiguous.body.details.candidates[0].id })));
     assert.equal(ambiguous.body.details.ref, "Q3 report");
     const byId = (x: { id: string }, y: { id: string }) => (x.id < y.id ? -1 : 1);
@@ -532,9 +538,10 @@ test("title alone: the item takes it with no new version, recorded as `renamed`,
     const queuedNotice = (queuedToA!.payload as { app_event: ArtifactAgentAppEvent }).app_event;
     assert.deepEqual([queuedNotice.reason, queuedNotice.renamed], ["subscribed", { by: { type: "agent", name: world.agentB.name }, from: "Site", to: "Site, renamed" }]);
     assert.deepEqual(await artifactEventsOf(world.agentB.id), []);
-    // Found by its new title, no longer by the old one.
-    assert.equal((await read(app, world.keys.a, "site, renamed")).body.artifact.id, id);
-    assert.equal((await read(app, world.keys.a, "Site")).status, 404);
+    // Found by its new title, no longer by the old one. (Looked up by B: A reading it, or pushing on it below, would
+    // have seen all of it and so handled the rename notice, consumed then: #raft-antiproton:#16.)
+    assert.equal((await read(app, world.keys.b, "site, renamed")).body.artifact.id, id);
+    assert.equal((await read(app, world.keys.b, "Site")).status, 404);
 
     // The same title again: nothing to change, nothing recorded.
     const again = await publish(app, world.keys.b, { artifact: id, base: 1, title: "Site, renamed", files: [] });
@@ -547,7 +554,7 @@ test("title alone: the item takes it with no new version, recorded as `renamed`,
     // Blank: refused, the title kept.
     assert.deepEqual((await publish(app, world.keys.b, { artifact: id, base: 1, title: "   ", files: [] })).body, BLANK_TITLE);
     // With a file changed, a title rides in the new version as before.
-    const v2 = await publish(app, world.keys.a, { artifact: id, base: 1, title: "Site v2", files: [text("a.html", "a2")] });
+    const v2 = await publish(app, world.keys.b, { artifact: id, base: 1, title: "Site v2", files: [text("b.html", "b2")] });
     assert.equal(v2.status, 201);
     assert.equal(v2.body.version.number, 2);
     assert.equal(v2.body.artifact.title, "Site v2");
@@ -935,6 +942,21 @@ test("acceptance 4–6: comments on other files are counted; on the files change
   }
 });
 
+test("another agent's lounge is no home: 403 FORBIDDEN whose sentence ends in a step", async ({ app, seed }) => {
+  const world = await seedWorld(seed);
+  try {
+    const { channel } = await openOrCreateAgentLounge(world.server.id, world.agentB.id);
+    const target = `#${channel.name}`;
+    assert.deepEqual(await publish(app, world.keys.a, { target, title: "t", files: [text("index.html", "x")] }), {
+      status: 403,
+      body: refusal({ code: "FORBIDDEN", error: AGENT_LOUNGE_PLACEMENT_REFUSAL, details: { target } }),
+    });
+    assert.match(AGENT_LOUNGE_PLACEMENT_REFUSAL, /, so give it another home or tell whoever asked you\.$/);
+  } finally {
+    __setArtifactR2StoreForTests(undefined);
+  }
+});
+
 test("who may publish: the artifact's server only; anything not visible is NOT_VISIBLE", async ({ app, seed }) => {
   const world = await seedWorld(seed);
   try {
@@ -944,7 +966,9 @@ test("who may publish: the artifact's server only; anything not visible is NOT_V
     await getDb().update(artifactItems).set({ homeKind: "public", homeChannelId: null }).where(eq(artifactItems.id, site));
     const notVisible = { status: 404, body: wire(notVisibleRefusal().body) };
     assert.deepEqual(await publish(app, world.keys.out, { artifact: priv.body.artifact.id, base: 1, files: [text("a.html", "x")] }), notVisible);
-    assert.deepEqual(await publish(app, world.keys.out, { artifact: "secret", base: 1, files: [text("a.html", "x")] }), notVisible);
+    // A title: the same answer (a search for the words as the step) whether or not one exists.
+    assert.deepEqual(await publish(app, world.keys.out, { artifact: "secret", base: 1, files: [text("a.html", "x")] }), { status: 404, body: wire(notVisibleTitle("secret").body) });
+    assert.deepEqual(await publish(app, world.keys.out, { artifact: "no such title", base: 1, files: [text("a.html", "x")] }), { status: 404, body: wire(notVisibleTitle("no such title").body) });
     assert.deepEqual(await publish(app, world.keys.peer, { artifact: priv.body.artifact.id, base: 1, files: [text("a.html", "x")] }), notVisible);
     assert.deepEqual(await publish(app, world.keys.a, { artifact: "pt_00000000-0000-4000-8000-000000000000", base: 1, files: [] }), notVisible);
     assert.equal((await read(app, world.keys.peer, site)).status, 200);
@@ -988,12 +1012,12 @@ test("limits: each with its code and limit; the JSON body may be large on this r
     }
     assert.deepEqual(await refused({ target, files: [text("index.html", "x"), text("index.html", "y")] }), refusal({
       code: "DUPLICATE_PATH",
-      error: "A path is listed twice, or both sent and deleted, in this push: list each path once.",
+      error: `"index.html" is listed twice, or both sent and deleted, in this push: list each path once.`,
       details: { path: "index.html" },
     }));
     assert.deepEqual(await refused({ target, files: [{ path: "x.png", content_base64: "not base64!" }] }), refusal({
       code: "INVALID_CONTENT",
-      error: "A file's content_base64 isn't valid padded base64: send it base64-encoded, or as content if it is text.",
+      error: `The content_base64 of "x.png" isn't valid padded base64: send it base64-encoded, or as content if it is text.`,
       details: { path: "x.png" },
     }));
     assert.deepEqual(await refused({ target, entry: "home.html", files: [text("index.html", "x")] }), entryNotFound("home.html"));

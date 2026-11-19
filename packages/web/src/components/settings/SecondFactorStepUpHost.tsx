@@ -26,12 +26,15 @@ const DESCRIPTION_IDS = {
   agentAccess: "settings.twoStep.stepUpAgentAccessDescription",
   secret: "settings.twoStep.stepUpSecretDescription",
   actionCard: "settings.twoStep.stepUpActionCardDescription",
+  // Only a lost device's revoke asks (#triage:#386): a plain sign-out needs the password alone.
+  signOutDevice: "settings.twoStep.stepUpLostDeviceDescription",
   other: "settings.twoStep.stepUpGenericDescription",
 } as const satisfies Record<StepUpReason, MessageId>;
 
 export default function SecondFactorStepUpHost() {
   const { formatMessage } = useIntl();
   const pending = useSecondFactorStepUpStore((state) => state.pending);
+  const email = useAuthStore((state) => state.user?.email);
   useEffect(() => registerSecondFactorStepUpHost(), []);
 
   const settle = pending?.settle;
@@ -46,6 +49,7 @@ export default function SecondFactorStepUpHost() {
   }, [settle]);
 
   const handleClose = useCallback(() => settle?.(false), [settle]);
+  const handleSignOutInstead = useCallback(() => settle?.("signOutInstead"), [settle]);
 
   const handleSignInAgain = useCallback(() => {
     settle?.(false);
@@ -60,6 +64,10 @@ export default function SecondFactorStepUpHost() {
       onAnswer={handleAnswer}
       onClose={handleClose}
       onSignInAgain={handleSignInAgain}
+      // Signing out a lost device: the authenticator may have gone with it (Warden).
+      recoveryEmail={pending.reason === "signOutDevice" ? email : undefined}
+      lostDevice={pending.lostDevice}
+      onSignOutInstead={handleSignOutInstead}
       testId="second-factor-step-up-dialog"
     />
   );

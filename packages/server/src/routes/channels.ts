@@ -9,7 +9,7 @@ import { DEPRECATED_GRAVATAR_HASH, isExternalAgentRuntime, isSubConversationType
 import { getProductEventSink } from "../services/productEventIngest";
 import { recordServerProductEvent } from "../services/serverProductEvents";
 import { getAgentsLastSeenAt } from "../services/agentCredentialService";
-import { type MarkConversationUnreadResponse } from "@botiverse/raft-shared";
+import { INBOX_BACKEND_HEADER, type MarkConversationUnreadResponse } from "@botiverse/raft-shared";
 import { emitChannelConversionCardUpdates } from "../services/channelConversionRealtimeService";
 import { emitJointProjectionUpdates, publishChannelUpdate } from "../services/channelRealtimeEvents";
 import { finishChannelArchive } from "../services/channelArchiveEffects";
@@ -130,6 +130,7 @@ import { markAllObjectActivityRead } from "../services/objectActivity";
 import { announceActivityChanged } from "../services/activityRealtime";
 import { getDb, getPoolMetrics, type DatabaseExecutor } from "../db/index";
 import { parseOffsetQueryParam } from "../lib/offsetQueryParam";
+import { parseThreadPreviewChars, THREAD_PREVIEW_CHARS_PARAM } from "../services/threadReplyPreview";
 
 /** Another person's personal assistant: answered as an id that names no agent (agentFindableBy). */
 function isOthersAssistant(agent: { assistantOwnerUserId?: string | null } | null | undefined, userId: string): boolean {
@@ -1735,6 +1736,9 @@ channelRouter.get("/inbox", async (req, res) => {
       })
       : { value: await load(), stale: false, staleReason: undefined, traceAttrs: {} };
     if (stale) res.setHeader(STALE_RESPONSE_HEADER, staleReason ?? "rw_overloaded");
+    // Which source served the rows (risingwave / postgres), for the web's drift check; not in the body.
+    const { backend, ...answer } = result;
+    if (backend) res.setHeader(INBOX_BACKEND_HEADER, backend);
     addTraceEvent("response.ready", {
       filter,
       channel_id_present: Boolean(channelId),
@@ -1748,10 +1752,10 @@ channelRouter.get("/inbox", async (req, res) => {
       ...staleTraceAttrs,
     });
     if (rowIds) {
-      res.json({ items: result.items });
+      res.json({ items: answer.items });
       return;
     }
-    res.json(stale ? { ...result, stale: true } : result);
+    res.json(stale ? { ...answer, stale: true } : answer);
   } catch (err) {
     sendJsonServerError(req, res, {
       error: "Failed to get inbox",
@@ -2008,7 +2012,11 @@ channelRouter.post("/inbox/read-all", noteInboxWriteBeforeReply, async (req, res
 const FOLLOWED_THREADS_MAX_LIMIT = 200;
 
 channelRouter.get("/threads/followed", async (req, res) => {
-  addTraceEvent("activity.list.fetch", activityListFetchTraceAttrs("followed_threads", req.headers[CHANNEL_FETCH_REASON_HEADER]));
+  addTraceEvent("activity.list.fetch", {
+    ...activityListFetchTraceAttrs("followed_threads", req.headers[CHANNEL_FETCH_REASON_HEADER]),
+    // #triage:#389: why a realtime_fallback reload of this list was asked for.
+    ...inboxFetchTriggerTraceAttrs(req.headers[INBOX_FETCH_TRIGGER_HEADER], req.headers[INBOX_FETCH_COALESCED_HEADER]),
+  });
   try {
     addTraceEvent("followed_threads.load.started");
     // `limit` pages the list (newest activity first) and returns `next`;
@@ -5278,7 +5286,10 @@ channelRouter.post("/:id/members", async (req, res) => {
 });
 
 // Human-only v1 surface for channel-local member/admin transitions. Agents can
-// hold the role but intentionally have no Agent API/CLI/action-card entry.
+// hold the role but intentionally have no Agent API/CLI entry. An agent may
+// prepare lowering a role (never raising one) as a request card (RFC 085
+// `channel:remove_admin`, services/delegableCardRoutes.ts): the person it
+// names confirms, and this route runs as them with its own checks.
 channelRouter.patch("/:id/members/:targetType/:memberId/role", async (req, res) => {
   const targetType = req.params.targetType === "user" || req.params.targetType === "agent"
     ? req.params.targetType
@@ -5989,6 +6000,7 @@ channelRouter.get("/:id/threads", async (req, res) => {
         parentMessageIds,
         parentMessageScopeSource,
         historyCutoff,
+        previewChars: parseThreadPreviewChars(req.query[THREAD_PREVIEW_CHARS_PARAM]),
         traceQuery: createTraceDbQueryTracer("channel_threads.loaded"),
       }),
       (durationMs, result) => {

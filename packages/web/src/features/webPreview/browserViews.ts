@@ -1,6 +1,6 @@
 import type { DesktopWebPreviewTabsBridge } from "@botiverse/raft-shared";
 
-import { useBrowserTabsStore } from "./browserTabsStore";
+import { browserOf, browserTabsListInShell, useBrowserTabsStore } from "./browserTabsStore";
 
 /**
  * Keeps the shell's native views (raftDesktop.webPreview.tabs, one per tab)
@@ -18,11 +18,37 @@ import { useBrowserTabsStore } from "./browserTabsStore";
  * - Only the tab in front shows, and only while the browser's panel is on
  *   screen (`setShowing`): parked behind the Artifact, every view is hidden
  *   (`activate(null)`) but none is destroyed.
+ *
+ * A pinned tab (#proj-workspace:#297) is the window's: the shell keeps its
+ * view when the window leaves a conversation, and this module presents a
+ * conversation with no tabs of its own while the pinned tabs' panel is open.
+ *
+ * Find in page (#proj-workspace:#292) follows the same rule: the list's find
+ * field (`find`) says what should be searched, and this module asks the
+ * shell for exactly that: a search while the field's tab is in front and its
+ * panel on screen, from the first match when the text changes, the next or
+ * previous match when asked, again when its page finishes loading, and none
+ * otherwise. A shell that predates it is asked nothing.
+ *
+ * On a shell that keeps the tab list itself (`tabs.list`,
+ * #proj-workspace:#295) the views are the shell's to make and destroy, by the
+ * same rules. This module then only says which conversation's browser the
+ * window is on and whether its panel is on screen (`list.present`); after a
+ * reload of this page that is what takes the views, still alive, back.
+ * Where the shell can mute a tab (`setMuted`) it is told this web shows the
+ * speaker on a tab (`backgroundMedia`, #proj-workspace:#299): a tab behind
+ * plays on and is heard, a page that plays outlives the conversation left
+ * (while it plays), and switching away from a playing video puts it in
+ * picture-in-picture, as Chrome does (apps/desktop webPreviewPlayback.ts).
  */
 
 let bridge: DesktopWebPreviewTabsBridge | null = null;
 let unsubscribeState: (() => void) | null = null;
+let unsubscribeRequest: (() => void) | null = null;
 let unsubscribeStore: (() => void) | null = null;
+let unsubscribeFound: (() => void) | null = null;
+/** The search the shell was last asked for: whose, its tab, its text, the list's `step` it was at, and whether its page was loading then. */
+let searching: { owner: string; tabId: string; text: string; step: number; loading: boolean } | null = null;
 /** The conversations whose channel panel is mounted, each with how many mounts hold it. */
 const attached = new Map<string, number>();
 /** The conversation whose browser panel (its placeholder) is on screen. */
@@ -33,21 +59,68 @@ let owner: string | null = null;
 const live = new Map<string, number>();
 /** The tab the shell was last told to show. */
 let shown: string | null = null;
+/** What a shell that keeps the list was last told (`present`): the owner and whether its panel is on screen. */
+let presented: string | null = null;
 
 /** The attached conversation with a browser; of several (two channel panels), the one in front last. */
 function wantedOwner(): string | null {
-  const { browsers } = useBrowserTabsStore.getState();
+  // A conversation with no tabs of its own has the pinned tabs' browser, while their panel is open (browserOf).
+  const state = useBrowserTabsStore.getState();
   let wanted: string | null = null;
   for (const conversationId of attached.keys()) {
-    const browser = browsers[conversationId];
-    if (browser && (wanted === null || browser.frontAt > browsers[wanted]!.frontAt)) wanted = conversationId;
+    const browser = browserOf(state, conversationId);
+    if (browser && (wanted === null || browser.frontAt > browserOf(state, wanted)!.frontAt)) wanted = conversationId;
   }
   return wanted;
 }
 
+/** The shell's search is what the find field of the browser on screen says (the tab in front's, with a text). */
+function reconcileFind(): void {
+  if (!bridge?.find || !bridge.stopFind) return;
+  const state = useBrowserTabsStore.getState();
+  const browser = owner !== null ? browserOf(state, owner) : null;
+  const open = owner !== null ? state.find[owner] : undefined;
+  // The field is its tab's: it goes with the tab (this runs again for the change; nothing below is left to do then).
+  if (owner !== null && open && browser && !browser.tabs.some((each) => each.id === open.tabId)) {
+    state.closeFind(owner);
+    return;
+  }
+  const find = showing === owner ? open : undefined;
+  const tab = find && browser?.activeId === find.tabId ? browser.tabs.find((each) => each.id === find.tabId) : undefined;
+  const wanted = owner !== null && find && tab && tab.url !== null && find.text !== "" ? find : null;
+  if (searching && (!wanted || wanted.tabId !== searching.tabId || owner !== searching.owner)) {
+    bridge.stopFind(searching.tabId, false);
+    searching = null;
+  }
+  if (!wanted || !tab || owner === null) return;
+  // From the first match for a text that changed, and again once the searched page finished loading (a navigation,
+  // a reload: the marks went with the page before); else the next or previous match when one was asked.
+  if (!searching || searching.text !== wanted.text || (searching.loading && !tab.loading)) bridge.find(wanted.tabId, wanted.text, { forward: true, fresh: true });
+  else if (searching.step !== wanted.step) bridge.find(wanted.tabId, wanted.text, { forward: wanted.forward, fresh: false });
+  searching = { owner, tabId: wanted.tabId, text: wanted.text, step: wanted.step, loading: tab.loading };
+}
+
 function reconcile(): void {
+  reconcileViews();
+  reconcileFind();
+}
+
+function reconcileViews(): void {
   if (!bridge) return;
-  const wanted = wantedOwner();
+  // The mirror ended (a sign-out) with a browser still presented: the shell is told the window is on none, on the
+  // list's own channel (it does not hear `closeAll` from a page whose list it keeps), so no page of the account
+  // that left stays painted or audible.
+  const mirroring = browserTabsListInShell();
+  const wanted = mirroring || presented === null ? wantedOwner() : null;
+  if (bridge.list && (mirroring || presented !== null)) {
+    owner = wanted;
+    const next = `${showing === wanted}:${wanted ?? ""}`;
+    if (wanted === null ? presented === null : next === presented) return;
+    presented = wanted === null ? null : next;
+    // This web shows the speaker on a tab where the shell can mute one: a tab behind plays on, heard (#299).
+    bridge.list.present(wanted, wanted !== null && showing === wanted, { backgroundMedia: bridge.setMuted !== undefined });
+    return;
+  }
   if (wanted !== owner) {
     if (owner !== null) bridge.closeAll();
     live.clear();
@@ -84,14 +157,44 @@ function connect(next: DesktopWebPreviewTabsBridge): void {
   unsubscribeState = next.onState((state) => {
     if (owner !== null && state && typeof state.tabId === "string") useBrowserTabsStore.getState().applyState(owner, state);
   });
+  unsubscribeFound = next.onFound?.((found) => {
+    if (owner === null || !found || typeof found.tabId !== "string" || typeof found.matches !== "number" || typeof found.active !== "number") return;
+    // An answer for a search already ended or replaced by another tab's is nobody's.
+    if (searching?.tabId === found.tabId) useBrowserTabsStore.getState().applyFound(owner, found.tabId, found.matches, found.active);
+  }) ?? null;
+  // What a tab's page asks the browser for (the link router's outcome, from the shell): a new tab, after the one
+  // that asked. At the cap a tab in front takes the tab that asked instead (as a page opened beside does).
+  unsubscribeRequest = next.onRequest?.((request) => {
+    if (owner === null || !request) return;
+    const store = useBrowserTabsStore.getState();
+    // A browser key pressed in a tab's page: the shell decided which command it is, the tab list carries it out.
+    if (request.type === "command" && typeof request.tabId === "string") {
+      store.runCommand(owner, request);
+      return;
+    }
+    if (request.type !== "open-tab" || typeof request.url !== "string") return;
+    const opener = typeof request.openerTabId === "string" ? request.openerTabId : undefined;
+    if (store.openUrlInTab(owner, request.url, { background: request.background === true, afterTabId: opener })) return;
+    if (request.background !== true && opener) store.navigate(owner, opener, request.url);
+  }) ?? null;
   unsubscribeStore = useBrowserTabsStore.subscribe(reconcile);
 }
 
 function disconnect(): void {
-  if (bridge && owner !== null) bridge.closeAll();
+  if (bridge?.list && (browserTabsListInShell() || presented !== null)) {
+    if (presented !== null) bridge.list.present(null, false, { backgroundMedia: bridge.setMuted !== undefined });
+  } else if (bridge && owner !== null) bridge.closeAll();
+  presented = null;
   unsubscribeState?.();
+  unsubscribeRequest?.();
   unsubscribeStore?.();
+  unsubscribeFound?.();
+  unsubscribeFound = null;
+  // No marks left in a page whose find field is gone.
+  if (searching) bridge?.stopFind?.(searching.tabId, false);
+  searching = null;
   unsubscribeState = null;
+  unsubscribeRequest = null;
   unsubscribeStore = null;
   bridge = null;
   owner = null;
@@ -115,6 +218,25 @@ export function attachBrowserViews(tabs: DesktopWebPreviewTabsBridge, conversati
     reconcile();
     if (attached.size === 0) disconnect();
   };
+}
+
+/** Whether the shell has find in page (its three calls come together); one that predates it gets no find field. */
+export function hasBrowserFind(tabs: DesktopWebPreviewTabsBridge): boolean {
+  return typeof tabs.find === "function" && typeof tabs.stopFind === "function" && typeof tabs.onFound === "function";
+}
+
+/**
+ * Closes the conversation's find field (its Close, or Escape in it): the search ends, its marks go, and the page it
+ * searched takes the keyboard back.
+ */
+export function closeBrowserFind(conversationId: string): void {
+  const find = useBrowserTabsStore.getState().find[conversationId];
+  if (!find) return;
+  if (conversationId === owner) {
+    bridge?.stopFind?.(find.tabId, true);
+    if (searching?.tabId === find.tabId) searching = null;
+  }
+  useBrowserTabsStore.getState().closeFind(conversationId);
 }
 
 /** The browser's panel for `conversationId` is on screen (its placeholder mounted), or no longer. */

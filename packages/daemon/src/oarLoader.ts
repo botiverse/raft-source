@@ -17,7 +17,7 @@ import { seaDetected } from "./drivers/nodeHostLaunch";
  * drivers/codex.ts imports statically (oarLoader.test.ts source guard).
  */
 /** The runtimes with no legacy driver, which only the OAR host runs (drivers/oarOnly.ts). */
-export type OarOnlyRuntimeId = "qwen" | "qoder" | "codebuddy";
+export type OarOnlyRuntimeId = "qwen" | "qoder";
 
 type OarRuntimeId = RuntimeAccountUsageProvider | "antigravity" | "cursor" | "opencode" | OarOnlyRuntimeId;
 
@@ -81,7 +81,6 @@ const LOADERS = {
   opencode: async () => (await import("@botiverse/oar/runtimes/opencode")).opencodeRuntime,
   qwen: async () => (await import("@botiverse/oar/runtimes/qwen")).qwenRuntime,
   qoder: async () => (await import("@botiverse/oar/runtimes/qoder")).qoderRuntime,
-  codebuddy: async () => (await import("@botiverse/oar/runtimes/codebuddy")).codebuddyRuntime,
 } as const satisfies Record<OarRuntimeId, () => Promise<Runtime>>;
 
 const loading = new Map<OarRuntimeId, Promise<Runtime>>();
@@ -182,10 +181,10 @@ export function loadOarObserve(): Promise<OarObserve> {
 
 /**
  * The OAR host's modules as a launch reaches them, for every runtime the host
- * runs (antigravity, codex, grok, and the OAR-only qwen, qoder and codebuddy): the runtime entry, the observe
+ * runs (antigravity, codex, grok, and the OAR-only qwen and qoder): the runtime entry, the observe
  * entry, and the session path (opened on an executable that does not exist,
  * so it fails at the spawn, after every module it needs was loaded),
- * Grok's and CodeBuddy's sign-in modules (loaded apart from their sessions), and
+ * Grok's sign-in module (OAR 0.99, loaded apart from its session), and
  * OpenCode's provider sign-in facade (OAR 0.100, loaded on creation). The
  * Computer's release smoke (`__verify-bundled-oar`) runs this on the
  * single-file binary, so a module missing from the bundle fails the build
@@ -198,7 +197,7 @@ export async function verifyBundledOarHost(): Promise<void> {
   }
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
-  for (const id of ["antigravity", "codex", "grok", "qwen", "qoder", "codebuddy"] as const) {
+  for (const id of ["antigravity", "codex", "grok", "qwen", "qoder"] as const) {
     const runtime = await loadOarSessionRuntime(id);
     if (runtime.id !== id) throw new Error(`bundled OAR ${id} runtime reports id ${runtime.id}`);
     const missing = join(tmpdir(), `raft-oar-verify-${process.pid}-no-such-${id}`);
@@ -221,12 +220,6 @@ export async function verifyBundledOarHost(): Promise<void> {
   if (!grok.authStatus || !grok.login || !grok.logout) throw new Error("bundled OAR grok runtime has no sign-in");
   const grokStatus = await grok.authStatus({ kind: "available", via: "executable", command: join(tmpdir(), `raft-oar-verify-${process.pid}-no-such-grok-auth`) }, { timeoutMs: 5_000 });
   if (grokStatus.kind !== "unknown") throw new Error(`bundled OAR grok status read ${grokStatus.kind} for an executable that does not exist`);
-  // CodeBuddy's status, login and logout (web sign-in) likewise: its account
-  // query on an executable that does not exist answers unknown.
-  const codebuddy = await loadOarRuntime("codebuddy");
-  if (!codebuddy.authStatus || !codebuddy.login || !codebuddy.logout) throw new Error("bundled OAR codebuddy runtime has no sign-in");
-  const codebuddyStatus = await codebuddy.authStatus({ kind: "available", via: "executable", command: join(tmpdir(), `raft-oar-verify-${process.pid}-no-such-codebuddy-auth`) }, { timeoutMs: 5_000 });
-  if (codebuddyStatus.kind !== "unknown") throw new Error(`bundled OAR codebuddy status read ${codebuddyStatus.kind} for an executable that does not exist`);
   // OpenCode's provider sign-in loads its facade and server modules on
   // creation. Given a version (no `--version` run), creating one on an
   // executable that does not exist loads them and fails at the spawn of

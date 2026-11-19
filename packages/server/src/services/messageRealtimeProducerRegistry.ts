@@ -65,6 +65,9 @@ export const messageServiceBasePayloadKeys = [
   "taskCurrentProjection",
   "threadId",
   "updatedAt",
+  // Raft voice calls: the call that posted this in the agent's name, or null.
+  // Agents read it as `posted_by=voice_call` (history reads carry the row).
+  "voiceCallId",
 ] as const;
 export const enrichedMessagePayloadKeys = [
   ...messageServiceBasePayloadKeys,
@@ -193,10 +196,10 @@ export const MESSAGE_REALTIME_PRODUCER_REGISTRY: ProducerRegistryEntry[] = [
   {
     id: "services/actionCardsService.ts#action-card.updated.thread-follower#message:updated",
     event: "message:updated",
-    audience: "thread follower user room",
+    audience: "thread follower user room (user-server room for a joint thread)",
     authority: "action card service after app/target access checks and persisted message update",
     applyTarget: "canonical action-card message/actionMetadata projection",
-    presence: "per-follower user room for thread target",
+    presence: "per-follower user room; scoped to the target's server when the thread has several joint surfaces",
     payloadKeys: messageSocketPayloadKeys,
   },
   {
@@ -211,10 +214,10 @@ export const MESSAGE_REALTIME_PRODUCER_REGISTRY: ProducerRegistryEntry[] = [
   {
     id: "services/actionCardsService.ts#action-card.new.thread-follower#message:new",
     event: "message:new",
-    audience: "thread follower user room",
+    audience: "thread follower user room (user-server room for a joint thread)",
     authority: "action card service after app/target access checks and persisted carrier message insert",
     applyTarget: "canonical action-card carrier message/actionMetadata projection",
-    presence: "per-follower user room for thread target",
+    presence: "per-follower user room; scoped to the target's server when the thread has several joint surfaces",
     payloadKeys: messageSocketPayloadKeys,
   },
   {
@@ -247,10 +250,10 @@ export const MESSAGE_REALTIME_PRODUCER_REGISTRY: ProducerRegistryEntry[] = [
   {
     id: "services/messageService.ts#message-service.system.joint-thread-follower#message:new",
     event: "message:new",
-    audience: "joint local thread follower user room",
+    audience: "joint local thread follower user-server room",
     authority: "system message producer after caller authorization and canonical persistence",
     applyTarget: "canonical system message row projected to joint local thread",
-    presence: "per-follower user room for joint thread projection",
+    presence: "per-follower user room scoped to the joint thread projection's server",
     payloadKeys: enrichedMessagePayloadKeys,
   },
   {
@@ -301,10 +304,10 @@ export const MESSAGE_REALTIME_PRODUCER_REGISTRY: ProducerRegistryEntry[] = [
   {
     id: "services/messageService.ts#message-service.persisted.joint-thread-follower#message:new",
     event: "message:new",
-    audience: "joint local thread follower user room",
+    audience: "joint local thread follower user-server room",
     authority: "message send pipeline after channel membership/producer checks and persistence",
     applyTarget: "canonical persisted message row projected to joint local thread",
-    presence: "per-follower user room for joint thread projection",
+    presence: "per-follower user room scoped to the joint thread projection's server",
     payloadKeys: enrichedMessagePayloadKeys,
   },
   {

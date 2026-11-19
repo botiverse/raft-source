@@ -76,6 +76,11 @@ export interface ComputerUpgradeDrainStateFile {
   notQuietAgentIds: string[];
   /** Absent while it waits. */
   finished?: ComputerUpgradeDrainFinished;
+  /**
+   * Once finished: how many agents the drain waited for (not quiet when it
+   * began). Optional: older runners do not write it.
+   */
+  waitedFor?: number;
   updatedAtMs: number;
 }
 
@@ -124,6 +129,8 @@ export function parseComputerUpgradeDrainStateFile(raw: unknown): ComputerUpgrad
     live: raw.live as number,
     notQuietAgentIds: raw.notQuietAgentIds as string[],
     ...(raw.finished !== undefined ? { finished: raw.finished as ComputerUpgradeDrainFinished } : {}),
+    // A malformed count is dropped, not a reason to reject the state.
+    ...(Number.isSafeInteger(raw.waitedFor) && (raw.waitedFor as number) >= 0 ? { waitedFor: raw.waitedFor as number } : {}),
     updatedAtMs: raw.updatedAtMs,
   };
 }

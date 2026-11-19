@@ -218,6 +218,12 @@ export function transitionThreadToParentMessage({
   recordMobileBackNavigation?: RecordMobileBackNavigationLike;
 }): void {
   const nextSearch = `?msg=${parentMessageId}`;
+  // Hands 52c09462: the same `?msg=` anchor (the thread was opened from a link
+  // to its parent, from Activity, or after an earlier jump) doesn't reload the
+  // channel, which is what locates a new anchor; this jump locates it itself.
+  const sameAnchor = typeof window !== "undefined"
+    && window.location?.pathname === pathname
+    && new URLSearchParams(window.location.search).get("msg") === parentMessageId;
   beginRightPanelSearchTransition(nextSearch, pathname);
   navigate(`${pathname}${nextSearch}`, { replace });
   beginRightPanelSearchTransition(nextSearch, pathname);
@@ -232,6 +238,16 @@ export function transitionThreadToParentMessage({
   // same event so a busy destination render cannot leave the old thread
   // mounted while the canonical parent URL is already visible.
   useThreadStore.getState().closeThread();
+  if (sameAnchor) {
+    // As the thread jump pill does: highlight a loaded parent, else load its window (which highlights it).
+    const messageStore = useMessageStore.getState();
+    const channelId = pathname.slice(pathname.lastIndexOf("/") + 1);
+    if (messageStore.channelMessages[channelId]?.some((message) => message.id === parentMessageId)) {
+      messageStore.setHighlightedMessageId(parentMessageId);
+    } else if (channelId) {
+      void messageStore.loadMessageContext(channelId, parentMessageId);
+    }
+  }
 }
 
 export function openThreadParentMessageRoute({

@@ -42,7 +42,10 @@ export default defineConfig({
     globalSetup: ["src/test/setup/pgliteTemplate.global.ts"],
     // CI has no RisingWave (a hard dependency of the server): install the
     // test-only Postgres references of the RisingWave-served reads.
-    setupFiles: ["src/test/setup/risingWaveReadReference.ts", "src/test/setup/readPositionSettle.ts", "src/test/setup/artifactsDeployment.ts"],
+    // Every test runs as the edition src/test/edition.ts names ("cloud"
+    // unless it says otherwise), in this tree and in the source-available
+    // snapshot alike (src/test/setup/edition.ts).
+    setupFiles: ["src/test/setup/risingWaveReadReference.ts", "src/test/setup/readPositionSettle.ts", "src/test/setup/artifactsDeployment.ts", "src/test/setup/edition.ts"],
     pool: "forks",
     ...(ci ? {} : { maxWorkers: localWorkers, execArgv: forkHeapExecArgv() }),
     // The previous Node runner imposed no per-test or per-hook timeout. Keep

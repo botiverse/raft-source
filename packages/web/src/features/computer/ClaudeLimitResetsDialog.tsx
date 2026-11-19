@@ -1,4 +1,4 @@
-import { Spinner } from "@botiverse/raft-ui";
+import { ListRow, ListRowBody, ListRowDescription, ListRowGroup, ListRowTitle, Spinner } from "@botiverse/raft-ui";
 import { ChoiceList } from "@botiverse/raft-ui/wip";
 import type { ChoiceListItem } from "@botiverse/raft-ui/wip";
 import type {
@@ -14,7 +14,7 @@ import ConfirmDialog from "../../components/ConfirmDialog";
 import Banner from "../../components/ui/Banner";
 import type { RuntimeAuthClient } from "../../utils/runtimeAuthClient";
 import { limitResetRequestErrorMessageId, limitResetRequestOutcomeUnknown } from "./limitResetOutcome";
-import { claudeKindMeta, claudeKindName, claudeLimitResetNote, claudeLimitResetRefusal, claudeLimitResetsNotSupportedHere } from "./claudeLimitResetCopy";
+import { claudeKindMeta, claudeKindName, claudeLimitResetNote, claudeLimitResetRefusal, claudeLimitResetsNotSupportedHere, claudeLimitResetsNotSupportedMessageId } from "./claudeLimitResetCopy";
 import type { RuntimeLimitResetOutcome } from "./limitResetOutcome";
 
 /**
@@ -107,13 +107,20 @@ type ReadState =
  * 5-hour reset. Then it reads, lists each kind with what Claude Code showed,
  * and hands the chosen one to `onUse` (the confirm). Nothing is retried for
  * the person.
+ *
+ * A viewer who did not connect the Computer (`canUse` false) gets the same
+ * read as a plain list: display-only rows, nothing to choose, Close as the
+ * one action, and copy that speaks of the Computer's resets, not "yours".
+ * The card opens it for them only where the read needs no consent
+ * (`claudeLimitResetOffer`). The consent is the connecting person's alone:
+ * if the Computer asks for one anyway, no read with consent is sent and the
+ * dialog says who can, as the server would.
  */
 export function ClaudeLimitResetsDialog({
   serverId,
   machineId,
   atFiveHourLimit,
   canUse = true,
-  canConsent = true,
   client,
   onUse,
   onLegacy,
@@ -124,10 +131,11 @@ export function ClaudeLimitResetsDialog({
   machineId: string;
   /** The card's usage shows the account at its 5-hour limit: ask before reading. */
   atFiveHourLimit: boolean;
-  /** The viewer connected this Computer: Use is offered (an owner or admin only views). */
+  /**
+   * The viewer connected this Computer: they can use a reset and consent to
+   * the read that may spend the 5-hour one. False: the list is read-only.
+   */
   canUse?: boolean;
-  /** The viewer connected this Computer: the read that may spend the 5-hour reset is offered. */
-  canConsent?: boolean;
   client: RuntimeAuthClient;
   onUse: (kind: RuntimeLimitResetKind) => void;
   /** The read showed the older program; `spent`: opening the list used its 5-hour reset. */
@@ -137,7 +145,11 @@ export function ClaudeLimitResetsDialog({
   onClose: () => void;
 }) {
   const { formatMessage } = useIntl();
-  const [state, setState] = useState<ReadState>(atFiveHourLimit ? { phase: "consent" } : { phase: "reading", consent: false });
+  const [state, setState] = useState<ReadState>(() => (!atFiveHourLimit
+    ? { phase: "reading", consent: false }
+    : canUse
+      ? { phase: "consent" }
+      : { phase: "failed", message: formatMessage({ id: "machine.runtimeUsage.claudeReset.ownerOnly" }) }));
   const [selected, setSelected] = useState<RuntimeLimitResetKind | null>(null);
   const liveRef = useRef(true);
   useEffect(() => {
@@ -154,7 +166,7 @@ export function ClaudeLimitResetsDialog({
       setState({
         phase: "failed",
         message: limitResetRequestOutcomeUnknown(error)
-          ? formatMessage({ id: "machine.runtimeUsage.claudeReset.readTimeout" })
+          ? formatMessage({ id: canUse ? "machine.runtimeUsage.claudeReset.readTimeout" : "machine.runtimeUsage.claudeReset.readTimeoutViewOnly" })
           : formatMessage({ id: limitResetRequestErrorMessageId(error) }, { runtime: "Claude Code" }),
       });
       return;
@@ -169,18 +181,21 @@ export function ClaudeLimitResetsDialog({
         return;
       case "unsupported":
         if (result.reason === "consent_required" && !consent) {
-          setState({ phase: "consent" });
+          // Someone who cannot give it is not asked: nothing more is sent.
+          setState(canUse
+            ? { phase: "consent" }
+            : { phase: "failed", message: formatMessage({ id: "machine.runtimeUsage.claudeReset.ownerOnly" }) });
           return;
         }
         if (claudeLimitResetsNotSupportedHere(result)) {
           onNotSupported?.();
-          setState({ phase: "failed", message: formatMessage({ id: "machine.runtimeUsage.claudeReset.notSupportedHere" }) });
+          setState({ phase: "failed", message: formatMessage({ id: claudeLimitResetsNotSupportedMessageId(result) }) });
           return;
         }
         setState({
           phase: "failed",
           message: result.reason === "not_attempted"
-            ? formatMessage({ id: "machine.runtimeUsage.claudeReset.notAttempted" })
+            ? formatMessage({ id: canUse ? "machine.runtimeUsage.claudeReset.notAttempted" : "machine.runtimeUsage.claudeReset.readFailedViewOnly" })
             : result.reason === "not_installed"
               ? formatMessage({ id: "machine.runtimeAuth.error.notInstalled" }, { runtime: "Claude Code" })
               : formatMessage({ id: "machine.runtimeUsage.limitReset.unsupported" }, { runtime: "Claude Code" }),
@@ -190,9 +205,9 @@ export function ClaudeLimitResetsDialog({
         setState({ phase: "failed", message: formatMessage({ id: "machine.runtimeUsage.limitReset.reauth" }, { runtime: "Claude Code" }) });
         return;
       default:
-        setState({ phase: "failed", message: formatMessage({ id: "machine.runtimeUsage.claudeReset.readFailed" }) });
+        setState({ phase: "failed", message: formatMessage({ id: canUse ? "machine.runtimeUsage.claudeReset.readFailed" : "machine.runtimeUsage.claudeReset.readFailedViewOnly" }) });
     }
-  }, [client, formatMessage, machineId, onLegacy, onNotSupported, serverId]);
+  }, [canUse, client, formatMessage, machineId, onLegacy, onNotSupported, serverId]);
 
   // The first read starts on open when no consent is needed; a later one only from Continue.
   const startedRef = useRef(false);
@@ -205,12 +220,12 @@ export function ClaudeLimitResetsDialog({
   // One read with consent per dialog, however often Continue is pressed.
   const consentedRef = useRef(false);
   const confirmConsent = useCallback(() => {
-    if (!canConsent || consentedRef.current) return;
+    if (!canUse || consentedRef.current) return;
     consentedRef.current = true;
     startedRef.current = true;
     setState({ phase: "reading", consent: true });
     void read(true);
-  }, [canConsent, read]);
+  }, [canUse, read]);
   const listed = state.phase === "read" ? state.result : null;
   const legacy = listed?.program === "legacy";
   const items = useMemo<ChoiceListItem[]>(() => (listed && !legacy
@@ -227,29 +242,6 @@ export function ClaudeLimitResetsDialog({
     if (usable && selected) onUse(selected);
   }, [onUse, selected, usable]);
   const choose = useCallback((value: string) => setSelected(value as RuntimeLimitResetKind), []);
-
-  if (state.phase === "consent" && !canConsent) {
-    // An owner or admin who did not connect the Computer: the read could spend
-    // the 5-hour reset of someone else's account, so there is no Continue.
-    return (
-      <ConfirmDialog
-        title={formatMessage({ id: "machine.runtimeUsage.claudeReset.consentTitle" })}
-        message={(
-          <p className="text-subhead text-foreground-muted" data-testid="claude-limit-resets-consent-owner-only">
-            {formatMessage({ id: "machine.runtimeUsage.claudeReset.ownerOnly" })}
-          </p>
-        )}
-        plainMessage
-        confirmLabel={formatMessage({ id: "machine.runtimeUsage.claudeReset.consentConfirm" })}
-        confirmVariant="warning"
-        confirmDisabled
-        initialFocus="cancel"
-        maxWidthClass="max-w-md"
-        onConfirm={confirmConsent}
-        onClose={onClose}
-      />
-    );
-  }
 
   if (state.phase === "consent") {
     return (
@@ -275,11 +267,12 @@ export function ClaudeLimitResetsDialog({
       title={title}
       plainMessage
       size="md"
-      closeOnConfirm={false}
-      confirmVariant="primary"
-      confirmDisabled={!usable}
-      hideCancel={false}
-      confirmLabel={formatMessage({ id: "machine.runtimeUsage.claudeReset.useSelectedAction" })}
+      // Read-only: nothing to use, so Close is the one action.
+      closeOnConfirm={!canUse}
+      confirmVariant={canUse ? "primary" : "outline"}
+      confirmDisabled={canUse && !usable}
+      hideCancel={!canUse}
+      confirmLabel={formatMessage({ id: canUse ? "machine.runtimeUsage.claudeReset.useSelectedAction" : "common.close" })}
       onConfirm={useSelected}
       onClose={onClose}
       message={(
@@ -287,7 +280,7 @@ export function ClaudeLimitResetsDialog({
           {reading && (
             <div className="flex items-center gap-2 text-subhead text-foreground-muted" role="status" data-testid="claude-limit-resets-reading">
               <Spinner size="xs" aria-hidden="true" />
-              {formatMessage({ id: "machine.runtimeUsage.claudeReset.reading" })}
+              {formatMessage({ id: canUse ? "machine.runtimeUsage.claudeReset.reading" : "machine.runtimeUsage.claudeReset.readingViewOnly" })}
             </div>
           )}
           {state.phase === "failed" && (
@@ -300,10 +293,23 @@ export function ClaudeLimitResetsDialog({
           )}
           {legacy && (
             <p className="text-subhead text-foreground-muted" data-testid="claude-limit-resets-legacy">
-              {formatMessage({ id: "machine.runtimeUsage.claudeReset.legacy" })}
+              {formatMessage({ id: canUse ? "machine.runtimeUsage.claudeReset.legacy" : "machine.runtimeUsage.claudeReset.legacyViewOnly" })}
             </p>
           )}
-          {items.length > 0 && (
+          {items.length > 0 && !canUse && (
+            // Display-only rows: a radio list with nothing to do with the choice would be a dead end.
+            <ListRowGroup role="list" aria-label={formatMessage({ id: "machine.runtimeUsage.claudeReset.listLabel" })} data-testid="claude-limit-resets-read-only">
+              {items.map((item) => (
+                <ListRow key={item.value} variant="plain" interactive={false} role="listitem">
+                  <ListRowBody>
+                    <ListRowTitle>{item.label}</ListRowTitle>
+                    <ListRowDescription>{item.meta}</ListRowDescription>
+                  </ListRowBody>
+                </ListRow>
+              ))}
+            </ListRowGroup>
+          )}
+          {items.length > 0 && canUse && (
             <ChoiceList
               items={items}
               value={selected}
@@ -313,12 +319,7 @@ export function ClaudeLimitResetsDialog({
               clearSearchLabel={formatMessage({ id: "search.clearSearch" })}
             />
           )}
-          {items.length > 0 && !canUse && (
-            <p className="text-footnote text-foreground-muted" data-testid="claude-limit-resets-owner-only">
-              {formatMessage({ id: "machine.runtimeUsage.claudeReset.ownerOnly" })}
-            </p>
-          )}
-          {items.length > 0 && atFiveHourLimit && (
+          {items.length > 0 && canUse && atFiveHourLimit && (
             <p className="text-footnote text-foreground-muted" data-testid="claude-limit-resets-at-limit-hint">
               {formatMessage({ id: "machine.runtimeUsage.claudeReset.atLimitHint" })}
             </p>

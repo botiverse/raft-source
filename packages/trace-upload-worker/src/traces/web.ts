@@ -25,6 +25,7 @@ import {
   type OtlpAnyValue,
 } from "./otlp";
 import { postOtlpJson } from "./otlpSink";
+import { sanitizeWebAgentActivityJoinKeys } from "./webAgentActivityJoinKeys";
 import {
   projectV2BestEffort,
   projectorDisabledByMissingCanonicalSink,
@@ -185,7 +186,7 @@ function readWebEventRecords(value: unknown): LocalEventRecord[] {
     if (!isLocalEventRecord(record) || record.surface !== "web") {
       throw new HttpError(400, `Invalid web trace event record at index ${idx}`);
     }
-    return record;
+    return sanitizeWebAgentActivityJoinKeys(record);
   });
 }
 

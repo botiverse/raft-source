@@ -4,6 +4,7 @@
 // MessageMarkdownText draws a text that isn't a message (an Artifact comment).
 import { MessageAppLink, markdownLinkText } from "./AppLinkChip";
 import { appLinkBlockHosts } from "./appLinkBlockHosts";
+import { useStableMarkdownComponents } from "../markdown/stableMarkdownComponents";
 import { memo, useCallback, useMemo } from "react";
 import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
@@ -640,8 +641,11 @@ function useRenderMessageMarkdown(
       taskContextChannelId,
       unavailableQuotedPermalinkUrl, mentionsDisplayOnly, permalinkHostnames, slots,
     ]);
+  // One component per element across rebuilds of the table above (members, channels and settings loading rebuild it a
+  // few times as a channel opens): a changed component would remount every link, chip and card in the message.
+  const stableComponents = useStableMarkdownComponents(markdownComponents);
   // Paragraphs and list items, then their links' block cards: per text, the rest of the map stays text-independent.
-  const withBlockHosts = useMemo(() => ({ ...markdownComponents, ...appLinkBlockHosts(content) }), [markdownComponents, content]);
+  const withBlockHosts = useMemo(() => ({ ...stableComponents, ...appLinkBlockHosts(content) }), [stableComponents, content]);
   return (
     <MarkdownContent
       source={content}

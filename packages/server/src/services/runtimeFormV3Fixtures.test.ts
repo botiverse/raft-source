@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { RuntimeFormV2Definition } from "@botiverse/raft-runtime-form";
+import { BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS } from "@botiverse/raft-shared";
 
 import {
   buildRuntimeFormV2,
@@ -41,9 +42,18 @@ const CONNECTIONS: RuntimeFormV3Connection[] = [
   { value: "connection:conn-off", underlyingProviderId: "deepseek" },
 ];
 
-/** A served v2 form (create or edit body) as the v3 routes send it. */
+/**
+ * A served v2 form (create or edit body) as the v3 routes send it, for a
+ * current Computer: the built form shows the limit fields for every preset
+ * provider that takes a typed id, and that Computer runs those through a
+ * saved connection too.
+ */
 function v3(runtimeId: string, form: RuntimeFormV2Definition, connections: RuntimeFormV3Connection[] = []): RuntimeFormV2Definition {
-  return toRuntimeFormV3(form, { connections, revision: runtimeFormV3Revision(runtimeId, form, V3_CAPABILITIES, connections) });
+  return toRuntimeFormV3(form, {
+    connections,
+    typedConnectionProviderIds: BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS,
+    revision: runtimeFormV3Revision(runtimeId, form, V3_CAPABILITIES, connections),
+  });
 }
 
 const edit = (runtimeId: string, runtimeConfig: Record<string, unknown>) =>

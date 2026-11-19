@@ -715,13 +715,16 @@ testMuteFlagOff("GET/PATCH /api/channels/:id/notification-settings stores per-us
     assert.equal(mentionItem.hasMention, true);
     // Re-mute anchored mute_from_seq after the formerly-muted message, so
     // under live derivation that message is ordinary unread (it predates the
-    // current mute window) and the personal mention pierces the window.
+    // current mute window). The personal mention inside the window lights the
+    // @ but does not count (#244, agreed: predicate_muted_channel_mention, as
+    // RisingWave's muted prefix).
     const mentionUnreadInbox = await getInbox("unread");
     const mentionUnreadItem = mentionUnreadInbox.items.find((item) => item.kind === "channel" && item.channelId === channel.id);
-    assert.ok(mentionUnreadItem, "direct @mention should pierce channel activity mute for Inbox Unread");
+    assert.ok(mentionUnreadItem, "the pre-mute unread message keeps the row in Inbox Unread");
     assert.equal(mentionUnreadItem.firstUnreadMessageId, ordinaryMutedMessage.id);
-    assert.equal(mentionUnreadItem.unreadCount, 2);
-    assert.equal(mentionUnreadInbox.totalUnreadCount, 2);
+    assert.equal(mentionUnreadItem.hasMention, true);
+    assert.equal(mentionUnreadItem.unreadCount, 1, "a mention past the mute boundary does not count");
+    assert.equal(mentionUnreadInbox.totalUnreadCount, 1);
   } finally {
     if (previousRisingWaveDatabaseUrl === undefined) {
       delete process.env.RISINGWAVE_DATABASE_URL;

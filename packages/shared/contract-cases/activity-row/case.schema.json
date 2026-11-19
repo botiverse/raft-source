@@ -1,0 +1,295 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raft.build/contract-cases/activity-row/case.schema.json",
+  "title": "Activity row contract case",
+  "description": "One Activity row rule web, the app and the server must agree on: the per-row position rule (a served row plus live messages, answers and reads, and whether the row is re-read) or the unread predicate (does a live message count for this viewer). See README.md in this directory.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["formatVersion", "id", "rule", "title", "status", "given", "steps"],
+  "properties": {
+    "formatVersion": {
+      "description": "Version of this format. A loader skips (and reports) a case whose version it does not know.",
+      "const": 1
+    },
+    "id": {
+      "description": "Same as the file name without `.json`.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "rule": {
+      "description": "position: the per-row position rule (given.row, steps, expect.row/reread). predicate: the unread predicate (given.viewer/scope/message, no steps, expect.verdict).",
+      "enum": ["position", "predicate"]
+    },
+    "title": { "type": "string", "minLength": 1 },
+    "why": { "description": "Why the rule is what it is, in a sentence or two.", "type": "string" },
+    "status": {
+      "description": "`agreed`: `expect` is the rule. `pending-product-decision`: the sides differ and nobody has chosen yet; `decision.candidates` records each candidate and loaders skip-and-report the case.",
+      "enum": ["agreed", "pending-product-decision"]
+    },
+    "sources": {
+      "description": "Where each side implements the rule today (paths, optionally with symbols). Documentation only.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "web": { "$ref": "#/$defs/stringList" },
+        "app": { "$ref": "#/$defs/stringList" },
+        "server": { "$ref": "#/$defs/stringList" }
+      }
+    },
+    "knownGaps": {
+      "description": "An agreed rule a side does not follow yet. That side's loader skips the case and reports the reason.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/knownGap" }
+    },
+    "given": { "$ref": "#/$defs/given" },
+    "steps": {
+      "description": "Acts in order. Always empty for a predicate case.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/step" }
+    },
+    "checkpoints": {
+      "description": "Expectations part-way through (after a given step). Position cases only.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/checkpoint" }
+    },
+    "expect": { "$ref": "#/$defs/expectation" },
+    "decision": { "$ref": "#/$defs/decision" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "agreed" } } },
+      "then": {
+        "required": ["expect"],
+        "properties": { "expect": true, "decision": false }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "pending-product-decision" } } },
+      "then": {
+        "required": ["decision"],
+        "properties": { "decision": true, "expect": false, "checkpoints": false, "knownGaps": false }
+      }
+    },
+    {
+      "if": { "properties": { "rule": { "const": "position" } } },
+      "then": {
+        "properties": {
+          "given": { "type": "object", "required": ["row"], "properties": { "row": true, "viewer": false, "scope": false, "message": false } },
+          "expect": { "$ref": "#/$defs/positionExpectation" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "rule": { "const": "predicate" } } },
+      "then": {
+        "properties": {
+          "given": { "type": "object", "required": ["viewer", "scope", "message"], "properties": { "row": false, "viewer": true, "scope": true, "message": true } },
+          "steps": { "type": "array", "maxItems": 0 },
+          "checkpoints": false,
+          "expect": { "$ref": "#/$defs/predicateExpectation" },
+          "decision": {
+            "type": "object",
+            "properties": {
+              "candidates": { "type": "array", "items": { "type": "object", "properties": { "expect": { "$ref": "#/$defs/predicateExpectation" } } } }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "stringList": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "side": { "enum": ["web", "app", "server"] },
+    "seq": { "description": "A message seq (messages.seq, a 64-bit bigserial) as a canonical decimal string, as the server sends latestActivitySeq. Loaders compare seqs exactly (BigInt / Long), never as floating-point numbers.", "type": "string", "pattern": "^(0|[1-9][0-9]*)$" },
+    "knownGap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["client", "reason"],
+      "properties": {
+        "client": { "$ref": "#/$defs/side" },
+        "reason": { "type": "string", "minLength": 1 },
+        "followUp": { "description": "Task or PR that closes the gap.", "type": "string" }
+      }
+    },
+    "row": {
+      "description": "A served Activity row's unread inputs, as an inbox answer carries them.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unreadCount", "hasMention", "position", "mentionOnly"],
+      "properties": {
+        "unreadCount": { "type": "integer", "minimum": 0 },
+        "hasMention": { "type": "boolean" },
+        "position": {
+          "description": "The row's latestActivitySeq (a decimal string): the highest seq this answer counted. null: the server could not pair it with the row's latest message; the row takes no live patches.",
+          "anyOf": [{ "$ref": "#/$defs/seq" }, { "type": "null" }]
+        },
+        "mentionOnly": { "description": "A mention with nothing else unread; the position is the highest mention seq.", "type": "boolean" }
+      }
+    },
+    "given": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "row": { "description": "Position cases: the row as the last answer delivered it (no seqs applied yet).", "$ref": "#/$defs/row" },
+        "viewer": {
+          "description": "Predicate cases: who reads the Activity.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "id"],
+          "properties": {
+            "type": { "enum": ["user", "agent"] },
+            "id": { "type": "string", "minLength": 1 }
+          }
+        },
+        "scope": {
+          "description": "Predicate cases: what the client knows about the row's conversation when the message arrives.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["rowKind"],
+          "properties": {
+            "rowKind": { "enum": ["channel", "dm", "thread", "task"] },
+            "threadFollowed": { "description": "Thread/task rows: the viewer follows it. Absent = true.", "type": "boolean" },
+            "activityMuted": { "description": "Channel/DM rows: the viewer muted the conversation's Activity (a live message is past the mute boundary). Absent = false.", "type": "boolean" },
+            "readOnArrival": { "description": "The client reads the message as it arrives (open at the bottom with the read saved, a read queued past it, a read hold). Absent = false.", "type": "boolean" }
+          }
+        },
+        "message": {
+          "description": "Predicate cases: the live message's fields, as message:new carries them.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["senderType", "senderId", "messageType"],
+          "properties": {
+            "senderType": { "type": "string", "minLength": 1 },
+            "senderId": { "type": "string", "minLength": 1 },
+            "messageType": { "enum": ["chat", "system"] },
+            "causalActorType": { "type": ["string", "null"] },
+            "causalActorId": { "type": ["string", "null"] },
+            "systemSubtype": { "description": "null: no subtype. Absent: the event did not carry the system provenance.", "type": ["string", "null"] },
+            "mentions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["type", "id"],
+                "properties": { "type": { "type": "string" }, "id": { "type": "string" } }
+              }
+            }
+          }
+        }
+      }
+    },
+    "step": {
+      "type": "object",
+      "required": ["act"],
+      "oneOf": [
+        {
+          "description": "A live message of the row's conversation arrives, with the unread predicate's verdict for it.",
+          "additionalProperties": false,
+          "required": ["act", "seq", "counts", "mentionsViewer"],
+          "properties": {
+            "act": { "const": "liveMessage" },
+            "seq": { "$ref": "#/$defs/seq" },
+            "counts": { "description": "The predicate's verdict. null: cannot be judged (re-read).", "type": ["boolean", "null"] },
+            "mentionsViewer": { "type": "boolean" }
+          }
+        },
+        {
+          "description": "An inbox answer arrives with this row (a list read or a single-row re-read).",
+          "additionalProperties": false,
+          "required": ["act", "row"],
+          "properties": {
+            "act": { "const": "answer" },
+            "row": { "$ref": "#/$defs/row" }
+          }
+        },
+        {
+          "description": "The viewer's read of the conversation up to seq is applied (a persisted read, or a read change's refSeq).",
+          "additionalProperties": false,
+          "required": ["act", "seq"],
+          "properties": {
+            "act": { "const": "read" },
+            "seq": { "$ref": "#/$defs/seq" }
+          }
+        }
+      ]
+    },
+    "rowState": {
+      "description": "What the row shows after the step. Only the listed keys are asserted. position: the row's shown latestActivitySeq (the delivered one, or the highest seq applied above it).",
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "unreadCount": { "type": "integer", "minimum": 0 },
+        "hasMention": { "type": "boolean" },
+        "position": { "anyOf": [{ "$ref": "#/$defs/seq" }, { "type": "null" }] },
+        "mentionOnly": { "type": "boolean" }
+      }
+    },
+    "expectation": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "row": { "$ref": "#/$defs/rowState" },
+        "reread": { "description": "Some step since the case started asked to re-read this one row (not which request; never the list).", "type": "boolean" },
+        "verdict": { "$ref": "#/$defs/verdict" }
+      }
+    },
+    "positionExpectation": {
+      "type": "object",
+      "required": ["reread"],
+      "properties": { "reread": true, "verdict": false }
+    },
+    "predicateExpectation": {
+      "type": "object",
+      "required": ["verdict"],
+      "properties": { "verdict": true, "row": false, "reread": false }
+    },
+    "verdict": {
+      "description": "The unread predicate's answer.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["counts", "mention"],
+      "properties": {
+        "counts": { "description": "One more unread on the row. null: cannot be judged from the event (the row is re-read).", "type": ["boolean", "null"] },
+        "mention": { "description": "It @-mentions the viewer: the row's @ lights.", "type": "boolean" }
+      }
+    },
+    "checkpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["afterStep"],
+      "minProperties": 2,
+      "properties": {
+        "afterStep": { "description": "1-based index into `steps`.", "type": "integer", "minimum": 1 },
+        "row": { "$ref": "#/$defs/rowState" },
+        "reread": { "description": "Some step up to this one asked to re-read the row.", "type": "boolean" }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["question", "owner", "candidates"],
+      "properties": {
+        "question": { "type": "string", "minLength": 1 },
+        "owner": { "description": "Who decides.", "type": "string", "minLength": 1 },
+        "candidates": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "summary", "currentBehaviourOf", "expect"],
+            "properties": {
+              "id": { "type": "string", "pattern": "^[a-z][a-zA-Z0-9-]*$" },
+              "summary": { "type": "string", "minLength": 1 },
+              "currentBehaviourOf": { "description": "The sides that behave like this today.", "type": "array", "items": { "$ref": "#/$defs/side" } },
+              "checkpoints": { "type": "array", "items": { "$ref": "#/$defs/checkpoint" } },
+              "expect": { "$ref": "#/$defs/expectation" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

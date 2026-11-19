@@ -58,7 +58,6 @@ const RAFT_RUNTIME_BY_AUTH_RUNTIME: Readonly<Record<RuntimeAuthRuntime, string>>
   pi: "pi",
   grok: "grok",
   opencode: "opencode",
-  codebuddy: "codebuddy",
 };
 
 export function raftRuntimeOfAuthRuntime(authRuntime: RuntimeAuthRuntime): string {

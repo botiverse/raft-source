@@ -24,20 +24,19 @@ type Metrics = { fontSize: string; fontWeight: string; lineHeight: string };
  * The runtime form is the protocol v2 one (task #8), served from the real
  * fixtures in packages/runtime-form/fixtures (Built-in's provider/model lists
  * are not in the fixtures; see `builtinSources`). In v2 the key's label is the
- * form's own "API Key" for every provider (v1 prefixed the provider name), its
- * required mark is the form's (Built-in requires it, Pi does not), and Model is
+ * form's own "API Key" for every provider (v1 prefixed the provider name), a
+ * required field's label carries no mark (only optional ones are marked), and Model is
  * a provider-dependent searchable combobox whose INPUT is measured here too —
  * it is the provider-dependent control that replaced v1's gateway model input.
  * Built-in's "Supports image input" is a boolean option card, not an input.
  */
 const STATES = [
   { caseId: "builtin-provider-dialog", runtimeId: "builtin", providerField: "providerId", provider: "DeepSeek",
-    expect: ["API Key*", "Model*"] },
+    expect: ["API Key", "Model"] },
   { caseId: "builtin-provider-dialog", runtimeId: "builtin", providerField: "providerId", provider: "OpenAI Compatible",
-    // builtin.form.json lists Base URL in no `required` (only minLength), so no mark.
-    expect: ["API Key*", "Base URL", "Model*"] },
+    expect: ["API Key", "Base URL", "Model"] },
   { caseId: "pi-provider-dialog", runtimeId: "pi", providerField: "provider", provider: "DeepSeek",
-    expect: ["API Key", "Model*"] },
+    expect: ["API Key", "Model"] },
 ] as const;
 
 const FORMS: Record<string, RuntimeFormV2Mock> = {

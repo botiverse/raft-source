@@ -432,45 +432,11 @@ export async function buildOpenCodeLaunchOptions(ctx: SpawnContext, home: string
 
   const v2 = isOpenCodeV2Launch(version);
   const agentCliFlag = v2 || requiresAgentCliFlag(version);
-  const builtConfig = buildOpenCodeConfig(ctx, home, managedMcp);
   // Without `--agent` (OpenCode >= 1.15, see requiresAgentCliFlag), `opencode
   // run` uses `default_agent`, else its built-in `build` agent, whose prompt is
   // OpenCode's own: the standing prompt in the `slock` agent was never used.
   // Verified on 1.15.0 and 1.18.35 by capturing the provider request.
-  const selectedConfig = agentCliFlag ? builtConfig : { ...builtConfig, default_agent: SLOCK_AGENT_NAME };
-  // task #1258 (2.x only). On 1.x `--pure` means "run without external
-  // plugins" (1.x plugin/index.ts: `flags.pure ? [] : cfg.plugin_origins`) and
-  // `--dir` pins the project; 2.x has neither flag and no plugin switch, so the
-  // same isolation is built from what 2.x does have (each verified on 2.0.27
-  // with a marker plugin, see opencode.live.test.ts and the task #1258 PR):
-  //  - OPENCODE_DISABLE_PROJECT_CONFIG=1: the workspace's opencode.json and
-  //    .opencode/plugins are not read, so a stray project file cannot redefine
-  //    the `slock` agent or load code into the agent.
-  //  - OPENCODE_CONFIG_DIR=<empty dir>: the user's config directory (its
-  //    opencode.json `plugin` list and plugins/ directory) is not read by
-  //    OpenCode. The parts of the user's opencode.json this driver supports
-  //    (provider, agent, mcp) still reach 2.x: buildOpenCodeConfig merges them
-  //    into the injected document, exactly as on 1.x.
-  //  - the injected document carries no `plugin` key: `plugin` lists are
-  //    merged across config sources, so an injected `[]` does not clear one,
-  //    and the user's own list must not travel through the merge above.
-  // OPENCODE_CONFIG_CONTENT has the last word over every file source
-  // (verified: an injected agent beat project, config-dir and user agents of
-  // the same name). Sessions, logs and auth stay in OpenCode's own data
-  // directories under the host user's HOME/XDG, as on 1.x.
-  const { plugin: _plugin, ...configWithoutPlugins } = selectedConfig;
-  const config = v2 ? configWithoutPlugins : selectedConfig;
-  let emptyConfigDir: string | null = null;
-  if (v2) {
-    const slockHome = ctx.slockHome ? path.resolve(ctx.slockHome) : resolveRaftHome();
-    emptyConfigDir = path.join(slockHome, OPENCODE_EMPTY_CONFIG_DIR);
-    mkdirSync(emptyConfigDir, { recursive: true });
-  }
-  const env: NodeJS.ProcessEnv = {
-    ...slock.spawnEnv,
-    OPENCODE_CONFIG_CONTENT: JSON.stringify(config),
-    ...(emptyConfigDir ? { OPENCODE_DISABLE_PROJECT_CONFIG: "1", OPENCODE_CONFIG_DIR: emptyConfigDir } : {}),
-  };
+  const { env, config } = buildOpenCodeLaunchEnv(ctx, slock.spawnEnv, { home, version, managedMcp, selectDefaultAgent: !agentCliFlag });
 
   // 2.x: `--standalone` is not optional. Without it `opencode run` discovers
   // or starts a per-user shared background server that owns sessions and
@@ -508,6 +474,79 @@ export async function buildOpenCodeLaunchOptions(ctx: SpawnContext, home: string
   args.push("--", turnPrompt);
 
   return { args, env, config };
+}
+
+/**
+ * The environment OpenCode starts in, on either host (the legacy `opencode
+ * run` per turn, the OAR host's `opencode acp` session,
+ * agentHost/oarOpencodeLaunch.ts): Raft's CLI transport environment
+ * (`spawnEnv`), the injected config with the `slock` agent carrying the
+ * standing prompt (`OPENCODE_CONFIG_CONTENT`), the 2.x config isolation, and
+ * `PWD` = the agent's workspace. `selectDefaultAgent` adds `default_agent:
+ * slock` for a launch that cannot name the agent itself (no `--agent`).
+ * `managedMcp` puts the managed MCP server into the config (the legacy
+ * driver); the OAR host passes none and attaches it as a session MCP server.
+ */
+export function buildOpenCodeLaunchEnv(
+  ctx: SpawnContext,
+  spawnEnv: NodeJS.ProcessEnv,
+  input: { home?: string; version: string | null; managedMcp: { name: string; url: string } | null; selectDefaultAgent: boolean },
+): { env: NodeJS.ProcessEnv; config: Record<string, unknown> } {
+  const v2 = isOpenCodeV2Launch(input.version);
+  const builtConfig = buildOpenCodeConfig(ctx, input.home ?? os.homedir(), input.managedMcp);
+  const selectedConfig = input.selectDefaultAgent ? { ...builtConfig, default_agent: SLOCK_AGENT_NAME } : builtConfig;
+  // task #1258 (2.x only). On 1.x `--pure` means "run without external
+  // plugins" (1.x plugin/index.ts: `flags.pure ? [] : cfg.plugin_origins`) and
+  // `--dir` pins the project; 2.x has neither flag and no plugin switch, so the
+  // same isolation is built from what 2.x does have (each verified on 2.0.27
+  // with a marker plugin, see opencode.live.test.ts and the task #1258 PR):
+  //  - OPENCODE_DISABLE_PROJECT_CONFIG=1: the workspace's opencode.json and
+  //    .opencode/plugins are not read, so a stray project file cannot redefine
+  //    the `slock` agent or load code into the agent.
+  //  - OPENCODE_CONFIG_DIR=<empty dir>: the user's config directory (its
+  //    opencode.json `plugin` list and plugins/ directory) is not read by
+  //    OpenCode. The parts of the user's opencode.json this driver supports
+  //    (provider, agent, mcp) still reach 2.x: buildOpenCodeConfig merges them
+  //    into the injected document, exactly as on 1.x.
+  //  - the injected document carries no `plugin` key: `plugin` lists are
+  //    merged across config sources, so an injected `[]` does not clear one,
+  //    and the user's own list must not travel through the merge above.
+  // OPENCODE_CONFIG_CONTENT has the last word over every file source
+  // (verified: an injected agent beat project, config-dir and user agents of
+  // the same name). Sessions, logs and auth stay in OpenCode's own data
+  // directories under the host user's HOME/XDG, as on 1.x.
+  const { plugin: _plugin, ...configWithoutPlugins } = selectedConfig;
+  const config = v2 ? configWithoutPlugins : selectedConfig;
+  let emptyConfigDir: string | null = null;
+  if (v2) {
+    const slockHome = ctx.slockHome ? path.resolve(ctx.slockHome) : resolveRaftHome();
+    emptyConfigDir = path.join(slockHome, OPENCODE_EMPTY_CONFIG_DIR);
+    mkdirSync(emptyConfigDir, { recursive: true });
+  }
+  const env: NodeJS.ProcessEnv = {
+    ...spawnEnv,
+    OPENCODE_CONFIG_CONTENT: JSON.stringify(config),
+    ...(emptyConfigDir ? { OPENCODE_DISABLE_PROJECT_CONFIG: "1", OPENCODE_CONFIG_DIR: emptyConfigDir } : {}),
+    // 2.x has no `--dir` and takes its working directory from $PWD, not
+    // from the process cwd (verified on 2.3.0: with cwd set to the
+    // workspace and PWD inherited from the daemon, both the agent's and a
+    // sub-agent's `pwd` printed the daemon's directory). Keep them equal.
+    PWD: ctx.workingDirectory,
+  };
+  return { env, config };
+}
+
+/**
+ * The environment the OAR host starts `opencode acp` in
+ * (agentHost/oarOpencodeLaunch.ts): the legacy driver's own (CLI transport,
+ * injected config, 2.x isolation, `PWD`), with `default_agent: slock`, since
+ * ACP has no `--agent` and OAR refuses `systemPrompt` on OpenCode 2.x, and
+ * without the managed MCP server in the config text: the OAR launch attaches
+ * it as a session MCP server, so its token is not in the environment.
+ */
+export async function prepareOpenCodeOarEnvironment(ctx: SpawnContext, version: string): Promise<NodeJS.ProcessEnv> {
+  const slock = await prepareCliTransport(ctx, { NO_COLOR: "1" });
+  return buildOpenCodeLaunchEnv(ctx, slock.spawnEnv, { version, managedMcp: null, selectDefaultAgent: true }).env;
 }
 
 export function parseOpenCodeModelsOutput(output: string): RuntimeModelSet | null {
@@ -946,7 +985,10 @@ function buildOpenCodeSystemPrompt(config: AgentConfig): AxSurfaceText {
  *
  * Uses `opencode run --format json`, which emits NDJSON events on stdout.
  * The command is per-turn and exits when the turn is complete; session state is
- * resumed with OpenCode's native `--session <id>` support.
+ * resumed with OpenCode's native `--session <id>` support. On 1.x the final
+ * step_finish ends the turn (and the daemon then terminates the process); on
+ * 2.x the end of stdout does (parseStdoutEnd), because background sub-agents
+ * (2.3+) keep the turn going after the parent's step_finish (see parseLine).
  */
 export class OpenCodeDriver implements RuntimeDriver {
   readonly id = "opencode";
@@ -1006,6 +1048,8 @@ export class OpenCodeDriver implements RuntimeDriver {
   private persistedSessionId: string | null = null;
   /** task #1258: where this launch records the session's OpenCode major once the id is known. */
   private sessionRecord: { path: string; major: number; version: string } | null = null;
+  /** 2.x: the last step was a finished reply (step_finish, not tool-calls) with nothing after it yet; see parseStdoutEnd. */
+  private replyFinished = false;
   /** The CLI version read for the last launch (see RuntimeDriver.launchedCliVersion). */
   launchedCliVersion: string | null = null;
   /**
@@ -1237,28 +1281,42 @@ export class OpenCodeDriver implements RuntimeDriver {
 
     switch (event.type) {
       case "step_start":
+        this.replyFinished = false;
         events.push({ kind: "thinking", text: "" });
         break;
 
       case "text":
         if (typeof event.part?.text === "string" && event.part.text.length > 0) {
           events.push({ kind: "text", text: event.part.text });
+          // 2.0.27 ends a plain reply with its text and no step_finish.
+          if (isOpenCodeV2Launch(this.launchedCliVersion)) this.replyFinished = true;
         }
         break;
 
       case "tool_use":
+        this.replyFinished = false;
         events.push(...this.finishedToolEvents(event.part));
         break;
 
       case "step_finish":
-        // 1.x ends every reply with a step_finish (reason "stop"); 2.0.27
-        // prints one only after tool calls and none for the final reply, so a
-        // 2.x turn may end without this event. That is fine for a per_turn
-        // runtime: the daemon closes the turn on process exit (see
-        // runtimeSession.ts turnBoundary "process_exit").
+        // 1.x ends every reply with a step_finish (reason "stop") and it is
+        // final. On 2.x it is not: 2.3.0 runs sub-agents in the background,
+        // prints the parent's step_finish(stop), then `background_wait`, and
+        // resumes the parent with its final reply once they finish. A
+        // turn_end here would make the daemon terminate the process
+        // (terminateProcessOnTurnEnd) and kill the sub-agents with it. So on
+        // 2.x the reply only marks the turn as answered, and the turn_end
+        // comes from parseStdoutEnd once `opencode run` has printed
+        // everything (about 80 ms after the final reply on 2.3.0).
         if (event.part?.reason !== "tool-calls") {
-          events.push({ kind: "turn_end", sessionId: this.announcedSessionId() });
+          if (isOpenCodeV2Launch(this.launchedCliVersion)) this.replyFinished = true;
+          else events.push({ kind: "turn_end", sessionId: this.announcedSessionId() });
         }
+        break;
+
+      case "background_wait":
+        // 2.3.0: the parent waits for background sub-agents and resumes after.
+        this.replyFinished = false;
         break;
 
       case "error": {
@@ -1269,11 +1327,26 @@ export class OpenCodeDriver implements RuntimeDriver {
           "Unknown OpenCode error";
         events.push({ kind: "error", message });
         events.push({ kind: "turn_end", sessionId: this.announcedSessionId() });
+        this.replyFinished = false;
         break;
       }
     }
 
     return events;
+  }
+
+  /**
+   * 2.x: the turn ends when the output does, if the last thing printed was
+   * reply output (a step_finish other than tool-calls, or text). A run that
+   * stopped mid-step (crash, tool call, background wait) gets no turn_end; its
+   * process exit decides the outcome. Known risk, accepted: a 2.x run that
+   * prints its reply and then never exits is not ended here (1.x was killed at
+   * its final step_finish). 2.3.0 exits about 80 ms after the reply.
+   */
+  parseStdoutEnd(): ParsedEvent[] {
+    if (!this.replyFinished) return [];
+    this.replyFinished = false;
+    return [{ kind: "turn_end", sessionId: this.announcedSessionId() }];
   }
 
   encodeStdinMessage(

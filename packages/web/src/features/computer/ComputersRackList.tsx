@@ -169,7 +169,7 @@ export function ComputersRackList({ variant, view }: { variant: RackVariant; vie
     [machines, thisDeviceMachine],
   );
   // Offline computers (most of a real fleet's, often for months, with nothing
-  // to read) wait in one folded section at the end, whatever the grouping and
+  // to read) wait in one section at the end (open by default; a person can fold it), whatever the grouping and
   // the sort; the online ones come first, grouped and sorted as chosen. With
   // Status: Offline they are the list itself, with no section.
   const offlineSection = filters.status !== "offline";
@@ -181,12 +181,11 @@ export function ComputersRackList({ variant, view }: { variant: RackVariant; vie
     () => (offlineSection ? otherMachines.filter((machine) => machine.status !== "online") : []),
     [otherMachines, offlineSection],
   );
-  // Folded by default; open by default when nothing else is online, so the
-  // page is never empty. A fold or unfold holds for this server and this
-  // default: on another server, or once the default changes (a search that
-  // leaves only offline computers, then cleared), it starts from the default.
-  const offlineDefaultOpen = onlineMachines.length === 0;
-  const offlineScope = `${serverId ?? ""}\0${offlineDefaultOpen ? "open" : "folded"}`;
+  // Open by default, as in the mobile App (artin, #proj-mobile:0095da7c;
+  // mobile #4709). A person's fold or unfold holds for this server; on another
+  // server it starts from the default again.
+  const offlineDefaultOpen = true;
+  const offlineScope = serverId ?? "";
   const [offlineChoice, setOfflineChoice] = useState<{ scope: string; open: boolean } | null>(null);
   const offlineOpen = offlineChoice?.scope === offlineScope ? offlineChoice.open : offlineDefaultOpen;
   const toggleOffline = useCallback(() => {

@@ -28,7 +28,7 @@
 +
 +Daemon updated from 1.0.0 to 1.0.1.
 +
-@@ -298,1 +319,4 @@
+@@ -299,1 +320,4 @@
 -- Keep MEMORY.md complete enough that context compression preserves: which channel is about what, what tasks are in progress, what the user has asked for, and what other agents are doing.
 \ No newline at end of file
 +- Keep MEMORY.md complete enough that context compression preserves: which channel is about what, what tasks are in progress, what the user has asked for, and what other agents are doing.

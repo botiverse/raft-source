@@ -1191,6 +1191,15 @@ test("completed receipt names each ignore file and marks a count at the bound as
   });
   assert.match(atBound, new RegExp(`as listed in \\.raftmigrateignore: 1 path, at least ${MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT} files \\(3 GB or more\\)\\.`));
   assert.match(atBound, new RegExp(`至少 ${MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT} 个文件（3 GB 以上）`));
+
+  // The source stopped sizing early (out of time): the totals are a lower bound too.
+  const partial = receipt({
+    ...base,
+    excludedIgnored: { count: 1, fileCount: 1200, bytes: 5 * 1024 ** 3, largest: [] },
+    excludedIgnoredPartial: true,
+  });
+  assert.match(partial, /as listed in \.raftmigrateignore: 1 path, at least 1200 files \(5 GB or more\)\./);
+  assert.match(partial, /至少 1200 个文件（5 GB 以上）/);
 });
 
 test("receipt sizes are readable binary units", () => {

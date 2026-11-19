@@ -13,6 +13,8 @@
 // from a gated refusal (#wg-ax:#13, Tenny).
 // grant_kind_unsupported, which setup's legacy migration falls back on when the
 // Server does not know the computer_migrate approval (#wg-device-auth:#1, Tenny).
+// IDEMPOTENCY_KEY_REUSED as the Artifacts send it, which the CLI's review reads
+// (#wg-ax:#13 P3); the Artifacts codes shared reads only to pick wording are not listed.
 // Removed since: ACTION_ENDPOINT_REVIEW_STALE, with Raft's card URL review
 // route and its web panel (App Admin decides those reviews, #proj-apps task #19).
 
@@ -245,6 +247,7 @@ export const REFUSAL_CODES = {
   download_url_unavailable: { kind: "alternate", action: "Point next at the binary download operation instead of a download URL.", clients: ["shared"] }, // shared/src/agentOps/attachments.ts:284
   raftbench_validation_failed: { kind: "alternate", action: "Read the body's issues and return an invalid outcome so the harness fixes and resubmits the whole result.", clients: ["shared"] }, // shared/src/agentOps/raftbench.ts:240
   idempotency_key_reused: { kind: "alternate", action: "Classify as the SDK's IDEMPOTENCY_KEY_REUSED error (not retryable), so the caller uses a new key for a different request.", clients: ["shared"] }, // shared/src/agentOps/outcome.ts:152
+  IDEMPOTENCY_KEY_REUSED: { kind: "alternate", action: "Classify as the SDK's IDEMPOTENCY_KEY_REUSED error (shared reads the code case-insensitively); the CLI's review then reports no uploaded images as left behind.", clients: ["shared", "cli"] }, // shared/src/agentOps/outcome.ts:155; cli/src/commands/artifact/review.ts:436
   others_agents_on_computer: { kind: "alternate", action: "Read the blocking agents and build the detach command that force-unbinds them.", clients: ["computer", "web"] }, // computer/src/apiClient.ts:972; web/src/features/computer/othersAgentsApi.ts:146
   others_agents_on_computers: { kind: "alternate", action: "Read the blocking agents and offer account deletion that force-unbinds them.", clients: ["web"] }, // web/src/features/settings/account/accountDeletionApi.ts:358
   sole_owner_servers: { kind: "alternate", action: "Read the servers the person solely owns and route account deletion through handing them over.", clients: ["web"] }, // web/src/features/settings/account/accountDeletionApi.ts:354

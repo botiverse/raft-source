@@ -39,7 +39,7 @@ export function agentStateDir(agentsDir: string, agentId: string): string {
 }
 
 /** A plain file's text, up to `maxBytes`; null for anything else (a link, a FIFO, a device, too large). */
-function readPlainSmallFile(file: string, maxBytes: number): string | null {
+export function readPlainSmallFile(file: string, maxBytes: number): string | null {
   let fd: number;
   try {
     fd = openSync(file, LEGACY_OPEN_FLAGS);

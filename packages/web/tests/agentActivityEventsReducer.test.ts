@@ -1155,3 +1155,19 @@ test("#proj-runtime:#43: a full-window reload over a full live log keeps the new
   // (about 800 x 500 x 2 here); a wall-clock bound failed on busy runners.
   assert.ok(keyed < 10 * (live.length + reloaded.length), `merge keyed ${keyed} entries for ${live.length + reloaded.length}`);
 });
+
+test("#oar-raft:#18: a sub-agent's own tool call says nothing about the main turn: no conflict with its idle frame", () => {
+  const initial = fold([socketEvent(12, "online", "Idle", 100, "idle")]);
+  const domain = createAgentActivityDomain({ initialState: initial });
+  const step: TrajectoryEntry = { kind: "tool_start", toolName: "bash", toolInput: "ls", callId: "c-1", subagent: { taskId: "child-1" } };
+
+  const transition = domain.store.dispatch({ kind: "patch:trajectory-append", agentId: "agent-1", entries: [step], serverSeq: 12, timestamp: 101 });
+
+  assert.notEqual(transition.outcome, "producer_seq_conflict");
+  assert.equal(transition.reconcileSuggested, false);
+  assert.equal(domain.store.getState().agentActivities["agent-1"]?.activity, "online");
+  // The main turn's own tool call still reads as working.
+  const main = createAgentActivityDomain({ initialState: initial }).store
+    .dispatch({ kind: "patch:trajectory-append", agentId: "agent-1", entries: [{ ...step, subagent: undefined }], serverSeq: 12, timestamp: 101 });
+  assert.equal(main.outcome, "producer_seq_conflict");
+});

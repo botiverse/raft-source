@@ -19,7 +19,6 @@ import { Readable } from "node:stream";
 import { and, eq, inArray } from "drizzle-orm";
 import {
   ARTIFACT_HOME_CHANGE_MAX_COUNTED,
-  SERVER_GUEST_FEATURE_FLAG_KEY,
   artifactWebPaths,
   asArtifactId,
   asChannelId,
@@ -29,7 +28,7 @@ import {
   type ServerId,
 } from "@botiverse/raft-shared";
 import { getDb } from "../../db/index";
-import { agents, channels, featureFlagRules, objectEventRecipients, objectEvents, objectInboxStates, serverMembers } from "../../db/schema";
+import { agents, channels, objectEventRecipients, objectEvents, objectInboxStates, serverMembers } from "../../db/schema";
 import { accessTokenForTest } from "../../test/integration/credentials";
 import { createAgent } from "../../services/agentService";
 import { AGENT_API_KEY_HMAC_SECRET_ENV, mintAgentCredential } from "../../services/agentCredentialService";
@@ -598,7 +597,6 @@ test("unpublish: the people who may make it public may make it private; a member
   const guest = await seed.human();
   await addMember(world.server.id, guest.id);
   await seedBoundGuest({ serverId: world.server.id, userId: guest.id });
-  await getDb().insert(featureFlagRules).values({ flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [world.server.id] });
   const asGuest = { token: await accessTokenForTest(guest.id), serverId: world.server.id };
   const guests = await world.make({ author: { type: "user", id: guest.id } });
   const viewer = await call(app, "GET", artifactWebPaths.viewer(asArtifactId(guests.id)), asGuest);

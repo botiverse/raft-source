@@ -1,6 +1,7 @@
+import { currentTimeMs } from "@botiverse/raft-shared";
 import type { RuntimeAccountUsageSnapshot } from "@botiverse/raft-shared";
 import type { IntlShape } from "react-intl";
-import { formatRelativeTime } from "../../utils/relativeTime";
+import { usageResetText } from "./rack/rackResetText";
 import { runtimeUsagePercentUsed } from "./bulkChangeModelPlan";
 import type { BulkRuntimeUsageSummary } from "./bulkChangeModelPlan";
 
@@ -19,7 +20,7 @@ export function runtimeUsageText(
   const plan = summary.plan ?? formatMessage({ id: "machine.runtimeUsage.accountFallback" });
   if (summary.kind === "used") return formatMessage({ id: "machine.detail.bulkModel.usageUsed" }, { plan, percent: summary.percent });
   if (summary.kind === "attention") return formatMessage({ id: "machine.detail.bulkModel.usageAttention" }, { plan });
-  const reset = summary.resetsAt ? formatRelativeTime(summary.resetsAt, locale) : null;
+  const reset = usageResetText(summary.resetsAt, locale, currentTimeMs());
   return reset
     ? formatMessage({ id: "machine.detail.bulkModel.usageLimit" }, { plan, reset })
     : formatMessage({ id: "machine.detail.bulkModel.usageLimitNoReset" }, { plan });
@@ -93,7 +94,7 @@ export function runtimeUsageWindowsLine(
     .map(({ window, rank }): RuntimeUsageLinePart | null => {
       const name = windowName(rank, formatMessage);
       if (window.status === "limit_reached") {
-        const reset = window.resetsAt ? formatRelativeTime(window.resetsAt, locale) : null;
+        const reset = usageResetText(window.resetsAt, locale, currentTimeMs());
         const text = reset
           ? formatMessage({ id: "machine.runtimeUsage.line.limit" }, { window: name, reset })
           : formatMessage({ id: "machine.runtimeUsage.line.limitNoReset" }, { window: name });

@@ -457,6 +457,7 @@ export function useActionCardCreateDialog({ messageId, metadata, dialogFunnel, m
         prefilledMachineMode={action.requiredComputer ? "required" : action.suggestedComputer ? "preferred" : undefined}
         prefilledHosting={action.hosting}
         prefilledHostedModel={action.model}
+        prefilledRuntime={action.suggestedRuntime}
         actionCardMessageId={messageId}
         actionCardConfirmationVersion={metadata.confirmationVersion}
         onCreated={agentCreated}

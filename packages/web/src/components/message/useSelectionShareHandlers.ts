@@ -216,6 +216,14 @@ export interface UseSelectionShareHandlersOptions {
   onUnresolvedSelection?: (unresolvedCount: number) => void;
 }
 
+/** The selection an image is being made of is gone: select mode ended, or moved to another conversation. */
+export function selectionEnded(
+  state: { isActive: boolean; channelId: string | null },
+  prev: { isActive: boolean; channelId: string | null },
+): boolean {
+  return prev.isActive && (!state.isActive || state.channelId !== prev.channelId);
+}
+
 export function useSelectionShareHandlers(
   opts: UseSelectionShareHandlersOptions = {},
 ): SelectionShareHandlers {
@@ -245,6 +253,13 @@ export function useSelectionShareHandlers(
     setPicCapturing(false);
     setPicCaptureProgress(null);
   }, []);
+
+  // Ending the selection (×, Esc, another conversation's selection) stops an
+  // image of it: its preview must never open on a selection that is gone.
+  useEffect(() => useSelectionStore.subscribe((state, prev) => {
+    if (!captureJobRef.current) return;
+    if (selectionEnded(state, prev)) cancelPicCapture();
+  }), [cancelPicCapture]);
 
   const captureSharePreview = useCallback(async (job: { id: number; controller: AbortController }) => {
     const { messages, unresolvedCount } = gatherSelectedMessagesWithMeta({ channelMessages, threadReplyMessages, threadParentMessageRef });

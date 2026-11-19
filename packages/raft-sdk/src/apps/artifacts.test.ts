@@ -7,11 +7,14 @@
 // `artifacts.comment` and `artifacts.review` with their ids (typed and invoked).
 import assert from "node:assert/strict";
 
-import { formatArtifactCheck } from "@botiverse/raft-shared/src/agentCliSurface";
+import { formatArtifactCheck, RAFT_HINTS } from "@botiverse/raft-shared/src/agentCliSurface";
 
 import { createRaft } from "../index";
 
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 7]);
+// The Server's SCREENSHOT_NOT_FOUND and IMAGE_NOT_FOUND (checkRead.ts, commentImages.ts), each with its step.
+const NO_SHOT = "Version 13 of this artifact has no phone screenshot: only a finished publish check has screenshots, and only the newest three checked versions keep them, so read the version's check first.";
+const NO_IMAGE = "No image on a comment of this artifact that you can see has that id: take the id from the comment's images in its comments.";
 
 const checkAnswer = {
   artifact: { id: "pt_abc", title: "Workspace prototype", currentVersion: 13 },
@@ -31,7 +34,7 @@ function server() {
     paths.push(`${url.pathname}${url.search}`);
     if (url.pathname.endsWith("/check")) return Response.json(checkAnswer);
     if (url.pathname.endsWith("/check/desktop")) return new Response(PNG, { headers: { "content-type": "image/png" } });
-    if (url.pathname.endsWith("/check/phone")) return Response.json({ error: "screenshot not found", code: "SCREENSHOT_NOT_FOUND", details: { shot: "phone", version: 13 } }, { status: 404 });
+    if (url.pathname.endsWith("/check/phone")) return Response.json({ error: NO_SHOT, code: "SCREENSHOT_NOT_FOUND", next: RAFT_HINTS.artifactCheck({ artifact: "pt_abc", version: 13 }), details: { shot: "phone", version: 13 } }, { status: 404 });
     return Response.json({ error: "not in this fake" }, { status: 500 });
   }) as typeof globalThis.fetch;
   return { fetch, paths };
@@ -74,8 +77,10 @@ test("artifacts.checkShot: a typed method returning the PNG's bytes; SCREENSHOT_
   const phone = await raft.artifacts.checkShot({ artifact: "pt_abc", version: 13, shot: "phone" });
   assert.ok(!phone.ok);
   assert.equal(phone.error.serverCode, "SCREENSHOT_NOT_FOUND");
-  assert.equal(phone.error.message, `v13 of "pt_abc" has no phone screenshot from its publish check.`);
-  assert.ok(phone.error.nextAction?.startsWith(`Read the version's check: artifacts_check({ artifact: "pt_abc", version: 13 }).`), phone.error.nextAction);
+  // The Server's sentence and its step, as a tool call (no CLI command).
+  assert.equal(phone.error.message, NO_SHOT);
+  assert.equal(phone.error.nextAction, `artifacts_check({ artifact: "pt_abc", version: 13 })`);
+  assert.ok(!/\braft [a-z]/.test(phone.text), phone.text);
   assert.deepEqual(fake.paths, ["/internal/agent-api/artifacts/pt_abc/check/desktop?version=13", "/internal/agent-api/artifacts/pt_abc/check/phone?version=13"]);
 });
 
@@ -93,7 +98,7 @@ function imageServer(options: { uploadRoute?: boolean } = {}) {
       return options.uploadRoute === false ? Response.json({ error: "Not found" }, { status: 404 }) : Response.json(keptImage, { status: 201 });
     }
     if (url.pathname.endsWith("/comment-images/f-1")) return new Response(PNG_IMAGE, { headers: { "content-type": "image/png" } });
-    if (url.pathname.endsWith("/comment-images/f-9")) return Response.json({ error: "no such image", code: "IMAGE_NOT_FOUND", details: { fileId: "f-9" } }, { status: 404 });
+    if (url.pathname.endsWith("/comment-images/f-9")) return Response.json({ error: NO_IMAGE, code: "IMAGE_NOT_FOUND", next: RAFT_HINTS.artifactComments({ artifact: "pt_abc", all: true }), details: { fileId: "f-9" } }, { status: 404 });
     if (url.pathname.endsWith("/reviews")) {
       const sent = body as { comments: Array<{ body: string; path?: string; images?: string[] }> };
       return Response.json({
@@ -156,8 +161,10 @@ test("artifacts.commentImage: a typed method returning the image's bytes and typ
   const missing = await raft.artifacts.commentImage({ artifact: "pt_abc", fileId: "f-9" });
   assert.ok(!missing.ok);
   assert.equal(missing.error.serverCode, "IMAGE_NOT_FOUND");
-  assert.equal(missing.error.message, `No image f-9 on a comment of "pt_abc" that you can see.`);
-  assert.equal(missing.error.nextAction, `Its id is on the comment's Images line: artifacts_comments({ artifact: "pt_abc", all: true })`);
+  // The Server's sentence and its step, as a tool call (no CLI command).
+  assert.equal(missing.error.message, NO_IMAGE);
+  assert.equal(missing.error.nextAction, `artifacts_comments({ artifact: "pt_abc", all: true })`);
+  assert.ok(!/\braft [a-z]/.test(missing.text), missing.text);
 });
 
 test("artifacts.review with images: each comment's fileIds from commentImageUpload go with it (typed and invoked); with one its body may be empty; the text counts them", async () => {

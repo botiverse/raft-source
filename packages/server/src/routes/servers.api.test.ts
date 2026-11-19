@@ -20,7 +20,6 @@ import {
   RAFT_CLIENT_CAPABILITIES_HEADER,
   RUNTIMES,
   RUNTIME_USAGE_WINDOW_SCOPE_CLIENT_CAPABILITY,
-  SERVER_GUEST_FEATURE_FLAG_KEY,
   SERVER_RUNTIME_CATALOG_VERSION,
   traceEventRowsForSpan,
   type ServerRuntimeCatalog,
@@ -28,7 +27,7 @@ import {
 import { openTestApp } from "../test/integration/app";
 import { seedPlaywrightScenario } from "../test/seedPlaywrightScenario";
 import { getDb } from "../db/index";
-import { agentMigrations, agentRuntimeProfiles, agents, channelHumans, channels as channelsTable, computerLifecycleDispatches, computerLifecycleOperationTargets, computerLifecycleOperations, computerOutageOccurrences, computerRevokeTokens, computers, featureFlagRules, featureFlags, jointChannels, jointChannelServers, machines, serverAgentMembers, serverInvites, serverJoinLinks, serverMemberRoleAuditEvents, serverMembers, servers as serversTable, subscriptions, users } from "../db/schema";
+import { agentMigrations, agentRuntimeProfiles, agents, channelHumans, channels as channelsTable, computerLifecycleDispatches, computerLifecycleOperationTargets, computerLifecycleOperations, computerOutageOccurrences, computerRevokeTokens, computers, featureFlagRules, featureFlags, integrationAuditEvents, jointChannels, jointChannelServers, machines, serverAgentMembers, serverInvites, serverJoinLinks, serverMemberRoleAuditEvents, serverMembers, servers as serversTable, subscriptions, users } from "../db/schema";
 import { createServer, getMemberSidebarOrder, removeMember, updateMemberSidebarOrder } from "../services/serverService";
 import { addHuman, createChannel, deleteChannel, findOrCreateDM, findOrCreateUserDM } from "../services/channelService";
 import { createMessage } from "../services/messageService";
@@ -36,6 +35,7 @@ import { createAgent, deleteAgent } from "../services/agentService";
 import { completeAgentMigrationAutoStart } from "../services/agentMigrationService";
 import { beginTestAgentMigration } from "../test/agentMigrationFixture";
 import { registerMachine } from "../services/machineService";
+import { computerControllerAttachers, computerControllerUserId } from "../services/computerControlAuthorization";
 import * as computerVersionService from "../services/computerVersionService";
 import { getLatestComputerReleaseNotes, getLatestComputerVersion, __resetLatestComputerVersionForTest } from "../services/computerVersionService";
 import { OFFICIAL_ONBOARDING_AGENT_IDENTITY } from "../services/officialOnboardingAgentIdentity";
@@ -1974,17 +1974,10 @@ test("PATCH member role never makes a Guest; a bound Guest is promoted with no f
     ]).onConflictDoNothing();
 
     // Guests are invited to a channel (#wg-rbac:#15): no role change makes one,
-    // whoever asks, with the old rollout flag on or off.
-    for (const flagOn of [false, true]) {
-      if (flagOn) {
-        await db.insert(featureFlagRules).values({
-          id: randomUUID(), flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [server.id],
-        });
-      }
-      for (const token of [ownerToken, adminToken]) {
-        const demote = await patchRole(token, member.id, "guest");
-        assert.equal(demote.status, 403, `flag ${flagOn ? "on" : "off"}: Member-to-Guest is refused`);
-      }
+    // whoever asks.
+    for (const token of [ownerToken, adminToken]) {
+      const demote = await patchRole(token, member.id, "guest");
+      assert.equal(demote.status, 403, "Member-to-Guest is refused");
     }
     assert.equal(await getServerMemberRole(server.id, member.id), "member");
     const [ordinaryMembership] = await db.select().from(channelHumans).where(and(
@@ -2001,7 +1994,6 @@ test("PATCH member role never makes a Guest; a bound Guest is promoted with no f
     assert.equal(await getServerMemberRole(server.id, owner.id), "owner");
 
     // A bound Guest is promoted, with no rollout flag needed: the binding clears, its channel stays.
-    await db.delete(featureFlagRules).where(eq(featureFlagRules.flagKey, SERVER_GUEST_FEATURE_FLAG_KEY));
     const guestHome = await createChannel(server.id, "guest-role-home", undefined, "private");
     const [guestUser] = await db.insert(users).values({
       email: "guest-guest-role-transitions@slock.test",
@@ -2055,14 +2047,6 @@ test("Guest-to-Member transition reacquires a paid human seat", async ({ app }) 
   const server = await createServer("Guest seat transition", `guest-seat-transition-${randomUUID()}`, owner.id);
   await seedBoundGuest({ serverId: server.id, userId: guest.id }, db);
   await insertActiveProSubscription(server.id, owner.id, 1);
-  await db.insert(featureFlagRules).values({
-    id: randomUUID(),
-    flagKey: SERVER_GUEST_FEATURE_FLAG_KEY,
-    stage: "server",
-    priority: 0,
-    decision: "allow",
-    values: [server.id],
-  });
 
   const response = await fetch(`${app.baseUrl}/api/servers/${server.id}/members/${guest.id}`, {
     method: "PATCH",
@@ -2319,14 +2303,6 @@ test("email invites are blocked but join links can be created when Pro universal
     assert.equal(inviteRefusal.code, "human_seat_limit_reached");
     assert.deepEqual(inviteRefusal.capacityLimit, { limitType: "universal", limit: 1, usage: 1, nextUsage: 2, humans: 1, agents: 0 });
 
-    await getDb().insert(featureFlagRules).values({
-      id: randomUUID(),
-      flagKey: SERVER_GUEST_FEATURE_FLAG_KEY,
-      stage: "server",
-      priority: 0,
-      decision: "allow",
-      values: [server.id],
-    });
     const guestInviteRes = await fetch(`${app.baseUrl}/api/servers/${server.id}/invites`, {
       method: "POST",
       headers: {
@@ -6308,6 +6284,359 @@ test("POST /computer/:action — member without manageMachines is refused (403, 
     assert.equal(relayCalls, 0, "member must not trigger a Computer control relay");
 });
 
+/** An adopted Computer: the machine row still names the previous owner, the live attach record names the adopter. */
+async function seedAdoptedComputer(slug: string, attachedBy: "adopter" | "none") {
+  const fixture = await seedRoleFixture(slug);
+  const [previousOwner] = await getDb().insert(users).values({
+    email: `previous-${slug}@slock.test`,
+    name: `previous-${slug}`,
+    displayName: `previous-${slug}`,
+    passwordHash: await fixturePasswordHash("password123"),
+    emailVerified: true,
+    profileSetupCompletedAt: new Date(),
+  }).returning();
+  await getDb().insert(serverMembers).values({ serverId: fixture.server.id, userId: previousOwner.id, role: "member" });
+  const [machine] = await getDb().insert(machines).values({
+    serverId: fixture.server.id,
+    userId: previousOwner.id,
+    name: "adopted-computer",
+    apiKeyHash: `unused-${slug}-hash`,
+  }).returning();
+  await getDb().insert(computers).values({
+    serverId: fixture.server.id,
+    machineId: machine.id,
+    name: "adopted-computer",
+    apiKeyHash: `unused-${slug}-computer-hash`,
+    apiKeyPrefix: "sk_computer_test",
+    attachedByUserId: attachedBy === "adopter" ? fixture.member.id : null,
+  });
+  return { ...fixture, previousOwner, machine };
+}
+
+async function restartAs(app: { baseUrl: string }, serverId: string, machineId: string, email: string) {
+  return fetch(`${app.baseUrl}/api/servers/${serverId}/machines/${machineId}/computer/restart`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${await tokenForHuman(email)}`, "X-Server-Id": serverId },
+  });
+}
+
+// Past the authority check an offline Computer answers 409 computer_offline; a refused caller gets 403 first.
+const offlineOrchestrator = () => ({ hasMachineLocally: () => false, getMachineComputerVersion: async () => null, sendComputerControl: async () => true });
+
+test("POST /computer/:action — after an adoption the adopter controls the Computer and the previous machine-row owner does not", async ({ app }) => {
+  const { member: adopter, previousOwner, server, machine } = await seedAdoptedComputer("computer-control-adopted", "adopter");
+  app.app.set("agentOrchestrator", offlineOrchestrator());
+
+  const asAdopter = await restartAs(app, server.id, machine.id, adopter.email);
+  assert.equal(asAdopter.status, 409, await asAdopter.clone().text());
+  assert.equal((await asAdopter.json()).code, "computer_offline", "the adopter passes the authority check");
+
+  const asPreviousOwner = await restartAs(app, server.id, machine.id, previousOwner.email);
+  assert.equal(asPreviousOwner.status, 403, "the previous machine-row owner keeps no control without controlComputers");
+});
+
+test("POST /computer/:action — with no attacher on record the machine-row owner still controls it", async ({ app }) => {
+  const { member, previousOwner, server, machine } = await seedAdoptedComputer("computer-control-no-attacher", "none");
+  app.app.set("agentOrchestrator", offlineOrchestrator());
+
+  const asRowOwner = await restartAs(app, server.id, machine.id, previousOwner.email);
+  assert.equal(asRowOwner.status, 409, await asRowOwner.clone().text());
+  assert.equal((await asRowOwner.json()).code, "computer_offline");
+
+  const asOtherMember = await restartAs(app, server.id, machine.id, member.email);
+  assert.equal(asOtherMember.status, 403);
+});
+
+async function machineRequestAs(
+  app: { baseUrl: string },
+  serverId: string,
+  machineId: string,
+  email: string,
+  path: string,
+  init: { method?: string; body?: unknown } = {},
+) {
+  return fetch(`${app.baseUrl}/api/servers/${serverId}/machines/${machineId}${path}`, {
+    method: init.method ?? "GET",
+    headers: {
+      Authorization: `Bearer ${await tokenForHuman(email)}`,
+      "X-Server-Id": serverId,
+      ...(init.body === undefined ? {} : { "Content-Type": "application/json" }),
+    },
+    ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+  });
+}
+
+test("machine workspaces — after an adoption the adopter lists and deletes them and the previous machine-row owner does not", async ({ app }) => {
+  const { member: adopter, previousOwner, server, machine } = await seedAdoptedComputer("workspace-adopted", "adopter");
+  const [leftover] = await getDb().insert(agents).values({
+    serverId: server.id, name: "leftover", runtime: "codex", machineId: machine.id, deletedAt: new Date(),
+    creatorType: "user", creatorId: adopter.id,
+  }).returning();
+  const deleteCalls: string[] = [];
+  app.app.set("agentOrchestrator", {
+    hasMachineLocally: () => true,
+    scanMachineWorkspaces: async () => [{ directoryName: leftover.id, totalSizeBytes: 1, lastModified: new Date(0).toISOString(), fileCount: 1 }],
+    deleteMachineWorkspaceDir: async (_machineId: string, directoryName: string) => {
+      deleteCalls.push(directoryName);
+      return true;
+    },
+  });
+
+  const listAsPreviousOwner = await machineRequestAs(app, server.id, machine.id, previousOwner.email, "/workspaces");
+  assert.equal(listAsPreviousOwner.status, 403);
+  const deleteAsPreviousOwner = await machineRequestAs(app, server.id, machine.id, previousOwner.email, `/workspaces/${leftover.id}`, { method: "DELETE" });
+  assert.equal(deleteAsPreviousOwner.status, 403);
+  assert.deepEqual(deleteCalls, [], "the previous machine-row owner deletes nothing on the adopter's Computer");
+
+  const listAsAdopter = await machineRequestAs(app, server.id, machine.id, adopter.email, "/workspaces");
+  assert.equal(listAsAdopter.status, 200, await listAsAdopter.clone().text());
+  assert.deepEqual(((await listAsAdopter.json()) as Array<{ directoryName: string }>).map((ws) => ws.directoryName), [leftover.id]);
+  const deleteAsAdopter = await machineRequestAs(app, server.id, machine.id, adopter.email, `/workspaces/${leftover.id}`, { method: "DELETE" });
+  assert.equal(deleteAsAdopter.status, 200, await deleteAsAdopter.clone().text());
+  assert.deepEqual(deleteCalls, [leftover.id]);
+});
+
+test("machine edit and runtime routes — after an adoption the adopter passes the authority check and the previous machine-row owner does not", async ({ app }) => {
+  const { member: adopter, previousOwner, server, machine } = await seedAdoptedComputer("machine-edit-adopted", "adopter");
+  let rescans = 0;
+  app.app.set("agentOrchestrator", {
+    hasMachineLocally: () => false,
+    rescanMachineRuntimes: async () => {
+      rescans += 1;
+      return true;
+    },
+  });
+  const unknownRuntime = "no-such-runtime";
+  // [path, init, the adopter's status once past the authority check]
+  const routes: Array<[string, { method?: string; body?: unknown }, number]> = [
+    ["", { method: "PATCH", body: { description: "adopted" } }, 200],
+    ["/runtime-options", {}, 200],
+    [`/runtime-form-definitions/${unknownRuntime}`, {}, 404],
+    [`/runtime-forms/v2/${unknownRuntime}`, {}, 404],
+    [`/runtime-form-definitions/${unknownRuntime}/option-sources/model`, {}, 404],
+    [`/runtime-forms/v2/${unknownRuntime}/option-sources/model`, {}, 404],
+    ["/runtime-models/codex", {}, 200],
+    ["/runtimes/rescan", { method: "POST" }, 200],
+  ];
+  for (const [path, init, adopterStatus] of routes) {
+    const asPreviousOwner = await machineRequestAs(app, server.id, machine.id, previousOwner.email, path, init);
+    assert.equal(asPreviousOwner.status, 403, `${init.method ?? "GET"} ${path || "/"}: the previous machine-row owner is refused`);
+    const asAdopter = await machineRequestAs(app, server.id, machine.id, adopter.email, path, init);
+    assert.equal(asAdopter.status, adopterStatus, `${init.method ?? "GET"} ${path || "/"}: ${await asAdopter.text()}`);
+  }
+  assert.equal(rescans, 1, "only the adopter's rescan reaches the Computer");
+  const [row] = await getDb().select({ description: machines.description }).from(machines).where(eq(machines.id, machine.id));
+  assert.equal(row.description, "adopted");
+});
+
+test("revoke-computer-key, notify-agent-owners and DELETE machine — after an adoption the adopter may and the previous machine-row owner may not", async ({ app }) => {
+  const { member: adopter, previousOwner, server, machine } = await seedAdoptedComputer("machine-remove-adopted", "adopter");
+  app.app.set("agentOrchestrator", { hasMachineLocally: () => true, evictCache: () => {}, deliverMessagesOnChannel: async () => {} });
+  const [previousOwnersAgent] = await getDb().insert(agents).values({
+    serverId: server.id, name: "previous-owners-agent", runtime: "codex", machineId: machine.id, status: "active",
+    creatorType: "user", creatorId: previousOwner.id,
+  }).returning();
+
+  const revokeAsPreviousOwner = await machineRequestAs(app, server.id, machine.id, previousOwner.email, "/revoke-computer-key", { method: "POST", body: {} });
+  assert.equal(revokeAsPreviousOwner.status, 403);
+  const notifyAsPreviousOwner = await machineRequestAs(app, server.id, machine.id, previousOwner.email, "/notify-agent-owners", { method: "POST", body: { agentIds: [previousOwnersAgent.id] } });
+  assert.equal(notifyAsPreviousOwner.status, 403);
+  const deleteAsPreviousOwner = await machineRequestAs(app, server.id, machine.id, previousOwner.email, "", { method: "DELETE" });
+  assert.equal(deleteAsPreviousOwner.status, 403);
+  const [live] = await getDb().select({ revokedAt: computers.revokedAt }).from(computers).where(eq(computers.machineId, machine.id));
+  assert.equal(live.revokedAt, null, "the previous machine-row owner did not cut the adopter's Computer off");
+
+  // The adopter is the person it is attached by: held to other people's agents like any attacher.
+  const revokeAsAdopter = await machineRequestAs(app, server.id, machine.id, adopter.email, "/revoke-computer-key", { method: "POST", body: {} });
+  assert.equal(revokeAsAdopter.status, 409, await revokeAsAdopter.clone().text());
+  const refused = await revokeAsAdopter.json() as { code: string; agents: Array<{ id: string }> };
+  assert.equal(refused.code, "others_agents_on_computer");
+  assert.deepEqual(refused.agents.map((agent) => agent.id), [previousOwnersAgent.id]);
+  const notifyAsAdopter = await machineRequestAs(app, server.id, machine.id, adopter.email, "/notify-agent-owners", { method: "POST", body: { agentIds: [previousOwnersAgent.id] } });
+  assert.equal(notifyAsAdopter.status, 200, await notifyAsAdopter.clone().text());
+  const forcedAsAdopter = await machineRequestAs(app, server.id, machine.id, adopter.email, "/revoke-computer-key", { method: "POST", body: { forceAgentIds: [previousOwnersAgent.id] } });
+  assert.equal(forcedAsAdopter.status, 200, await forcedAsAdopter.clone().text());
+  assert.deepEqual((await forcedAsAdopter.json()).unboundAgentIds, [previousOwnersAgent.id]);
+
+  // The dialog's path (DeleteComputerDialog): revoke, then DELETE. The revoked attach record still names the adopter,
+  // so the previous machine-row owner gets nothing back and the adopter finishes the removal.
+  app.app.set("agentOrchestrator", { hasMachineLocally: () => true, scanMachineWorkspaces: async () => [], disconnectMachineForUnlink: async () => {} });
+  const afterRevoke: Array<[string, { method?: string; body?: unknown }]> = [
+    ["", { method: "PATCH", body: { description: "previous owner" } }],
+    ["/workspaces", {}],
+    ["/revoke-computer-key", { method: "POST", body: {} }],
+    ["", { method: "DELETE" }],
+  ];
+  for (const [path, init] of afterRevoke) {
+    const res = await machineRequestAs(app, server.id, machine.id, previousOwner.email, path, init);
+    assert.equal(res.status, 403, `${init.method ?? "GET"} ${path || "/"} after the revoke: the previous machine-row owner is refused`);
+  }
+  const deleteAsAdopterAfterRevoke = await machineRequestAs(app, server.id, machine.id, adopter.email, "", { method: "DELETE" });
+  assert.equal(deleteAsAdopterAfterRevoke.status, 200, await deleteAsAdopterAfterRevoke.clone().text());
+  assert.equal((await getDb().select({ id: machines.id }).from(machines).where(eq(machines.id, machine.id))).length, 0);
+});
+
+test("DeleteComputerDialog path — a member who adopted revokes, then deletes the Computer", async ({ app }) => {
+  const { member: adopter, previousOwner, server, machine } = await seedAdoptedComputer("machine-dialog-adopted", "adopter");
+  app.app.set("agentOrchestrator", { hasMachineLocally: () => true, evictCache: () => {}, disconnectMachineForUnlink: async () => {} });
+  const revoke = await machineRequestAs(app, server.id, machine.id, adopter.email, "/revoke-computer-key", { method: "POST", body: {} });
+  assert.equal(revoke.status, 200, await revoke.clone().text());
+  const asPreviousOwner = await machineRequestAs(app, server.id, machine.id, previousOwner.email, "", { method: "DELETE" });
+  assert.equal(asPreviousOwner.status, 403, "the previous machine-row owner regains nothing once the key is revoked");
+  const asAdopter = await machineRequestAs(app, server.id, machine.id, adopter.email, "", { method: "DELETE" });
+  assert.equal(asAdopter.status, 200, await asAdopter.clone().text());
+  assert.equal((await getDb().select({ id: machines.id }).from(machines).where(eq(machines.id, machine.id))).length, 0);
+});
+
+test("feedback transcript includeMachineLogTail — after an adoption only the adopter may attach the machine's log tail", async ({ app }) => {
+  const { member: adopter, previousOwner, server, machine } = await seedAdoptedComputer("log-tail-adopted", "adopter");
+  const collected: Array<{ agentId: string; includeMachineLogTail: boolean }> = [];
+  app.app.set("agentOrchestrator", {
+    hasMachineLocally: () => true,
+    collectFeedbackTranscript: async (agentId: string, _reportId: string, _window: unknown, options: { includeMachineLogTail: boolean }) => {
+      collected.push({ agentId, includeMachineLogTail: options.includeMachineLogTail });
+      return { reachable: true };
+    },
+  });
+  // Each may inspect their own agent (its creator), so only the log tail rule tells them apart.
+  const [previousOwnersAgent] = await getDb().insert(agents).values({
+    serverId: server.id, name: "previous-owners-agent", runtime: "codex", machineId: machine.id, status: "active",
+    creatorType: "user", creatorId: previousOwner.id,
+  }).returning();
+  const [adoptersAgent] = await getDb().insert(agents).values({
+    serverId: server.id, name: "adopters-agent", runtime: "codex", machineId: machine.id, status: "active",
+    creatorType: "user", creatorId: adopter.id,
+  }).returning();
+  const feedback = (email: string, agentId: string) => machineRequestAs(
+    app, server.id, machine.id, email, `/agents/${agentId}/feedback/${randomUUID()}/transcript`,
+    { method: "POST", body: { includeMachineLogTail: true } },
+  );
+
+  const asPreviousOwner = await feedback(previousOwner.email, previousOwnersAgent.id);
+  assert.equal(asPreviousOwner.status, 403, await asPreviousOwner.clone().text());
+  assert.equal((await asPreviousOwner.json()).code, "machine_log_tail_owner_required");
+  const asAdopter = await feedback(adopter.email, adoptersAgent.id);
+  assert.equal(asAdopter.status, 202, await asAdopter.clone().text());
+  assert.deepEqual(collected, [{ agentId: adoptersAgent.id, includeMachineLogTail: true }]);
+});
+
+async function controlledByCurrentUserAs(app: { baseUrl: string }, serverId: string, email: string) {
+  const res = await fetch(`${app.baseUrl}/api/servers/${serverId}/machines`, {
+    headers: { Authorization: `Bearer ${await tokenForHuman(email)}`, "X-Server-Id": serverId },
+  });
+  assert.equal(res.status, 200, await res.clone().text());
+  const body = (await res.json()) as { machines: Array<{ id: string; controlledByCurrentUser?: boolean }> };
+  return new Map(body.machines.map((machine) => [machine.id, machine.controlledByCurrentUser]));
+}
+
+test("GET /machines controlledByCurrentUser — follows the controller the routes use, through an adoption and a revoke", async ({ app }) => {
+  const { member: adopter, previousOwner, server, machine } = await seedAdoptedComputer("machine-list-controller", "adopter");
+  const [rawDaemon] = await getDb().insert(machines).values({
+    serverId: server.id, userId: previousOwner.id, name: "raw-daemon", apiKeyHash: "unused-machine-list-controller-raw",
+  }).returning();
+
+  const expectFlags = async (when: string) => {
+    const asAdopter = await controlledByCurrentUserAs(app, server.id, adopter.email);
+    const asPreviousOwner = await controlledByCurrentUserAs(app, server.id, previousOwner.email);
+    assert.equal(asAdopter.get(machine.id), true, `${when}: the adopter controls the adopted machine`);
+    assert.equal(asPreviousOwner.get(machine.id), false, `${when}: the previous machine-row owner does not`);
+    assert.equal(asPreviousOwner.get(rawDaemon.id), true, `${when}: a never-attached machine follows machines.userId`);
+    assert.equal(asAdopter.get(rawDaemon.id), false, `${when}: nobody else controls the never-attached machine`);
+  };
+  await expectFlags("attached");
+  await getDb().update(computers).set({ revokedAt: new Date() }).where(eq(computers.machineId, machine.id));
+  await expectFlags("after the revoke");
+});
+
+test("computerControllerAttachers — one query for the whole server, the same controller computerControllerUserId names", async ({ db: _db }) => {
+  const { member: adopter, previousOwner, server, machine: adopted } = await seedAdoptedComputer("controller-attachers", "adopter");
+  const insertMachine = async (name: string) => (await getDb().insert(machines).values({
+    serverId: server.id, userId: previousOwner.id, name, apiKeyHash: `unused-controller-attachers-${name}`,
+  }).returning())[0];
+  const computerRow = (machineId: string, name: string, attachedByUserId: string | null, revokedAt: Date | null, createdAt: Date) => ({
+    serverId: server.id, machineId, name, apiKeyHash: `unused-controller-attachers-${name}`, apiKeyPrefix: "sk_computer_test",
+    attachedByUserId, revokedAt, createdAt,
+  });
+  // Revoked by the adopter, then reattached live by no one: the live record wins, and naming no one falls back to the row owner.
+  const liveUnattributed = await insertMachine("live-unattributed");
+  // Two revoked records: the most recent one wins.
+  const revokedTwice = await insertMachine("revoked-twice");
+  const rawDaemon = await insertMachine("raw-daemon");
+  await getDb().insert(computers).values([
+    computerRow(liveUnattributed.id, "live-unattributed-old", adopter.id, new Date(2_000), new Date(1_000)),
+    computerRow(liveUnattributed.id, "live-unattributed-new", null, null, new Date(500)),
+    computerRow(revokedTwice.id, "revoked-twice-old", previousOwner.id, new Date(2_000), new Date(1_000)),
+    computerRow(revokedTwice.id, "revoked-twice-new", adopter.id, new Date(4_000), new Date(3_000)),
+  ]);
+
+  const pg = (getDb() as unknown as { $client: { query: (...args: unknown[]) => Promise<unknown> } }).$client;
+  const originalQuery = pg.query.bind(pg);
+  let queries = 0;
+  pg.query = (...args: unknown[]) => {
+    queries += 1;
+    return originalQuery(...args);
+  };
+  let attachers: Map<string, string | null>;
+  try {
+    attachers = await computerControllerAttachers(getDb(), server.id);
+  } finally {
+    pg.query = originalQuery;
+  }
+  assert.equal(queries, 1);
+
+  for (const machine of [adopted, liveUnattributed, revokedTwice, rawDaemon]) {
+    const expected = await computerControllerUserId(getDb(), server.id, machine);
+    assert.equal(attachers.get(machine.id) ?? machine.userId, expected, machine.name);
+  }
+  assert.equal(attachers.get(adopted.id), adopter.id);
+  assert.equal(attachers.get(liveUnattributed.id), null);
+  assert.equal(attachers.get(revokedTwice.id), adopter.id);
+  assert.equal(attachers.has(rawDaemon.id), false);
+});
+
+test("DELETE machine — after an adoption the adopter removes the Computer", async ({ app }) => {
+  const { member: adopter, previousOwner, server, machine } = await seedAdoptedComputer("machine-delete-adopted", "adopter");
+  app.app.set("agentOrchestrator", { hasMachineLocally: () => true, disconnectMachineForUnlink: async () => {} });
+  const asPreviousOwner = await machineRequestAs(app, server.id, machine.id, previousOwner.email, "", { method: "DELETE" });
+  assert.equal(asPreviousOwner.status, 403);
+  const asAdopter = await machineRequestAs(app, server.id, machine.id, adopter.email, "", { method: "DELETE" });
+  assert.equal(asAdopter.status, 200, await asAdopter.clone().text());
+  const rows = await getDb().select({ id: machines.id }).from(machines).where(eq(machines.id, machine.id));
+  assert.equal(rows.length, 0);
+});
+
+async function machineAuditEvents(serverId: string, eventType: string) {
+  return getDb().select({ actorId: integrationAuditEvents.actorId, requesterId: integrationAuditEvents.requesterId })
+    .from(integrationAuditEvents)
+    .where(and(eq(integrationAuditEvents.serverId, serverId), eq(integrationAuditEvents.eventType, eventType)));
+}
+
+test("machine removal audit — after an adoption the adopter revokes and deletes: both events name the adopter, not the previous machine-row owner", async ({ app }) => {
+  const { member: adopter, server, machine } = await seedAdoptedComputer("machine-audit-adopted", "adopter");
+  app.app.set("agentOrchestrator", { hasMachineLocally: () => true, evictCache: () => {}, disconnectMachineForUnlink: async () => {} });
+  // A Computer's machine key is never rotated (409, nothing audited): the adopter's only key action is the revoke.
+  const rotate = await machineRequestAs(app, server.id, machine.id, adopter.email, "/rotate-key", { method: "POST" });
+  assert.equal(rotate.status, 409, await rotate.clone().text());
+  assert.equal((await rotate.json()).code, "computer_key_rotation_unsupported");
+  assert.deepEqual(await machineAuditEvents(server.id, "computer.key_rotated"), []);
+
+  const revoke = await machineRequestAs(app, server.id, machine.id, adopter.email, "/revoke-computer-key", { method: "POST", body: {} });
+  assert.equal(revoke.status, 200, await revoke.clone().text());
+  const remove = await machineRequestAs(app, server.id, machine.id, adopter.email, "", { method: "DELETE" });
+  assert.equal(remove.status, 200, await remove.clone().text());
+
+  assert.deepEqual(await machineAuditEvents(server.id, "computer.key_revoked"), [{ actorId: adopter.id, requesterId: adopter.id }]);
+  assert.deepEqual(await machineAuditEvents(server.id, "computer.removed"), [{ actorId: adopter.id, requesterId: adopter.id }]);
+});
+
+test("machine removal audit — an admin deletes an adopted Computer: the admin is the actor, the adopter the requester", async ({ app }) => {
+  const { admin, member: adopter, server, machine } = await seedAdoptedComputer("machine-audit-admin", "adopter");
+  app.app.set("agentOrchestrator", { hasMachineLocally: () => true, disconnectMachineForUnlink: async () => {} });
+  const remove = await machineRequestAs(app, server.id, machine.id, admin.email, "", { method: "DELETE" });
+  assert.equal(remove.status, 200, await remove.clone().text());
+  assert.deepEqual(await machineAuditEvents(server.id, "computer.removed"), [{ actorId: admin.id, requesterId: adopter.id }]);
+});
+
 test("POST /computer/:action — unknown action is rejected (400 unknown_action)", async ({ app }) => {
     const { owner, server } = await seedRoleFixture("computer-control-bad-action");
     const [machine] = await getDb().insert(machines).values({
@@ -6862,25 +7191,17 @@ test("an email invite carries the member role, and Guest is refused rather than 
   assert.equal(bogus.status, 400, "admin/owner must not be reachable by email invite");
   assert.deepEqual(await bogus.json(), { error: "role must be one of: member, guest" });
 
-  // A Guest is invited to a channel, not to the server (#wg-rbac:#15), with the
-  // old server_guest_v0 gate off or on. The inviter must not receive a member
-  // invite after asking for a Guest one: that would hand out more access than
-  // they chose, silently. So assert the absence of the row, not just the shape
-  // of the response (raised by @Ark, #proj-frontend).
-  for (const gateOn of [false, true]) {
-    if (gateOn) {
-      await db.insert(featureFlagRules).values({
-        id: randomUUID(), flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [server.id],
-      });
-    }
-    const guestEmail = `invite-guest-${gateOn ? "on" : "off"}-${randomUUID()}@slock.test`;
-    const refused = await invite(guestEmail, { role: "guest" });
-    assert.equal(refused.status, 400, `gate ${gateOn ? "on" : "off"}`);
-    assert.deepEqual(await refused.json(), { error: "Guests are invited to one channel, not to the server" });
-    const leaked = await db.select({ id: serverInvites.id }).from(serverInvites)
-      .where(eq(serverInvites.invitedEmail, guestEmail));
-    assert.equal(leaked.length, 0, "a refused Guest invite must not leave an invite row behind");
-  }
+  // A Guest is invited to a channel, not to the server (#wg-rbac:#15). The
+  // inviter must not receive a member invite after asking for a Guest one: that
+  // would hand out more access than they chose, silently. So assert the absence
+  // of the row, not just the shape of the response (raised by @Ark, #proj-frontend).
+  const guestEmail = `invite-guest-${randomUUID()}@slock.test`;
+  const refused = await invite(guestEmail, { role: "guest" });
+  assert.equal(refused.status, 400);
+  assert.deepEqual(await refused.json(), { error: "Guests are invited to one channel, not to the server" });
+  const leaked = await db.select({ id: serverInvites.id }).from(serverInvites)
+    .where(eq(serverInvites.invitedEmail, guestEmail));
+  assert.equal(leaked.length, 0, "a refused Guest invite must not leave an invite row behind");
 });
 
 test("an upgrade lifecycle operation resolves its target from Hands with no upgrade flag set", async ({ app }) => {

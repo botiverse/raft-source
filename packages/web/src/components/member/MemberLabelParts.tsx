@@ -116,16 +116,17 @@ export function ExternalOriginRibbon({ origin }: { origin: MemberOrigin }) {
  * top-right corner. It lies over the corner and takes no row of its own: the
  * card's header starts at its usual padding. Its nearest positioned ancestor
  * must be the card. Neutral grey: cyan means "from another server" here.
- * Put a RoleCornerTagSpacer at the end of the card's name line.
+ * Put a RoleCornerTagSpacer at the end of the card's name line. A span (laid
+ * out as a flex box), so it may sit inside a button (the Members page's tiles).
  */
 export function RoleCornerTag({ label }: { label: string }) {
   return (
-    <div
+    <span
       data-testid="profile-card-role-tag"
       className="absolute top-0 right-0 flex h-6 items-center rounded-bl-[10px] bg-fill-medium pr-3 pl-2.5 text-caption font-medium text-foreground"
     >
       {label}
-    </div>
+    </span>
   );
 }
 

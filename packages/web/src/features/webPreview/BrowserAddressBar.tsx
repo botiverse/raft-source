@@ -2,26 +2,35 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, FormEvent, KeyboardEvent } from "react";
 import { useIntl } from "react-intl";
 import { ArrowLeft, ArrowRight, ArrowUpRight, RefreshCw } from "lucide-react";
-import { Badge, InputGroup, InputGroupInput, PanelAction } from "@botiverse/raft-ui";
+import { Badge, Button, InputGroup, InputGroupAddon, InputGroupInput, PanelAction } from "@botiverse/raft-ui";
 import type { DesktopWebPreviewTabsBridge } from "@botiverse/raft-shared";
 
 import Tooltip from "../../components/ui/Tooltip";
 import { useRaftPermalinkHostnames } from "../../store/raftAppHosts";
+import { BrowserSiteSettings } from "./BrowserSiteSettings";
 import { useBrowserTabsStore } from "./browserTabsStore";
 import type { BrowserTab } from "./browserTabsStore";
 import { typedWebAddress, webPreviewUrl } from "./webPreviewAddress";
 import { openWebPreviewInNewTab, webPreviewTarget } from "./webPreviewStore";
 
 /**
- * The built-in browser's address row, for the tab in front: Back, Forward,
- * Reload, the address, Open in browser (the system browser).
+ * The built-in browser's address row, for the tab in front. Its anatomy:
+ * [Back][Forward][Reload] [field: (Site settings) (Not secure) address (Open in browser)].
+ * What moves through the tab's history stands before the field; what acts on
+ * the address shown stands inside it, at its trailing edge; nothing follows
+ * the field.
+ *
+ * The site settings (BrowserSiteSettings: the microphone and the camera of a
+ * secure site, and the indicator while the page uses one) lead the field, where
+ * Chrome keeps them and where sites tell people to look.
  *
  * The address reads as before (host bold, the rest muted; a plain-http page
  * marked Not secure). Pressing it, or an empty tab, turns it into a field:
  * Enter loads what was typed in this tab (typedWebAddress; only what the
  * view may show: http(s), not Raft's own hosts, no credentials), Escape or
  * leaving the field puts the address back. Mounted per tab (keyed by the
- * panel), so an empty tab opens with the field focused.
+ * panel), so an empty tab opens with the field focused. The address field's
+ * key pressed in the page (Cmd/Ctrl+L) does the same as pressing the address.
  */
 export function BrowserAddressBar({ bridge, conversationId, tab }: { bridge: DesktopWebPreviewTabsBridge; conversationId: string; tab: BrowserTab }) {
   const { formatMessage } = useIntl();
@@ -32,13 +41,24 @@ export function BrowserAddressBar({ bridge, conversationId, tab }: { bridge: Des
   const [text, setText] = useState("");
   const [invalid, setInvalid] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  // The address field's key, pressed in the tab's page (the shell's shortcut table; it gave this page the keyboard
+  // first): the address becomes the field, as if pressed.
+  const addressFocus = useBrowserTabsStore((s) => s.addressFocus[conversationId] ?? 0);
+  const [addressFocusSeen, setAddressFocusSeen] = useState(addressFocus);
+  if (addressFocusSeen !== addressFocus) {
+    setAddressFocusSeen(addressFocus);
+    setText(tab.url ?? "");
+    setInvalid(false);
+    setEditing(true);
+  }
   const field = empty || editing;
-  // An empty tab starts in its address field; a pressed address takes the focus as it becomes one.
+  // An empty tab starts in its address field; a pressed address takes the focus as it becomes one, and a field
+  // already there takes it again at the address field's key.
   useEffect(() => {
     if (!field) return;
     inputRef.current?.focus();
     inputRef.current?.select();
-  }, [field]);
+  }, [field, addressFocus]);
   const { host, rest } = useMemo(() => {
     const parsed = webPreviewUrl(tab.url);
     if (!parsed) return { host: tab.url ?? "", rest: "" };
@@ -131,6 +151,11 @@ export function BrowserAddressBar({ bridge, conversationId, tab }: { bridge: Des
             />
           ) : (
             <>
+              {tab.site ? (
+                <InputGroupAddon align="inline-start">
+                  <BrowserSiteSettings bridge={bridge} tab={tab} />
+                </InputGroupAddon>
+              ) : null}
               {tab.url?.startsWith("http:") ? (
                 <Badge appearance="soft" variant="warning" className="ml-2 shrink-0 self-center" data-testid="web-preview-not-secure">
                   {formatMessage({ id: "webPreview.notSecure" })}
@@ -152,13 +177,16 @@ export function BrowserAddressBar({ bridge, conversationId, tab }: { bridge: Des
               </div>
             </>
           )}
+          {/* What acts on this address lives in the field, at its trailing edge (the address never runs under it). */}
+          <InputGroupAddon align="inline-end">
+            <Tooltip content={openLabel}>
+              <Button type="button" size="icon-md" variant="ghost" aria-label={openLabel} onClick={openInBrowser} disabled={empty} data-testid="web-preview-open-tab">
+                <ArrowUpRight />
+              </Button>
+            </Tooltip>
+          </InputGroupAddon>
         </InputGroup>
       </form>
-      <Tooltip content={openLabel}>
-        <PanelAction aria-label={openLabel} onClick={openInBrowser} disabled={empty} data-testid="web-preview-open-tab">
-          <ArrowUpRight />
-        </PanelAction>
-      </Tooltip>
     </div>
   );
 }

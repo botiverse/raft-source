@@ -18,9 +18,12 @@ import {
   type ActivityTurnTokenCountField,
   type ActivityTurnTokens,
   type AgentUsageResponse,
+  compareComputerVersions,
+  isComputerSemver,
+  runtimeReportsTurnTokens,
 } from "@botiverse/raft-shared";
 import { getDb, type DatabaseExecutor } from "../db/index";
-import { agentUsageContext, agentUsageDaily } from "../db/schema";
+import { agents, agentUsageContext, agentUsageDaily, machines } from "../db/schema";
 
 export interface TurnTokensState {
   tokens?: ActivityTurnTokens;
@@ -52,6 +55,26 @@ const SQL_COLUMN: Record<ActivityTurnTokenCountField, string> = {
   output: "output",
   reasoningOutput: "reasoning_output",
 };
+
+/**
+ * Oldest Computer that sends each turn's token counts on its Activity summary
+ * (#14578, first shipped in Computer 1.25.0). Older Computers never report
+ * usage, so the panel tells "too old to report" apart from "has not run".
+ */
+export const AGENT_USAGE_MIN_COMPUTER_VERSION = "1.25.0";
+
+/**
+ * Whether a Computer of this version reports token usage. Compares the
+ * release (major.minor.patch) only, like the version floor, so a prerelease or
+ * staging build of 1.25.0 (1.25.0-rc.1) counts as reporting. Unknown or
+ * non-SemVer versions do not.
+ */
+export function computerReportsUsage(computerVersion: string | null | undefined): boolean {
+  const trimmed = computerVersion?.trim() ?? "";
+  if (!trimmed || !isComputerSemver(trimmed)) return false;
+  const release = (value: string) => value.split("+", 1)[0]!.split("-", 1)[0]!;
+  return compareComputerVersions(release(trimmed), AGENT_USAGE_MIN_COMPUTER_VERSION) >= 0;
+}
 
 /** UTC date (YYYY-MM-DD) of an epoch-ms time. */
 export function utcDay(epochMs: number): string {
@@ -194,9 +217,22 @@ export async function readAgentUsage(input: {
     .where(and(eq(agentUsageDaily.serverId, input.serverId), inArray(agentUsageDaily.agentId, ids)))
     .groupBy(agentUsageDaily.agentId);
   const sinceByAgent = new Map(firstDays.map((row) => [row.agentId, row.since]));
+  const agentRows = await db.select({ agentId: agents.id, runtime: agents.runtime, machineId: machines.id, computerVersion: machines.computerVersion })
+    .from(agents)
+    .leftJoin(machines, eq(machines.id, agents.machineId))
+    .where(and(eq(agents.serverId, input.serverId), inArray(agents.id, ids)));
+  const computerVersionByAgent = new Map(agentRows.filter((row) => row.machineId !== null).map((row) => [row.agentId, row.computerVersion]));
+  const runtimeByAgent = new Map(agentRows.map((row) => [row.agentId, row.runtime]));
   base.agents = ids.map((id) => {
     const since = sinceByAgent.get(id) ?? null;
-    return { agent_id: id, since, usage_reported: since !== null };
+    return {
+      agent_id: id,
+      since,
+      usage_reported: since !== null,
+      // null: no Computer at all (hosted assistant, external agent), so "too old" does not apply.
+      computer_reports_usage: computerVersionByAgent.has(id) ? computerReportsUsage(computerVersionByAgent.get(id)) : null,
+      runtime_reports_usage: runtimeReportsTurnTokens(runtimeByAgent.get(id)),
+    };
   });
 
   const rows = await db.select({

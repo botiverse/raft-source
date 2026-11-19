@@ -20,7 +20,7 @@
 // server-mode answer.
 //
 // Fixture: __fixtures__/oauthServerModeFrozen.json
-// sha256:  6a6fe140f487dd53f7fafc6dade1f3e07e2db52aa36a77fba5084a4e8a2d9af6
+// sha256:  2bfe0d1f3aba4244b846280dfeed7e08b2a95a187610a384946b30ebbe657b87
 // From phase 3a PR 1 on, a PR that changes the fixture is blocked (review
 // rule; the last test pins the sha256 above, so the change shows here too).
 //

@@ -98,6 +98,61 @@ export function artifactSplashPhase(startedAt: number, now: number): number {
   return ((elapsed % ARTIFACT_SPLASH_CYCLE_MS) + ARTIFACT_SPLASH_CYCLE_MS) % ARTIFACT_SPLASH_CYCLE_MS;
 }
 
+/**
+ * How long until the cycle running at `now` ends (ms; 0 on a boundary, or before the splash appears): where a new
+ * icon may take over (Kirby, #proj-workspace:#302). The icon drawn while the kind was unknown (`doc`) is never
+ * swapped mid-assembly for the kind's: it finishes its cycle and the next one draws the new icon, so the change
+ * reads as the next picture, not a flicker. The native App follows the same rule.
+ */
+export function artifactSplashUntilNextCycle(startedAt: number, now: number): number {
+  if (now - startedAt < ARTIFACT_SPLASH_APPEAR_AFTER_MS) return 0;
+  const phase = artifactSplashPhase(startedAt, now);
+  return phase === 0 ? 0 : ARTIFACT_SPLASH_CYCLE_MS - phase;
+}
+
+/**
+ * The icon each opening (by its start) shows now, so the part that takes over from another (the link's
+ * screen, then the page's; stage 0, then 1) keeps it until the cycle ends rather than restarting on its own.
+ * Only the latest few openings are kept.
+ */
+const shownIcons = new Map<number, ArtifactSplashIcon>();
+const SHOWN_ICONS_KEPT = 8;
+
+function rememberShownIcon(startedAt: number, icon: ArtifactSplashIcon): void {
+  shownIcons.delete(startedAt);
+  shownIcons.set(startedAt, icon);
+  while (shownIcons.size > SHOWN_ICONS_KEPT) shownIcons.delete(shownIcons.keys().next().value as number);
+}
+
+/**
+ * The icon to draw for `wanted`: while the icon `moving` (looping, on screen), a change waits for the cycle's end
+ * (artifactSplashUntilNextCycle); otherwise (still, reduced motion, the ending, not yet appeared) it is at once.
+ */
+export function useArtifactSplashShownIcon(wanted: ArtifactSplashIcon, startedAt: number, moving: boolean): ArtifactSplashIcon {
+  const [shown, setShown] = useState<ArtifactSplashIcon>(() => {
+    const held = shownIcons.get(startedAt);
+    return moving && held !== undefined && artifactSplashUntilNextCycle(startedAt, currentTimeMs()) > 0 ? held : wanted;
+  });
+  useEffect(() => {
+    // Only a looping icon is handed on; one that stopped (its ending, still) is the opening's last word.
+    if (!moving) {
+      shownIcons.delete(startedAt);
+      return;
+    }
+    rememberShownIcon(startedAt, shown);
+    if (shown === wanted) return;
+    const wait = artifactSplashUntilNextCycle(startedAt, currentTimeMs());
+    if (wait === 0) {
+      setShown(wanted);
+      return;
+    }
+    const timer = window.setTimeout(() => setShown(wanted), wait);
+    return () => window.clearTimeout(timer);
+  }, [moving, shown, startedAt, wanted]);
+  // Not moving: the wanted icon at once, in this very render (an ending never settles the old one first).
+  return moving ? shown : wanted;
+}
+
 export function artifactSplashLitAt(cell: SplashCell, phaseMs: number): boolean {
   const at = phaseMs / ARTIFACT_SPLASH_CYCLE_MS;
   return at >= cell.on && at < cell.off;

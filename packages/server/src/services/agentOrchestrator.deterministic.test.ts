@@ -87,7 +87,8 @@ import {
   type ComputerSourceFact,
   type EvaluateComputerBroadcastPolicyInput,
 } from "./computerBroadcastPolicyService";
-import { computerUpgradeRequestDeadlineMs, createComputerUpgradeRequest, getOpenComputerUpgradeRequest, projectComputerUpgradeRequest, UPGRADE_REQUEST_DEADLINE_MS } from "./computerUpgradeRequestService";
+import { computerUpgradeRequestDeadlineMs, createComputerUpgradeRequest, getOpenComputerUpgradeRequest, projectComputerUpgradeRequest, settleRefusedComputerUpgradeRequest, UPGRADE_AUTO_RETRY_DELAY_MS, UPGRADE_REQUEST_DEADLINE_MS, type ComputerUpgradeAutoRetryOutcome, type ComputerUpgradeRequestRow } from "./computerUpgradeRequestService";
+import { computerUpgradeRequests } from "../db/schema";
 import { ComputerVersionFloor } from "./computerVersionFloorService";
 import { randomUUID } from "node:crypto";
 import { agentDeliveryAckSeconds, agentDeliveryOutcomesTotal, agentDeliveryPending, agentDeliveryTrackedTotal } from "../metrics";
@@ -10535,12 +10536,102 @@ test("step 13: computer:upgrade:draining is kept on the connection and pushed as
   // PR 4: the web follows the request's own (drain-stretched) deadline.
   assert.equal(pushed().at(-1)?.deadlineAt, row.deadlineAt.toISOString(), "the projection carries the stretched deadline");
 
+  assert.equal((await getOpenComputerUpgradeRequest(machineId))?.reason, null, "a drain in progress marks nothing");
+
   await orchestrator.handleMachineMessage(machineId, { type: "computer:upgrade:draining", requestId: row.id, deadlineAt, live: 2, notQuietAgentIds: [], finished: "quiet" } as MachineToServerMessage);
   assert.deepEqual([pushed().at(-1)?.phase, pushed().at(-1)?.drainingAgentIds], ["installing", []]);
+  // The next `ready` comes on a new connection: the finished drain is kept on the row (c85f4355).
+  assert.equal((await getOpenComputerUpgradeRequest(machineId))?.reason, "drain_finished");
 
   // A settled request carries no phase.
   const projected = projectComputerUpgradeRequest({ ...row, outcome: "done" }, orchestrator.getComputerUpgradeDrain(machineId));
   assert.equal(projected.phase, undefined);
+  orchestrator.shutdown();
+});
+
+test("step 13: after the drain finished, a ready on the old version with no receipt records no_result_recorded and keeps the request open (c85f4355)", async ({ db }) => {
+  const [user] = await db.insert(users).values({ email: "upgrade-no-result@example.com", name: "upgrade-no-result", passwordHash: "test" }).returning();
+  const server = await createServer("upgrade-no-result", "upgrade-no-result", user!.id);
+  const machineId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  const { row } = await createComputerUpgradeRequest({ serverId: server.id, machineId, targetVersion: "1.0.69", requestedByUserId: user!.id, deadlineMs: computerUpgradeRequestDeadlineMs(600_000) });
+  const orchestrator = new ReadyReconcileDeterministicOrchestrator();
+  const captured: Array<{ room: string; event: string; payload: unknown }> = [];
+  (orchestrator as unknown as { io: ReturnType<typeof makeFakeServerIO> }).io = makeFakeServerIO(captured);
+  seedMachineConnection(orchestrator, machineId, makeFakeWs(), "1.0.0", [DAEMON_CAPABILITY_COMPUTER_UPGRADE_DRAIN_V1]);
+  const events: Array<[string, Record<string, unknown>]> = [];
+  const recordEvent = (orchestrator as any).recordEvent.bind(orchestrator);
+  (orchestrator as any).recordEvent = (name: string, attrs: Record<string, unknown> = {}) => {
+    events.push([name, attrs]);
+    return recordEvent(name, attrs);
+  };
+  await orchestrator.handleMachineMessage(machineId, { type: "computer:upgrade:draining", requestId: row.id, deadlineAt: "2026-11-08T10:10:00.000Z", live: 0, notQuietAgentIds: [], finished: "quiet" } as MachineToServerMessage);
+  const pushesBefore = captured.filter((e) => e.event === "machine:upgrade-request").length;
+
+  await orchestrator.handleMachineMessage(machineId, {
+    type: "ready",
+    capabilities: [DAEMON_CAPABILITY_COMPUTER_UPGRADE_DRAIN_V1],
+    runtimes: [],
+    daemonVersion: "1.0.68",
+    computerVersion: "1.0.68",
+    runningAgents: [],
+  } as MachineToServerMessage);
+
+  const open = await getOpenComputerUpgradeRequest(machineId);
+  assert.equal(open?.id, row.id, "still open");
+  assert.equal(open?.reason, "installer_left_no_result: Raft Computer came back on 1.0.68 without a result from the installer.");
+  assert.deepEqual(
+    events.filter(([name]) => name.startsWith("server.computer.upgrade_request.") && name !== "server.computer.upgrade_request.draining").map(([name, attrs]) => [name, attrs.outcome, attrs.via, attrs.reason_code]),
+    [["server.computer.upgrade_request.no_result_recorded", "", "ready", "installer_left_no_result"]],
+  );
+  assert.equal(captured.filter((e) => e.event === "machine:upgrade-request").length, pushesBefore, "the web keeps showing it in progress");
+  orchestrator.shutdown();
+});
+
+test("step 13: a drain let go (`ended`) does not mark the request: the upgrade did not go on", async ({ db }) => {
+  const [user] = await db.insert(users).values({ email: "upgrade-drain-ended@example.com", name: "upgrade-drain-ended", passwordHash: "test" }).returning();
+  const server = await createServer("upgrade-drain-ended", "upgrade-drain-ended", user!.id);
+  const machineId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  const { row } = await createComputerUpgradeRequest({ serverId: server.id, machineId, targetVersion: "1.0.99", requestedByUserId: user!.id, deadlineMs: computerUpgradeRequestDeadlineMs(600_000) });
+  const orchestrator = new ReadyReconcileDeterministicOrchestrator();
+  (orchestrator as unknown as { io: ReturnType<typeof makeFakeServerIO> }).io = makeFakeServerIO([]);
+  seedMachineConnection(orchestrator, machineId, makeFakeWs(), "1.0.0", [DAEMON_CAPABILITY_COMPUTER_UPGRADE_DRAIN_V1]);
+  await orchestrator.handleMachineMessage(machineId, { type: "computer:upgrade:draining", requestId: row.id, deadlineAt: "2026-11-08T10:10:00.000Z", live: 1, notQuietAgentIds: [], finished: "ended" } as MachineToServerMessage);
+  assert.equal((await getOpenComputerUpgradeRequest(machineId))?.reason, null);
+  orchestrator.shutdown();
+});
+
+test("upgrade auto-retry sweep: claims only Computers with a live connection, and one failing row is recorded failed_internal without stopping the others", async ({ db }) => {
+  const [user] = await db.insert(users).values({ email: "auto-retry-sweep@example.com", name: "auto-retry-sweep", passwordHash: "test" }).returning();
+  const server = await createServer("auto-retry-sweep", "auto-retry-sweep", user!.id);
+  const orchestrator = new ReadyReconcileDeterministicOrchestrator();
+  const nowMs = (orchestrator as unknown as { clock: { now(): number } }).clock.now();
+  const failedAt = new Date(nowMs - UPGRADE_AUTO_RETRY_DELAY_MS - 60_000);
+  const machines = {
+    throws: "e1111111-1111-4111-8111-111111111111",
+    runs: "e2222222-2222-4222-8222-222222222222",
+    stale: "e3333333-3333-4333-8333-333333333333",
+  };
+  for (const machineId of Object.values(machines)) {
+    const { row } = await createComputerUpgradeRequest({ serverId: server.id, machineId, targetVersion: "1.0.60", requestedByUserId: user!.id, now: failedAt });
+    await settleRefusedComputerUpgradeRequest({ machineId, requestId: row.id, code: "computer_control_failed", reason: "installer_download_failed: TimeoutError", now: failedAt });
+  }
+  for (const machineId of [machines.throws, machines.runs]) {
+    (seedMachineConnection(orchestrator, machineId, makeFakeWs()) as unknown as { replicaGeneration: string | null }).replicaGeneration = "generation-1";
+  }
+  // A socket that is no longer open: in machineConnections, but not sendable.
+  (seedMachineConnection(orchestrator, machines.stale, makeFakeWs(3)) as unknown as { replicaGeneration: string | null }).replicaGeneration = "generation-1";
+  const ran: string[] = [];
+  (orchestrator as unknown as { runComputerUpgradeAutoRetry: (row: ComputerUpgradeRequestRow) => Promise<ComputerUpgradeAutoRetryOutcome> }).runComputerUpgradeAutoRetry = async (row) => {
+    ran.push(row.machineId);
+    if (row.machineId === machines.throws) throw new Error("policy read failed");
+    return { original: row, result: "target_withdrawn", retry: null };
+  };
+  await (orchestrator as unknown as { sweepComputerUpgradeAutoRetries(): Promise<void> }).sweepComputerUpgradeAutoRetries();
+  assert.deepEqual(ran.sort(), [machines.throws, machines.runs].sort(), "the stale connection is not claimed");
+  const rows = new Map((await db.select().from(computerUpgradeRequests)).map((row) => [row.machineId, row]));
+  assert.equal(rows.get(machines.throws)?.autoRetryResult, "failed_internal");
+  assert.ok(rows.get(machines.runs)?.autoRetryClaimedAt, "the row after the failing one still ran");
+  assert.equal(rows.get(machines.stale)?.autoRetryClaimedAt, null, "left for a live connection or the offline skip");
   orchestrator.shutdown();
 });
 
@@ -10600,6 +10691,10 @@ test("computer:upgrade:done ok:false settles this machine's open upgrade request
       ["server.computer.upgrade_request.done_unmatched", machineId, "late"],
     ],
   );
+  // The countable class is read from the stored reason; the daemon's own code stays in `code`.
+  const refused = events.find(([name]) => name === "server.computer.upgrade_request.refused")?.[1];
+  assert.equal(refused?.reason_code, "unsafe_kill_mode");
+  assert.equal(refused?.code, "upgrade_start_rejected");
   orchestrator.shutdown();
 });
 
@@ -10632,9 +10727,44 @@ test("computer:upgrade:done ok:false with an unresolved installer receipt keeps 
   assert.match(open?.reason ?? "", /^recovery_unresolved: /);
   assert.equal(captured.some((e) => e.event === "machine:upgrade-request"), false, "the web keeps showing it in progress");
   assert.deepEqual(
-    events.filter(([name]) => name.startsWith("server.computer.upgrade_request.")).map(([name, attrs]) => [name, attrs.outcome, attrs.via]),
-    [["server.computer.upgrade_request.unresolved_recorded", "", "upgrade_done"]],
+    events.filter(([name]) => name.startsWith("server.computer.upgrade_request.")).map(([name, attrs]) => [name, attrs.outcome, attrs.via, attrs.reason_code]),
+    [["server.computer.upgrade_request.unresolved_recorded", "", "upgrade_done", "recovery_unresolved"]],
   );
+  orchestrator.shutdown();
+});
+
+test("computer:upgrade:done carries the installer receipt's fixed fields to the retry decision", async ({ db }) => {
+  // 77ce1c3a's class: the installer's own release lookup failed. The text
+  // alone never qualified; installerOutcome + installerCode do.
+  const [user] = await db.insert(users).values({ email: "upgrade-fixed-fields@example.com", name: "upgrade-fixed-fields", passwordHash: "test" }).returning();
+  const server = await createServer("upgrade-fixed-fields", "upgrade-fixed-fields", user!.id);
+  const machineId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+  const otherMachineId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+  const orchestrator = new ReadyReconcileDeterministicOrchestrator();
+  (orchestrator as unknown as { io: ReturnType<typeof makeFakeServerIO> }).io = makeFakeServerIO([]);
+  for (const id of [machineId, otherMachineId]) {
+    (seedMachineConnection(orchestrator, id, makeFakeWs()) as { computerVersion: string | null }).computerVersion = "1.0.63";
+  }
+  const reason = "UPGRADE_INSTALLER_FAILED: The requested Raft Computer release could not be resolved.";
+
+  const { row } = await createComputerUpgradeRequest({ serverId: server.id, machineId, targetVersion: "1.0.64", requestedByUserId: user!.id });
+  await orchestrator.handleMachineMessage(machineId, {
+    type: "computer:upgrade:done", requestId: row.id, ok: false, code: "upgrade_installer_failed", reason,
+    installerOutcome: "failed", installerCode: "release_resolution_failed",
+  } as MachineToServerMessage);
+  const [settled] = await db.select().from(computerUpgradeRequests).where(eq(computerUpgradeRequests.id, row.id));
+  assert.equal(settled?.outcome, "failed");
+  assert.equal(settled?.reason, reason);
+  assert.equal(settled?.autoRetryFailureCode, "release_resolution_failed");
+
+  // The same text from an older Computer (no fields): not retried, as before.
+  const { row: old } = await createComputerUpgradeRequest({ serverId: server.id, machineId: otherMachineId, targetVersion: "1.0.64", requestedByUserId: user!.id });
+  await orchestrator.handleMachineMessage(otherMachineId, {
+    type: "computer:upgrade:done", requestId: old.id, ok: false, code: "upgrade_installer_failed", reason,
+  } as MachineToServerMessage);
+  const [legacy] = await db.select().from(computerUpgradeRequests).where(eq(computerUpgradeRequests.id, old.id));
+  assert.equal(legacy?.outcome, "failed");
+  assert.equal(legacy?.autoRetryFailureCode, null);
   orchestrator.shutdown();
 });
 
@@ -24136,10 +24266,12 @@ async function readyWithHeartbeat(
   await orchestrator.awaitThirdPartyEventReconnectPasses();
 }
 
-function redeliverSkips(sink: MemoryTraceSink): string[] {
+/** The skip outcomes traced for one trigger's pass (default: the reconnect pass). */
+function redeliverSkips(sink: MemoryTraceSink, trigger: "machine_ready" | "daemon_instance_changed" = "machine_ready"): string[] {
   const all = [...sink.getAllLogEvents(), ...sink.getAllSpans().flatMap((span) => spanEvents(sink, span))];
   // The same event can be both a log event and a span event: distinct outcomes.
-  return [...new Set(all.filter((event) => event.name === "server.third_party_event.redeliver_skipped").map((event) => String(event.attrs?.outcome)))];
+  return [...new Set(all.filter((event) => event.name === "server.third_party_event.redeliver_skipped" && event.attrs?.trigger === trigger)
+    .map((event) => String(event.attrs?.outcome)))];
 }
 
 function sendsCarryingEvent(orchestrator: ReadyReconcileDeterministicOrchestrator, eventId: string) {
@@ -24512,6 +24644,370 @@ test("ready outage start: the reconnect pass skips an event a pending start of t
 
     assert.equal((await f.rowOf(carried!.id)).updatedAt.getTime(), carried!.updatedAt.getTime(), "not claimed");
     assert.equal((await f.rowOf(other!.id)).updatedAt.getTime() > other!.updatedAt.getTime(), true, "the other event is");
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
+/**
+ * A `ready` from daemon instance `daemonInstanceId` on a fresh connection
+ * after a 1-minute outage (the reconnect pass skips it as short), then waits
+ * for the app-event passes it starts.
+ */
+async function readyFromDaemonInstance(orchestrator: ReadyReconcileDeterministicOrchestrator, machineId: string, daemonInstanceId: string) {
+  const { machines: machinesTable } = await import("../db/schema");
+  await getDb().update(machinesTable).set({ lastHeartbeat: new Date(Date.now() - 60_000) }).where(eq(machinesTable.id, machineId));
+  (orchestrator as any).machineConnections.get(machineId).connectedAt = Date.now();
+  await orchestrator.handleMachineMessage(machineId, { ...readyFrame, daemonInstanceId } as MachineToServerMessage);
+  await orchestrator.awaitThirdPartyEventReconnectPasses();
+}
+
+function startDispatchesCarryingEvent(orchestrator: ReadyReconcileDeterministicOrchestrator, eventId: string): Set<string | undefined> {
+  return new Set(sendsCarryingEvent(orchestrator, eventId)
+    .map((msg) => msg.type === "agent:start" ? msg.startDispatchId : (msg as Extract<ServerToMachineMessage, { type: "agent:deliver" }>).deliveryId));
+}
+
+// Machine ca4239b1, 11-15 (#raft-antiproton:#14, event 5b2edac3): a Reminder
+// notice was pushed and acked (`agent:deliver:ack`: no ack-retry record left)
+// while the Computer's upgrade drain held the idle agent's start; the drain's
+// shutdown resolved the start and the event was lost with the old daemon.
+test("a machine whose daemon comes back as a new instance (restart, upgrade) gets its acked but lost app event again, exactly once; a same-instance reconnect gets nothing", async ({ seed }) => {
+  // Pushed 5 minutes ago: younger than any parked record (the reconnect pass would leave it), acked, still `delivering`.
+  const f = await parkedAppEventFixture(seed, { machineId: "db", createdAgoMs: [5 * 60_000] });
+  const { sink, tracer } = makeDeterministicTracer();
+  const orchestrator = new ReadyReconcileDeterministicOrchestrator(new InMemoryReplicaStateStore(), undefined, tracer);
+  try {
+    seedActiveAgent(orchestrator, f.agentId, f.machineId!);
+    seedMachineConnection(orchestrator, f.machineId!, makeFakeWs(), "1.0.50");
+
+    // The first instance this machine is recorded with: nothing to compare with.
+    await readyFromDaemonInstance(orchestrator, f.machineId!, "daemon-before-upgrade");
+    assert.deepEqual(sendsCarryingEvent(orchestrator, f.event.id), [], "first instance: nothing sent");
+    // A socket reconnect of the same daemon (a network blip).
+    await readyFromDaemonInstance(orchestrator, f.machineId!, "daemon-before-upgrade");
+    assert.deepEqual(sendsCarryingEvent(orchestrator, f.event.id), [], "same instance: nothing sent");
+    assert.equal((await f.rowOf()).updatedAt.getTime(), f.event.updatedAt.getTime(), "nor claimed");
+    assert.deepEqual(redeliverSkips(sink, "daemon_instance_changed").sort(), ["skipped_first_instance", "skipped_same_instance"]);
+
+    // The upgraded daemon connects.
+    await readyFromDaemonInstance(orchestrator, f.machineId!, "daemon-after-upgrade");
+    await waitFor(() => sendsCarryingEvent(orchestrator, f.event.id).length > 0);
+    const sends = sendsCarryingEvent(orchestrator, f.event.id);
+    assert.equal(sends.length, 1, "sent again once");
+    const start = sends[0] as Extract<ServerToMachineMessage, { type: "agent:start" }>;
+    assert.equal(start.type, "agent:start", "the idle agent is woken by it");
+    assert.match(start.wakeMessage!.content, /^Sent again after your computer restarted: this app notification was created at \d{4}-\d\d-\d\d \d\d:\d\d:\d\dZ, and the restart may have lost it/);
+    const claimedAt = (await f.rowOf()).updatedAt.getTime();
+    assert.ok(claimedAt > f.event.updatedAt.getTime(), "claimed");
+    const sent = sink.getAllSpans()
+      .filter((span) => span.name === "server.third_party_event.redeliver")
+      .flatMap((span) => spanEvents(sink, span))
+      .filter((event) => event.name === "server.third_party_event.redeliver.sent");
+    assert.equal(sent.length, 1, "one sent trace event");
+    assert.equal(sent[0]!.attrs?.third_party_event_id, f.event.id);
+    assert.equal(sent[0]!.attrs?.agent_id, f.agentId);
+    assert.equal(sent[0]!.attrs?.trigger, "daemon_instance_changed");
+    assert.ok(Number(sent[0]!.attrs?.age_ms) >= 5 * 60_000, "age_ms: since the event was created");
+
+    // The same new instance again (a reconnect after the upgrade): nothing new.
+    await readyFromDaemonInstance(orchestrator, f.machineId!, "daemon-after-upgrade");
+    // The pending start's own ready retry re-sends that same start (same dispatch id).
+    assert.deepEqual(startDispatchesCarryingEvent(orchestrator, f.event.id), new Set([start.startDispatchId]), "not sent again");
+    assert.equal((await f.rowOf()).updatedAt.getTime(), claimedAt, "nor claimed again");
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
+test("a `ready` without a daemon instance id runs no restart pass and leaves the machine's marker alone", async ({ seed }) => {
+  const f = await parkedAppEventFixture(seed, { machineId: "db", createdAgoMs: [5 * 60_000] });
+  const { sink, tracer } = makeDeterministicTracer();
+  const orchestrator = new ReadyReconcileDeterministicOrchestrator(new InMemoryReplicaStateStore(), undefined, tracer);
+  try {
+    seedActiveAgent(orchestrator, f.agentId, f.machineId!);
+    seedMachineConnection(orchestrator, f.machineId!, makeFakeWs(), "1.0.50");
+    await readyFromDaemonInstance(orchestrator, f.machineId!, "daemon-a");
+    await readyFromDaemonInstance(orchestrator, f.machineId!, "");
+    assert.deepEqual(redeliverSkips(sink, "daemon_instance_changed").sort(), ["skipped_first_instance", "skipped_no_instance_id"]);
+    await readyFromDaemonInstance(orchestrator, f.machineId!, "daemon-a");
+    assert.deepEqual(sendsCarryingEvent(orchestrator, f.event.id), [], "daemon-a is still the machine's last instance");
+    assert.ok(redeliverSkips(sink, "daemon_instance_changed").includes("skipped_same_instance"));
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
+test("two daemons taking turns on one machine (A, B, A, B) re-send an app event on their first flip only", async ({ seed }) => {
+  const f = await parkedAppEventFixture(seed, { machineId: "db", createdAgoMs: [5 * 60_000] });
+  const { sink, tracer } = makeDeterministicTracer();
+  const orchestrator = new ReadyReconcileDeterministicOrchestrator(new InMemoryReplicaStateStore(), undefined, tracer);
+  try {
+    seedActiveAgent(orchestrator, f.agentId, f.machineId!);
+    seedMachineConnection(orchestrator, f.machineId!, makeFakeWs(), "1.0.50");
+    await readyFromDaemonInstance(orchestrator, f.machineId!, "install-a");
+    await readyFromDaemonInstance(orchestrator, f.machineId!, "install-b");
+    await waitFor(() => sendsCarryingEvent(orchestrator, f.event.id).length > 0);
+    const dispatches = startDispatchesCarryingEvent(orchestrator, f.event.id);
+    assert.equal(dispatches.size, 1, "the first flip counts as a restart");
+    const claimedAt = (await f.rowOf()).updatedAt.getTime();
+
+    // The start carrying it was acked (no in-flight exclusion left), and each
+    // later flip connects after that claim: only the marker's previous instance stops it.
+    (orchestrator as any).pendingAgentStartAcks.clear();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await readyFromDaemonInstance(orchestrator, f.machineId!, "install-a");
+    await readyFromDaemonInstance(orchestrator, f.machineId!, "install-b");
+    assert.deepEqual(startDispatchesCarryingEvent(orchestrator, f.event.id), dispatches, "no new send");
+    assert.equal((await f.rowOf()).updatedAt.getTime(), claimedAt, "nor claim");
+    assert.ok(redeliverSkips(sink, "daemon_instance_changed").includes("skipped_returned_to_previous_instance"));
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
+// #raft-antiproton:#14: 16 app events lost in a week. Each was pushed and
+// acked into the live process's inbox during a runtime-error backoff
+// (`queued_runtime_error_backoff`); the process then ended (the
+// same-fingerprint fence, a stop, a crash) and dropped its inbox. Chat comes
+// back with the next start's catch-up; app events stayed `delivering` until
+// they expired. Now the daemon names the dropped app events
+// (`agent:inbox:dropped_app_events`), they go back to `queued`, and the
+// agent's next `agent:runtime:ready` sends them (the next-start pass).
+
+const DAEMON = "daemon-now";
+
+/** The agent's daemon (instance DAEMON) names the app events its process dropped when it ended. */
+async function droppedAppEvents(orchestrator: AgentOrchestrator, machineId: string, agentId: string, eventIds: unknown[], exitReason: string, daemonInstanceId = DAEMON) {
+  await orchestrator.handleMachineMessage(machineId, {
+    type: "agent:inbox:dropped_app_events", agentId, launchId: "launch-1", daemonInstanceId, exitReason, eventIds,
+  } as unknown as MachineToServerMessage);
+}
+
+/** Lets a delivery's background send (sendAgentDeliveryWithAckRetry) reach sentToMachine. */
+const settleSends = () => new Promise((resolve) => setTimeout(resolve, 50));
+
+/** A runtime process of the agent produced its first output (any start, or every turn of a per-turn runtime). */
+async function runtimeReady(orchestrator: ReadyReconcileDeterministicOrchestrator, machineId: string, agentId: string, launchId = "launch-1") {
+  await orchestrator.handleMachineMessage(machineId, { type: "agent:runtime:ready", agentId, launchId } as MachineToServerMessage);
+  await orchestrator.awaitThirdPartyEventReconnectPasses();
+}
+
+async function droppedEventsSetup(seed: Parameters<typeof parkedAppEventFixture>[0]) {
+  // Pushed 5 minutes ago and acked into the backoff: `delivering`.
+  const f = await parkedAppEventFixture(seed, { machineId: "db", createdAgoMs: [5 * 60_000] });
+  const { sink, tracer } = makeDeterministicTracer();
+  const orchestrator = new ReadyReconcileDeterministicOrchestrator(new InMemoryReplicaStateStore(), undefined, tracer);
+  seedActiveAgent(orchestrator, f.agentId, f.machineId!);
+  const conn = seedMachineConnection(orchestrator, f.machineId!, makeFakeWs(), "1.0.50") as { daemonInstanceId?: string };
+  conn.daemonInstanceId = DAEMON;
+  return { f, sink, orchestrator };
+}
+
+function droppedIngests(sink: MemoryTraceSink) {
+  return sink.getAllSpans().filter((span) => span.name === "server.third_party_event.dropped_on_exit.ingest").map((span) => span.attrs ?? {});
+}
+
+async function expectSentOnceAtNextStart(seed: Parameters<typeof parkedAppEventFixture>[0], exitReason: string) {
+  const { f, sink, orchestrator } = await droppedEventsSetup(seed);
+  try {
+    await droppedAppEvents(orchestrator, f.machineId!, f.agentId, [f.event.id], exitReason);
+    assert.equal((await f.rowOf()).status, "queued", "back in the queue");
+    assert.deepEqual(sendsCarryingEvent(orchestrator, f.event.id), [], "nothing sent while no runtime runs");
+    assert.deepEqual(droppedIngests(sink).map((attrs) => [attrs.outcome, attrs.exit_reason, attrs.requeued_count]), [["processed", exitReason, 1]]);
+
+    // The agent starts again.
+    await runtimeReady(orchestrator, f.machineId!, f.agentId);
+    await waitFor(() => sendsCarryingEvent(orchestrator, f.event.id).length > 0);
+    const sends = sendsCarryingEvent(orchestrator, f.event.id);
+    assert.equal(sends.length, 1, "re-sent once");
+    const deliver = sends[0] as Extract<ServerToMachineMessage, { type: "agent:deliver" }>;
+    assert.equal(deliver.type, "agent:deliver");
+    assert.match(deliver.message.content, /^Sent again after the agent restarted: this app notification was created at \d{4}-\d\d-\d\d \d\d:\d\d:\d\dZ/);
+    const row = await f.rowOf();
+    assert.equal(row.status, "delivering", "claimed");
+    const sent = sink.getAllSpans()
+      .filter((span) => span.name === "server.third_party_event.redeliver")
+      .flatMap((span) => spanEvents(sink, span))
+      .filter((event) => event.name === "server.third_party_event.redeliver.sent");
+    assert.deepEqual(sent.map((event) => [event.attrs?.third_party_event_id, event.attrs?.trigger]), [[f.event.id, "runtime_ready"]]);
+
+    // A second start (or the next turn): nothing new.
+    await runtimeReady(orchestrator, f.machineId!, f.agentId, "launch-2");
+    await settleSends();
+    assert.equal(sendsCarryingEvent(orchestrator, f.event.id).length, 1, "not sent again");
+    assert.equal((await f.rowOf()).updatedAt.getTime(), row.updatedAt.getTime(), "nor claimed again");
+  } finally {
+    orchestrator.shutdown();
+  }
+}
+
+test("an app event acked into a runtime-error backoff, then the same-fingerprint fence trips: the agent's next start re-sends it exactly once", async ({ seed }) => {
+  await expectSentOnceAtNextStart(seed, "sticky_failure_handed_to_server");
+});
+
+test("an app event dropped by an explicit stop is re-sent once when the agent starts again", async ({ seed }) => {
+  await expectSentOnceAtNextStart(seed, "explicit_stop");
+});
+
+test("a per-turn runtime that starts and exits normally three times re-sends nothing (its exits name no dropped events)", async ({ seed }) => {
+  const { f, orchestrator } = await droppedEventsSetup(seed);
+  try {
+    for (let turn = 1; turn <= 3; turn += 1) await runtimeReady(orchestrator, f.machineId!, f.agentId, `launch-${turn}`);
+    await settleSends();
+    assert.deepEqual(sendsCarryingEvent(orchestrator, f.event.id), [], "no wake loop");
+    const row = await f.rowOf();
+    assert.equal(row.status, "delivering", "the pushed event is left to the inbox");
+    assert.equal(row.updatedAt.getTime(), f.event.updatedAt.getTime(), "nor claimed");
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
+test("an idle end (no dropped-events frame) and the next start re-send nothing; an event pushed to an earlier run and left unread is untouched", async ({ seed }) => {
+  const { f, orchestrator } = await droppedEventsSetup(seed);
+  try {
+    await runtimeReady(orchestrator, f.machineId!, f.agentId);
+    await settleSends();
+    assert.deepEqual(sendsCarryingEvent(orchestrator, f.event.id), []);
+    assert.equal((await f.rowOf()).updatedAt.getTime(), f.event.updatedAt.getTime());
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
+test("dropped app events go out on the agent's next wake too: a delivery the daemon starts the runtime for by itself (no server start)", async ({ seed }) => {
+  const { f, orchestrator } = await droppedEventsSetup(seed);
+  try {
+    await droppedAppEvents(orchestrator, f.machineId!, f.agentId, [f.event.id], "nonrecoverable_crash");
+    // A chat message wakes the agent: the daemon restarts its runtime from its
+    // restart snapshot on the same launch, without the server's start catch-up.
+    await orchestrator.deliverMessage(f.agentId, makeAgentMessage("are you there?"));
+    assert.equal(orchestrator.sentToMachine.filter((msg) => msg.type === "agent:start").length, 0, "no server start");
+    await runtimeReady(orchestrator, f.machineId!, f.agentId);
+    await waitFor(() => sendsCarryingEvent(orchestrator, f.event.id).length > 0);
+    await settleSends();
+    const sends = sendsCarryingEvent(orchestrator, f.event.id);
+    assert.deepEqual(sends.map((msg) => msg.type), ["agent:deliver"], "sent once, to the running runtime");
+    assert.equal(orchestrator.sentToMachine.filter((msg) => msg.type === "agent:start").length, 0, "still no server start");
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
+test("an Artifact's quiet notices (a rename, a channel announcement), queued and never pushed, stay quiet over runtime readies", async ({ seed }) => {
+  const { f, orchestrator } = await droppedEventsSetup(seed);
+  try {
+    const { agents: agentsTable, thirdPartyAgentEvents } = await import("../db/schema");
+    const [agentRow] = await getDb().select({ serverId: agentsTable.serverId }).from(agentsTable).where(eq(agentsTable.id, f.agentId));
+    // Artifacts task #160: queued in the rename's / the push's transaction, never pushed (they wake no agent).
+    const createdAt = new Date(Date.now() - 2 * 60 * 60_000);
+    const quiet = [];
+    for (const notice of [
+      { renamed: { by: "Alice", from: "Old title", to: "New title" } },
+      { channelAnnouncement: { channel: "#general", publisher: "Alice", number: 3, note: null } },
+    ]) {
+      const [row] = await getDb().insert(thirdPartyAgentEvents).values({
+        serverId: agentRow!.serverId,
+        agentId: f.agentId,
+        clientId: null,
+        systemApp: "system.artifacts",
+        kind: "notification",
+        summary: "Artifact notice",
+        payload: { app_event: { app: "artifacts", kind: "artifact", artifact: { id: randomUUID(), title: "New title" }, reason: "subscribed", ...notice } },
+        payloadHash: "0".repeat(64),
+        resource: `urn:raft:server:${agentRow!.serverId}:agent-inbound`,
+        status: "queued",
+        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60_000),
+        createdAt,
+        updatedAt: createdAt,
+      }).returning();
+      quiet.push(row!);
+    }
+    for (let turn = 1; turn <= 3; turn += 1) await runtimeReady(orchestrator, f.machineId!, f.agentId, `launch-${turn}`);
+    await settleSends();
+    for (const row of quiet) {
+      assert.deepEqual(sendsCarryingEvent(orchestrator, row.id), [], "never pushed");
+      const after = await f.rowOf(row.id);
+      assert.equal(after.status, "queued", "still queued, for the agent's next read");
+      assert.equal(after.updatedAt.getTime(), createdAt.getTime(), "untouched");
+    }
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
+test("a dropped-events frame and the next process's ready handled at the same time: the pass runs after the requeue and sends the event once", async ({ seed }) => {
+  const { f, sink, orchestrator } = await droppedEventsSetup(seed);
+  try {
+    // The frame's validation is slow; the ready (sent after it) is not.
+    const o = orchestrator as any;
+    const validate = o.validateMachineAgentMessage.bind(orchestrator);
+    o.validateMachineAgentMessage = async (...args: unknown[]) => {
+      if (args[3] === "agent:inbox:dropped_app_events") await new Promise((resolve) => setTimeout(resolve, 100));
+      return validate(...args);
+    };
+    // Both off the socket at once, unawaited (routes/daemon.ts).
+    const frame = droppedAppEvents(orchestrator, f.machineId!, f.agentId, [f.event.id], "session_replace_failed");
+    const ready = orchestrator.handleMachineMessage(f.machineId!, { type: "agent:runtime:ready", agentId: f.agentId, launchId: "launch-1" } as MachineToServerMessage);
+    await Promise.all([frame, ready]);
+    await orchestrator.awaitThirdPartyEventReconnectPasses();
+    await waitFor(() => sendsCarryingEvent(orchestrator, f.event.id).length > 0);
+    await settleSends();
+    assert.equal(sendsCarryingEvent(orchestrator, f.event.id).length, 1, "sent once, by that ready");
+    assert.equal((await f.rowOf()).status, "delivering", "not left queued");
+    assert.equal(droppedIngests(sink)[0]!.launch_id, "launch-1", "the process's launch is traced");
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
+test("a requeued event goes out once over a per-turn runtime's three readies", async ({ seed }) => {
+  const { f, orchestrator } = await droppedEventsSetup(seed);
+  try {
+    await droppedAppEvents(orchestrator, f.machineId!, f.agentId, [f.event.id], "nonrecoverable_crash");
+    for (let turn = 1; turn <= 3; turn += 1) {
+      await runtimeReady(orchestrator, f.machineId!, f.agentId, `launch-${turn}`);
+      await waitFor(() => sendsCarryingEvent(orchestrator, f.event.id).length > 0);
+      await settleSends();
+    }
+    assert.equal(sendsCarryingEvent(orchestrator, f.event.id).length, 1, "once, at the first turn");
+  } finally {
+    orchestrator.shutdown();
+  }
+});
+
+test("a dropped-events frame acts only on its own agent's rows on the sending machine, at most 100 ids, from the connected daemon; the rest is traced", async ({ seed }) => {
+  const { f, sink, orchestrator } = await droppedEventsSetup(seed);
+  // Another agent, on another machine.
+  const other = await parkedAppEventFixture(seed, { machineId: "db", createdAgoMs: [5 * 60_000] });
+  try {
+    // Its id in this agent's frame.
+    await droppedAppEvents(orchestrator, f.machineId!, f.agentId, [other.event.id], "nonrecoverable_crash");
+    // A frame naming that agent.
+    await droppedAppEvents(orchestrator, f.machineId!, other.agentId, [other.event.id], "nonrecoverable_crash");
+    // A frame of another daemon process (stale).
+    await droppedAppEvents(orchestrator, f.machineId!, f.agentId, [f.event.id], "nonrecoverable_crash", "daemon-before");
+    // 101 ids: this agent's own event is the 101st.
+    await droppedAppEvents(orchestrator, f.machineId!, f.agentId, [...Array.from({ length: 100 }, () => randomUUID()), f.event.id], "nonrecoverable_crash");
+
+    for (const row of [await other.rowOf(), await f.rowOf()]) assert.equal(row.status, "delivering", "untouched");
+    const ingests = droppedIngests(sink);
+    assert.deepEqual(ingests.map((attrs) => [attrs.outcome, attrs.reason ?? null]), [
+      ["processed", null],
+      ["dropped", "invalid_agent"],
+      ["dropped", "stale_instance"],
+      ["processed", null],
+    ]);
+    assert.equal(ingests[0]!.ignored_other_agent, 1);
+    assert.equal(ingests[0]!.requeued_count, 0);
+    assert.equal(ingests[3]!.listed_count, 101);
+    assert.equal(ingests[3]!.ignored_over_cap, 1);
+    assert.equal(ingests[3]!.ignored_not_found, 100);
+
+    await runtimeReady(orchestrator, f.machineId!, f.agentId);
+    await settleSends();
+    assert.deepEqual(sendsCarryingEvent(orchestrator, other.event.id), [], "another agent's event is never sent");
+    assert.deepEqual(sendsCarryingEvent(orchestrator, f.event.id), []);
   } finally {
     orchestrator.shutdown();
   }

@@ -76,6 +76,26 @@ function addCounts(into: TurnTokenCounts, next: TurnTokenCounts): void {
   }
 }
 
+/**
+ * The `token_usage` sources folded below, and the runtimes that emit each
+ * (builtin runs on the pi driver). Its runtimes must equal shared's
+ * RUNTIMES_REPORTING_TURN_TOKENS_FROM_TELEMETRY (runtimeTurnTokens.test.ts);
+ * the switch below is exhaustive over these keys, so a new fold branch needs
+ * an entry here.
+ */
+export const TURN_TOKEN_USAGE_SOURCE_RUNTIMES = {
+  claude_result_usage: ["claude"],
+  pi_message_end_usage: ["pi", "builtin"],
+  kimi_turn_step_completed_usage: ["kimi-sdk"],
+  codex_thread_token_usage_updated: ["codex"],
+} as const satisfies Record<string, readonly string[]>;
+
+type TurnTokenUsageSource = keyof typeof TURN_TOKEN_USAGE_SOURCE_RUNTIMES;
+
+function isTurnTokenUsageSource(source: string | undefined): source is TurnTokenUsageSource {
+  return source !== undefined && Object.hasOwn(TURN_TOKEN_USAGE_SOURCE_RUNTIMES, source);
+}
+
 /** Folds one `token_usage` report into the open turn. Sources whose numbers
  * are not known to mean the same thing (gemini reports only a total) are
  * skipped rather than guessed. */
@@ -84,9 +104,10 @@ export function noteTurnTokenUsage(acc: TurnTokenAccumulator, event: TelemetryEv
     noteTurnProviderRequest(acc, event);
     return;
   }
-  if (event.name !== "token_usage") return;
+  if (event.name !== "token_usage" || !isTurnTokenUsageSource(event.source)) return;
   const { attrs } = event;
-  switch (event.source) {
+  const source: TurnTokenUsageSource = event.source;
+  switch (source) {
     case "claude_result_usage": {
       addCounts(acc.added, counts(num(attrs, "inputTokens"), num(attrs, "outputTokens"), num(attrs, "cachedInputTokens"), num(attrs, "cacheCreationInputTokens")));
       const lastRequest = num(attrs, "lastRequestContextTokens");
@@ -115,6 +136,10 @@ export function noteTurnTokenUsage(acc: TurnTokenAccumulator, event: TelemetryEv
       }
       acc.sessionLatest = total;
       return;
+    }
+    default: {
+      const unhandled: never = source;
+      return unhandled;
     }
   }
 }

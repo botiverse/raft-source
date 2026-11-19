@@ -1,5 +1,6 @@
 import { isDesktopDeepLinkPathname } from "@botiverse/raft-shared";
 import { isHostShell } from "../embed";
+import { isInstalledWebApp } from "./clientPlatformHint";
 import { detectDesktopOs } from "./desktopDownload";
 import { isElectronDesktopShell } from "./desktopShell";
 import { isEmbeddedBrowserUserAgent } from "./embeddedBrowser";
@@ -35,6 +36,20 @@ export function canOpenInDesktopApp(
   // The desktop builds of WeChat, Feishu and DingTalk block custom schemes.
   if (isEmbeddedBrowserUserAgent(nav?.userAgent)) return false;
   return detectDesktopOs(nav) !== null;
+}
+
+/**
+ * Where the "Open this page in Raft Desktop?" banner may show: a computer's
+ * browser tab. Not the web app installed as its own window (Chrome/Edge
+ * Install, Safari Add to Dock): the person there already reads it as "the
+ * app", and the offer opened a second app on the same page (huxijin,
+ * #proj-deskop 197537c8). Settings › How links open still shows there
+ * (canOpenInDesktopApp): it sets this browser's choice, which its tabs use.
+ */
+export function offersDesktopAppInThisWindow(
+  nav: NavigatorLike = typeof navigator === "undefined" ? undefined : navigator,
+): boolean {
+  return canOpenInDesktopApp(nav) && !isInstalledWebApp();
 }
 
 /** Hands the link to the OS. A top-level navigation, not an iframe: Chrome and Edge ask once, then open the app. */

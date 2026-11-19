@@ -26,7 +26,7 @@
  * written in the same transaction that ends the card, on the card's own inbox
  * item `app:system.assistant/card/<card message id>` (ownerActionCardObjectRef).
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { IncomingMessage, ServerResponse } from "node:http";
 import { Socket } from "node:net";
 import { and, asc, desc, eq, gt, isNull, sql } from "drizzle-orm";
@@ -53,6 +53,9 @@ import {
 } from "./assistantOwnerActions";
 import { recordIntegrationAuditEventBestEffort } from "./integrationAuditService";
 import { createSystemAppAgentEvent, type SystemAppAgentEvent } from "./systemAppAgentEvents";
+import { runInOwnerDispatch } from "./ownerDispatchContext";
+import { OWNER_DISPATCH_MARK, type OwnerDispatchMark } from "./ownerDispatchMark";
+export { OWNER_DISPATCH_MARK, isOwnerDispatch, ownerDispatchMarkOf, type OwnerDispatchMark } from "./ownerDispatchMark";
 
 export const ASSISTANT_OWNER_ACTION_CARD_TTL_MS = 24 * 60 * 60 * 1000;
 /** How long an outcome event waits for the assistant (it reads them through /events). */
@@ -235,18 +238,6 @@ async function ownerWroteSince(dmChannelId: string, ownerUserId: string, since: 
 
 // ── Deciding: the card's form ────────────────────────────────────────────────
 
-/**
- * Marks a request this module dispatched (dispatchOwnerRoute): a JS Symbol on
- * the request object, so no client can set it. A marked request never comes
- * back in as the assistant (middleware/assistantAsOwner.ts) and never confirms
- * an owner-action card (routes/actions.ts): no dispatch from inside a dispatch.
- */
-export const OWNER_DISPATCH_MARK: unique symbol = Symbol("raft.assistantOwnerDispatch");
-
-/** Whether `req` is one dispatchOwnerRoute made. */
-export function isOwnerDispatch(req: object): boolean {
-  return (req as { [OWNER_DISPATCH_MARK]?: unknown })[OWNER_DISPATCH_MARK] !== undefined;
-}
 
 /**
  * The owner's own Confirm request, which the confirmed route runs as
@@ -271,9 +262,31 @@ export interface OwnerConfirmRequest {
 export interface OwnerRouteAnswer {
   status: number;
   body: Record<string, unknown>;
+  /** The dispatched request's id (the mark's, and its X-Request-Id); absent from a stand-in runner. */
+  requestId?: string;
+  /**
+   * The route's step-up gate refused it for a second step (routes/secondFactor.ts set it on the dispatch mark).
+   * Read this, never the body's `code`: a route that relays another answer, or refuses after it wrote, could carry
+   * that code without the gate having refused (Tenny 296b02bc).
+   */
+  stepUpRequired?: boolean;
 }
 
-export type OwnerRouteDispatcher = (input: { ownerRequest: OwnerConfirmRequest; serverId: string; request: OwnerRouteRequest; cardMessageId: string }) => Promise<OwnerRouteAnswer>;
+export type OwnerRouteDispatcher = (input: {
+  ownerRequest: OwnerConfirmRequest;
+  serverId: string;
+  request: OwnerRouteRequest;
+  cardMessageId: string;
+  /** Sent as the request's Idempotency-Key, for a route that takes one (a request:prepare card: its id and attempt). */
+  idempotencyKey?: string;
+  /**
+   * The dispatched request's own id (a fresh one when absent): on its mark,
+   * as its X-Request-Id, and as the request id of every audit row the route
+   * writes while it runs (ownerDispatchContext.ts), so the caller's own audit
+   * event can name it.
+   */
+  requestId?: string;
+}) => Promise<OwnerRouteAnswer>;
 
 /**
  * 30 s: the routes in the confirm tier answer once they have validated and
@@ -310,7 +323,8 @@ export function setOwnerDispatchBoundsForTest(bounds: { timeoutMs?: number; maxB
  * answer after OWNER_DISPATCH_TIMEOUT_MS is a 504 ("may still finish"), and at
  * most OWNER_DISPATCH_MAX_RESPONSE_BYTES of the body are kept.
  */
-export const dispatchOwnerRoute: OwnerRouteDispatcher = ({ ownerRequest, serverId, request, cardMessageId }) => new Promise((resolve, reject) => {
+export const dispatchOwnerRoute: OwnerRouteDispatcher = ({ ownerRequest, serverId, request, cardMessageId, idempotencyKey, requestId: givenRequestId }) => new Promise((resolve, reject) => {
+  const requestId = givenRequestId ?? randomUUID();
   const payload = Buffer.from(JSON.stringify(request.body));
   const socket = new Socket();
   // Not connected: the owner's own address, so the rate limits count this against them.
@@ -328,9 +342,13 @@ export const dispatchOwnerRoute: OwnerRouteDispatcher = ({ ownerRequest, serverI
   if (ownerRequest.headers.authorization) headers.authorization = ownerRequest.headers.authorization;
   if (ownerRequest.headers.cookie) headers.cookie = ownerRequest.headers.cookie;
   if (ownerRequest.headers.origin) headers.origin = ownerRequest.headers.origin;
+  if (idempotencyKey) headers["idempotency-key"] = idempotencyKey;
+  // Ours, never the Confirm request's: what the route's own audit rows record.
+  headers["x-request-id"] = requestId;
   req.headers = headers;
   req.rawHeaders = Object.entries(headers).flat();
-  (req as unknown as { [OWNER_DISPATCH_MARK]: string })[OWNER_DISPATCH_MARK] = cardMessageId;
+  const mark: OwnerDispatchMark = { cardMessageId, requestId };
+  (req as unknown as { [OWNER_DISPATCH_MARK]: OwnerDispatchMark })[OWNER_DISPATCH_MARK] = mark;
   req.push(payload);
   req.push(null);
   const res = new ServerResponse(req);
@@ -347,6 +365,7 @@ export const dispatchOwnerRoute: OwnerRouteDispatcher = ({ ownerRequest, serverI
         error: `The route didn't answer within ${Math.round(dispatchTimeoutMs / 1000)} seconds; it may still finish, so check before trying again`,
         code: OWNER_DISPATCH_TIMEOUT_CODE,
       },
+      requestId,
     });
   }, dispatchTimeoutMs);
   timer.unref?.();
@@ -371,7 +390,7 @@ export const dispatchOwnerRoute: OwnerRouteDispatcher = ({ ownerRequest, serverI
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) body = parsed as Record<string, unknown>;
       } catch { body = { error: text.slice(0, 500) }; }
     }
-    resolve({ status: res.statusCode, body });
+    resolve({ status: res.statusCode, body, requestId, ...(mark.stepUpRequired === true ? { stepUpRequired: true } : {}) });
   };
   const toBuffer = (chunk: unknown, encoding?: unknown) => typeof chunk === "string"
     ? Buffer.from(chunk, typeof encoding === "string" ? encoding as BufferEncoding : "utf8")
@@ -391,16 +410,27 @@ export const dispatchOwnerRoute: OwnerRouteDispatcher = ({ ownerRequest, serverI
     return res;
   }) as ServerResponse["end"];
   try {
-    ownerRequest.app(req, res);
+    // Everything the route runs (its audit writers included) knows the dispatch's request id.
+    runInOwnerDispatch(requestId, () => ownerRequest.app(req, res));
   } catch (err) {
     if (!settled) { settled = true; clearTimeout(timer); reject(err); }
   }
 });
 
 let dispatcher: OwnerRouteDispatcher = dispatchOwnerRoute;
-/** Tests only: what a confirmed card runs instead of the real route. */
+/** Tests only: what a confirmed card runs instead of the real route (an owner-action card's or a request:prepare card's). */
 export function setOwnerRouteDispatcherForTest(next: OwnerRouteDispatcher | null): void {
+  if (process.env.NODE_ENV !== "test") throw new Error("the owner route dispatcher hook is test-only");
   dispatcher = next ?? dispatchOwnerRoute;
+}
+
+/**
+ * The one runner a confirmed card's route goes through: dispatchOwnerRoute,
+ * or a test's stand-in. A request:prepare card (preparedRequestCards.ts) runs
+ * its route through it as well; there is no second runner.
+ */
+export function ownerRouteDispatcher(): OwnerRouteDispatcher {
+  return dispatcher;
 }
 
 interface DecisionInput {

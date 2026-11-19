@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   listAgentMigrationWorkspace,
+  startMeasuringAgentMigrationIgnoredEntries,
   normalizeAgentMigrationSymlinkTarget,
   summarizeAgentMigrationTransfer,
 } from "./agentMigrationExport";
@@ -240,6 +241,105 @@ test("measuring ignored paths stops at one shared bound, while every ignored fil
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("a walk that does not measure records ignored paths at zero, and sizing them apart gives the measuring walk's totals", async () => {
+  const root = tempRoot();
+  const workspace = path.join(root, "agent-ignore-apart");
+  try {
+    mkdirSync(path.join(workspace, "repo", "datasets", "pkg"), { recursive: true });
+    writeFileSync(path.join(workspace, "repo", "datasets", "pkg", "index.js"), "12345");
+    writeFileSync(path.join(workspace, "repo", "datasets", "pkg", "lib.js"), "123");
+    mkdirSync(path.join(workspace, "scratch"), { recursive: true });
+    writeFileSync(path.join(workspace, "scratch", "big.log"), "1234567");
+    writeFileSync(path.join(workspace, "keep.txt"), "keep\n");
+    writeFileSync(path.join(workspace, ".raftbackupignore"), "**/datasets\nscratch\n");
+
+    const measuredInWalk = await listWorkspace(workspace);
+    const listed: string[] = [];
+    const scanned: number[] = [];
+    const unmeasured = await listAgentMigrationWorkspace({
+      workspacePath: workspace,
+      measureIgnored: false,
+      onEntry: (relativePath) => { listed.push(relativePath); },
+      onProgress: (progress) => { scanned.push(progress.files); },
+    });
+    assert.deepEqual([...listed].sort(), [...measuredInWalk.listed].sort());
+    assert.deepEqual(scanned, [], "no ignored file is visited by the walk");
+    assert.deepEqual(
+      unmeasured.excludedIgnored,
+      measuredInWalk.excludedIgnored.map((entry) => ({ ...entry, fileCount: 0, sizeBytes: 0 })),
+    );
+
+    const measuring = startMeasuringAgentMigrationIgnoredEntries({
+      workspacePath: workspace,
+      excludedIgnored: unmeasured.excludedIgnored,
+    });
+    await measuring.finished;
+    const { entries: measured, complete } = measuring.snapshot();
+    assert.equal(complete, true);
+    assert.deepEqual(measured, measuredInWalk.excludedIgnored);
+    assert.deepEqual(measured.map(({ path: entryPath, fileCount, sizeBytes }) => ({ entryPath, fileCount, sizeBytes })), [
+      { entryPath: "repo/datasets", fileCount: 2, sizeBytes: 8 },
+      { entryPath: "scratch", fileCount: 1, sizeBytes: 7 },
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("sizing ignored paths apart keeps the one shared bound, and stops at once when told to", async () => {
+  const root = tempRoot();
+  const workspace = path.join(root, "agent-ignore-apart-bound");
+  try {
+    for (const dir of ["a", "b"]) {
+      mkdirSync(path.join(workspace, dir), { recursive: true });
+      for (let i = 0; i < 8; i += 1) writeFileSync(path.join(workspace, dir, `f${i}`), "x");
+    }
+    writeFileSync(path.join(workspace, ".raftmigrateignore"), "a/\nb/\n");
+    const { excludedIgnored } = await listAgentMigrationWorkspace({
+      workspacePath: workspace,
+      measureIgnored: false,
+      onEntry: () => undefined,
+    });
+
+    const bounded = startMeasuringAgentMigrationIgnoredEntries({
+      workspacePath: workspace,
+      excludedIgnored,
+      ignoredFileMeasureLimit: 10,
+    });
+    await bounded.finished;
+    assert.deepEqual(bounded.snapshot().entries.map((entry) => entry.fileCount), [8, 2]);
+    assert.equal(bounded.snapshot().complete, false, "cut at the bound: a lower bound");
+
+    const stop = new AbortController();
+    const stopped = startMeasuringAgentMigrationIgnoredEntries({
+      workspacePath: workspace,
+      excludedIgnored,
+      signal: stop.signal,
+    });
+    stop.abort();
+    // Read at once, without waiting for the measuring to settle.
+    assert.deepEqual(stopped.snapshot(), { entries: excludedIgnored, complete: false });
+    await stopped.finished;
+    assert.deepEqual(stopped.snapshot(), { entries: excludedIgnored, complete: false }, "nothing counted after the stop");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the summary marks ignored totals partial only when asked, and never without ignored paths", () => {
+  const base = {
+    includedFileCount: 1,
+    includedBytes: 1,
+    memoryMdPresent: false,
+    notesPresent: false,
+    excludedRegenerable: [],
+  };
+  const ignored = [{ path: "a", reason: "raftmigrateignore" as const, source: "agentFile" as const, wildcard: false, fileCount: 1, sizeBytes: 1 }];
+  assert.equal(summarizeAgentMigrationTransfer({ ...base, excludedIgnored: ignored, ignoredPartial: true }).excludedIgnoredPartial, true);
+  assert.equal("excludedIgnoredPartial" in summarizeAgentMigrationTransfer({ ...base, excludedIgnored: ignored }), false);
+  assert.equal("excludedIgnoredPartial" in summarizeAgentMigrationTransfer({ ...base, excludedIgnored: [], ignoredPartial: true }), false);
 });
 
 test("the summary never reports more ignored files than its bound, so a strict server still accepts it", () => {

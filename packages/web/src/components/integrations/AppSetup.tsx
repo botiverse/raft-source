@@ -22,7 +22,7 @@ export function AppSetupFields({ required, url, description, onRequiredChange, o
       <span className="text-subhead font-semibold text-foreground">{formatMessage({ id: "appSetup.requiresConfiguration" })}</span>
     </label>
     {required ? <>
-      <FormField label={formatMessage({ id: "appSetup.urlLabel" })} htmlFor="app-setup-url" hint={formatMessage({ id: "appSetup.urlHint" })} required>
+      <FormField label={formatMessage({ id: "appSetup.urlLabel" })} htmlFor="app-setup-url" hint={formatMessage({ id: "appSetup.urlHint" })}>
         <Input id="app-setup-url" type="url" value={url} onChange={onUrlChange} maxLength={2000} required />
       </FormField>
       <FormField label={formatMessage({ id: "appSetup.descriptionLabel" })} htmlFor="app-setup-description" optional>

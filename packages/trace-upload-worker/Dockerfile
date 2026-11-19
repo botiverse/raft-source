@@ -1,4 +1,4 @@
-ARG NODE_VERSION=24.22.1
+ARG NODE_VERSION=24.22.3
 FROM node:${NODE_VERSION}-bookworm-slim AS base
 
 # Retain the Debian security fixes that are newer than the node base tag.
@@ -31,6 +31,9 @@ COPY packages/trace-upload-worker/ packages/trace-upload-worker/
 # Keep workspace TypeScript outside node_modules: Node/Oxc deliberately does not
 # transpile packages there. Preserve the normal workspace symlinks while copying
 # only the three filtered projects and their production dependency graph.
+# Modes, like mtimes, must not depend on the tarball or the store state: a
+# package directory arrived 777 in one install and 755 in another (staging
+# run 43734952399, image-layer-diff). Normalize to 755 directories and 644 or 755 files.
 RUN mkdir -p /out-app/packages /out-dependencies/packages \
   && mv node_modules /out-dependencies/node_modules \
   && cp package.json tsconfig.json /out-app/ \
@@ -41,6 +44,7 @@ RUN mkdir -p /out-app/packages /out-dependencies/packages \
        fi; \
        cp -a "packages/$package" "/out-app/packages/$package"; \
      done \
+  && find /out-app /out-dependencies \( -type d -o -type f \) -exec chmod u=rwX,go=rX {} + \
   && find /out-app /out-dependencies -exec touch --no-dereference --date=@0 {} +
 
 FROM base AS runtime

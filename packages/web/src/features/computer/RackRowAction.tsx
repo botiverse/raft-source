@@ -9,6 +9,7 @@ import { ComputerManualInstall } from "../../components/machine/ComputerManualIn
 import { ComputerUpgradeFailureHintText } from "../../components/machine/ComputerUpgradeFailureHint";
 import type { RackVariant, UpgradeCard, RestartState } from "./computersRackTypes";
 import { RackCommand } from "./RackCommand";
+import { ThisDeviceRackAction } from "./ThisDeviceRackAction";
 
 /**
  * The row's one next step, from the Computer page's own logic: offline, the
@@ -16,14 +17,20 @@ import { RackCommand } from "./RackCommand";
  * install for a Computer the web can't upgrade, or the restart in progress.
  * Only for whoever may manage the computer; nothing otherwise.
  */
-export function RackRowAction({ machine, canManage, variant, upgrade, restart, thisDevice = false }: {
+export function RackRowAction({ machine, canManage, canControl, variant, upgrade, restart, thisDevice = false, onOpen, offline }: {
   machine: Machine;
   canManage: boolean;
+  /** May upgrade it from the web (canControlComputer); without it the one-click Upgrade is not offered. */
+  canControl: boolean;
   variant: RackVariant;
   upgrade: UpgradeCard;
   restart: RestartState;
   /** The machine Raft Desktop runs on: managed with its page's buttons, never a command. */
   thisDevice?: boolean;
+  /** Open the computer (This device's page), as the row's name does. */
+  onOpen?: () => void;
+  /** Offline as the row shows it (This device: also while Raft Computer does not run here); default: the server's status. */
+  offline?: boolean;
 }) {
   const { formatMessage } = useIntl();
   const serverSlug = useServerStore((s) => s.current?.slug);
@@ -32,9 +39,11 @@ export function RackRowAction({ machine, canManage, variant, upgrade, restart, t
   if (!canManage || machine.isComputer !== true) return null;
   const windows = machine.os?.toLowerCase().startsWith("win") ?? false;
   const deploymentEnv = import.meta.env?.VITE_DEPLOYMENT_ENV;
-  if (machine.status !== "online") {
-    // This device comes back with Start on its page (ThisDeviceSections), not a command.
-    if (upgradeReconnecting || thisDevice) return null;
+  if (offline ?? machine.status !== "online") {
+    if (upgradeReconnecting) return null;
+    // This device: its page's first step (Start, Install, Try again, …) or
+    // "Open This device", never a command and never nothing.
+    if (thisDevice) return onOpen ? <ThisDeviceRackAction machineId={machine.id} onOpen={onOpen} /> : null;
     const commands = getComputerCommands(serverSlug, deploymentEnv, getServerUrl(), windows ? { platform: "windows" } : {});
     if (!commands?.restart) return null;
     return (
@@ -63,7 +72,7 @@ export function RackRowAction({ machine, canManage, variant, upgrade, restart, t
       </span>
     );
   }
-  if (cardState.kind === "oneClick") {
+  if (cardState.kind === "oneClick" && canControl) {
     const label = formatMessage({ id: "machine.detail.upgradeToVersion" }, { version: cardState.version });
     const upgradeButton = (
       <Button size="md" variant="outline" onClick={startUpgrade} data-testid={`rack-upgrade-${machine.id}`}>

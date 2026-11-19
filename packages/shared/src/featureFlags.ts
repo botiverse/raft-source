@@ -12,7 +12,6 @@ export const ANTIPROTON_HOSTED_RUNTIME_FEATURE_FLAG_KEY = "antiproton_hosted_run
 /** Computer-scoped provider probes (Phase 2A). Server-stage, default off. */
 /** Wave 3: launch enforcement on matching fresh Computer receipts + legacy probe retirement. */
 export const SERVER_LABS_UI_FEATURE_FLAG_KEY = "server_labs_ui_v0";
-export const SERVER_GUEST_FEATURE_FLAG_KEY = "server_guest_v0";
 /**
  * External channel invites (#wg-rbac:#16): a Server owner or admin invites
  * people outside the Server to a channel by email. Evaluated on the host
@@ -28,6 +27,15 @@ export const EXTERNAL_CHANNELS_FEATURE_FLAG_KEY = "external_channels_v1";
  * while off the open route answers 404.
  */
 export const AGENT_LOUNGE_FEATURE_FLAG_KEY = "agent_lounge_v0";
+/**
+ * RFC 085 prepared-request cards (`request:prepare`): an agent prepares an
+ * operation on the delegable list for a named person to confirm. Evaluated on
+ * the preparing agent's server, server-scoped, not seeded; missing = off.
+ * While off, prepare refuses the type with the same answer as a card type the
+ * server doesn't know. Cards already posted keep working (commit, decline,
+ * withdraw, expiry): the flag gates preparing only.
+ */
+export const PREPARED_REQUEST_CARD_FEATURE_FLAG_KEY = "prepared_request_card_v0";
 /**
  * Emergency hold of web Computer upgrades for one platform (10-24, #proj-o11y:ae66286a).
  * Server-scoped; missing = not held, so shipping it
@@ -48,6 +56,13 @@ export const COMPUTER_HOST_IDENTITY_FEATURE_FLAG_KEY = "computer_host_identity_v
  * The Server also needs a Computer advertising `agent-context-view:v0`.
  */
 export const AGENT_CONTEXT_VIEW_FEATURE_FLAG_KEY = "agent_context_view_v0";
+/**
+ * Raft voice (#wg-runtime-form:#22): ask an agent what it is doing now, or
+ * ask it one question answered by a read-only fork of its session
+ * (agentSideAsk.ts). Server-scoped, default off; missing = off. Off, the
+ * voice endpoints answer as for an unknown agent.
+ */
+export const AGENT_VOICE_FEATURE_FLAG_KEY = "agent_voice_v1";
 /**
  * Emergency stop for the Computer version floor (COMPUTER_MIN_SUPPORTED_VERSION
  * / COMPUTER_MIN_VERSION_ENFORCE_AT on the server): past the deadline, agents
@@ -75,6 +90,18 @@ export const APP_PROMPT_TEXT_CONSENT_FEATURE_FLAG_KEY = "app_prompt_text_consent
  * answer is off, Artifact links stay plain links and nothing of it is shown.
  */
 export const WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY = "workspace_artifacts_v0";
+/**
+ * Retired flag keys that the Server answers directly from deployment runtime
+ * configuration (`answerFlagFromDeployment` / `answerAppFlagFromDeployment`)
+ * rather than reading Feature Flag Admin rows, rules, kill switches, or defaults.
+ */
+export const DEPLOYMENT_ANSWERED_FEATURE_FLAG_KEYS = [
+  WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY,
+] as const;
+
+export function isDeploymentAnsweredFeatureFlagKey(key: string): boolean {
+  return (DEPLOYMENT_ANSWERED_FEATURE_FLAG_KEYS as readonly string[]).includes(key);
+}
 /**
  * Interactive link cards (RFC 076 §9). Retired on the server
  * (#raft-architecture:#32): the batched read always sends version 2 to a
@@ -145,6 +172,7 @@ export type SlackBridgeFeatureFlagKey =
 
 export * from "./featureFlagRolloutGuardrail";
 export * from "./featureFlagClientRules";
+export * from "./featureFlagDefaultPolicy";
 
 
 /**
@@ -289,3 +317,31 @@ export const HUMAN_AVATAR_BUILDER_FEATURE_FLAG_KEY = "human_avatar_builder_v0";
  * advertising DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET_CLAUDE_KINDS.
  */
 export const CLAUDE_LIMIT_RESET_FEATURE_FLAG_KEY = "claude_limit_reset";
+/**
+ * The account notification switch "Replies in threads I follow"
+ * (`followedThreadReplies`, docs/contracts/notifications.md §1.2, §2.1), not
+ * shipped for now. User-scoped (evaluated per user, with no server: the
+ * setting is account-wide, so every server and device gets one answer),
+ * default off, not seeded; a missing flag or an evaluation failure reads as
+ * off. Off: GET/PATCH /api/me/notification-settings and the account
+ * `notification_prefs:updated` frame leave `followedThreadReplies` out, a
+ * PATCH that sends it is accepted without writing it, and the notification
+ * policy treats it as on for everyone whatever is stored (the column and its
+ * values are kept). Clients hide the row when the field is absent.
+ */
+export const NOTIFICATION_FOLLOWED_THREAD_REPLIES_SWITCH_FEATURE_FLAG_KEY = "notification_followed_thread_replies_switch";
+/**
+ * "How did you hear about Raft?" for everyone, not only the owner in server
+ * setup (web components/onboarding/ReferralSourcePrompt): a signed-in person
+ * with no answer and no recorded skip (`users.referral_source`,
+ * `referral_source_skipped_at`), whose account is at most 30 days old, is asked
+ * once in a small card after landing in a server, and may skip. Web only: the
+ * server stores and evaluates it and reads it nowhere (the answer and the skip
+ * are the existing PATCH /api/auth/me fields). Evaluated for the current
+ * server, not seeded. In production it is off until a flag row enables it.
+ * An environment running default-on (staging, featureFlagDefaultPolicy.ts)
+ * answers on without a row, except for its servers that keep stored defaults.
+ * An evaluation failure reads as off. Off: nobody is asked outside the owner
+ * setup survey, as before.
+ */
+export const REFERRAL_SOURCE_PROMPT_FEATURE_FLAG_KEY = "referral_source_prompt_v0";

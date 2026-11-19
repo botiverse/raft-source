@@ -58,6 +58,8 @@ export function actionCardTypeAuthority(type: StoredActionCardActionType): Actio
       return { kind: "none", why: "answering an Agent's question in the channel takes no server permission" };
     case "assistant:owner_action":
       return { kind: "none", why: "only the assistant's owner may decide (its form handler); a confirmed card runs the owner's own route on their own session, with that route's checks" };
+    case "request:prepare":
+      return { kind: "none", why: "only the person named may decide (its form handler); a confirmed card runs that person's own route on their own session, through the route's own checks (the list's permission only folds the card)" };
     default:
       return assertNeverActionCardType(type);
   }

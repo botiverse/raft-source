@@ -290,7 +290,7 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
             showHint={false}
           />
 
-          <FormField label={formatMessage({ id: "channel.create.nameLabel" })} required>
+          <FormField label={formatMessage({ id: "channel.create.nameLabel" })}>
             <Input
               type="text"
               value={name}

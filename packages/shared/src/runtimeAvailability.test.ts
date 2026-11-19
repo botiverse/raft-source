@@ -90,6 +90,6 @@ for (const runtimeId of ["antigravity", "copilot"]) {
   });
 }
 
-test("Qwen Code, Qoder and CodeBuddy Code are experimental; no other runtime is", () => {
-  assert.deepEqual(RUNTIMES.filter((runtime) => isRuntimeExperimental(runtime.id)).map((runtime) => runtime.id).sort(), ["codebuddy", "qoder", "qwen"]);
+test("Qwen Code and Qoder are experimental; no other runtime is", () => {
+  assert.deepEqual(RUNTIMES.filter((runtime) => isRuntimeExperimental(runtime.id)).map((runtime) => runtime.id).sort(), ["qoder", "qwen"]);
 });

@@ -4,6 +4,7 @@ import { test } from "vitest";
 import { CardActionPastDeadlineError, getOidcJwks, oidcIssuer, serverRoleClaim, signAppLinkPreviewAssertion, signCardActionAssertion } from "./oidcService";
 
 const decode = (part: string) => JSON.parse(Buffer.from(part, "base64url").toString()) as Record<string, unknown>;
+const request = { handleSha256: "b".repeat(64), actionId: "approve", clientRequestId: "crid-0123456789abcdef", handleExp: 1_792_620_600, prepared: null };
 
 test("card action assertion: own typ/audience/token_use, phase and server_role, 30 s, bound to URL and body", () => {
   process.env.JWT_SECRET ??= "card-action-assertion-test-secret-at-least-32-bytes";
@@ -13,7 +14,7 @@ test("card action assertion: own typ/audience/token_use, phase and server_role, 
   const token = signCardActionAssertion({
     clientKey: "vault-50e32c", userId: "user-1", serverId: "server-1", serverRole: "admin",
     installationId: "install-1", messageId: "message-1", urlSha256: createHash("sha256").update(url).digest("hex"), phase: "execute", body, jti: "jti-1", now,
-    notAfter: new Date(now.getTime() + 600_000),
+    notAfter: new Date(now.getTime() + 600_000), request,
   });
   const [h, p, s] = token.split(".");
   const header = decode(h!);
@@ -82,7 +83,7 @@ test("notAfter caps exp at the first-send deadline and refuses to sign at or aft
   const iat = Math.floor(now.getTime() / 1000);
   const base = { clientKey: "vault-50e32c", userId: "user-1", serverId: "server-1", serverRole: "member",
     installationId: "install-1", messageId: "message-1", urlSha256: "a".repeat(64), body: "{}", jti: "jti-1", now } as const;
-  const sign = (notAfter: Date) => decode(signCardActionAssertion({ ...base, phase: "execute", notAfter }).split(".")[1]!);
+  const sign = (notAfter: Date) => decode(signCardActionAssertion({ ...base, phase: "execute", notAfter, request }).split(".")[1]!);
   assert.equal(decode(signCardActionAssertion({ ...base, phase: "status" }).split(".")[1]!).exp, iat + 30, "no deadline (status): the usual 30 s");
   assert.equal(sign(new Date((iat + 600) * 1000)).exp, iat + 30, "a far deadline does not extend it");
   assert.equal(sign(new Date((iat + 10) * 1000)).exp, iat + 10, "a near deadline cuts it");
@@ -103,5 +104,29 @@ test("execute requires notAfter, in the type and at run time; prepare and status
   for (const phase of ["prepare", "status"] as const) {
     assert.equal(decode(signCardActionAssertion({ ...base, phase }).split(".")[1]!).phase, phase);
   }
-  assert.equal(decode(signCardActionAssertion({ ...base, phase: "execute", notAfter: new Date(now.getTime() + 600_000) }).split(".")[1]!).phase, "execute");
+  assert.equal(decode(signCardActionAssertion({ ...base, phase: "execute", notAfter: new Date(now.getTime() + 600_000), request }).split(".")[1]!).phase, "execute");
+});
+
+test("RFC 086 §5.3: an execute assertion names the request a sealed value's JWE header is compared with; prepare and status don't", () => {
+  process.env.JWT_SECRET ??= "card-action-assertion-test-secret-at-least-32-bytes";
+  const now = new Date("2026-10-20T22:00:00Z");
+  const base = { clientKey: "vault-50e32c", userId: "user-1", serverId: "server-1", serverRole: "member",
+    installationId: "install-1", messageId: "message-1", urlSha256: "a".repeat(64), body: "{}", jti: "jti-1", now } as const;
+  const notAfter = new Date(now.getTime() + 600_000);
+  const REQUEST_CLAIMS = ["handle_sha256", "action_id", "client_request_id", "handle_exp", "prepared_action_id", "prepared_digest"];
+  const pick = (claims: Record<string, unknown>) => Object.fromEntries(REQUEST_CLAIMS.filter((name) => Object.hasOwn(claims, name)).map((name) => [name, claims[name]]));
+  const undo = decode(signCardActionAssertion({ ...base, phase: "execute", notAfter, request }).split(".")[1]!);
+  assert.deepEqual(pick(undo), { handle_sha256: "b".repeat(64), action_id: "approve", client_request_id: "crid-0123456789abcdef", handle_exp: 1_792_620_600 },
+    "no prepared claims without a confirmation");
+  const prepared = { actionId: "0b6f5c1e-3c9f-4f1a-9c55-4c6c3c2e8a10", digest: "c".repeat(64) };
+  const confirmed = decode(signCardActionAssertion({ ...base, phase: "execute", notAfter, request: { ...request, prepared } }).split(".")[1]!);
+  assert.deepEqual(pick(confirmed), {
+    handle_sha256: "b".repeat(64), action_id: "approve", client_request_id: "crid-0123456789abcdef", handle_exp: 1_792_620_600,
+    prepared_action_id: prepared.actionId, prepared_digest: prepared.digest,
+  });
+  assert.equal(confirmed.sub, "user-1");
+  assert.equal(confirmed.server_id, "server-1");
+  assert.ok(Number(confirmed.exp) < 1_792_620_600, "the JWT's own exp stays its 30 s; the handle's expiry is handle_exp");
+  for (const phase of ["prepare", "status"] as const) assert.deepEqual(pick(decode(signCardActionAssertion({ ...base, phase }).split(".")[1]!)), {}, phase);
+  assert.throws(() => signCardActionAssertion({ ...base, phase: "execute", notAfter, request: { ...request, handleSha256: "not-hex" } }), /hex SHA-256/);
 });

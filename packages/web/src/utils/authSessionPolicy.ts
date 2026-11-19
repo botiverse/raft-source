@@ -6,6 +6,22 @@ export function shouldRetryLoadUserAfterError(status: number | undefined): boole
   return status === 401 || status === 403;
 }
 
+let storedSessionRejected: () => void = () => {};
+
+/**
+ * main.tsx: what starts the moment the boot's `/auth/me` answers 401/403 for
+ * the stored session (authStore loadUser), before the refresh that usually
+ * confirms it is gone: the sign-in page's code (pages/landingPages.ts).
+ */
+export function onStoredSessionRejected(run: () => void): void {
+  storedSessionRejected = run;
+}
+
+/** authStore loadUser: `/auth/me` turned the stored session down. */
+export function noteStoredSessionRejected(): void {
+  storedSessionRejected();
+}
+
 export function shouldKeepSessionAfterLoadUserFailure(status: number | undefined): boolean {
   return status !== 401 && status !== 403;
 }

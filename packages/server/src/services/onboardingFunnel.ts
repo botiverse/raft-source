@@ -40,6 +40,7 @@ export const ONBOARDING_FUNNEL_MILESTONES = [
   "first_agent_created",
   "first_agent_turn_started",
   "first_agent_reply",
+  "first_result",
 ] as const;
 export type OnboardingFunnelMilestone = (typeof ONBOARDING_FUNNEL_MILESTONES)[number];
 
@@ -85,6 +86,28 @@ function sqlTimestamp(date: Date): string {
  * is bounded to the cohort's servers and their agents and walks an index from
  * the oldest row: (agent_id, created_at) on agent_activity_events and
  * (sender_id, created_at, id) on messages.
+ *
+ * first_result (Ferry / Nova, 2026-11-14) is stricter than first_agent_reply:
+ * one of the server's own agents produced something, not only answered. It is
+ * the earlier of
+ *   - its first chat message with an attachment (the owner opener excluded,
+ *     as for the reply), and
+ *   - the first task it moved to done (task_events `status_changed` or
+ *     `reopened` with payload.to = 'done' and the agent as actor).
+ * Both are read through the cohort servers' own channels (idx_channels_server,
+ * then idx_attachments_channel_created_linked / idx_tasks_channel_number and
+ * idx_task_events_task): neither attachments nor task_events has an index by
+ * uploader or actor. So a result an agent produced in another server's channel
+ * is not counted.
+ * Every step of that path is a `JOIN LATERAL (... OFFSET 0)`. Do not remove
+ * the OFFSET 0 or turn these back into plain joins: it keeps the planner from
+ * flattening the subquery, and with plain joins production scanned all of
+ * attachments and task_events (AndyLok, read replica, 2026-11-14: 2.3 s and
+ * 5.8 s against 0.8 s and 0.6 s, the former growing with the whole tables).
+ * All steps need it, the cohort-to-channels one included: with only the last
+ * steps lateral the planner walked every channel instead.
+ * Publishing a Raft Artifact is NOT counted yet: what this query can read does
+ * not say who published a version. Adding it later will raise the number.
  */
 export function buildOnboardingFunnelSql(from: Date, to: Date): string {
   return `
@@ -130,6 +153,30 @@ agent_mins AS (
   FROM agent_firsts
   GROUP BY server_id
 ),
+result_attachments AS (
+  SELECT c.id AS server_id, min(m.created_at) AS attached_at
+  FROM cohort c
+  JOIN LATERAL (SELECT ch.id FROM channels ch WHERE ch.server_id = c.id OFFSET 0) ch ON true
+  JOIN LATERAL (SELECT t.message_id FROM attachments t
+                WHERE t.channel_id = ch.id AND t.message_id IS NOT NULL OFFSET 0) t ON true
+  JOIN messages m ON m.id = t.message_id
+  JOIN own_agents oa ON oa.server_id = c.id AND oa.id::text = m.sender_id
+  WHERE m.sender_type = 'agent' AND m.message_type = 'chat'
+    AND (m.agent_send_key IS NULL OR m.agent_send_key NOT LIKE '${OWNER_OPENER_SEND_KEY_PATTERN}')
+  GROUP BY c.id
+),
+result_tasks AS (
+  SELECT c.id AS server_id, min(e.created_at) AS done_at
+  FROM cohort c
+  JOIN LATERAL (SELECT ch.id FROM channels ch WHERE ch.server_id = c.id OFFSET 0) ch ON true
+  JOIN LATERAL (SELECT k.id FROM tasks k WHERE k.channel_id = ch.id OFFSET 0) k ON true
+  JOIN LATERAL (SELECT e.created_at, e.actor_id FROM task_events e
+                WHERE e.task_id = k.id AND e.actor_type = 'agent'
+                  AND e.event_type IN ('status_changed', 'reopened')
+                  AND e.payload->>'to' = 'done' OFFSET 0) e ON true
+  JOIN own_agents oa ON oa.server_id = c.id AND oa.id::text = e.actor_id
+  GROUP BY c.id
+),
 machine_mins AS (
   SELECT d.server_id,
     min(d.created_at) AS computer_added_at,
@@ -145,11 +192,14 @@ SELECT
   extract(epoch FROM (mm.machine_connected_at - c.created_at)) * 1000 AS machine_connected_ms,
   extract(epoch FROM (am.agent_created_at - c.created_at)) * 1000 AS agent_created_ms,
   extract(epoch FROM (am.turn_started_at - c.created_at)) * 1000 AS turn_started_ms,
-  extract(epoch FROM (am.replied_at - c.created_at)) * 1000 AS replied_ms
+  extract(epoch FROM (am.replied_at - c.created_at)) * 1000 AS replied_ms,
+  extract(epoch FROM (least(ra.attached_at, rt.done_at) - c.created_at)) * 1000 AS result_ms
 FROM cohort c
 JOIN owner_first f ON f.owner_id = c.owner_id
 LEFT JOIN machine_mins mm ON mm.server_id = c.id
 LEFT JOIN agent_mins am ON am.server_id = c.id
+LEFT JOIN result_attachments ra ON ra.server_id = c.id
+LEFT JOIN result_tasks rt ON rt.server_id = c.id
 `;
 }
 
@@ -171,6 +221,7 @@ export function parseOnboardingFunnelRows(rows: readonly Record<string, unknown>
       first_agent_created: toMs(row.agent_created_ms),
       first_agent_turn_started: toMs(row.turn_started_ms),
       first_agent_reply: toMs(row.replied_ms),
+      first_result: toMs(row.result_ms),
     },
   }));
 }

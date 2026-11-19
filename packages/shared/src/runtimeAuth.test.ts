@@ -6,7 +6,6 @@ import {
   DAEMON_CAPABILITY_RUNTIME_AUTH_ANTIGRAVITY,
   DAEMON_CAPABILITY_RUNTIME_AUTH_ANTIGRAVITY_LOGOUT,
   DAEMON_CAPABILITY_RUNTIME_AUTH_GROK,
-  DAEMON_CAPABILITY_RUNTIME_AUTH_CODEBUDDY,
   DAEMON_CAPABILITY_RUNTIME_AUTH_OPENCODE,
   DAEMON_CAPABILITY_RUNTIME_AUTH_PI,
   DAEMON_CAPABILITY_RUNTIME_AUTH_QWEN_PROVIDER,
@@ -63,8 +62,8 @@ describe("runtime auth runtimes", () => {
 
   it("offers Qoder a sign-in but no sign-out, Qwen Code a provider key only; every other runtime both (Antigravity's sign-out since OAR 0.98)", () => {
     const withAction = (action: Parameters<typeof runtimeAuthSupports>[1]) => RUNTIME_AUTH_RUNTIMES.filter((runtime) => runtimeAuthSupports(runtime, action));
-    assert.deepEqual(withAction("login"), ["claude", "codex", "kimi", "qoder", "antigravity", "pi", "grok", "opencode", "codebuddy"]);
-    assert.deepEqual(withAction("logout"), ["claude", "codex", "kimi", "antigravity", "pi", "grok", "opencode", "codebuddy"]);
+    assert.deepEqual(withAction("login"), ["claude", "codex", "kimi", "qoder", "antigravity", "pi", "grok", "opencode"]);
+    assert.deepEqual(withAction("logout"), ["claude", "codex", "kimi", "antigravity", "pi", "grok", "opencode"]);
     assert.deepEqual(withAction("connect_provider"), ["qwen", "pi", "opencode"]);
   });
 
@@ -106,11 +105,7 @@ describe("runtime auth runtimes", () => {
     assert.deepEqual(runtimeAuthRuntimesOfComputer([auth, v2, qwen, agy, pi, grok]).includes("opencode"), false, "a Computer from before OpenCode's sign-in (OAR 0.99) drops its requests");
     assert.deepEqual(runtimeAuthRuntimesOfComputer([auth, v2, DAEMON_CAPABILITY_RUNTIME_AUTH_OPENCODE]), ["claude", "codex", "kimi", "qoder", "opencode"]);
     assert.deepEqual(runtimeAuthRuntimesOfComputer([auth, DAEMON_CAPABILITY_RUNTIME_AUTH_OPENCODE]), ["claude", "codex"], "OpenCode needs V2 too");
-    assert.equal(runtimeAuthRuntimesOfComputer([auth, v2, qwen, agy, pi, grok, DAEMON_CAPABILITY_RUNTIME_AUTH_OPENCODE]).includes("codebuddy"), false, "a Computer from before CodeBuddy's sign-in drops its requests");
-    assert.deepEqual(runtimeAuthRuntimesOfComputer([auth, v2, DAEMON_CAPABILITY_RUNTIME_AUTH_CODEBUDDY]), ["claude", "codex", "kimi", "qoder", "codebuddy"]);
-    assert.deepEqual(runtimeAuthRuntimesOfComputer([auth, DAEMON_CAPABILITY_RUNTIME_AUTH_CODEBUDDY]), ["claude", "codex"], "CodeBuddy needs V2 too");
-    assert.deepEqual(runtimeAuthLogoutRuntimesOfComputer([auth, v2, DAEMON_CAPABILITY_RUNTIME_AUTH_CODEBUDDY]), ["claude", "codex", "kimi", "codebuddy"], "CodeBuddy's sign-out comes with its sign-in");
-    assert.deepEqual(runtimeAuthRuntimesOfComputer([auth, v2, qwen, agy, pi, grok, DAEMON_CAPABILITY_RUNTIME_AUTH_OPENCODE, DAEMON_CAPABILITY_RUNTIME_AUTH_CODEBUDDY]), RUNTIME_AUTH_RUNTIMES);
+    assert.deepEqual(runtimeAuthRuntimesOfComputer([auth, v2, qwen, agy, pi, grok, DAEMON_CAPABILITY_RUNTIME_AUTH_OPENCODE]), RUNTIME_AUTH_RUNTIMES);
     assert.equal(runtimeAuthRuntimesOfComputer([auth, v2, qwen]), runtimeAuthRuntimesOfComputer([qwen, v2, auth]), "the same capabilities give the same array");
     assert.equal(runtimeAuthRuntimesOfComputer([auth, v2, pi, qwen]), runtimeAuthRuntimesOfComputer([qwen, pi, v2, auth]));
   });
@@ -134,14 +129,8 @@ describe("runtime auth runtimes", () => {
     assert.deepEqual(RUNTIME_AUTH_RUNTIMES.filter(runtimeAuthLogoutNeedsCapability), ["antigravity"]);
   });
 
-  it("leaves Antigravity alone to the server's say (its revive flag); CodeBuddy Code, like Qoder, has no server flag", () => {
+  it("leaves Antigravity alone to the server's say (its revive flag)", () => {
     assert.deepEqual(RUNTIME_AUTH_RUNTIMES.filter(isRuntimeAuthServerGated), ["antigravity"]);
-  });
-
-  it("signs CodeBuddy Code in on its own Raft runtime, with no region or provider", () => {
-    assert.equal(runtimeAuthRuntimeFor("codebuddy"), "codebuddy");
-    assert.ok(runtimeAuthLoginRegionFits("codebuddy", undefined));
-    assert.equal(runtimeAuthSignsInPerProvider("codebuddy"), false);
   });
 });
 
@@ -310,15 +299,6 @@ describe("Grok agents and the Computer's shared sign-in", () => {
     assert.equal(sharedCredentialsAuthRuntime({ runtime: "grok", model: "default", envVars: { GROK_HOME: "/srv/grok" } }), null);
     assert.equal(sharedCredentialsAuthRuntime({ runtime: "grok", model: "default", envVars: { HOME: "/srv/home" } }), null);
     assert.equal(sharedCredentialsAuthRuntime({ runtime: "grok", model: "default", envVars: { XAI_API_KEY: "xai-1" } }), null);
-  });
-});
-
-describe("CodeBuddy Code agents and the Computer's shared sign-in", () => {
-  it("run on the shared sign-in unless an API key, another account service or HOME gives one its own", () => {
-    assert.equal(sharedCredentialsAuthRuntime({ runtime: "codebuddy", model: "default" }), "codebuddy");
-    assert.equal(sharedCredentialsAuthRuntime({ runtime: "codebuddy", model: "default", envVars: { CODEBUDDY_API_KEY: "ck-1" } }), null);
-    assert.equal(sharedCredentialsAuthRuntime({ runtime: "codebuddy", model: "default", envVars: { CODEBUDDY_INTERNET_ENVIRONMENT: "internal" } }), null);
-    assert.equal(sharedCredentialsAuthRuntime({ runtime: "codebuddy", model: "default", envVars: { HOME: "/srv/home" } }), null);
   });
 });
 

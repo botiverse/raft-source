@@ -16,7 +16,8 @@ import { kickAppNotificationDelivery } from "../services/appNotificationDelivery
 import multer from "multer";
 import { randomUUID } from "node:crypto";
 import type { Server as SocketServer } from "socket.io";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, isNull, sql } from "drizzle-orm";
+import type { DatabaseExecutor } from "../db/index";
 import * as serverService from "../services/serverService";
 import { createServerAsOwner, ServerCreateInputError } from "../services/serverCreateService";
 import { recordServerCreated } from "../services/onboardingProductEvents";
@@ -92,6 +93,7 @@ import { assistantWeChatRouter } from "./assistantWeChat";
 import { emitMemberAppearanceUpdated, parseMemberAppearanceInput } from "../lib/memberAppearanceInput";
 import { getAgentUsageRoute } from "./agentUsage";
 import { actorHasServerCapabilityInServer, actorRoleHasServerCapability, getActorServerRoleInServer } from "../lib/actorPermissions";
+import { canManageMachineResource, computerControllerAttachers, computerControllerUserId, controllerUserIdFromAttachers, isManagedComputerMachine } from "../services/computerControlAuthorization";
 import { FencedAuthorizationDeniedError, ServerMembershipRevokedError, withActorMembershipFence } from "../lib/actorMembershipFence";
 import { createScopeAttestation } from "../lib/scopeAttestation";
 import { getDb } from "../db/index";
@@ -281,15 +283,6 @@ function routeServerSetupStateService(orchestrator: AgentOrchestrator) {
 }
 
 const LOCAL_COMPUTER_LIFECYCLE_ACTIONS = new Set(["start", "stop", "restart", "upgrade"] as const);
-
-function canManageMachineResource(
-  callerRole: ServerRole | null,
-  userId: string,
-  machine: { userId: string },
-  capability: ServerCapability,
-): boolean {
-  return machine.userId === userId || actorRoleHasServerCapability(callerRole, capability);
-}
 
 function isRuntimeAccountUsageProvider(value: string): value is RuntimeAccountUsageProvider {
   return (RUNTIME_ACCOUNT_USAGE_PROVIDERS as readonly string[]).includes(value);
@@ -3058,10 +3051,11 @@ export async function buildMachineList(input: {
   // still follow the whole list's order.
   const onlyIds = machineIds ? new Set(machineIds) : null;
   const machines = onlyIds ? allMachines.filter((m) => onlyIds.has(m.id)) : allMachines;
-  const [computerLinkedMachineAttachers, computerLinkedMachineCreators, computerOwners] = await Promise.all([
+  const [computerLinkedMachineAttachers, computerLinkedMachineCreators, computerOwners, controllerAttachers] = await Promise.all([
     getComputerLinkedMachineAttachers(serverId),
     getComputerLinkedMachineCreators(serverId),
     getComputerOwners(serverId),
+    computerControllerAttachers(getDb(), serverId),
   ]);
   const agentCountsByMachine = await machineService.countActiveAgentsByMachine(serverId, { userId }, {
     traceQuery: createTraceDbQueryTracer("machines.agent_counts.loaded"),
@@ -3082,6 +3076,10 @@ export async function buildMachineList(input: {
         return {
           ...readModel,
           creator: computerLinkedMachineCreators.get(m.id) ?? null,
+          // Whether the viewer is the machine's controller, as the routes decide it
+          // (computerControllerUserId): after a revoke this stays with the person it
+          // was attached by, while computerAttachedByCurrentUser and creator are empty.
+          controlledByCurrentUser: controllerUserIdFromAttachers(controllerAttachers, m) === userId,
           // Computer owner v1: who Raft records as its owner; null = Public.
           owner: computerOwners.get(m.id) ?? null,
           ...(sameMachineGroups ? { sameMachineGroup: sameMachineGroups.get(m.id) ?? null } : {}),
@@ -3181,7 +3179,7 @@ export async function buildMachineList(input: {
     // "Needs attention" per Computer (composeReadinessAttention): what a person
     // must act on, each with who fixes it by name. A failure leaves it out.
     const readinessAgents = readinessInputs.size > 0
-      ? await loadReadinessAgentsByMachine([...readinessInputs.keys()]).catch(() => null)
+      ? await loadReadinessAgentsByMachine([...readinessInputs.keys()], { userId }).catch(() => null)
       : null;
     const readinessOwnerNames = readinessAgents
       ? await loadMemberDisplayNames(serverId, [...readinessAgents.values()].flat().map(readinessAgentOwnerUserId)).catch(() => new Map<string, string>())
@@ -3330,7 +3328,7 @@ serverRouter.patch("/:id/machines/:machineId", async (req, res) => {
       res.status(404).json({ error: "Machine not found in this server" });
       return;
     }
-    if (!canManageMachineResource(callerRole, req.userId!, machine, "editMachines")) {
+    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "editMachines")) {
       res.status(403).json({ error: "The `editMachines` capability or machine creator authority is required to edit machines" });
       return;
     }
@@ -3369,7 +3367,7 @@ serverRouter.patch("/:id/machines/:machineId", async (req, res) => {
         .where(eq(machinesTable.id, req.params.machineId))
         .for("update");
       if (!lockedMachine || lockedMachine.serverId !== req.params.id) throw new FencedAuthorizationDeniedError("not_found");
-      if (!canManageMachineResource(lockedRole, req.userId!, lockedMachine, "editMachines")) {
+      if (!await canManageMachineResource(tx, req.params.id, lockedRole, req.userId!, lockedMachine, "editMachines")) {
         throw new FencedAuthorizationDeniedError("forbidden");
       }
       return machineService.updateMachine(req.params.machineId, updates, { executor: tx });
@@ -3410,7 +3408,7 @@ serverRouter.delete("/:id/machines/:machineId", async (req, res) => {
       res.status(404).json({ error: "Machine not found in this server" });
       return;
     }
-    if (!canManageMachineResource(callerRole, req.userId!, machine, "removeMachines")) {
+    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "removeMachines")) {
       res.status(403).json({ error: "The `removeMachines` capability or machine creator authority is required to remove machines" });
       return;
     }
@@ -3437,7 +3435,9 @@ serverRouter.delete("/:id/machines/:machineId", async (req, res) => {
         .where(eq(machinesTable.id, req.params.machineId))
         .for("update");
       if (!lockedMachine || lockedMachine.serverId !== req.params.id) throw new FencedAuthorizationDeniedError("not_found");
-      if (!canManageMachineResource(lockedRole, req.userId!, lockedMachine, "removeMachines")) {
+      // Read before the delete takes the attach records with it: after an adoption, the adopter, not the row's owner.
+      const controllerUserId = await computerControllerUserId(tx, req.params.id, lockedMachine);
+      if (controllerUserId !== req.userId && !actorRoleHasServerCapability(lockedRole, "removeMachines")) {
         throw new FencedAuthorizationDeniedError("forbidden");
       }
       ({ revokedCredentialAgentIds } = await machineService.deleteMachine(req.params.machineId, { executor: tx }));
@@ -3447,8 +3447,8 @@ serverRouter.delete("/:id/machines/:machineId", async (req, res) => {
         outcome: "success",
         source: "web",
         actor: { type: "human", id: req.userId! },
-        // The person who connected the machine authorized its access.
-        requester: { type: "human", id: lockedMachine.userId },
+        // The person it is attached by (computerControllerUserId) authorized its access, as on revoke-computer-key.
+        requester: { type: "human", id: controllerUserId },
         target: { type: "machine", id: lockedMachine.id },
         metadata: { machineId: lockedMachine.id, machineName: lockedMachine.name, ...serverAuditContextMetadata({ actorRole: lockedRole }) },
       }, tx);
@@ -3536,7 +3536,7 @@ serverRouter.post("/:id/machines/:machineId/revoke-computer-key", async (req, re
       res.status(404).json({ error: "Machine not found in this server" });
       return;
     }
-    if (!canManageMachineResource(callerRole, req.userId!, machine, "removeMachines")) {
+    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "removeMachines")) {
       res.status(403).json({ error: "The `removeMachines` capability or machine creator authority is required to revoke a Computer's key" });
       return;
     }
@@ -3556,7 +3556,9 @@ serverRouter.post("/:id/machines/:machineId/revoke-computer-key", async (req, re
         .where(eq(machinesTable.id, req.params.machineId))
         .for("update");
       if (!current || current.serverId !== req.params.id) throw new FencedAuthorizationDeniedError("not_found");
-      if (!canManageMachineResource(lockedRole, req.userId!, current, "removeMachines")) {
+      // The person it is attached by now (after an adoption, the adopter, not the machine row's owner).
+      const controllerUserId = await computerControllerUserId(tx, req.params.id, current);
+      if (controllerUserId !== req.userId && !actorRoleHasServerCapability(lockedRole, "removeMachines")) {
         throw new FencedAuthorizationDeniedError("forbidden");
       }
       const live = await tx
@@ -3566,7 +3568,7 @@ serverRouter.post("/:id/machines/:machineId/revoke-computer-key", async (req, re
       if (live.length === 0) throw new NoLiveComputerKeyError();
       // Only the person who attached it is held to its other people's agents (Tenny, Warden): an admin
       // removing someone else's Computer takes it offline with every agent still bound, as before.
-      const unbound = current.userId === req.userId
+      const unbound = controllerUserId === req.userId
         ? await unbindForcedOthersAgents(tx, { machineId: current.id, attacherUserId: req.userId!, forceAgentIds, now })
         : [];
       const operationId = newAuditOperationId();
@@ -3577,7 +3579,7 @@ serverRouter.post("/:id/machines/:machineId/revoke-computer-key", async (req, re
           outcome: "success",
           source: "web",
           actor: { type: "human", id: req.userId! },
-          requester: { type: "human", id: current.userId },
+          requester: { type: "human", id: controllerUserId },
           target: { type: "machine", id: current.id },
           metadata: { agentIds: unbound.map((agent) => agent.id), machineId: current.id, ...serverAuditContextMetadata({ actorRole: lockedRole, operationId }) },
         }, tx);
@@ -3682,7 +3684,7 @@ serverRouter.post("/:id/machines/:machineId/notify-agent-owners", async (req, re
       res.status(404).json({ error: "Machine not found in this server" });
       return;
     }
-    if (!canManageMachineResource(callerRole, req.userId!, machine, "removeMachines")) {
+    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "removeMachines")) {
       res.status(403).json({ error: "The `removeMachines` capability or machine creator authority is required to ask about this Computer's agents" });
       return;
     }
@@ -3733,7 +3735,7 @@ serverRouter.post("/:id/machines/:machineId/rotate-key", async (req, res) => {
       res.status(404).json({ error: "Machine not found in this server" });
       return;
     }
-    if (!canManageMachineResource(callerRole, req.userId!, machine, "rotateMachineKeys")) {
+    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "rotateMachineKeys")) {
       res.status(403).json({ error: "The `rotateMachineKeys` capability or machine creator authority is required to rotate machine keys" });
       return;
     }
@@ -3753,7 +3755,8 @@ serverRouter.post("/:id/machines/:machineId/rotate-key", async (req, res) => {
         .where(eq(machinesTable.id, req.params.machineId))
         .for("update");
       if (!lockedMachine || lockedMachine.serverId !== req.params.id) throw new FencedAuthorizationDeniedError("not_found");
-      if (!canManageMachineResource(lockedRole, req.userId!, lockedMachine, "rotateMachineKeys")) {
+      const controllerUserId = await computerControllerUserId(tx, req.params.id, lockedMachine);
+      if (controllerUserId !== req.userId && !actorRoleHasServerCapability(lockedRole, "rotateMachineKeys")) {
         throw new FencedAuthorizationDeniedError("forbidden");
       }
       // B15 (#infra:358ea6d0): this rotates only the legacy sk_machine_* key. A
@@ -3778,8 +3781,9 @@ serverRouter.post("/:id/machines/:machineId/rotate-key", async (req, res) => {
         outcome: "success",
         source: "web",
         actor: { type: "human", id: req.userId! },
-        // The person who connected the machine authorized its access.
-        requester: { type: "human", id: lockedMachine.userId },
+        // The person it is attached by authorized its access, as on DELETE and revoke-computer-key. A machine with
+        // any attach record was refused above, so here that is the machine row's owner.
+        requester: { type: "human", id: controllerUserId },
         target: { type: "machine", id: lockedMachine.id },
         metadata: { machineId: lockedMachine.id, machineName: lockedMachine.name, ...serverAuditContextMetadata({ actorRole: lockedRole }) },
       }, tx);
@@ -3886,18 +3890,17 @@ serverRouter.post("/:id/machines/:machineId/computer/:action", async (req, res) 
       res.status(404).json({ error: "Machine not found in this server" });
       return;
     }
-    if (!canManageMachineResource(callerRole, req.userId!, machine, "controlComputers")) {
+    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "controlComputers")) {
       addTraceEvent("computer.control.rejected", {
         action,
         reason: "forbidden",
         server_id: req.params.id,
         machine_id: req.params.machineId,
       });
-      res.status(403).json({ error: "The `controlComputers` capability or machine creator authority is required to control Computers" });
+      res.status(403).json({ error: "The `controlComputers` capability, or being the person this Computer is attached by, is required to control Computers" });
       return;
     }
-    const computerLinkedMachineIds = await getComputerLinkedMachineIds(req.params.id);
-    if (!computerLinkedMachineIds.has(machine.id)) {
+    if (!await isManagedComputerMachine(req.params.id, machine.id)) {
       addTraceEvent("computer.control.rejected", {
         action,
         reason: "not_a_computer",
@@ -4032,7 +4035,7 @@ serverRouter.post("/:id/machines/:machineId/computer/:action", async (req, res) 
         if (!sent) {
           const failed = await failUndeliveredComputerUpgradeRequest(row.id, new Date(agentOrchestrator.getCurrentTimeMs()));
           recordTraceEvent("server.computer.upgrade_request.undelivered", {
-            ...(failed ? computerUpgradeRequestTraceAttrs(failed) : { request_id: row.id, server_id: req.params.id, machine_id: machine.id }),
+            ...(failed ? computerUpgradeRequestTraceAttrs(failed) : { request_id: row.id, server_id: req.params.id, machine_id: machine.id, reason_code: "" }),
             source_version: sourceFact?.version ?? "",
           });
           res.status(409).json({ error: "Computer is not online", code: "computer_offline" });
@@ -4086,7 +4089,7 @@ serverRouter.post("/:id/machines/:machineId/computer/:action", async (req, res) 
         .where(eq(machinesTable.id, machine.id))
         .for("share");
       if (!lockedMachine || lockedMachine.serverId !== req.params.id) throw new FencedAuthorizationDeniedError("not_found");
-      if (!canManageMachineResource(lockedRole, req.userId!, lockedMachine, "controlComputers")) {
+      if (!await canManageMachineResource(tx, req.params.id, lockedRole, req.userId!, lockedMachine, "controlComputers")) {
         throw new FencedAuthorizationDeniedError("forbidden");
       }
       return createUserComputerLifecycleOperation({
@@ -4165,7 +4168,7 @@ serverRouter.post("/:id/machines/:machineId/computer/:action", async (req, res) 
       if (error.reason === "not_found") {
         res.status(404).json({ error: "Machine not found in this server" });
       } else {
-        res.status(403).json({ error: "The `controlComputers` capability or machine creator authority is required to control Computers" });
+        res.status(403).json({ error: "The `controlComputers` capability, or being the person this Computer is attached by, is required to control Computers" });
       }
       return;
     }
@@ -4217,8 +4220,8 @@ serverRouter.post("/:id/machines/:machineId/computer-lifecycle-operations", asyn
     res.status(404).json({ error: "Machine not found in this server" });
     return;
   }
-  if (!canManageMachineResource(callerRole, req.userId!, machine, "controlComputers")) {
-    res.status(403).json({ error: "The `controlComputers` capability or machine creator authority is required to control Computers" });
+  if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "controlComputers")) {
+    res.status(403).json({ error: "The `controlComputers` capability, or being the person this Computer is attached by, is required to control Computers" });
     return;
   }
   const orchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
@@ -4323,7 +4326,7 @@ serverRouter.post("/:id/machines/:machineId/computer-lifecycle-operations", asyn
         .where(eq(machinesTable.id, machine.id))
         .for("share");
       if (!lockedMachine || lockedMachine.serverId !== req.params.id) throw new FencedAuthorizationDeniedError("not_found");
-      if (!canManageMachineResource(lockedRole, req.userId!, lockedMachine, "controlComputers")) {
+      if (!await canManageMachineResource(tx, req.params.id, lockedRole, req.userId!, lockedMachine, "controlComputers")) {
         throw new FencedAuthorizationDeniedError("forbidden");
       }
       return createUserComputerLifecycleOperation({
@@ -4354,7 +4357,7 @@ serverRouter.post("/:id/machines/:machineId/computer-lifecycle-operations", asyn
       if (error.reason === "not_found") {
         res.status(404).json({ error: "Machine not found in this server" });
       } else {
-        res.status(403).json({ error: "The `controlComputers` capability or machine creator authority is required to control Computers" });
+        res.status(403).json({ error: "The `controlComputers` capability, or being the person this Computer is attached by, is required to control Computers" });
       }
       return;
     }
@@ -4391,7 +4394,7 @@ serverRouter.get("/:id/machines/:machineId/workspaces", async (req, res) => {
       res.status(404).json({ error: "Machine not found in this server" });
       return;
     }
-    if (!canManageMachineResource(callerRole, req.userId!, machine, "editMachines")) {
+    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "editMachines")) {
       res.status(403).json({ error: "You do not have permission to view machine workspaces" });
       return;
     }
@@ -4485,7 +4488,7 @@ serverRouter.get("/:id/machines/:machineId/runtime-options", async (req, res) =>
       res.status(404).json({ error: "Computer not found" });
       return;
     }
-    if (!canManageMachineResource(callerRole, req.userId!, machine, "editMachines")) {
+    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "editMachines")) {
       res.status(403).json({ error: "The `editMachines` capability or machine creator authority is required to inspect runtime options" });
       return;
     }
@@ -4649,7 +4652,7 @@ const handleRuntimeFormDefinition = (protocol: 1 | 2): RequestHandler<{ id: stri
       res.status(404).json({ error: "Computer not found" });
       return;
     }
-    if (!canManageMachineResource(callerRole, req.userId!, machine, "editMachines")) {
+    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "editMachines")) {
       res.status(403).json({ error: "The `editMachines` capability or machine creator authority is required to inspect runtime form definitions" });
       return;
     }
@@ -4689,14 +4692,16 @@ const handleRuntimeFormDefinition = (protocol: 1 | 2): RequestHandler<{ id: stri
       // task #10: advertised client capabilities (`?clientCapabilities=`).
       const clientCapabilities = parseRuntimeFormV2ClientCapabilities(req.query[RUNTIME_FORM_V2_CLIENT_CAPABILITIES_QUERY]);
       let definition = await buildRuntimeFormV2ForServer(req.params.runtimeId, req.params.id, clientCapabilities) ?? v2.buildForm();
+      let typedConnectionProviderIds: readonly string[] = [];
       if (req.params.runtimeId === "builtin") {
         // task #10: the limit fields show for a preset provider only for a
         // client that renders its typed id AND on a Computer that runs one;
-        // otherwise OpenRouter is served list-only and limit-free, as before.
+        // otherwise such a provider is served list-only and limit-free, as before.
         // Same probe and cache as the model source the client loads next.
         const typed = await builtInTypedModelProvidersFor({ req, res, serverId: req.params.id, machine, clientCapabilities });
         if (typed === "handled") return;
-        definition = withBuiltInModelLimitVisibility(definition, typed);
+        definition = withBuiltInModelLimitVisibility(definition, typed.presets);
+        typedConnectionProviderIds = typed.connections;
       }
       // runtime_form.v3: the same form in v3 shapes (services/runtimeFormV3).
       if (isRuntimeFormV3Request(clientCapabilities)) {
@@ -4704,6 +4709,7 @@ const handleRuntimeFormDefinition = (protocol: 1 | 2): RequestHandler<{ id: stri
           runtimeId: req.params.runtimeId,
           serverId: req.params.id,
           clientCapabilities,
+          typedConnectionProviderIds,
           connectionsVisible: await actorHasServerCapabilityInServer(req.params.id, "user", req.userId!, "manageExternalAuth"),
         });
       }
@@ -4730,7 +4736,7 @@ const handleRuntimeFormOptionSource = (protocol: 1 | 2): RequestHandler<{ id: st
       res.status(404).json({ error: "Computer not found" });
       return;
     }
-    if (!canManageMachineResource(callerRole, req.userId!, machine, "editMachines")) {
+    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "editMachines")) {
       res.status(403).json({ error: "The `editMachines` capability or machine creator authority is required to inspect runtime form option sources" });
       return;
     }
@@ -4906,7 +4912,7 @@ serverRouter.post("/:id/machines/:machineId/runtimes/rescan", async (req, res) =
       res.status(404).json({ error: "Computer not found" });
       return;
     }
-    if (!canManageMachineResource(callerRole, req.userId!, machine, "editMachines")) {
+    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "editMachines")) {
       res.status(403).json({ error: "The `editMachines` capability or machine creator authority is required to rescan runtimes" });
       return;
     }
@@ -4983,7 +4989,7 @@ serverRouter.get("/:id/machines/:machineId/runtime-models/:runtime", async (req,
       res.status(404).json({ error: "Machine not found in this server" });
       return;
     }
-    if (!canManageMachineResource(callerRole, req.userId!, machine, "editMachines")) {
+    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "editMachines")) {
       res.status(403).json({ error: "The `editMachines` capability or machine creator authority is required to inspect runtime models" });
       return;
     }
@@ -5334,7 +5340,7 @@ serverRouter.post("/:id/machines/:machineId/agents/:agentId/feedback/:reportId/t
       return;
     }
     const includeMachineLogTail = requestedMachineLogTail === true;
-    if (includeMachineLogTail && machine.userId !== req.userId) {
+    if (includeMachineLogTail && await computerControllerUserId(getDb(), req.params.id, machine) !== req.userId) {
       res.status(403).json({
         error: "Only the human who attached this machine may include its runner log tail in a report",
         code: "machine_log_tail_owner_required",
@@ -5406,7 +5412,7 @@ serverRouter.delete("/:id/machines/:machineId/workspaces/:directoryName", async 
       res.status(404).json({ error: "Machine not found in this server" });
       return;
     }
-    if (!canManageMachineResource(callerRole, req.userId!, machine, "controlComputers")) {
+    if (!await canManageMachineResource(getDb(), req.params.id, callerRole, req.userId!, machine, "controlComputers")) {
       res.status(403).json({ error: "The `controlComputers` capability or machine creator authority is required to delete machine workspaces" });
       return;
     }

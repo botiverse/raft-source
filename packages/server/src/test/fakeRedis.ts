@@ -5,7 +5,9 @@ import * as redis from "../redis";
 /**
  * A Redis double for the counts replicas share, on a clock the test moves:
  * the fixed-window counter's script (services/fixedWindowRateLimit.ts: INCRBY
- * and a TTL on one key) and the slots' (services/sharedSlots.ts: leases in a
+ * and a TTL on one key), the app.ts limiters' store's
+ * (services/sharedRateLimitStore.ts: INCR and a PEXPIRE on one key) and the
+ * slots' (services/sharedSlots.ts: leases in a
  * sorted set, ZREM to give one back). Every replica of a test talks to it, as
  * to the one Redis; `failing` throws on every call (Redis down).
  */
@@ -24,6 +26,14 @@ export function installFakeRedis(options: { failing?: boolean } = {}) {
         const next = { count: (entry?.count ?? 0) + Number(units), expiresAtMs: entry?.expiresAtMs ?? clock.now + Number(windowSeconds) * 1000 };
         counters.set(key, next);
         return [next.count, Math.ceil((next.expiresAtMs - clock.now) / 1000)];
+      }
+      if (/PEXPIRE/.test(script) && /INCR/.test(script)) {
+        const [windowMs = "60000"] = args;
+        let entry = counters.get(key);
+        if (entry && entry.expiresAtMs <= clock.now) entry = undefined;
+        const next = { count: (entry?.count ?? 0) + 1, expiresAtMs: entry?.expiresAtMs ?? clock.now + Number(windowMs) };
+        counters.set(key, next);
+        return [next.count, next.expiresAtMs - clock.now];
       }
       if (/ZREMRANGEBYSCORE/.test(script)) {
         const [nowMs, expiresAtMs, limit, id] = args;

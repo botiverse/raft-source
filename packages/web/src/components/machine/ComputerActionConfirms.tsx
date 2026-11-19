@@ -37,7 +37,7 @@ export function ComputerActionConfirms({ name, agentCount, upgrade, restart }: {
       ) : null}
       {version !== null ? (
         <ConfirmDialog
-          title={formatMessage({ id: "machine.detail.upgradeToVersion" }, { version })}
+          title={formatMessage({ id: "machine.detail.upgradeToVersionTitle" }, { version })}
           message={formatMessage({ id: "machine.detail.upgradeConfirmMessage" }, { name, version, count: agentCount })}
           confirmLabel={formatMessage({ id: "machine.detail.upgradeConfirm" })}
           confirmIcon={<AlertTriangle size={14} />}

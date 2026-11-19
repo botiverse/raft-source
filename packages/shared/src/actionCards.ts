@@ -24,6 +24,7 @@ import { lazySchema } from "./lazySchema";
 import { FEEDBACK_SUBMIT_MESSAGE_MAX_LENGTH, FEEDBACK_SUBMIT_TYPES } from "./feedbackSubmit";
 import { AGENT_UPGRADE_CARD_GATES } from "./upgradeGates";
 import { validateEmailAddress } from "./emailValidation";
+import { preparedRequestActionSchema, type PreparedRequestCardOutcome } from "./preparedRequestCard";
 
 const uuidSchema = lazySchema("uuidSchema", () => z.uuid());
 
@@ -91,11 +92,23 @@ export const agentCreateOperationSchema = lazySchema("agentCreateOperationSchema
    * the dialog when available; `requiredComputer` prevents silent fallback to
    * any other computer.
    *
-   * Runtime / model / reasoning effort remain human-picked technical fields,
-   * except for a hosted agent's model below.
+   * Runtime / model / reasoning effort remain the person's pick. The agent may
+   * only suggest the starting runtime (`suggestedRuntime` below) and, for a
+   * hosted agent, its model; the person still picks in the dialog.
    */
   suggestedComputer: idOrHandleSchema.optional(),
   requiredComputer: idOrHandleSchema.optional(),
+  /**
+   * Runtime id the Create Agent dialog starts on, marked as this agent's
+   * suggestion. A suggestion only: there is no required runtime, and model and
+   * reasoning effort stay unset. Prepare refuses an id this server does not
+   * offer for new agents now (unknown, deprecated, or behind a flag that is
+   * off), naming the ids it offers, and refuses it with `hosting:
+   * "antiproton"`. Where the chosen computer cannot run it, the dialog says so
+   * and leaves the runtime unpicked.
+   */
+  suggestedRuntime: z.string().trim().min(1).max(40).optional()
+    .describe('Runtime id to start the Create Agent dialog on (for example "claude" or "codex"), only when the person named that runtime; the person still picks, and sees it was your suggestion. An id this server does not offer for new agents is refused, and the refusal lists the offered ids. Not with hosting: "antiproton".'),
   /**
    * Where the agent runs. `antiproton` preselects "Hosted by Raft
    * (Antiproton)" (no computer); absent or `computer` keeps the computer
@@ -929,6 +942,8 @@ export const storedActionCardActionSchema = lazySchema("storedActionCardActionSc
   agentApproveCallOperationSchema,
   storedQuestionAskActionSchema,
   assistantOwnerActionOperationSchema,
+  // RFC 085: an agent prepares it (preparedRequestCard.ts), but what it stores is the server's.
+  preparedRequestActionSchema,
 ]));
 export type StoredActionCardAction = z.infer<typeof storedActionCardActionSchema>;
 export type StoredActionCardActionType = StoredActionCardAction["type"];
@@ -989,6 +1004,7 @@ export const STORED_ACTION_CARD_ACTION_TYPES: readonly StoredActionCardActionTyp
   "seats:add",
   "agent:approve_call",
   "assistant:owner_action",
+  "request:prepare",
 ] satisfies StoredActionCardActionType[]);
 
 const SENSITIVE_PRESENTATION_KEY_PARTS = [
@@ -1209,6 +1225,20 @@ export function buildActionCardPresentation(action: StoredActionCardAction): Act
         ],
         riskLevel: "elevated",
       };
+    case "request:prepare":
+      // RFC 085: decided in its form, only by the person named. No entity's
+      // name here: the spec card names each from what its viewer can see.
+      return {
+        title: `Confirm a request for @${action.addressee.handle}`,
+        confirmLabel: "Decide",
+        genericApprovalAllowed: false,
+        displayItems: [
+          { key: "For", value: `@${action.addressee.handle}` },
+          { key: "Operation", value: action.operation },
+          ...(action.note ? [{ key: "Reason", value: clipPresentationValue(action.note) }] : []),
+        ],
+        riskLevel: "elevated",
+      };
   }
 }
 
@@ -1267,6 +1297,12 @@ export function actionCardActionCrossFieldIssue(action: ActionCardAction): Actio
       return {
         path: action.suggestedComputer ? "suggestedComputer" : "requiredComputer",
         message: 'agent:create with hosting: "antiproton" makes a cloud agent, which does not run on a Computer; leave out suggestedComputer and requiredComputer',
+      };
+    }
+    if (action.hosting === "antiproton" && action.suggestedRuntime !== undefined) {
+      return {
+        path: "suggestedRuntime",
+        message: 'agent:create with hosting: "antiproton" makes a cloud agent, which runs on Raft\'s cloud runtime, not a runtime you suggest; leave out suggestedRuntime',
       };
     }
     if (action.model !== undefined && action.hosting !== "antiproton") {
@@ -1483,7 +1519,34 @@ export function formatInvalidActionCardFields(issues: readonly ActionCardActionI
  * reply follows. States are additive: a client reads one it does not know as
  * ended (view-only, nothing to press).
  */
-export type ActionCardState = "prepared" | "executed" | "frozen" | "reconfirm_required" | "expired" | "withdrawn";
+export type ActionCardState = "prepared" | "executed" | "frozen" | "reconfirm_required" | "expired" | "withdrawn" | "declined";
+
+/**
+ * States a client may not know yet, and the known state every client is
+ * served instead (RFC 085 §4.4). `declined`: the person named on a
+ * `request:prepare` card declined it. It is the card's stored state, but no
+ * client declares that it knows it (cards go to a whole channel in one
+ * payload, so the server can't serve it per viewer), so every client is
+ * served `expired`, the known state that says the card ended without running
+ * (`executed` would tell an older client it ran). A client that knows reads
+ * the card's `result` (`prepared-request`, outcome `declined`, who and when).
+ * Applied where every card is served (the server's withStoredActionCardSpec);
+ * an entry leaves this table once every supported client draws its state.
+ *
+ * Accepted (Tenny, slock #14735) only while `prepared_request_card_v0` is on
+ * for /raft alone: before the flag opens to other servers, clients declare
+ * the states they draw and get `declined` as itself (the client-declared
+ * states task).
+ */
+export const ACTION_CARD_STATES_SERVED_AS = { declined: "expired" } as const satisfies Partial<Record<ActionCardState, ActionCardState>>;
+
+/** Card metadata (or anything) with its state as clients are served it (ACTION_CARD_STATES_SERVED_AS). */
+export function withServedActionCardState<T>(metadata: T): T {
+  if (typeof metadata !== "object" || metadata === null || Array.isArray(metadata)) return metadata;
+  const state = (metadata as { state?: unknown }).state;
+  if (typeof state !== "string" || !Object.hasOwn(ACTION_CARD_STATES_SERVED_AS, state)) return metadata;
+  return { ...metadata, state: ACTION_CARD_STATES_SERVED_AS[state as keyof typeof ACTION_CARD_STATES_SERVED_AS] };
+}
 
 /**
  * How long a card can be completed (#proj-apps:#40): 30 days from when it was
@@ -1678,6 +1741,7 @@ export const ACTION_CARD_ACTION_KEYS = {
   // agent:create
   hosting: "v2-drops",
   model: "v2-drops",
+  suggestedRuntime: "v2-drops",
   // integration:connect_mcp
   mcpServerId: "v2-drops",
   reason: "v2-drops",
@@ -1737,6 +1801,21 @@ export const ACTION_CARD_ACTION_KEYS = {
   phrase: "v2-drops",
   tool: "v2-drops",
   view: "v2-drops",
+  // request:prepare (RFC 085)
+  attempt: "v2-drops",
+  body: "v2-drops",
+  changedAt: "v2-drops",
+  changePending: "v2-drops",
+  digest: "v2-drops",
+  display: "v2-drops",
+  note: "v2-drops",
+  operation: "v2-drops",
+  params: "v2-drops",
+  permission: "v2-drops",
+  refusal: "v2-drops",
+  route: "v2-drops",
+  summaryModel: "v2-drops",
+  template: "v2-drops",
 } as const satisfies Record<KeysOfUnion<StoredActionCardAction>, "v2-keeps" | "v2-drops">;
 
 export type ActionCardResult =
@@ -1919,6 +1998,25 @@ export type ActionCardResult =
       answeredAt: string;
       /** By question id, in question order. */
       answers: Record<string, ActionCardQuestionAnswer>;
+    }
+  | {
+      /**
+       * How a `request:prepare` card ended where a person acted (RFC 085):
+       * the route answered 2xx (`success`), it may have run (`unknown`: no
+       * answer in time, a 5xx, or a claim that outlived its run), it changed
+       * into something its agent can't see (`changed_since_prepared`), or the
+       * person declined (`declined`; the card's state is `declined`, served
+       * as `expired`). Never the route's response.
+       */
+      kind: "prepared-request";
+      outcome: PreparedRequestCardOutcome;
+      /** The route's HTTP status when it answered; null otherwise. */
+      status: number | null;
+      /** The commit attempt this ended (the card's `attempt`). */
+      attempt: number;
+      /** Who decided (confirmed or declined); null when nobody did. */
+      decidedByUserId: string | null;
+      decidedAt: string;
     };
 
 /**
@@ -2019,6 +2117,14 @@ export const ACTION_CARD_RESULT_KEYS = {
     answeredBy: "v2-drops",
     answeredAt: "v2-drops",
     answers: "v2-drops",
+  },
+  "prepared-request": {
+    kind: "v2-keeps",
+    outcome: "v2-drops",
+    status: "v2-drops",
+    attempt: "v2-drops",
+    decidedByUserId: "v2-drops",
+    decidedAt: "v2-drops",
   },
 } as const satisfies {
   [Kind in ActionCardResult["kind"]]: Record<KeysOfUnion<Extract<ActionCardResult, { kind: Kind }>>, "v2-keeps" | "v2-drops">;

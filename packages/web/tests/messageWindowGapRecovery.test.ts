@@ -275,7 +275,7 @@ test("explicit channel loadOlder updates that channel bucket without switching t
     assert.deepEqual(harness.messages(CHANNEL_ID).map((item) => item.id), ["m-10"]);
     assert.deepEqual(harness.messages("channel-b").map((item) => item.id), ["channel-b-older", "channel-b-latest"]);
     assert.deepEqual(useMessageStore.getState().messages.map((item) => item.id), ["m-10"]);
-    assert.deepEqual(harness.getCalls(), ["/messages/channel/channel-b?limit=50&before=20"]);
+    assert.deepEqual(harness.getCalls(), ["/messages/channel/channel-b?limit=50&before=20&threadPreviewChars=200"]);
   } finally {
     harness.restore();
   }
@@ -703,7 +703,7 @@ test("loadOlder prepends one contiguous page without duplicating the anchor or d
 
     assert.deepEqual(harness.snapshot(channelId).messageIds, ["m-8", "m-9", "m-10", "m-11", "m-12"]);
     assert.deepEqual(harness.messages(channelId).map((item) => item.seq), [8, 9, 10, 11, 12]);
-    assert.deepEqual(harness.getCalls(), [`/messages/channel/${channelId}?limit=50&before=10`]);
+    assert.deepEqual(harness.getCalls(), [`/messages/channel/${channelId}?limit=50&before=10&threadPreviewChars=200`]);
     assert.deepEqual(harness.windowMeta(channelId), {
       loading: false,
       loadingOlder: false,
@@ -2126,7 +2126,7 @@ test("canonical reply context opens the owning thread before restoring the paren
       harness.getCalls(),
       [
         "/messages/context/clicked-reply-alias",
-        "/messages/channel/requested-parent-channel?limit=50",
+        "/messages/channel/requested-parent-channel?limit=50&threadPreviewChars=200",
       ],
       "after routing the canonical reply into its thread, the requested parent timeline is restored",
     );
@@ -2162,7 +2162,7 @@ test("falls back to the channel timeline when focused message context is missing
     assert.equal(harness.windowMeta(CHANNEL_ID).contextLoadError, "message.chatPanel.messageNotFound");
     assert.deepEqual(harness.getCalls(), [
       "/messages/context/missing-message",
-      "/messages/channel/channel-1?limit=50",
+      "/messages/channel/channel-1?limit=50&threadPreviewChars=200",
     ]);
   } finally {
     harness.restore();
@@ -2218,8 +2218,8 @@ test("stale focused-context failure cannot publish after leaving and re-entering
     assert.equal(harness.windowMeta(CHANNEL_ID).contextLoadError, null);
     assert.deepEqual(harness.getCalls(), [
       "/messages/context/stale-message",
-      "/messages/channel/channel-2?limit=50",
-      "/messages/channel/channel-1?limit=50",
+      "/messages/channel/channel-2?limit=50&threadPreviewChars=200",
+      "/messages/channel/channel-1?limit=50&threadPreviewChars=200",
     ]);
   } finally {
     harness.restore();

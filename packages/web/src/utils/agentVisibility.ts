@@ -1,5 +1,6 @@
 import type { Agent } from "../store/agentStore";
 import type { ServerCapabilities } from "@botiverse/raft-shared";
+import { isExternalAgentRuntime } from "@botiverse/raft-shared";
 
 export function canViewAgentPrivateSurfaces(
   agent: Pick<Agent, "creatorType" | "creatorId">,
@@ -33,4 +34,23 @@ export function agentRuntimePermissions(
     canStopAgent: canControlAgentRuntime && canViewAgentPrivateSurfaces(agent, currentUserId, capabilities.stopAgents),
     canResetAgentWorkspace: managed && canViewAgentPrivateSurfaces(agent, currentUserId, capabilities.resetAgentWorkspace),
   };
+}
+
+/**
+ * Who may edit an agent's runtime config (the Edit runtime config dialog,
+ * AgentRuntimeConfigEditor): the rule the profile's Runtime config pencil
+ * follows (AgentDetailPanel's canManageAgent, `editAgents` or the creator, on
+ * a live agent of this server; AgentProfileInfo's canOpenRuntimeConfigEditor,
+ * never an external agent), read by the Members page's Edit agent. Never an
+ * archived agent or an App's identity (its runtime is the App's).
+ */
+export function canEditAgentRuntimeConfig(
+  agent: Pick<Agent, "creatorType" | "creatorId" | "deletedAt" | "managedByAppInstallId" | "external" | "runtime">,
+  currentUserId: string | undefined,
+  capabilities: Pick<ServerCapabilities, "editAgents">,
+  { isBoundedPublicProjection = false }: { isBoundedPublicProjection?: boolean } = {},
+): boolean {
+  if (isBoundedPublicProjection || agent.deletedAt || agent.managedByAppInstallId) return false;
+  if (agent.external === true || isExternalAgentRuntime(agent.runtime)) return false;
+  return canViewAgentPrivateSurfaces(agent, currentUserId, capabilities.editAgents);
 }

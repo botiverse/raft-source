@@ -91,6 +91,8 @@ test("upgrade drain: the service's request begins the hosts' drain with the time
     t.fake.finish("quiet");
     await flush();
     assert.equal(t.state().finished, "quiet");
+    // How many agents it waited for goes to the service with `finished` (its `drain` step).
+    assert.equal(t.state().waitedFor, 1);
     assert.deepEqual(t.sent.at(-1), { type: "computer:upgrade:draining", requestId: "req-1", deadlineAt: new Date(1_060_000).toISOString(), live: 1, notQuietAgentIds: [], finished: "quiet" });
     t.channel.tick();
     assert.deepEqual(t.fake.calls, ["begin:60000"], "quiet: still held, the shutdown comes next");

@@ -2,6 +2,7 @@ import { publishChannelUpdate } from "./channelRealtimeEvents";
 import { AGENT_KIND_RULES, agentKindOf } from "./agentMemberListPolicy";
 import { socketUserServerRoom } from "../socket/platformScope";
 import { ALL_CHANNEL_TEAM_THRESHOLD, currentDate, isExternalAgentRuntime, referralSourceLabel, signupRoleLabel } from "@botiverse/raft-shared";
+import type { AgentMessage } from "@botiverse/raft-shared";
 import type { Server as SocketServer } from "socket.io";
 import { createHash } from "node:crypto";
 import { and, eq } from "drizzle-orm";
@@ -19,6 +20,15 @@ import {
 import * as userService from "./userService";
 import { createAppReminder } from "../apps/reminder/crud";
 import { getHostedOnboardingAgentState } from "./hostedCindyService";
+import { deliverOnboardingWake, onboardingHeldWakeStore, type OnboardingHeldWakeStore, type OnboardingWakeRoute } from "./onboardingHeldWakes";
+import {
+  ONBOARDING_ALL_CHANNEL_GREETING_TTL_MS,
+  ONBOARDING_OWNER_BRIEFING_TTL_MS,
+  allChannelGreetingObjectRef,
+  onboardingInstructionsAsInboxItems,
+  ownerBriefingObjectRef,
+  sendOnboardingInboxItem,
+} from "./onboardingInboxItems";
 import { computeNextFire, type Recurrence } from "./recurrence";
 import { OWNER_OPENER_TEAM_MODE_HTML } from "./ownerOpenerArtifactHtml";
 import { createIdempotentPendingAttachmentProjectionWithExecutor } from "./attachmentProjectionWriterService";
@@ -129,6 +139,12 @@ type OnboardingServiceDeps = {
   claimOwnerOpener: typeof serverService.claimOwnerOpener;
   releaseOwnerOpenerClaim: typeof serverService.releaseOwnerOpenerClaim;
   createSchedule: typeof createAppReminder;
+  /** How an onboarding wake goes to this agent (AgentOrchestrator.onboardingWakeRoute). */
+  onboardingWakeRoute: (orchestrator: AgentOrchestrator, agentId: string) => Promise<OnboardingWakeRoute>;
+  holdOnboardingWake: OnboardingHeldWakeStore["hold"];
+  /** Whether this agent's onboarding instructions go as inbox items (Computer 1.0.68+; 1.25.3+ for a per-turn runtime). */
+  onboardingInstructionsAsInboxItems: typeof onboardingInstructionsAsInboxItems;
+  sendOnboardingInboxItem: typeof sendOnboardingInboxItem;
 };
 
 const defaultOnboardingServiceDeps: OnboardingServiceDeps = {
@@ -159,7 +175,32 @@ const defaultOnboardingServiceDeps: OnboardingServiceDeps = {
   claimOwnerOpener: serverService.claimOwnerOpener,
   releaseOwnerOpenerClaim: serverService.releaseOwnerOpenerClaim,
   createSchedule: createAppReminder,
+  onboardingWakeRoute: (orchestrator, agentId) => orchestrator.onboardingWakeRoute(agentId),
+  holdOnboardingWake: onboardingHeldWakeStore.hold,
+  onboardingInstructionsAsInboxItems,
+  sendOnboardingInboxItem,
 };
+
+/**
+ * Whether an onboarding instruction for this agent goes as an inbox item
+ * (onboardingInboxItems.ts): Computer 1.0.68+, or 1.25.3+ for a runtime
+ * #14955 holds wakes for (its route is not `unchanged`: a per-turn driver
+ * not on the OAR host). A failed lookup keeps the old path.
+ */
+async function instructionsAsInboxItems(deps: OnboardingServiceDeps, orchestrator: AgentOrchestrator, agentId: string): Promise<boolean> {
+  try {
+    const perTurnRuntime = (await deps.onboardingWakeRoute(orchestrator, agentId)) !== "unchanged";
+    return await deps.onboardingInstructionsAsInboxItems(agentId, { perTurnRuntime });
+  } catch (err) {
+    console.warn(`[Onboarding] Computer version lookup for agent ${agentId} failed; using the message path: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
+/** An instruction as one line: `raft inbox read` shows an app event's first line only. */
+function asOneLine(text: string): string {
+  return text.split("\n").map((line) => line.trim()).filter(Boolean).join(" ");
+}
 
 let onboardingServiceDepsOverride: Partial<OnboardingServiceDeps> | null = null;
 
@@ -601,17 +642,62 @@ async function sendOwnerOpenerV2(
     roleLabel: signupRoleLabel(user.signupRole),
     referralLabel: user.referralSource ? referralSourceLabel(user.referralSource) : null,
   });
+  const opener = { channelId: targetChannel.id, messageIds: sentMessageIds, artifactAttachmentId };
+
+  // Computer 1.0.68+ (1.25.3+ for a per-turn runtime): the briefing is an inbox item of `system.onboarding`
+  // (onboardingInboxItems.ts), one per server: a replay finds it and writes
+  // nothing. It counts as delivered once the item is written: a push that
+  // fails leaves it queued for the sweep and the agent's next /events, and it
+  // lives 7 days. Nothing is held (onboarding_held_wakes is not written) and
+  // nothing un-stamps it.
+  if (await instructionsAsInboxItems(deps, agentOrchestrator, onboardingAgentId)) {
+    try {
+      await deps.sendOnboardingInboxItem(agentOrchestrator, {
+        serverId,
+        agentId: onboardingAgentId,
+        objectRef: ownerBriefingObjectRef(serverId),
+        summary: `Onboarding briefing (system-triggered). ${asOneLine(instruction)}`,
+        payload: {
+          type: "owner_briefing",
+          version: OWNER_OPENER_V2_VERSION,
+          owner_user_id: targetUserId,
+          owner_name: user.name,
+          channel_id: targetChannel.id,
+          channel_name: targetChannel.name,
+          opener_message_ids: sentMessageIds,
+          topics: OWNER_OPENER_V2_TOPICS,
+          ...(artifactAttachmentId ? { team_mode_artifact_attachment_id: artifactAttachmentId } : {}),
+        },
+        ttlMs: ONBOARDING_OWNER_BRIEFING_TTL_MS,
+        relatedChannelId: targetChannel.id,
+      });
+    } catch (err) {
+      // Not written: the briefing did not happen. No stamp, so the next activation retries.
+      console.warn(`[Onboarding] Failed to write the briefing item for agent ${onboardingAgentId}; not marking onboarding as sent: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
+    return opener;
+  }
+
+  // Older Computers: a synthetic seq-0 message.
+  //
   // This wake is the ONLY thing that tells Cindy who she is talking to (her role, her
-  // playbook, "do not repeat the opener"). It is delivered `transient`, and a transient
-  // delivery to an agent that is not currently able to receive is DROPPED, not queued.
-  // At activation her runtime is often still coming up, so it lands in nothing — and
-  // the caller used to stamp "sent" anyway, which meant it was never retried. Cindy then
-  // greeted the owner and, asked who they were, honestly answered that she had no idea.
+  // playbook, "do not repeat the opener"). The Server can drop it (an agent it cannot
+  // deliver to: `dropped` in the receipt), and the caller used to stamp "sent" anyway,
+  // which meant it was never retried. Cindy then greeted the owner and, asked who they
+  // were, honestly answered that she had no idea.
   //
   // So the delivery receipt decides. A dropped ledger = the briefing did not happen:
   // report it, do not stamp, and the next activation runs this again. The visible opener
   // messages above are keyed by `agentSendKey`, so replaying is a no-op for the human.
-  const delivery = await agentOrchestrator.deliverMessage(onboardingAgentId, {
+  //
+  // It is NOT a transient delivery (an older comment here said it was): for most
+  // runtimes it is an ordinary seq-0 inbox message. For a runtime driver that exits
+  // after every turn (Cursor, the old Antigravity/Gemini/Copilot drivers) that message
+  // restarted the agent after every turn, so for those it goes transient once the
+  // agent's process is idle, held until then (onboardingHeldWakes.ts). A held ledger
+  // counts as sent: the hold is what delivers it.
+  const ledgerMessage = {
     channel_id: targetChannel.id,
     channel_name: targetChannel.name,
     channel_type: "channel",
@@ -622,11 +708,20 @@ async function sendOwnerOpenerV2(
     timestamp: currentDate().toISOString(),
     seq: 0,
     message_id: `opener-v2-ledger-${serverId}`,
-  }).catch((err: unknown) => {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`[Onboarding] Failed to deliver ledger to agent ${onboardingAgentId}: ${msg}`);
-    return { status: "dropped", reason: "delivery_threw" } as const;
-  });
+  } satisfies AgentMessage;
+  const delivery = await deps.onboardingWakeRoute(agentOrchestrator, onboardingAgentId)
+    .then((route) => deliverOnboardingWake(agentOrchestrator, {
+      agentId: onboardingAgentId,
+      kind: "owner_opener_ledger",
+      message: ledgerMessage,
+      route,
+    }, { store: { hold: deps.holdOnboardingWake } }))
+    .then((outcome) => outcome.kind === "held" ? { status: "queued", reason: "held_for_idle" } as const : outcome.result)
+    .catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[Onboarding] Failed to deliver ledger to agent ${onboardingAgentId}: ${msg}`);
+      return { status: "dropped", reason: "delivery_threw" } as const;
+    });
 
   if (delivery.status === "dropped") {
     console.warn(
@@ -635,11 +730,7 @@ async function sendOwnerOpenerV2(
     return null;
   }
 
-  return {
-    channelId: targetChannel.id,
-    messageIds: sentMessageIds,
-    artifactAttachmentId,
-  };
+  return opener;
 }
 
 function buildAllChannelAgenticGreetingInstruction(channelName: string) {
@@ -686,18 +777,41 @@ export async function triggerNewAgentAllChannelGreeting(
   if (!claimed) return false;
 
   try {
-    await agentOrchestrator.deliverMessage(agentId, {
-      channel_id: allChannel.id,
-      channel_name: allChannel.name,
-      channel_type: "channel",
-      sender_id: "system",
-      sender_name: "system",
-      sender_type: "system",
-      content: buildAllChannelAgenticGreetingInstruction(allChannel.name),
-      timestamp: new Date().toISOString(),
-      seq: 0,
-      message_id: `all-greeting-${serverId}-${agentId}`,
-    });
+    // Computer 1.0.68+ (1.25.3+ for a per-turn runtime): an inbox item of `system.onboarding`, one per agent
+    // and server, living a day (a late "hello, I just joined" is noise).
+    if (await instructionsAsInboxItems(deps, agentOrchestrator, agentId)) {
+      await deps.sendOnboardingInboxItem(agentOrchestrator, {
+        serverId,
+        agentId,
+        objectRef: allChannelGreetingObjectRef(serverId, agentId),
+        summary: asOneLine(buildAllChannelAgenticGreetingInstruction(allChannel.name)),
+        payload: { type: "all_channel_greeting", channel_id: allChannel.id, channel_name: allChannel.name },
+        ttlMs: ONBOARDING_ALL_CHANNEL_GREETING_TTL_MS,
+        relatedChannelId: allChannel.id,
+      });
+      return true;
+    }
+    // Older Computers: a synthetic seq-0 message. On a per-turn runtime driver
+    // it goes transient once the agent is idle (onboardingHeldWakes.ts);
+    // everywhere else as before.
+    const route = await deps.onboardingWakeRoute(agentOrchestrator, agentId);
+    await deliverOnboardingWake(agentOrchestrator, {
+      agentId,
+      kind: "all_channel_greeting",
+      message: {
+        channel_id: allChannel.id,
+        channel_name: allChannel.name,
+        channel_type: "channel",
+        sender_id: "system",
+        sender_name: "system",
+        sender_type: "system",
+        content: buildAllChannelAgenticGreetingInstruction(allChannel.name),
+        timestamp: new Date().toISOString(),
+        seq: 0,
+        message_id: `all-greeting-${serverId}-${agentId}`,
+      },
+      route,
+    }, { store: { hold: deps.holdOnboardingWake } });
     return true;
   } catch (err) {
     await deps.clearAllChannelIntroSentClaim(agentId, claimedAt).catch(() => {});
@@ -798,11 +912,13 @@ export async function triggerOwnerOnboardingOnAgentActivation(
 
   // Do not brief an agent that is not running.
   //
-  // The briefing is a transient wake: delivered to a dead agent it is simply lost,
-  // and the "sent" flag below would then be stamped anyway, so it would never be
-  // retried. That is exactly what happened in a real run — Cindy crashed on a stale
-  // runtime credential, the survey answer was delivered into the void, and she came
-  // back up knowing nothing about the person she was there to help.
+  // Briefing an agent that is not running could lose the briefing while the "sent"
+  // flag below is stamped anyway, so it would never be retried. That is exactly what
+  // happened in a real run — Cindy crashed on a stale runtime credential, the survey
+  // answer was delivered into the void, and she came back up knowing nothing about
+  // the person she was there to help. (The briefing is an inbox item on Computer
+  // 1.0.68+ and an ordinary seq-0 message before, transient only for a per-turn
+  // runtime once idle: see sendOwnerOpenerV2.)
   //
   // Returning false claims nothing, so the next activation (which fires this same
   // trigger when the agent starts) delivers it for real.

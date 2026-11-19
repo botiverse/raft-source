@@ -703,6 +703,7 @@ test("agent-api response contracts parse representative envelopes", () => {
     },
     assistantOwnerArtifact: { owner: { userId: "33333333-3333-4333-8333-333333333333" }, artifact: { id: "pt_abc12345", url: "https://app.raft.build/artifacts/pt_abc12345", title: "Plan", description: null, home: { kind: "conversation", conversation: { id: "55555555-5555-4555-8555-555555555555", type: "channel", target: "#design" } }, author: { type: "user", name: "ada" }, version: 1, latestVersion: 1, commentCount: 0, position: 3, createdAt: "2026-11-12T00:00:00.000Z", updatedAt: "2026-11-12T00:00:00.000Z" }, versions: [], files: [{ path: "index.html", kind: "html", sizeBytes: 12, entry: true }], file: { kind: "text", path: "index.html", entry: true, contentType: "text/html", sizeBytes: 12, content: "<h1>Plan</h1>", truncated: false }, comments: { items: [], olderCursor: null, newestPosition: 3 } },
     assistantOwnerArtifactPublish: { artifact: { id: "pt_abc12345", url: "https://app.raft.build/artifacts/pt_abc12345", version: 1, unchanged: false, homeConversationId: "55555555-5555-4555-8555-555555555555" } },
+    assistantOwnerArtifactPublishAsOwner: { artifact: { id: "pt_abc12345", url: "https://app.raft.build/artifacts/pt_abc12345", version: 1, unchanged: false }, home: { id: "55555555-5555-4555-8555-555555555555", ref: "#design" } },
     assistantOwnerActivity: { owner: { userId: "33333333-3333-4333-8333-333333333333" }, items: [], hasMore: false, nextSince: null },
     assistantOwnerResolve: { id: "88888888-8888-4888-8888-888888888888", type: "human", name: "ada" },
     assistantCheckStateImport: { briefToday: "due" },
@@ -1183,6 +1184,7 @@ test("agent-api response contracts parse representative envelopes", () => {
       logoUrl: "/api/integration-logos/client-uuid-1/hash.webp",
     },
     integrationAppList: { apps: [] },
+    integrationAppCardButtons: { clientId: "client-uuid-1", clientKey: "drive9", cardButtons: { mode: "allow", state: "allowed", inForce: true, actionEndpoint: "https://drive9.example/card-actions", pendingActionEndpoint: null, allowedActionEndpoint: "https://drive9.example/card-actions", changedAt: "2026-11-14T00:00:00.000Z", changedBy: { type: "agent", id: "agent-uuid-1", name: "box" } } },
     integrationAppStatus: {
       app: {
         state: "committed",
@@ -1204,6 +1206,7 @@ test("agent-api response contracts parse representative envelopes", () => {
       messageId: "msg-action-1",
       metadata: { kind: "action-card", state: "withdrawn" },
     },
+    actionOperations: { enabled: false, operations: [] },
     attachmentUpload: {
       id: "attachment-1",
       filename: "log.txt",

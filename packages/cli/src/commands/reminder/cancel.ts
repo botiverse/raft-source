@@ -23,8 +23,8 @@ interface CancelOpts {
 export const reminderCancelCommand = defineCommand(
   {
     name: "cancel",
-    description: "Cancel a scheduled reminder by id (full uuid or 8-char prefix)",
-    options: [{ flags: "--id <id>", description: "Reminder id (full uuid or short prefix)" }],
+    description: "Cancel a scheduled reminder by id",
+    options: [{ flags: "--id <id>", description: "Reminder id (full uuid, short prefix, or reminder:<id> as raft inbox check prints it)" }],
   },
   async (ctx, opts: CancelOpts) => {
       if (!opts.id || opts.id.trim().length === 0) {

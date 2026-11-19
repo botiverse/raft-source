@@ -1,3 +1,4 @@
+import { markAgentProgress } from "./agentProgressMarks";
 import { readSlackBotMentionAuthority } from "./slackBotMentionAuthority";
 import { acquireFeatureFlagReadLock, evaluateFeatureFlag } from "./featureFlagService";
 import { getComputedJointHumanPublicRowsForScopes, getComputedJointHumanPublicRows, getJointHumanDeliveryRows, resolveJointHumanEntrySql } from "./jointHumanMembershipAccess";
@@ -63,7 +64,7 @@ import { getJointLimitStatesForJoints, resolveParentJointId } from "./jointChann
 import { getExternalFreezeAtForChannels } from "./externalChannelFreezeState";
 import { DEPRECATED_GRAVATAR_HASH, asServerId, EXTERNAL_CHANNELS_FEATURE_FLAG_KEY, MAX_JOINT_CHANNEL_SERVERS, PLAN_CONFIG, activityMuteSupportedFor, currentDate, currentTimeMs, formatInboxScopeCorruptionLine, getEffectiveLimits, makeInboxScopeReadFrontier, type AgentActivity, type InboxScopeCursorCorruption, type InboxScopeReadFrontier, type ServerId, type ServerPlan, type TraceAttributes, type TrajectoryEntry, CHANNEL_MANAGEMENT_CAPABILITIES, canAddChannelMembers, canGuestPostToChannel, canGuestReadChannel, channelSupportsRoles, getChannelAdminBasis, hasEffectiveChannelCapability, type ChannelRole, type ServerRole } from "@botiverse/raft-shared";
 import { actorRoleHasServerCapability } from "../lib/actorPermissions";
-import { channelTypeSupportsThreadSort, type ChannelThreadSort, RAFT_TASK_REF_SEPARATOR, formatDmPeerRef, formatRaftChannelTaskRef, isSubConversationType, parseDmPeerRef, type DmPeerKind, type MarkUnreadOutcome } from "@botiverse/raft-shared";
+import { channelTypeSupportsThreadSort, type ChannelThreadSort, RAFT_TASK_REF_SEPARATOR, formatDmPeerRef, formatRaftChannelTaskRef, isSubConversationType, parseDmPeerRef, type DmPeerKind, type MarkUnreadOutcome, type InboxBackend } from "@botiverse/raft-shared";
 import { DmTargetResolutionError } from "./dmTargetResolutionError";
 import { untracedDbQuery, type DbQueryTracer } from "../tracing/dbQueryTrace";
 import { MESSAGE_SHORT_ID_RE, uuidShortIdRange } from "../lib/messageId";
@@ -93,7 +94,7 @@ import {
   type ReadMutationAck,
 } from "./readMutationSequencer";
 import { activityPromotionAllowedByMuteSql, isActivityPromotionSuppressedByMute } from "./inboxMutePolicy";
-import { taskConversationUnreadMessageSql } from "./inboxUnreadEligibility";
+import { inboxPersonalMentionSql, inboxRowMessageCountsUnreadSql, taskConversationUnreadMessageSql } from "./inboxUnreadEligibility";
 import {
   clearChannelDoneSuppression,
   clearFollowedThreadSuppressionForAll,
@@ -124,6 +125,7 @@ import {
 import { withChannelWriterFence, assertChannelWritableInTransaction } from "./channelConversionFenceService";
 import { announceJointInvitesChanged, announceJointInvitesForJoints, coalesceListChanges } from "./listChangedRealtime";
 import { ActionCardConversionFrozenError, assertActionCardWritableInTransaction } from "./actionCardConversionService";
+import { truncateThreadReplyPreview } from "./threadReplyPreview";
 
 interface ChannelServiceOptions {
   executor?: DatabaseExecutor;
@@ -2617,6 +2619,12 @@ interface ThreadSummaryOptions {
    */
   includeParticipants?: boolean;
   /**
+   * The caller renders latestReplies[].preview as a one-row preview only and
+   * asked for it cut to this many characters (threadReplyPreview.ts). Absent:
+   * full reply content, as older clients expect.
+   */
+  previewChars?: number;
+  /**
    * Resolve reply agents only among this server's agents, as the caller's
    * parent rows do (the anonymous public page joins agents on its own server
    * id). A reply whose agent belongs to another server gets the parent row's
@@ -4584,6 +4592,17 @@ export class ArchivedNameCollisionError extends Error {
  * archived. Call from write-path code to freeze all mutations on archived
  * channels.
  */
+/**
+ * A conversation's root, walked as the archive check walks it (a thread to
+ * its parent, a Joint thread's local face to its local parent, a task
+ * conversation to its channel): whether it is archived, and the root's type
+ * (`joint` for a Joint Channel or a thread in one). Never throws for an
+ * archived one, unlike assertChannelNotArchived.
+ */
+export async function getConversationArchiveRoot(channelId: string): Promise<ChannelArchiveState> {
+  return getChannelArchiveState(channelId);
+}
+
 export async function assertChannelNotArchived(channelId: string): Promise<Pick<ChannelArchiveState, "rootType"> | void> {
   const state = await getChannelArchiveState(channelId);
   if (state.archived) throw new ChannelArchivedError(channelId);
@@ -8296,6 +8315,17 @@ export function agentVisibleMemberServers(
   return visible.map(server => ({ name: server.name, slug: server.slug }));
 }
 
+/** Whether a roster person belongs to the viewer's server, so the viewer may
+ * see their role there. A joint roster row says so directly (`inViewerServer`;
+ * its `serverId` is only the first other source); a local row is the viewer's
+ * own when its `serverId` is. */
+export function isViewerServerMember(
+  member: { serverId: string; inViewerServer?: boolean },
+  viewerServerId: string,
+): boolean {
+  return member.inViewerServer ?? member.serverId === viewerServerId;
+}
+
 /** The viewed server first (when present), then the rest by name, then id. */
 export function orderChannelMemberServers(
   servers: readonly ChannelMemberServer[],
@@ -11047,7 +11077,10 @@ export async function getOrCreateThreadForChannel(
 type ThreadSummaryLatestReply = {
   messageId: string;
   seq: number;
+  /** The reply's content, or at most `previewChars` of it when the caller asked; see threadReplyPreview.ts. */
   preview: string;
+  /** Present (true) only when `preview` was cut; the full reply comes from the thread. */
+  truncated?: true;
   senderId: string;
   senderType: "user" | "agent" | "system" | "external_projection";
   /** Stable unique handle retained for identity/backward compatibility. */
@@ -11327,10 +11360,12 @@ export async function getThreadSummaries(
   for (const row of latestRows) {
     const isSystem = row.messageType === "system";
     const list = latestRepliesByThreadId.get(row.threadChannelId) ?? [];
+    const preview = opts?.previewChars ? truncateThreadReplyPreview(row.content, opts.previewChars) : row.content;
     list.push({
       messageId: row.messageId,
       seq: row.seq,
-      preview: row.content,
+      preview,
+      ...(preview === row.content ? {} : { truncated: true as const }),
       senderId: row.senderId,
       senderType: isSystem ? "system" : row.senderType,
       senderName: isSystem
@@ -14285,6 +14320,12 @@ function buildRisingWaveInboxItemsServingQuery(
   // mention, ordering, pagination, or total-count semantic changed here or in
   // the PG SQL must be mirrored in the other side and in:
   // infra/risingwave/sql/024-risingwave-unread-inbox-full-materialized.sql
+  // The per-message unread and @ rules are not inline on the PG side: they are
+  // inboxRowMessageCountsUnreadSql / inboxPersonalMentionSql
+  // (inboxUnreadEligibility.ts), kept equal to the RW unread_count FILTER
+  // (075-inbox-cursor-decouple.sql, the muted prefix boundary, 078's task
+  // filter) and to packages/shared/src/activityUnreadPredicate.ts by the
+  // activity-row contract cases (activityUnreadPredicate.contractCases.test.ts).
   // Then run: pnpm --filter @botiverse/raft-server risingwave:verify-inbox-parity
   // PG and RW stringify timestamptz with slightly different timezone/fractional
   // formatting. Keep the shared serving query byte-comparable at the API layer.
@@ -15292,6 +15333,12 @@ export type InboxItemsResult = {
   totalCount: number;
   totalUnreadCount: number;
   activeUnreadCount: number;
+  /**
+   * Which read source served the rows (readInboxItems): the RisingWave views
+   * or the canonical Postgres read. GET /channels/inbox sends it as
+   * `X-Raft-Inbox-Backend` (shared INBOX_BACKEND_HEADER), not in the body.
+   */
+  backend?: InboxBackend;
 };
 
 export function inboxItemActivityAt(item: InboxItem): string {
@@ -15407,6 +15454,7 @@ async function getUnifiedActivityAllInboxItems(
     totalCount: active.totalCount + unfollowedItems.length,
     totalUnreadCount: active.totalUnreadCount,
     activeUnreadCount: active.activeUnreadCount,
+    ...(active.backend ? { backend: active.backend } : {}),
   };
 }
 
@@ -15581,7 +15629,8 @@ async function readInboxItems(
       : "forced_canonical";
   if (!useCanonicalPostgres) {
     const override = getActivityReadSourceOverride();
-    if (override) return override.inboxItems(serverId, userId, { ...opts, q });
+    // The test-only stand-in for the RisingWave reads.
+    if (override) return { ...(await override.inboxItems(serverId, userId, { ...opts, q })), backend: "risingwave" };
     const risingWaveResult = await getInboxItemsFromRisingWave(serverId, userId, {
       filter,
       limit,
@@ -15602,7 +15651,7 @@ async function readInboxItems(
       "none",
       risingWaveResult.contractVersion,
     );
-    return buildRisingWaveInboxItemsResult(risingWaveResult, limit, traceQuery, db);
+    return { ...(await buildRisingWaveInboxItemsResult(risingWaveResult, limit, traceQuery, db)), backend: "risingwave" };
   }
 
   const legacyActivityChannelFilterPredicate = channelId
@@ -16015,9 +16064,7 @@ async function readInboxItems(
       INNER JOIN messages m
         ON m.channel_id = a."storageChannelId"
        AND m.seq > a."lastReadSeq"${legacyCutoffAndM}
-       AND NOT (m.sender_type = 'user' AND m.sender_id = ${userId})
-       AND ${legacyChatActivityPromotionAllowedSql(userId, sql`a."muteFromSeq"`)}
-       AND ${taskConversationUnreadMessageSql(sql`m`, sql`a."kind" = 'task'`)}
+       AND ${inboxRowMessageCountsUnreadSql({ message: sql`m`, userId, muteFromSeq: sql`a."muteFromSeq"`, isTaskConversation: sql`a."kind" = 'task'` })}
       WHERE NOT a."isOutsiderMention"
     ),
     page AS (
@@ -16079,9 +16126,7 @@ async function readInboxItems(
         FROM messages m
         WHERE m.channel_id = p."storageChannelId"
           AND m.seq > p."lastReadSeq"${legacyCutoffAndM}
-          AND NOT (m.sender_type = 'user' AND m.sender_id = ${userId})
-          AND ${legacyChatActivityPromotionAllowedSql(userId, sql`p."muteFromSeq"`)}
-          AND ${taskConversationUnreadMessageSql(sql`m`, sql`p."kind" = 'task'`)}
+          AND ${inboxRowMessageCountsUnreadSql({ message: sql`m`, userId, muteFromSeq: sql`p."muteFromSeq"`, isTaskConversation: sql`p."kind" = 'task'` })}
         ORDER BY m.seq ASC
         LIMIT 1
       ) first_unread ON true
@@ -16090,9 +16135,7 @@ async function readInboxItems(
         FROM messages m
         WHERE m.channel_id = p."storageChannelId"
           AND m.seq > p."lastReadSeq"${legacyCutoffAndM}
-          AND NOT (m.sender_type = 'user' AND m.sender_id = ${userId})
-          AND ${legacyChatActivityPromotionAllowedSql(userId, sql`p."muteFromSeq"`)}
-          AND ${taskConversationUnreadMessageSql(sql`m`, sql`p."kind" = 'task'`)}
+          AND ${inboxRowMessageCountsUnreadSql({ message: sql`m`, userId, muteFromSeq: sql`p."muteFromSeq"`, isTaskConversation: sql`p."kind" = 'task'` })}
       ) unread ON true
       LEFT JOIN LATERAL (
         SELECT count(*)::int AS reply_count
@@ -16107,9 +16150,7 @@ async function readInboxItems(
       LEFT JOIN LATERAL (
         SELECT true AS found, mm.message_id AS first_mention_message_id
         FROM message_mentions mm
-        WHERE mm.target_type = 'user'
-          AND mm.target_id = ${userId}::uuid
-          AND (mm.notifiable_at_send OR mm.notified_at IS NOT NULL)
+        WHERE ${inboxPersonalMentionSql(sql`mm`, userId)}
           AND (
             mm.channel_id = p."sourceChannelId"
             OR EXISTS (
@@ -16472,8 +16513,7 @@ async function readInboxItems(
         FROM messages m
         WHERE m.channel_id = c.storage_channel_id
           AND m.seq > c.last_read_seq${legacyCutoffAndM}
-          AND NOT (m.sender_type = 'user' AND m.sender_id = ${userId})
-          AND ${legacyChatActivityPromotionAllowedSql(userId, sql`c.mute_from_seq`)}
+          AND ${inboxRowMessageCountsUnreadSql({ message: sql`m`, userId, muteFromSeq: sql`c.mute_from_seq`, isTaskConversation: sql`false` })}
         ORDER BY m.seq ASC
         LIMIT 1
       ) first_unread ON true
@@ -16482,15 +16522,12 @@ async function readInboxItems(
         FROM messages m
         WHERE m.channel_id = c.storage_channel_id
           AND m.seq > c.last_read_seq${legacyCutoffAndM}
-          AND NOT (m.sender_type = 'user' AND m.sender_id = ${userId})
-          AND ${legacyChatActivityPromotionAllowedSql(userId, sql`c.mute_from_seq`)}
+          AND ${inboxRowMessageCountsUnreadSql({ message: sql`m`, userId, muteFromSeq: sql`c.mute_from_seq`, isTaskConversation: sql`false` })}
       ) unread ON true
       LEFT JOIN LATERAL (
         SELECT true AS found, mm.message_id AS first_mention_message_id
         FROM message_mentions mm
-        WHERE mm.target_type = 'user'
-          AND mm.target_id = ${userId}::uuid
-          AND (mm.notifiable_at_send OR mm.notified_at IS NOT NULL)
+        WHERE ${inboxPersonalMentionSql(sql`mm`, userId)}
           AND (
             mm.channel_id = c.id
             OR EXISTS (
@@ -16675,8 +16712,7 @@ async function readInboxItems(
         FROM messages m
         WHERE m.channel_id = t.storage_channel_id
           AND m.seq > COALESCE(rc.last_read_seq, 0)${legacyCutoffAndM}
-          AND NOT (m.sender_type = 'user' AND m.sender_id = ${userId})
-          AND ${taskConversationUnreadMessageSql(sql`m`, sql`t.conversation_kind = 'task'`)}
+          AND ${inboxRowMessageCountsUnreadSql({ message: sql`m`, userId, muteFromSeq: sql`NULL::bigint`, isTaskConversation: sql`t.conversation_kind = 'task'` })}
         ORDER BY m.seq ASC
         LIMIT 1
       ) first_unread ON true
@@ -16685,15 +16721,12 @@ async function readInboxItems(
         FROM messages m
         WHERE m.channel_id = t.storage_channel_id
           AND m.seq > COALESCE(rc.last_read_seq, 0)${legacyCutoffAndM}
-          AND NOT (m.sender_type = 'user' AND m.sender_id = ${userId})
-          AND ${taskConversationUnreadMessageSql(sql`m`, sql`t.conversation_kind = 'task'`)}
+          AND ${inboxRowMessageCountsUnreadSql({ message: sql`m`, userId, muteFromSeq: sql`NULL::bigint`, isTaskConversation: sql`t.conversation_kind = 'task'` })}
       ) unread ON true
       LEFT JOIN LATERAL (
         SELECT true AS found, mm.message_id AS first_mention_message_id
         FROM message_mentions mm
-        WHERE mm.target_type = 'user'
-          AND mm.target_id = ${userId}::uuid
-          AND (mm.notifiable_at_send OR mm.notified_at IS NOT NULL)
+        WHERE ${inboxPersonalMentionSql(sql`mm`, userId)}
           AND (
             mm.channel_id = t.source_channel_id
             OR EXISTS (
@@ -16903,6 +16936,7 @@ async function readInboxItems(
       rawRows,
       page.totalUnreadCount,
     ),
+    backend: "postgres",
   };
 }
 
@@ -17570,6 +17604,7 @@ export async function markRead(
   if (!scope) return { channelId, maxReadSeq: 0, readStateVersion: 0, changed: false };
   const result = readStateResultFromAckScope(scope);
   readProgress?.finish(result);
+  if (resolved.kind === "agent" && result.changed) markAgentProgress(resolved.id);
   return result;
 }
 
@@ -17893,6 +17928,7 @@ export async function markReadLatest(
   if (!scope) return { channelId, maxReadSeq: 0, readStateVersion: 0, changed: false };
   const result = readStateResultFromAckScope(scope);
   readProgress?.finish(result);
+  if (resolved.kind === "agent" && result.changed) markAgentProgress(resolved.id);
   return result;
 }
 

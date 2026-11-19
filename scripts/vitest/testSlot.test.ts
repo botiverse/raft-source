@@ -9,6 +9,9 @@ import { afterEach, expect, test } from "vitest";
 
 import { MACHINE_SLOT_DIR, holdTestSlotForThisRun } from "./testSlot";
 
+// These runs are not logged (testRunLog.test.ts covers the log); never the host's runs.jsonl.
+process.env.RAFT_TEST_NO_RUN_LOG = "1";
+
 const moduleUrl = new URL("./testSlot.ts", import.meta.url).href;
 const hasFlock = spawnSync("flock", ["--version"], { stdio: "ignore" }).status === 0;
 const it = test.skipIf(!hasFlock || process.platform === "win32");

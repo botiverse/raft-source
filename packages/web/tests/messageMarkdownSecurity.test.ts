@@ -187,8 +187,8 @@ test("message markdown supports email autolinks", () => {
 test("message markdown preserves ordered list start numbers", () => {
   const html = renderEscapedUserMarkdown("2. resumed item");
 
-  assert.match(html, /<ol start="2" translate="no" class="mb-1 pl-5 list-decimal notranslate">/);
-  assert.match(html, /<li translate="no" class="mb-0\.5 notranslate">resumed item<\/li>/);
+  assert.match(html, /<ol start="2" dir="[a-z]+" translate="no" class="mb-1 ps-5 list-decimal notranslate">/);
+  assert.match(html, /<li translate="no" class="mb-0\.5 \[unicode-bidi:plaintext\] notranslate">resumed item<\/li>/);
   assert.doesNotMatch(html, /node="\[object Object\]"/);
 });
 
@@ -208,8 +208,8 @@ test("message markdown preserves GFM task-list checked state", () => {
 test("shared markdown preserves ordered list start numbers by default", () => {
   const html = renderDefaultMarkdown("2. resumed item");
 
-  assert.match(html, /<ol start="2" translate="no" class="mb-1 pl-5 list-decimal notranslate">/);
-  assert.match(html, /<li translate="no" class="mb-0\.5 notranslate">resumed item<\/li>/);
+  assert.match(html, /<ol start="2" dir="[a-z]+" translate="no" class="mb-1 ps-5 list-decimal notranslate">/);
+  assert.match(html, /<li translate="no" class="mb-0\.5 \[unicode-bidi:plaintext\] notranslate">resumed item<\/li>/);
   assert.doesNotMatch(html, /node="\[object Object\]"/);
 });
 

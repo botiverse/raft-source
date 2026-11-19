@@ -6,7 +6,7 @@
 
 import type { Request } from "express";
 import { and, eq, lt, ne } from "drizzle-orm";
-import { SERVER_SETUP_BLOCK_REASONS, asServerId } from "@botiverse/raft-shared";
+import { SERVER_SETUP_GATE_BLOCK_REASONS, asServerId } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
 import { servers } from "../db/schema";
 import type { ServerSetupGateReason } from "./serverSetupStateService";
@@ -15,7 +15,8 @@ import { getProductEventSink } from "./productEventIngest";
 import { recordServerProductEvent } from "./serverProductEvents";
 
 // `server_setup_blocked.reason` names projection gate reasons: a renamed reason must break the build here.
-const SETUP_BLOCK_REASONS_ARE_GATE_REASONS: readonly ServerSetupGateReason[] = SERVER_SETUP_BLOCK_REASONS;
+// (The new onboarding flow's `cindy_*` reasons are not gate reasons and are not in this list.)
+const SETUP_BLOCK_REASONS_ARE_GATE_REASONS: readonly ServerSetupGateReason[] = SERVER_SETUP_GATE_BLOCK_REASONS;
 void SETUP_BLOCK_REASONS_ARE_GATE_REASONS;
 
 function requestPlatform(req: Request) {

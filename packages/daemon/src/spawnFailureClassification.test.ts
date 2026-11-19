@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { classifySpawnFailure } from "./spawnFailureClassification";
+import os from "node:os";
+import { classifySpawnFailure, displayHostDir } from "./spawnFailureClassification";
 import { RuntimeVersionTooOldError } from "./runtimeLaunchVersion";
 import {
   AgentProxyBindError,
@@ -186,4 +187,35 @@ test("a provider API key that cannot go in an HTTP header is classified as provi
 
 test("other untyped start errors keep the generic runtime_spawn_failed", () => {
   assert.equal(classifySpawnFailure(new Error("API key contains a bad character")).reason, "runtime_spawn_failed");
+});
+
+// #proj-raft-computer:1bfb0122: a missing model in a workspace with Pi code
+// Raft no longer loads (#14773) names that as the likely cause, keeps the
+// usual way out, and names the Computer's own extension folder. The error's
+// text (its fingerprint) stays as it was.
+test("a missing model with ignored workspace Pi code names the likely cause, the agent dir, and keeps the usual way out", () => {
+  const error = new RuntimeModelNotFoundError({
+    runtimeId: "pi", model: "wildwork/noname",
+    ignoredWorkspaceCode: [".pi/extensions", ".pi/settings.json packages"], hostExtensionDir: "/srv/pi-agent",
+  });
+  assert.equal(error.message, "Model wildwork/noname is not available for the pi runtime on this computer");
+  const result = classifySpawnFailure(error);
+  assert.equal(result.reason, "model_not_found");
+  assert.equal(result.userMessage, "Model wildwork/noname is not on this Computer. This agent's workspace has Pi code that Raft no longer loads, for security (.pi/extensions, .pi/settings.json packages). If the model came from there, install that extension or package on the Computer, in its Pi agent folder; otherwise choose another model in the agent's settings.");
+  // Without workspace code, or without the folder to name: the old sentence.
+  assert.doesNotMatch(classifySpawnFailure(new RuntimeModelNotFoundError({ runtimeId: "pi", model: "x/y" })).userMessage, /workspace/);
+  assert.doesNotMatch(classifySpawnFailure(new RuntimeModelNotFoundError({ runtimeId: "pi", model: "x/y", ignoredWorkspaceCode: [".pi/extensions"] })).userMessage, /workspace/);
+});
+
+// Tenny's 1.28.0 review: the agent's error is visible to everyone who can see
+// the agent, so the folder never shows the Computer user's name.
+test("the agent dir in a user message never shows the home folder's path", () => {
+  assert.equal(displayHostDir("/home/alice/.pi/agent", "/home/alice"), "~/.pi/agent");
+  assert.equal(displayHostDir("/home/alice", "/home/alice"), "its Pi agent folder", "never the home folder itself");
+  assert.equal(displayHostDir("/home/alice/..pi", "/home/alice"), "~/..pi", "a folder named ..x is still under home");
+  assert.equal(displayHostDir("/home/alicex/.pi/agent", "/home/alice"), "its Pi agent folder");
+  assert.equal(displayHostDir("/srv/pi-agent", "/home/alice"), "its Pi agent folder");
+  const error = new RuntimeModelNotFoundError({ runtimeId: "pi", model: "w/n", ignoredWorkspaceCode: [".pi/extensions"], hostExtensionDir: `${os.homedir()}/.pi/agent` });
+  assert.match(classifySpawnFailure(error).userMessage, /in ~\/\.pi\/agent;/);
+  assert.doesNotMatch(classifySpawnFailure(error).userMessage, new RegExp(os.homedir().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });

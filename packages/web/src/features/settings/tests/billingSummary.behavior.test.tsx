@@ -370,7 +370,7 @@ test("cancel-subscription confirms in a dialog, then posts /billing/cancel", asy
     fireEvent.click(screen.getByRole("button", { name: "Cancel subscription" }));
   });
   const dialog = screen.getByRole("dialog");
-  assert.ok(within(dialog).getByRole("heading", { name: "Cancel subscription" }));
+  assert.ok(within(dialog).getByRole("heading", { name: "Cancel subscription?" }));
   // The action is itself a cancel, so its Cancel says what stays (task #148).
   assert.ok(within(dialog).getByRole("button", { name: "Keep subscription" }));
   assert.ok(within(dialog).queryByRole("button", { name: "Cancel" }) === null);

@@ -9,6 +9,8 @@ import { openArtifactOnPlainClick, useArtifactLinkTargets } from "../../apps/art
 import LeavingRaftMark, { opensInNewTabAriaLabel } from "../ui/LeavingRaftMark";
 import { appLinkDomain, appLinkOpenHref } from "../../utils/appLinkAddress";
 import { CardRelativeTime, KEEP_END, KeptEnd } from "./CardElements";
+import { MessageCardActingButtons } from "./MessageCardActingButtons";
+import type { MessageCardActionsRead } from "./messageCardActions";
 import { MessageCardElements, MessageCardHeaderView } from "./MessageCardElements";
 import { messageCardDrawsSomething } from "./messageCardTree";
 import { messageCardShowsUpdated } from "./messageCardRead";
@@ -35,10 +37,20 @@ import type { ReadMessageCard } from "./messageCardRead";
  * renderer restricted to its subset. The buttons are messageCard's row, at
  * the card's bottom end. Once replaced (revision > 1) the footer says when
  * ("Updated 3 minutes ago").
+ *
+ * An App's card may have acting buttons (RFC 086: `read.acting`, the stored
+ * `actions`). Those are drawn by MessageCardActingButtons from this viewer's
+ * answer to the link card read (`actions`; null where the message is shown
+ * read-only), never as the stored disabled placeholder with its "Update
+ * Raft…" reason, which is for clients older than this one.
  */
-export function MessageCardBody({ read }: { read: ReadMessageCard }) {
+export function MessageCardBody({ read, actions = null }: { read: ReadMessageCard; actions?: MessageCardActionsRead | null }) {
   const { formatMessage } = useIntl();
-  const buttons = messageCardButtons(read.card);
+  const buttons = useMemo(() => messageCardButtons(read.card), [read.card]);
+  const link = useCallback(
+    (id: string, button: MessageCardButton, index: number) => <MessageCardLink key={id} button={button} showDomain={!repeatsLater(buttons, index)} />,
+    [buttons],
+  );
   const elements = messageCardDrawsSomething(read.card, read.card.root, 0);
   const { inset, actionRow } = messageCard();
   return (
@@ -48,9 +60,11 @@ export function MessageCardBody({ read }: { read: ReadMessageCard }) {
         // Under the header the body goes on at the card's inset: 12px from the header's last line, not 24.
         <div className={inset({ className: cn("flex min-w-0 flex-col gap-3", read.card.header && "pt-0") })} data-message-card-content="">
           {elements ? <MessageCardElements card={read.card} /> : null}
-          {buttons.length ? (
+          {buttons.length && read.acting ? (
+            <MessageCardActingButtons acting={read.acting} buttons={buttons} read={actions} link={link} />
+          ) : buttons.length ? (
             <div className={actionRow({ className: "min-w-0" })} data-message-card-buttons="">
-              {buttons.map(([id, button], index) => <MessageCardLink key={id} button={button} showDomain={!repeatsLater(buttons, index)} />)}
+              {buttons.map(([id, button], index) => link(id, button, index))}
             </div>
           ) : null}
         </div>

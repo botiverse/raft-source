@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
 import { idsNamedBy, splitCatalog } from "../src/i18n/messages/catalogParts";
-import { bootDownload, catalogPartSource, firstDownload, wrapLazyImports } from "../scripts/catalogPartsPlugin";
+import { bootDownload, catalogPartSource, firstDownload, firstPartDownload, wrapLazyImports } from "../scripts/catalogPartsPlugin";
 import { dynamicImportTargets, validateCatalogParts } from "../scripts/check-catalog-parts";
 
 const IDS = [
@@ -83,6 +83,23 @@ test("a later chunk with app code loads through the gate (a boot-started page's 
     'd(()=>import("./katex-!~{003}~.js"))',
   ].join(";"));
   assert.deepEqual(wrapLazyImports('import("./Gone.js")', "assets/x.js", chunks, first).unresolved, ["./Gone.js"]);
+});
+
+test("a first-part page (sign-in) counts with the first download: its words in the first part, its load ungated", () => {
+  const chunks = Object.fromEntries([
+    chunk("assets/index-!~{001}~.js", { isEntry: true, imports: ["assets/app-shell-!~{04$}~.js"] }),
+    chunk("assets/app-shell-!~{04$}~.js"),
+    chunk("assets/SignInPage-!~{0d$}~.js", { imports: ["assets/LoginPage-!~{0e$}~.js", "assets/app-shell-!~{04$}~.js"] }),
+    chunk("assets/LoginPage-!~{0e$}~.js"),
+    chunk("assets/RegisterPage-!~{0b$}~.js"),
+  ].map((c) => [c.fileName, c]));
+  const signIn = "/repo/packages/web/src/assets/SignInPage-!~{0d$}~.js.tsx";
+  const boot = new Set([signIn, "/repo/packages/web/src/assets/RegisterPage-!~{0b$}~.js.tsx"]);
+  const first = firstPartDownload(Object.values(chunks), new Set([signIn]));
+  assert.deepEqual([...first].sort(), ["assets/LoginPage-!~{0e$}~.js", "assets/SignInPage-!~{0d$}~.js", "assets/app-shell-!~{04$}~.js", "assets/index-!~{001}~.js"]);
+  assert.deepEqual([...bootDownload(Object.values(chunks), boot, first)], ["assets/RegisterPage-!~{0b$}~.js"]);
+  const wrapped = wrapLazyImports('s(()=>import("./SignInPage-!~{0d$}~.js"));r(()=>import("./RegisterPage-!~{0b$}~.js"))', "assets/app-shell-!~{04$}~.js", chunks, first, boot);
+  assert.equal(wrapped.code, 's(()=>import("./SignInPage-!~{0d$}~.js"));r(()=>(globalThis.__raftCatalogGate||(m=>m))(import("./RegisterPage-!~{0b$}~.js"),"boot"))');
 });
 
 test("the boot-started pages are what their loaders import", () => {

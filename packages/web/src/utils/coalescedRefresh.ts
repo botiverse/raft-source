@@ -25,7 +25,8 @@ export function createCoalescedRefresh({
   schedule = (callback, ms) => setTimeout(callback, ms),
   clear = (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
 }: {
-  run: () => void;
+  /** `asks`: how many requests this reload stands for (deferred ones included). */
+  run: (asks: number) => void;
   delayMs: number;
   isVisible: () => boolean;
   schedule?: (callback: () => void, ms: number) => unknown;
@@ -33,8 +34,13 @@ export function createCoalescedRefresh({
 }): CoalescedRefresh {
   let timer: unknown = null;
   let deferred = false;
+  let asks = 0;
 
   const request = () => {
+    asks += 1;
+    schedule_();
+  };
+  const schedule_ = () => {
     if (!isVisible()) {
       deferred = true;
       return;
@@ -46,7 +52,9 @@ export function createCoalescedRefresh({
         deferred = true;
         return;
       }
-      run();
+      const folded = Math.max(1, asks);
+      asks = 0;
+      run(folded);
     }, delayMs);
   };
 
@@ -55,12 +63,13 @@ export function createCoalescedRefresh({
     flushIfPending: () => {
       if (!deferred || !isVisible()) return;
       deferred = false;
-      request();
+      schedule_();
     },
     cancel: () => {
       if (timer !== null) clear(timer);
       timer = null;
       deferred = false;
+      asks = 0;
     },
   };
 }

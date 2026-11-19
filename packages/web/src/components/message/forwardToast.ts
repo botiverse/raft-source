@@ -1,35 +1,35 @@
-import type { ComponentPropsWithRef, ReactNode } from "react";
-import { createToastManager } from "@botiverse/raft-ui";
-import { toastTimeout } from "../toastBridge";
-
-export const forwardToastManager = createToastManager();
+import { showToast } from "../toastBridge";
 
 type ForwardToastOptions = {
   action?: {
-    label: ReactNode;
-    onClick?: ComponentPropsWithRef<"button">["onClick"];
+    label: string;
+    onClick?: () => void;
   };
   dismissible?: boolean;
 };
 
+/**
+ * The Forward flow's, the desktop sign-in's and the desktop notices' toasts
+ * (desktopNotice). They are the app's toasts (LocalizedToastProvider), at
+ * the one place every toast takes, the bottom center above the composer
+ * (Raft DS › Toast › Where it appears): they used to have a viewport of their
+ * own at the top center, over the search bar (cindyz, 2026-11-14).
+ */
 function addForwardToast(
   intent: "info" | "success" | "warning" | "error",
   title: string,
   options: ForwardToastOptions = {},
 ) {
-  return forwardToastManager.add({
+  return showToast({
     actionProps: options.action
-      ? { children: options.action.label, onClick: options.action.onClick }
+      ? { children: options.action.label, onClick: () => options.action?.onClick?.() }
       : undefined,
-    // 8s with an action or as an error, 5s (the provider's) otherwise.
-    timeout: toastTimeout({ hasAction: Boolean(options.action), type: intent }),
     title,
     type: intent,
     priority: intent === "error" ? "high" : undefined,
     data: {
       intent,
       hasClose: options.dismissible ?? false,
-      hasIcon: false,
     },
   });
 }

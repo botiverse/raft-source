@@ -9,7 +9,13 @@ import { execFile, spawn } from "node:child_process";
 import { closeSync, mkdirSync, openSync } from "node:fs";
 import { join } from "node:path";
 import type { Channel } from "./lib/channelState";
-import type { ComputerLastUpgradeReceipt } from "@botiverse/raft-shared";
+import {
+  normalizeComputerUpgradeInstallerCode,
+  normalizeComputerUpgradeInstallerDiagnosticCode,
+  parseComputerUpgradeInstallerReport,
+  withComputerUpgradeInstallerReport,
+  type ComputerLastUpgradeReceipt,
+} from "@botiverse/raft-shared";
 import { computerDir, resolveRaftHome } from "./paths";
 import { COMPUTER_VERSION } from "./version";
 import { computerFetch } from "./proxy";
@@ -25,6 +31,8 @@ export interface InstallerDownloadStats {
   cached?: boolean;
   /** Set once the installer is resolved; a launch failure after this is not a download failure. */
   resolved?: boolean;
+  /** The spawn failed once and succeeded on the retry; what failed first ("spawn EBADF"). */
+  spawnRetriedAfter?: string;
 }
 
 export { describeNetworkError };
@@ -113,6 +121,16 @@ export function installerArgs(input: { targetVersion?: string; channel?: Channel
   return ["upgrade", "--channel", channel === "latest" ? "main" : channel];
 }
 
+/**
+ * The installer release channel this machine fetches from
+ * (`RAFT_COMPUTER_INSTALLER_CHANNEL`, operator-set; default `main`). One rule
+ * for the download and for the upgrade trace that names it, so the trace can
+ * never disagree with what was fetched: blank or whitespace means the default.
+ */
+export function installerChannel(env: NodeJS.ProcessEnv = process.env): string {
+  return env.RAFT_COMPUTER_INSTALLER_CHANNEL?.trim() || "main";
+}
+
 /** Resolve once, verify, and return a direct executable invocation (never a shell). */
 export async function installerCommand(args: string[], env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform, arch: string = process.arch,
@@ -126,7 +144,7 @@ export async function installerCommand(args: string[], env: NodeJS.ProcessEnv = 
   if ((base.protocol !== "https:" && !(base.protocol === "http:" && loopback)) || base.username || base.password || base.search || base.hash) {
     throw new Error("invalid_installer_download_base");
   }
-  const channel = env.RAFT_COMPUTER_INSTALLER_CHANNEL ?? "main";
+  const channel = installerChannel(env);
   const channelUrl = `${base.href.replace(/\/$/, "")}/${encodeURIComponent(channel)}/${target}`;
   // A non-redirect answer names its status (an unexplained
   // `installer_release_unavailable` told nothing, AndyLok 685fdea3); a 5xx
@@ -245,26 +263,79 @@ export function readInstallerVersion(command: string): Promise<string | null> {
 }
 
 /**
+ * The detached installer could not be started: the OS refused the spawn
+ * itself, twice. `message` starts with the fixed code (remoteUpgradeTrace
+ * `upgradeErrorCode` reads it) and names what failed (`spawn EBADF`), so the
+ * trace can count what the OS said without any path.
+ */
+export class InstallerLaunchError extends Error {
+  constructor(readonly causes: readonly string[], readonly attempts: number) {
+    super(`installer_launch_failed: ${[...new Set(causes)].join(",")} (${attempts} attempts)`);
+    this.name = "InstallerLaunchError";
+  }
+}
+
+/** `<syscall> <code>` of an OS error ("spawn EBADF", "open EACCES"), else its message's last token. */
+function spawnCause(error: unknown): string {
+  const { code, syscall } = (error ?? {}) as { code?: unknown; syscall?: unknown };
+  if (typeof code === "string" && code) return `${typeof syscall === "string" && syscall ? syscall : "spawn"} ${code}`.slice(0, 40);
+  const message = error instanceof Error ? error.message : String(error);
+  return (/[A-Za-z0-9_]+$/.exec(message.trim())?.[0] ?? "unknown").slice(0, 40);
+}
+
+export interface LaunchInstallerDeps {
+  /** Tests: the spawn and the installer resolution; the pause before the one retry. */
+  spawnImpl?: typeof spawn;
+  resolveCommand?: typeof installerCommand;
+  retryDelayMs?: number;
+}
+
+const LAUNCH_RETRY_DELAY_MS = 500;
+
+/**
  * A detached native installer survives service replacement. Acceptance is not completion.
  * `beforeSpawn` sees the verified installer and may veto the launch by throwing.
+ *
+ * The spawn itself has failed with `EBADF` on macOS a few times (11-01, 11-04,
+ * 11-13; cause unknown, #67), both here and after a drain, and the request
+ * then failed with only "spawn EBADF" behind it. The spawn is tried once more
+ * with a freshly opened log file; a second failure is InstallerLaunchError.
  */
 export async function launchInstallerDetached(slockHome: string, args: string[], requestId: string,
   env: NodeJS.ProcessEnv = process.env, stats?: InstallerDownloadStats,
-  beforeSpawn?: (command: string) => Promise<void>): Promise<number | null> {
+  beforeSpawn?: (command: string) => Promise<void>, deps: LaunchInstallerDeps = {}): Promise<number | null> {
   const childEnv = { ...env, RAFT_COMPUTER_INSTALLER_CALLER: undefined, RAFT_HOME: slockHome, SLOCK_HOME: slockHome, RAFT_COMPUTER_NON_INTERACTIVE: "1",
     RAFT_COMPUTER_OPERATION_ID: requestId, RAFT_COMPUTER_APPROVED_BY: `remote:${requestId}` };
-  const invocation = await installerCommand(args, childEnv, undefined, undefined, stats);
+  const invocation = await (deps.resolveCommand ?? installerCommand)(args, childEnv, undefined, undefined, stats);
   await beforeSpawn?.(invocation.command);
   const logDir = join(computerDir(slockHome), "installer", "launches");
   mkdirSync(logDir, { recursive: true });
-  const log = openSync(join(logDir, `${createHash("sha256").update(requestId).digest("hex")}.log`), "a");
-  let child;
+  const logPath = join(logDir, `${createHash("sha256").update(requestId).digest("hex")}.log`);
+  const spawnOnce = async (): Promise<number | null> => {
+    const log = openSync(logPath, "a");
+    let child;
+    try {
+      child = (deps.spawnImpl ?? spawn)(invocation.command, invocation.args, { detached: true, stdio: ["ignore", log, log], env: childEnv });
+    } finally { closeSync(log); }
+    await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+    child.unref();
+    return child.pid ?? null;
+  };
   try {
-    child = spawn(invocation.command, invocation.args, { detached: true, stdio: ["ignore", log, log], env: childEnv });
-  } finally { closeSync(log); }
-  await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
-  child.unref();
-  return child.pid ?? null;
+    return await spawnOnce();
+  } catch (first) {
+    const firstCause = spawnCause(first);
+    await new Promise<void>((resolve) => setTimeout(resolve, deps.retryDelayMs ?? LAUNCH_RETRY_DELAY_MS));
+    try {
+      const pid = await spawnOnce();
+      // The cause is unknown: keep the evidence of a failure the retry hid.
+      if (stats) stats.spawnRetriedAfter = firstCause;
+      process.stderr.write(`[installer] spawn retried after ${firstCause} (request ${requestId})\n`);
+      return pid;
+    } catch (second) {
+      throw new InstallerLaunchError([firstCause, spawnCause(second)], 2);
+    }
+  }
 }
 
 /** Read only a settled, request-bound proof from the installer, never infer it from launch. */
@@ -397,10 +468,51 @@ async function readRemoteUpgradeReceipt(slockHome: string, requestId: string, fa
       : typeof receipt.error === "string" ? receipt.error
       : typeof receipt.detail?.reason === "string" ? receipt.detail.reason
       : undefined;
-    return { targetVersion, outcome, ...(reason ? { reason } : {}) };
+    if (outcome === "promoted") return { targetVersion, outcome, ...(reason ? { reason } : {}) };
+    const code = normalizeComputerUpgradeInstallerCode(receipt.code);
+    const diagnosticCode = installerDiagnosticCode(receipt.detail?.diagnostic);
+    return {
+      targetVersion,
+      outcome,
+      ...(reason ? { reason } : {}),
+      ...(code ? { code } : {}),
+      ...(diagnosticCode ? { diagnosticCode } : {}),
+    };
   } catch {
     return null;
   }
+}
+
+/**
+ * The update engine's error class leading a receipt's `detail.diagnostic`
+ * (`DOWNLOAD_FAILED: overall timeout` → `DOWNLOAD_FAILED`), else null. The
+ * installer prefixes a cause carried over from an earlier run with
+ * `upgrade still requires recovery: ` (rust/operation.rs
+ * record_failure_diagnostic) and reads past it itself (recorded_cause); so
+ * does this. Only the token goes on, never the text.
+ */
+export function installerDiagnosticCode(diagnostic: unknown): string | null {
+  if (typeof diagnostic !== "string") return null;
+  const cause = diagnostic.startsWith("upgrade still requires recovery: ")
+    ? diagnostic.slice("upgrade still requires recovery: ".length)
+    : diagnostic;
+  return normalizeComputerUpgradeInstallerDiagnosticCode(/^([A-Z][A-Z0-9_]*)(?::|$)/u.exec(cause)?.[1]);
+}
+
+/**
+ * The error the launching runner throws for an installer that gave up
+ * without stopping the service: the text older Servers read
+ * (`UPGRADE_INSTALLER_FAILED: <reason>`, unchanged), and the receipt's
+ * outcome and codes as fixed fields for `computer:upgrade:done`.
+ */
+export function remoteUpgradeInstallerFailure(receipt: ComputerLastUpgradeReceipt): Error {
+  const error = new Error(`UPGRADE_INSTALLER_FAILED: ${receipt.reason ?? `installer_${receipt.outcome}`}`);
+  const report = parseComputerUpgradeInstallerReport({
+    installerOutcome: receipt.outcome,
+    installerCode: receipt.code,
+    installerDiagnosticCode: receipt.diagnosticCode,
+  });
+  return report ? withComputerUpgradeInstallerReport(error, report) : error;
 }
 
 /** Matches the server's request deadline (UPGRADE_REQUEST_DEADLINE_MS); a later report settles nothing. */
@@ -422,6 +534,18 @@ export async function waitForRemoteUpgradeFailureReceipt(slockHome: string, requ
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
 } = {}): Promise<ComputerLastUpgradeReceipt | null> {
+  const receipt = await waitForRemoteUpgradeReceipt(slockHome, requestId, options);
+  return receipt && receipt.outcome !== "promoted" ? receipt : null;
+}
+
+/** The request's receipt once it appears (promoted included), or null when the wait ends first. */
+async function waitForRemoteUpgradeReceipt(slockHome: string, requestId: string, options: {
+  targetVersion?: string;
+  timeoutMs?: number;
+  pollMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+}): Promise<ComputerLastUpgradeReceipt | null> {
   const timeoutMs = options.timeoutMs ?? REMOTE_UPGRADE_FAILURE_WATCH_MS;
   const pollMs = options.pollMs ?? 5_000;
   const now = options.now ?? Date.now;
@@ -430,7 +554,7 @@ export async function waitForRemoteUpgradeFailureReceipt(slockHome: string, requ
   const deadline = now() + timeoutMs;
   for (;;) {
     const receipt = await readRemoteUpgradeReceipt(slockHome, requestId, options.targetVersion);
-    if (receipt) return receipt.outcome === "promoted" ? null : receipt;
+    if (receipt) return receipt;
     if (now() >= deadline) return null;
     await sleep(pollMs);
   }
@@ -444,12 +568,17 @@ export async function waitForRemoteUpgradeFailureReceipt(slockHome: string, requ
  * the request open until the deadline. While the last web upgrade launched for
  * this server is inside its deadline and has no receipt yet, wait for it;
  * resolves with a non-promoted receipt, or null.
+ *
+ * A promoted receipt resolves `{ requestId, succeeded: true }`: the new
+ * version's `ready` came before the installer's receipt, so the steps derived
+ * from it (`new_version_started`, `installer_finished`) are sent now rather
+ * than at the next reconnect (9081e716: still unsent 1.5 h after, 11-15).
  */
 export async function watchRemoteUpgradeOutcome(slockHome: string, serverId: string, options: {
   pollMs?: number;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
-} = {}): Promise<{ requestId: string; outcome: ComputerLastUpgradeReceipt["outcome"]; reason: string } | null> {
+} = {}): Promise<{ requestId: string; succeeded: true } | { requestId: string; outcome: ComputerLastUpgradeReceipt["outcome"]; reason: string; code?: string; diagnosticCode?: string } | null> {
   const now = options.now ?? Date.now;
   let marker: { requestId?: unknown; targetVersion?: unknown; originServerId?: unknown; launchedAt?: unknown; drainMs?: unknown };
   try {
@@ -465,14 +594,25 @@ export async function watchRemoteUpgradeOutcome(slockHome: string, serverId: str
   const remainingMs = launchedAtMs + REMOTE_UPGRADE_FAILURE_WATCH_MS + drainMs - now();
   if (!Number.isFinite(remainingMs) || remainingMs <= 0) return null;
   const targetVersion = typeof marker.targetVersion === "string" ? marker.targetVersion : undefined;
-  // Already there: the `ready` that preceded this call carried it.
-  if (await readRemoteUpgradeReceipt(slockHome, marker.requestId, targetVersion)) return null;
-  const failure = await waitForRemoteUpgradeFailureReceipt(slockHome, marker.requestId, {
+  // Already there: the `ready` that preceded this call carried it (a failure
+  // is not reported twice). A promotion still has its steps sent: they are
+  // acknowledged per step, so a second send sends nothing again.
+  const present = await readRemoteUpgradeReceipt(slockHome, marker.requestId, targetVersion);
+  if (present) return present.outcome === "promoted" ? { requestId: marker.requestId, succeeded: true } : null;
+  const failure = await waitForRemoteUpgradeReceipt(slockHome, marker.requestId, {
     ...(targetVersion ? { targetVersion } : {}),
     timeoutMs: remainingMs,
     ...(options.pollMs !== undefined ? { pollMs: options.pollMs } : {}),
     ...(options.sleep ? { sleep: options.sleep } : {}),
     now,
   });
-  return failure ? { requestId: marker.requestId, outcome: failure.outcome, reason: failure.reason ?? `installer_${failure.outcome}` } : null;
+  if (!failure) return null;
+  if (failure.outcome === "promoted") return { requestId: marker.requestId, succeeded: true };
+  return {
+    requestId: marker.requestId,
+    outcome: failure.outcome,
+    reason: failure.reason ?? `installer_${failure.outcome}`,
+    ...(failure.code ? { code: failure.code } : {}),
+    ...(failure.diagnosticCode ? { diagnosticCode: failure.diagnosticCode } : {}),
+  };
 }

@@ -1,0 +1,46 @@
+{
+  "formatVersion": 1,
+  "id": "seq_above_2_53",
+  "rule": "position",
+  "title": "Seqs above 2^53 compare exactly: 9007199254740993 is above 9007199254740992",
+  "why": "Seqs are 64-bit (messages.seq is a bigserial) and travel as decimal strings; a float compare reads both as 9007199254740992 and would re-read the row.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/shared/src/activityRowPosition.ts (reduceActivityRow; not wired yet, step 2)"
+    ],
+    "server": [
+      "packages/server/src/services/channelService.ts (latestActivitySeqSameSource; the row's latestActivitySeq)",
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (unread_count and latest_seq from one materialized row)"
+    ]
+  },
+  "given": {
+    "row": {
+      "unreadCount": 0,
+      "hasMention": false,
+      "position": "9007199254740992",
+      "mentionOnly": false
+    }
+  },
+  "steps": [
+    {
+      "act": "liveMessage",
+      "seq": "9007199254740993",
+      "counts": true,
+      "mentionsViewer": false
+    },
+    {
+      "act": "liveMessage",
+      "seq": "9007199254740993",
+      "counts": true,
+      "mentionsViewer": false
+    }
+  ],
+  "expect": {
+    "row": {
+      "unreadCount": 1,
+      "position": "9007199254740993"
+    },
+    "reread": false
+  }
+}

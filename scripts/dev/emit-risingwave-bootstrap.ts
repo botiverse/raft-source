@@ -69,10 +69,20 @@ export function renderReleaseQaRisingWaveBootstrap(sourceRoot: string) {
     return name !== null && name !== "rw_message_mentions" &&
       /\bCREATE TABLE\b/i.test(statement);
   });
-  const cdcNames = cdcStatements.map((statement) => createdRelationName(statement)!);
-  if (cdcNames.length !== 18 || new Set(cdcNames).size !== cdcNames.length) {
+  const catalogCdcNames = cdcStatements.map((statement) => createdRelationName(statement)!);
+  if (catalogCdcNames.length !== 18 || new Set(catalogCdcNames).size !== catalogCdcNames.length) {
     throw new Error("release-QA needs the 18 distinct production CDC projections");
   }
+  // A parallel graph can introduce explicit CDC projections before production's
+  // catalog snapshot changes. Preserve every existing production projection,
+  // then append only newly declared artifact tables; never infer columns.
+  for (const statement of allStatements) {
+    const name = createdRelationName(statement);
+    if (name && /\bCREATE TABLE\b/i.test(statement) && !catalogCdcNames.includes(name)) {
+      cdcStatements.push(rewriteSource(statement));
+    }
+  }
+  const cdcNames = cdcStatements.map((statement) => createdRelationName(statement)!);
   const publicationTables = [...new Set(cdcStatements.map((statement) => {
     if (/\(\s*\*\s*\)/.test(statement)) throw new Error("inferred QA CDC projection");
     const upstream = /FROM\s+:"rw_source_name"\s+TABLE\s+'public\.([a-z_]+)'/i.exec(statement)?.[1];

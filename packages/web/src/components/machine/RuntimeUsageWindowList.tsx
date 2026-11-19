@@ -1,7 +1,8 @@
 import { Meter, MeterIndicator, MeterTrack } from "@botiverse/raft-ui/wip";
+import { currentTimeMs } from "@botiverse/raft-shared";
 import type { RuntimeAccountUsageWindow } from "@botiverse/raft-shared";
 import { useIntl } from "react-intl";
-import { formatRelativeTime } from "../../utils/relativeTime";
+import { usageResetText } from "./rack/rackResetText";
 import { runtimeUsagePercentUsed } from "./bulkChangeModelPlan";
 
 /** Used up by the provider's word or the ratio itself (as the usage card). */
@@ -23,7 +24,7 @@ function UsageWindowLine({ window }: { window: RuntimeAccountUsageWindow }) {
   const usedUp = windowUsedUp(window);
   const percent = usedUp ? 100 : runtimeUsagePercentUsed(window.usedRatio ?? 0);
   const reset = window.resetsAt
-    ? formatRelativeTime(window.resetsAt, locale) ?? formatMessage({ id: "machine.runtimeUsage.later" })
+    ? usageResetText(window.resetsAt, locale, currentTimeMs()) ?? formatMessage({ id: "machine.runtimeUsage.later" })
     : null;
   // The words a screen reader hears, as the usage card says them.
   const valueText = usedUp

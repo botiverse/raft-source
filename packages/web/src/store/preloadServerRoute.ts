@@ -37,5 +37,6 @@ export function preloadServerRoute(pathname: string, search: string, userId: str
   const params = new URLSearchParams(search);
   if (!userId || params.has("thread") || params.has("msg")) return;
   if (channelWindowChoice(conversationId, null).kind !== "latest") return;
-  void openChannelWindow(conversationId, null);
+  // Kept once loaded for ChatPanel's mount to take (openChannelWindow `preload`).
+  void openChannelWindow(conversationId, null, { preload: true });
 }

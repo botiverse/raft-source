@@ -16,6 +16,7 @@ import { useChannelStore } from "../../../store/channelStore";
 import { useMachineStore } from "../../../store/machineStore";
 import { useServerStore } from "../../../store/serverStore";
 import api from "../../../api/client";
+import { flushProductEvents, resetProductEventsForTest } from "../../../analytics/track";
 import { en } from "../../../i18n/messages/en";
 
 const AGENT_ID = "external-agent-1";
@@ -27,6 +28,9 @@ const PAGE = { id: "cred-page", maskedToken: "sk_agent_bbbb***", name: PAGE_CRED
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  // The setup-event tests below: never leave their token or sender behind, whatever failed.
+  for (const storage of new Set([window.localStorage, globalThis.localStorage])) storage?.removeItem("slock_access_token");
+  resetProductEventsForTest();
   useAgentStore.setState(useAgentStore.getInitialState(), true);
   useAuthStore.setState({ user: null } as never);
   useChannelStore.setState(useChannelStore.getInitialState(), true);
@@ -222,4 +226,63 @@ test("a new credential's secret shows only until the card goes: a remount shows 
   assert.ok(!document.body.innerHTML.includes(secret), "the secret is nowhere on the page");
   assert.ok(!JSON.stringify(useAgentStore.getState()).includes(secret), "no store kept it");
   assert.ok(!JSON.stringify({ ...localStorage }).includes(secret) && !JSON.stringify({ ...sessionStorage }).includes(secret), "no browser storage kept it");
+});
+
+// External agent setup events (Grace, 2026-11-15): the card records a switch, a credential made, replaced or
+// revoked (only once the server did it), and the first sign-in seen from the page. No agent id, no secret.
+type SentEvent = { event: string; properties: Record<string, unknown> };
+function captureSetupEvents() {
+  const sent: SentEvent[] = [];
+  // The sender reads globalThis.localStorage; on a Node with its own Web Storage that is not jsdom's.
+  const storages = [...new Set([window.localStorage, globalThis.localStorage])].filter(Boolean);
+  for (const storage of storages) storage.setItem("slock_access_token", "token-1");
+  resetProductEventsForTest(async (url, init) => {
+    if (url.endsWith("/product-events/config")) return new Response(JSON.stringify({ clientEventsAllowed: true }), { status: 200 });
+    for (const { event, properties } of (JSON.parse(String(init?.body)) as { events: SentEvent[] }).events) sent.push({ event, properties });
+    return new Response(JSON.stringify({ accepted: 1 }), { status: 202 });
+  });
+  return async () => {
+    await flushProductEvents();
+    for (const storage of storages) storage.removeItem("slock_access_token");
+    resetProductEventsForTest();
+    assert.equal(JSON.stringify(sent).includes(AGENT_ID) || JSON.stringify(sent).includes("sk_agent_"), false, "no agent id or secret on any event");
+    return sent
+      .filter((item) => item.event.startsWith("external_agent_setup_"))
+      .map(({ event, properties }) => [event.replace("external_agent_setup_", ""), properties.step ?? properties.action, properties.surface, properties.method]);
+  };
+}
+
+test("the card records a switch with the method switched to, and a first credential once it is made", async () => {
+  const events = captureSetupEvents();
+  stubCredentials([CLI]);
+  vi.spyOn(api, "put").mockResolvedValue({ data: {} } as never);
+  const post = vi.spyOn(api, "post").mockResolvedValue({ data: { agentId: AGENT_ID, credentialId: "cred-new", apiKey: "sk_agent_new-fixture" } } as never);
+  renderAgent({ setupState: "waiting_for_login", externalSetupMethod: "existing_agent" });
+  await waitFor(() => assert.equal(screen.queryAllByTestId("external-agent-credential-row").length, 1));
+  fireEvent.click(screen.getByRole("button", { name: en["agent.externalCard.createCredential"] }));
+  await waitFor(() => assert.equal(credentialPosts(post).length, 1));
+  await screen.findByTestId("external-agent-new-credential");
+  fireEvent.click(screen.getByRole("button", { name: en["agent.createExternal.switchToSdk"] }));
+  await waitFor(() => assert.equal(screen.getByTestId("external-agent-steps").getAttribute("data-method"), "sdk"));
+  assert.deepEqual(await events(), [
+    ["action", "credential_created", "profile_card", "existing_agent"],
+    ["action", "method_switched", "profile_card", "sdk"],
+  ]);
+});
+
+test("the card records a revoke only after the server deleted the credential", async () => {
+  const events = captureSetupEvents();
+  stubCredentials([CLI, PAGE]);
+  const del = vi.spyOn(api, "delete").mockRejectedValueOnce(new Error("offline")).mockResolvedValue({ data: {} } as never);
+  renderAgent({ setupState: "connected" });
+  await waitFor(() => assert.equal(screen.getAllByTestId("external-agent-credential-row").length, 2));
+  for (const attempt of [1, 2]) {
+    fireEvent.click(within(screen.getAllByTestId("external-agent-credential-row")[0]!).getByTestId("external-agent-credential-menu"));
+    fireEvent.click(await screen.findByRole("menuitem", { name: en["agent.externalCard.revoke"] }));
+    fireEvent.click(await screen.findByTestId("external-agent-revoke-confirm"));
+    await waitFor(() => assert.equal(del.mock.calls.length, attempt));
+    await waitFor(() => assert.ok(screen.queryByTestId("external-agent-revoke-confirm") === null, "the confirm closed"));
+  }
+  await waitFor(() => assert.equal(screen.getAllByTestId("external-agent-credential-row").length, 1));
+  assert.deepEqual(await events(), [["action", "credential_revoked", "profile_card", "existing_agent"]]);
 });

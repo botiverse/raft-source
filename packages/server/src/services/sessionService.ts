@@ -26,6 +26,7 @@ import {
 import { getRedis, isRedisAvailable } from "../redis";
 import { revokeSocketAccess } from "../socket/accessRevocation";
 import { revokeKeysOfRevokedDeviceSessions } from "./deviceSessionKeys";
+import { currentSessionClient } from "./sessionClient";
 import type { SessionIssueProof } from "./sessionIssueGate";
 import { serializeErrorForLog } from "../tracing/safeErrorLog";
 import { rememberTraceUserId } from "../tracing/traceUserId";
@@ -128,7 +129,7 @@ function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
 }
 
-async function lockActiveUser(tx: DatabaseExecutor, userId: string): Promise<boolean> {
+export async function lockActiveUser(tx: DatabaseExecutor, userId: string): Promise<boolean> {
   const [user] = await tx.select({ retiredAt: users.retiredAt, traceUserId: users.traceUserId }).from(users)
     .where(eq(users.id, userId)).limit(1).for("update");
   // Same row read: login and refresh spans export the user as trace_user_id
@@ -421,10 +422,21 @@ export function refreshLifetimeMs(scope: SessionScope): number {
  * the family's sessions in the same transaction, so a rotation should never
  * find one; this keeps that from being the only guard.
  */
-async function familyScope(tx: DatabaseExecutor, familyId: string): Promise<SessionScope | null> {
-  const [family] = await tx.select({ scope: sessionFamilies.scope, revokedAt: sessionFamilies.revokedAt, retiredAt: sessionFamilies.retiredAt })
-    .from(sessionFamilies)
-    .where(eq(sessionFamilies.id, familyId)).limit(1);
+async function familyScope(tx: DatabaseExecutor, familyId: string, now: Date): Promise<SessionScope | null> {
+  // The read is the write that marks the family active (`last_active_at`) and
+  // keeps its client claims current (sessionClient.ts; display only): one
+  // statement on the row the rotation already reads, under the person's
+  // `users` lock it already holds. Only a live family is marked.
+  const client = currentSessionClient();
+  const live = sql`${sessionFamilies.revokedAt} is null and ${sessionFamilies.retiredAt} is null`;
+  const [family] = await tx.update(sessionFamilies)
+    .set({
+      lastActiveAt: sql`case when ${live} then ${now.toISOString()}::timestamptz else ${sessionFamilies.lastActiveAt} end`,
+      clientPlatform: sql`case when ${live} then coalesce(${client.platform}::text, ${sessionFamilies.clientPlatform}) else ${sessionFamilies.clientPlatform} end`,
+      clientVersion: sql`case when ${live} then coalesce(${client.version}::text, ${sessionFamilies.clientVersion}) else ${sessionFamilies.clientVersion} end`,
+    })
+    .where(eq(sessionFamilies.id, familyId))
+    .returning({ scope: sessionFamilies.scope, revokedAt: sessionFamilies.revokedAt, retiredAt: sessionFamilies.retiredAt });
   if (!family) throw new Error("SESSION_FAMILY_MISSING");
   if (family.revokedAt || family.retiredAt) return null;
   return family.scope;
@@ -544,10 +556,15 @@ export async function createSession(
 
   const create = async (tx: DatabaseExecutor) => {
     if (!(await lockActiveUser(tx, userId))) throw new Error("USER_RETIRED");
+    const client = currentSessionClient();
     await tx.insert(sessionFamilies).values({
       id: familyId,
       userId,
       scope,
+      // Display only (sessionClient.ts): the sign-in request's own claims.
+      clientPlatform: client.platform,
+      clientVersion: client.version,
+      lastActiveAt: currentDate(),
       // An app login inherits the approver's verification time (proofForAppLogin); any other proof verified just now.
       ...(proof.secondFactor === "verified"
         ? { secondFactorVerifiedAt: proof.flow === "app_login" ? proof.verifiedAt : currentDate(), secondFactorMethod: proof.method }
@@ -712,7 +729,8 @@ export async function isRevokedSessionRefreshToken(refreshToken: string): Promis
  * and revoke what a device session handed out (revokeKeysOfRevokedDeviceSessions). */
 export async function revokeSessionFamilyInTransaction(
   tx: DatabaseExecutor, userId: string, familyId: string,
-  reason: "logout" | "capability" | "device_login_revoked", now = currentDate(),
+  reason: "logout" | "capability" | "device_login_revoked" | typeof USER_SIGNED_OUT_REVOKED_REASON | typeof USER_REVOKED_REASON,
+  now = currentDate(),
 ) {
   await lockActiveUser(tx, userId);
   await tx.update(sessionFamilies).set({
@@ -814,13 +832,48 @@ export async function denyLoginCodesApprovedBy(
  * replaced a second-factor secret while it is on (new backup codes, a re-bound
  * authenticator app). Not a security revoke: like a logout, what those
  * sessions issued or approved keeps working (approverSessionGrants.ts reads
- * only `revoke_all`, `password_changed` and `device_login_revoked`), but a
+ * only `revoke_all`, `password_changed`, `device_login_revoked`,
+ * `user_revoked` and `user_revoked_others`), but a
  * login code they approved that nobody has exchanged yet dies with them, as
  * with any revoke (denyLoginCodesApprovedBy).
  */
 export const SECOND_FACTOR_ENABLED_REVOKED_REASON = "second_factor_enabled";
 export const SECOND_FACTOR_CHANGED_REVOKED_REASON = "second_factor_changed";
-export type OtherSessionsRevokedReason = typeof SECOND_FACTOR_ENABLED_REVOKED_REASON | typeof SECOND_FACTOR_CHANGED_REVOKED_REASON;
+
+/**
+ * The person signed one or more of their own other sign-ins out from their
+ * sign-in list (DELETE /api/me/sessions/:familyId and POST
+ * /api/me/sessions/revoke-others, reason `sign_out`; services/mySessions.ts).
+ * Logout-like: what those sessions issued or approved keeps working.
+ */
+export const USER_SIGNED_OUT_REVOKED_REASON = "user_signed_out";
+
+/**
+ * The person revoked one of their own other sign-ins from their sign-in list
+ * as a lost or stolen device (DELETE /api/me/sessions/:familyId, reason
+ * `lost_device`). A SECURITY revoke: approverSessionGrants.ts
+ * (securityRevokedFamily) reads it, so what that one session approved
+ * through one-time grants and issued itself (webSessionIssuedKeys.ts) is
+ * revoked too, and maintenance's repair retries a cascade that failed.
+ */
+export const USER_REVOKED_REASON = "user_revoked";
+
+/**
+ * The same, for every other sign-in at once (POST
+ * /api/me/sessions/revoke-others, reason `lost_device`). Its own reason
+ * because its reach is the person's, like a password change's `revoke_all`:
+ * every revoked family of theirs but the one that asked, the ones signed out
+ * earlier included (approverSessionGrants.ts reads it as it reads
+ * `revoke_all`), so a thief who signed the stolen session out first doesn't
+ * keep what it approved.
+ */
+export const USER_REVOKED_OTHERS_REVOKED_REASON = "user_revoked_others";
+
+export type OtherSessionsRevokedReason =
+  | typeof SECOND_FACTOR_ENABLED_REVOKED_REASON
+  | typeof SECOND_FACTOR_CHANGED_REVOKED_REASON
+  | typeof USER_SIGNED_OUT_REVOKED_REASON
+  | typeof USER_REVOKED_OTHERS_REVOKED_REASON;
 
 /**
  * Signs out every live `full` family of the person (their own sign-ins: web,
@@ -918,7 +971,7 @@ export async function rotateSession(oldRefreshToken: string, userId: string): Pr
 
     if (!consumed?.familyId) return null;
 
-    const scope = await familyScope(tx, consumed.familyId);
+    const scope = await familyScope(tx, consumed.familyId, currentDate());
     if (!scope) return null;
     const sessionId = randomUUID();
     const familyId = consumed.familyId;
@@ -984,7 +1037,7 @@ async function refreshSessionWithDurableReplay(
       });
 
     if (consumed?.familyId) {
-      const scope = await familyScope(tx, consumed.familyId);
+      const scope = await familyScope(tx, consumed.familyId, now);
       if (!scope) return { refreshed: null, replayTrace: replayTrace("child_invalid", redisAvailable) };
       const familyId = consumed.familyId;
 

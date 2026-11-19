@@ -9,7 +9,7 @@ import { DirectMessageIcon } from "@botiverse/ricons";
 import { useCallback, useContext } from "react";
 import type { HTMLAttributes, ReactElement, ReactNode } from "react";
 import { useIntl } from "react-intl";
-import { Play, RotateCcw, Square } from "lucide-react";
+import { Pencil, Play, RotateCcw, Square } from "lucide-react";
 import { isExternalAgentRuntime } from "@botiverse/raft-shared";
 import { useServerPermissions } from "../../hooks/useServerPermissions";
 import type { Agent } from "../../store/agentStore";
@@ -21,6 +21,7 @@ import { agentRuntimePermissions } from "../../utils/agentVisibility";
 import { MemberActionsContext, canMessageEntry } from "./memberActionsContext";
 import type { MemberActions } from "./memberActionsContext";
 import type { MemberEntry } from "./membersPageModel";
+import { useCanEditAgent } from "./memberTileParts";
 
 type TriggerProps = Omit<HTMLAttributes<HTMLElement>, "children" | "onDoubleClick"> & Record<`data-${string}`, string | undefined>;
 
@@ -29,8 +30,9 @@ type TriggerProps = Omit<HTMLAttributes<HTMLElement>, "children" | "onDoubleClic
  * right-click, or a long press on touch), with a double-click that opens the
  * DM with them, as the retired Members sidebar had. A click still opens the
  * profile (the caller's onClick). The menu holds what the profile offers
- * from its head, by the profile's rules: Message, and for an agent Start or
- * Stop and Restart / reset. With nothing to offer (a Guest, either side) there
+ * from its head, by the profile's rules: Message, and for an agent Edit
+ * agent… (the Runtime config pencil's dialog), Start or Stop and Restart /
+ * reset. With nothing to offer (a Guest, either side) there
  * is no menu and no double-click.
  */
 export function MemberMenuTrigger({ entry, render, children, ...props }: TriggerProps & {
@@ -95,9 +97,17 @@ function AgentMenuItems({ entry, agent, actions }: { entry: MemberEntry; agent: 
   }, [actions, agent, controls.stop]);
   const restartReset = useCallback(() => actions.requestReset(agent), [actions, agent]);
   const hasControls = controls.start || controls.stop || controls.restartReset;
+  const canEdit = useCanEditAgent(agent);
+  const edit = useCallback(() => actions.requestEdit(agent), [actions, agent]);
   return (
     <>
       <MessageItem entry={entry} actions={actions} labelId="agent.detail.directMessage" />
+      {canEdit ? (
+        <ContextMenuItem onClick={edit} data-testid="member-menu-edit">
+          <Pencil />
+          {formatMessage({ id: "members.page.editAgentMenu" })}
+        </ContextMenuItem>
+      ) : null}
       {hasControls ? <ContextMenuSeparator /> : null}
       {controls.start || controls.stop ? (
         <ContextMenuItem onClick={startStop} data-testid="member-menu-start-stop">

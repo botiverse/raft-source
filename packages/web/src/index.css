@@ -723,17 +723,17 @@
 /* Task v2's Tasks and Files column in the row (task #165). The row's widths
    are rowLayout's (#189): the conversation is a column like the others and
    goes down to 160px, its content clipped below 360 (rule 2). */
-.thread-layout-container:has(> [data-testid="channel-side-slot"] [data-mode="beside"]) > .thread-main-column {
+.thread-layout-container[data-has-side-beside] > .thread-main-column {
   min-width: 160px;
 }
 
 /* With another floating over the messages, the channel keeps room for it and
    for readable messages beside it (280 + 240; ChannelSideArea placeSections). */
-.thread-layout-container:has(> [data-testid="channel-side-slot"] [data-mode="beside"]):has([data-testid="channel-side-float-slot"] [data-mode="float"]) > .thread-main-column {
+.thread-layout-container[data-has-side-beside][data-has-side-float] > .thread-main-column {
   min-width: 520px;
 }
 
-.thread-layout-container:has(> .thread-side-column) > .thread-main-column {
+.thread-layout-container[data-has-thread] > .thread-main-column {
   display: none;
 }
 
@@ -783,7 +783,7 @@
    displays can still use the desktop split. */
 @media (orientation: landscape), (min-width: 1280px) {
   @container thread-layout (min-width: 720px) {
-    .thread-layout-container:has(> .thread-side-column) > .thread-main-column {
+    .thread-layout-container[data-has-thread] > .thread-main-column {
       display: flex;
     }
 
@@ -833,7 +833,7 @@
    column (a workspace Artifact, F41) puts the thread behind the channel: still
    mounted where it was, back on top when it is opened again. The split row
    keeps both on screen, so there the thread stays. */
-.thread-layout-container[data-thread-behind="true"]:has(> .thread-side-column) > .thread-main-column {
+.thread-layout-container[data-thread-behind="true"][data-has-thread] > .thread-main-column {
   display: flex;
 }
 
@@ -857,11 +857,11 @@
    row where the thread is still in its thread-only (absolute) mode. */
 @media (min-width: 1024px) {
   @container thread-layout (min-width: 720px) {
-    .thread-layout-container:not([data-row-plan]):has(> .thread-profile-side-column[data-collapse-channel="true"]) > .thread-main-column {
+    .thread-layout-container:not([data-row-plan])[data-profile-collapse-channel="true"] > .thread-main-column {
       display: none;
     }
 
-    .thread-layout-container:not([data-row-plan]):has(> .thread-profile-side-column[data-collapse-channel="true"]) > .thread-side-column {
+    .thread-layout-container:not([data-row-plan])[data-profile-collapse-channel="true"] > .thread-side-column {
       flex: 1 1 auto;
       min-width: 0;
       width: auto;
@@ -870,11 +870,11 @@
 
     /* The channel is folded, so the thread is first in the row: the sidebar
        already draws that edge, and the profile owns the divider on its right. */
-    .thread-layout-container:not([data-row-plan]):has(> .thread-profile-side-column[data-collapse-channel="true"]) > .thread-side-column > [data-slot="thread-panel-root"] {
+    .thread-layout-container:not([data-row-plan])[data-profile-collapse-channel="true"] > .thread-side-column > [data-slot="thread-panel-root"] {
       border-left-width: 0;
     }
 
-    .thread-layout-container:not([data-row-plan]):has(> .thread-profile-side-column[data-collapse-channel="true"]) > .thread-profile-side-column > :is([data-testid="profile-panel"], [data-profile-panel-fallback]) {
+    .thread-layout-container:not([data-row-plan])[data-profile-collapse-channel="true"] > .thread-profile-side-column > :is([data-testid="profile-panel"], [data-profile-panel-fallback]) {
       position: relative;
       inset: auto;
       z-index: auto;
@@ -889,15 +889,15 @@
     /* A Channel avatar opens Profile without leaving the Channel. In the
        existing Channel + Thread row, fold only the retained Thread pane; the
        same Profile pane geometry is reused for both entry sources. */
-    .thread-layout-container:not([data-row-plan]):has(> .thread-profile-side-column[data-collapse-thread="true"]) > .thread-main-column {
+    .thread-layout-container:not([data-row-plan])[data-profile-collapse-thread="true"] > .thread-main-column {
       display: flex;
     }
 
-    .thread-layout-container:not([data-row-plan]):has(> .thread-profile-side-column[data-collapse-thread="true"]) > .thread-side-column {
+    .thread-layout-container:not([data-row-plan])[data-profile-collapse-thread="true"] > .thread-side-column {
       display: none;
     }
 
-    .thread-layout-container:not([data-row-plan]):has(> .thread-profile-side-column[data-collapse-thread="true"]) > .thread-profile-side-column > :is([data-testid="profile-panel"], [data-profile-panel-fallback]) {
+    .thread-layout-container:not([data-row-plan])[data-profile-collapse-thread="true"] > .thread-profile-side-column > :is([data-testid="profile-panel"], [data-profile-panel-fallback]) {
       position: relative;
       inset: auto;
       z-index: auto;
@@ -913,7 +913,7 @@
        divider on its own box, so nothing inside the chat column (the composer
        bar stacks above the resize handle) can cover it, and the chat keeps a
        readable width instead of shrinking to a strip. */
-    .thread-layout-container:not([data-row-plan]):has(> .thread-profile-side-column[data-collapse-channel="false"][data-collapse-thread="false"]) > .thread-profile-side-column > :is([data-testid="profile-panel"], [data-profile-panel-fallback]) {
+    .thread-layout-container:not([data-row-plan])[data-profile-collapse-channel="false"][data-profile-collapse-thread="false"] > .thread-profile-side-column > :is([data-testid="profile-panel"], [data-profile-panel-fallback]) {
       max-width: calc(100% - 160px);
       border-left: 1px solid var(--line-seam);
     }
@@ -923,12 +923,12 @@
   /* Too narrow for two readable panes: fold the conversation away and let the
      profile take the row, next to the sidebar, which already draws that edge. */
   @container thread-layout (max-width: 719.98px) {
-    .thread-layout-container:not([data-row-plan]):has(> .thread-profile-side-column) > .thread-main-column,
-    .thread-layout-container:not([data-row-plan]):has(> .thread-profile-side-column) > .thread-side-column {
+    .thread-layout-container:not([data-row-plan])[data-has-profile] > .thread-main-column,
+    .thread-layout-container:not([data-row-plan])[data-has-profile] > .thread-side-column {
       display: none;
     }
 
-    .thread-layout-container:not([data-row-plan]):has(> .thread-profile-side-column) > .thread-profile-side-column > :is([data-testid="profile-panel"], [data-profile-panel-fallback]) {
+    .thread-layout-container:not([data-row-plan])[data-has-profile] > .thread-profile-side-column > :is([data-testid="profile-panel"], [data-profile-panel-fallback]) {
       /* ProfilePanel sets width/flex inline for its resizable desktop size. */
       flex: 1 1 auto !important;
       width: auto !important;
@@ -938,13 +938,13 @@
     }
 
     /* The profile fills the row here, so its width does not apply: no handle. */
-    .thread-layout-container:not([data-row-plan]):has(> .thread-profile-side-column) > .thread-profile-side-column > [data-testid="profile-panel"] > [data-slot="column-resize-handle"] {
+    .thread-layout-container:not([data-row-plan])[data-has-profile] > .thread-profile-side-column > [data-testid="profile-panel"] > [data-slot="column-resize-handle"] {
       display: none;
     }
 
     /* The legacy task side panel folds the same way rather than going under
        its 320px minimum beside a conversation squeezed below 360px. */
-    .thread-layout-container:not([data-row-plan]):has(> :is([data-testid="legacy-task-panel"], [data-legacy-task-panel-fallback])) > .thread-main-column {
+    .thread-layout-container:not([data-row-plan])[data-has-legacy-task] > .thread-main-column {
       display: none;
     }
 
@@ -965,7 +965,7 @@
 /* Thread | Profile with the channel folded: the thread takes the rest of the
    row, so its own width does not apply and its handle would sit on the same
    seam as the sidebar's. Only the sidebar's handle is offered there. */
-.thread-layout-container:not([data-row-plan]):has(> .thread-profile-side-column[data-collapse-channel="true"]) > .thread-side-column > .thread-side-column-resizer {
+.thread-layout-container:not([data-row-plan])[data-profile-collapse-channel="true"] > .thread-side-column > .thread-side-column-resizer {
   display: none;
 }
 
@@ -978,9 +978,9 @@
    `visibility: visible` (ChannelSideArea ThreadColumnMerged). `!important`:
    those surfaces' own rules above show and fold the row's columns at a higher
    specificity, and none of them applies while the panel is open. */
-.thread-layout-container:has(> .shortcut-help-column) > :is(.thread-side-column, [data-testid="legacy-task-panel"], [data-legacy-task-panel-fallback]),
-.thread-layout-container:has(> .shortcut-help-column) > :is(.thread-side-column, [data-testid="legacy-task-panel"], [data-legacy-task-panel-fallback]) *,
-.thread-layout-container:has(> .shortcut-help-column) > .thread-profile-side-column * {
+.thread-layout-container[data-has-help] > :is(.thread-side-column, [data-testid="legacy-task-panel"], [data-legacy-task-panel-fallback]),
+.thread-layout-container[data-has-help] > :is(.thread-side-column, [data-testid="legacy-task-panel"], [data-legacy-task-panel-fallback]) *,
+.thread-layout-container[data-has-help] > .thread-profile-side-column * {
   visibility: hidden !important;
   pointer-events: none !important;
 }
@@ -993,8 +993,8 @@
        row at the width they had (absolute, at its end), the conversation keeps
        360px, and the panel draws the line between them (its overlay class
        turns the attached edge off). */
-    .thread-layout-container:has(> .shortcut-help-column) > :is([data-testid="legacy-task-panel"], [data-legacy-task-panel-fallback]),
-    .thread-layout-container:has(> .shortcut-help-column) > .thread-profile-side-column > * {
+    .thread-layout-container[data-has-help] > :is([data-testid="legacy-task-panel"], [data-legacy-task-panel-fallback]),
+    .thread-layout-container[data-has-help] > .thread-profile-side-column > * {
       position: absolute !important;
       inset-block: 0;
       right: 0;
@@ -1006,7 +1006,7 @@
        panel doesn't make ChannelSideArea re-measure (useSideRoom), so taking
        the thread out of flow here isn't read as the thread covering. */
     @media (orientation: landscape), (min-width: 1280px) {
-      .thread-layout-container:has(> .shortcut-help-column) > .thread-side-column:not([data-covers]) {
+      .thread-layout-container[data-has-help] > .thread-side-column:not([data-covers]) {
         position: absolute !important;
         inset-block: 0;
         right: 0;
@@ -1015,7 +1015,7 @@
       }
     }
 
-    .thread-layout-container:has(> .shortcut-help-column):not(:has(> .thread-side-column[data-covers])) > .thread-main-column {
+    .thread-layout-container[data-has-help]:not([data-has-thread-covers]) > .thread-main-column {
       display: flex !important;
     }
 
@@ -1030,7 +1030,7 @@
        row over it, the channel and the side columns, which all stay as the
        cover left them (the thread in place at its own width, so its replies
        don't reflow; the channel hidden and inert). */
-    .thread-layout-container:has(> .thread-side-column[data-covers]) > .shortcut-help-column {
+    .thread-layout-container[data-has-thread-covers] > .shortcut-help-column {
       position: absolute !important;
       inset: 0;
       z-index: var(--z-index-cover);
@@ -1039,7 +1039,7 @@
       border-left-width: 0;
     }
 
-    .thread-layout-container:has(> .thread-side-column[data-covers]) > .shortcut-help-column > [data-slot="column-resize-handle"] {
+    .thread-layout-container[data-has-thread-covers] > .shortcut-help-column > [data-slot="column-resize-handle"] {
       display: none;
     }
   }
@@ -1049,13 +1049,13 @@
      column of the planned row (`[data-row-width]`): the plan gives it and the
      conversation their widths there (rules below the #189 block). */
   @container thread-layout (max-width: 719.98px) {
-    .thread-layout-container:has(> .shortcut-help-column:not([data-row-width])) > :is(.thread-side-column, [data-testid="legacy-task-panel"], [data-legacy-task-panel-fallback]),
-    .thread-layout-container:has(> .shortcut-help-column:not([data-row-width])) > .thread-profile-side-column > * {
+    .thread-layout-container[data-has-help]:not([data-help-row-width]) > :is(.thread-side-column, [data-testid="legacy-task-panel"], [data-legacy-task-panel-fallback]),
+    .thread-layout-container[data-has-help]:not([data-help-row-width]) > .thread-profile-side-column > * {
       position: absolute !important;
       inset: 0;
     }
 
-    .thread-layout-container:has(> .shortcut-help-column:not([data-row-width])) > .thread-main-column {
+    .thread-layout-container[data-has-help]:not([data-help-row-width]) > .thread-main-column {
       display: none !important;
     }
 
@@ -1189,7 +1189,7 @@
   border-left: 1px solid var(--line-seam);
 }
 
-.thread-layout-container[data-row-plan]:not(#_):has(> .shortcut-help-column[data-row-width]) > .thread-side-column {
+.thread-layout-container[data-row-plan]:not(#_)[data-help-row-width] > .thread-side-column {
   position: absolute !important;
   top: 0 !important;
   bottom: 0 !important;

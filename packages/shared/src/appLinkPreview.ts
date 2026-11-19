@@ -77,20 +77,33 @@ export const appLinkPreviewListResponseSchema = lazySchema("appLinkPreviewListRe
  * the App as not reviewed by Raft, before every acting button of an App whose
  * read item says `app.reviewed: false`, undo-window buttons included. Only such
  * a client gets those buttons (and that field); others see them as navigate.
+ * `execute.toast.v1` (RFC 076 §6.3): the client reads `app_result` on
+ * execute's answer, the App's toast for an operation that finished at once
+ * (linkCardExecuteToastForCapabilities).
  */
-export const LINK_CARD_CAPABILITIES = ["card.v2", "button.v1", "confirm.v1", "undo.v1", "inline.v1", "inline.tone.v2", "block.v1", "preview.v3", "badge.color.v1", "unreviewed_app.v1"] as const;
+export const LINK_CARD_CAPABILITIES = ["card.v2", "button.v1", "confirm.v1", "undo.v1", "inline.v1", "inline.tone.v2", "block.v1", "preview.v3", "badge.color.v1", "unreviewed_app.v1", "execute.toast.v1"] as const;
 export type LinkCardCapability = typeof LINK_CARD_CAPABILITIES[number];
 export const UNREVIEWED_APP_CAPABILITY = "unreviewed_app.v1" satisfies LinkCardCapability;
+export const EXECUTE_TOAST_CAPABILITY = "execute.toast.v1" satisfies LinkCardCapability;
 export const LINK_CARD_ACTION_ID = /^[a-z][a-z0-9_]{0,31}$/;
 const MAX_BUTTONS = 4;
+
+// Exactly one of confirm / undoWindowMs. An App's card message names its
+// acting buttons with the same two shapes and bounds (RFC 086 §4.1).
+const linkCardExecuteConfirmAction = lazySchema("linkCardExecuteConfirmAction", () =>
+  z.object({ kind: z.literal("execute"), action_id: z.string().regex(LINK_CARD_ACTION_ID), confirm: z.literal("prepare") }).strict());
+const linkCardExecuteUndoAction = lazySchema("linkCardExecuteUndoAction", () =>
+  z.object({ kind: z.literal("execute"), action_id: z.string().regex(LINK_CARD_ACTION_ID), undoWindowMs: z.number().int().min(1000).max(10000) }).strict());
+/** A button's execute action (RFC 076): `{ kind: "execute", action_id, confirm: "prepare" }` or `{ kind: "execute", action_id, undoWindowMs }`. */
+export const linkCardExecuteActionSchema = lazySchema("linkCardExecuteActionSchema", () => z.union([linkCardExecuteConfirmAction, linkCardExecuteUndoAction]));
+export type LinkCardExecuteAction = z.infer<typeof linkCardExecuteActionSchema>;
 
 export const linkCardButtonActionSchema = lazySchema("linkCardButtonActionSchema", () => z.union([
   z.object({ kind: z.literal("navigate"), url: z.string().max(2000).refine((s) => !!publicPreviewUrl(s), "Expected a public HTTPS URL") }).strict(),
   // A preview refresh: no action id, no handle, only the read-only credential.
   z.object({ kind: z.literal("read") }).strict(),
-  // Exactly one of confirm / undoWindowMs.
-  z.object({ kind: z.literal("execute"), action_id: z.string().regex(LINK_CARD_ACTION_ID), confirm: z.literal("prepare") }).strict(),
-  z.object({ kind: z.literal("execute"), action_id: z.string().regex(LINK_CARD_ACTION_ID), undoWindowMs: z.number().int().min(1000).max(10000) }).strict(),
+  linkCardExecuteConfirmAction,
+  linkCardExecuteUndoAction,
 ]));
 export type LinkCardButtonAction = z.infer<typeof linkCardButtonActionSchema>;
 
@@ -422,11 +435,13 @@ export function linkCardBadgeColorsForCapabilities(items: readonly AppLinkPrevie
  * `v3` (the same as version 3 items, only for a client that declared
  * `preview.v3`; RFC 076 §14) or `rate_limited` (read it again after
  * `retry_after` seconds). `app` is Raft's record of the App, its icon the one
- * Raft stores. Strict, like each GET preview.
+ * Raft stores, and `reviewed: false` on an item of an App acting under its
+ * own Server's confirmation, sent only to a client that declared
+ * `unreviewed_app.v1` (RFC 076 §17). Strict, like each GET preview.
  */
 export const linkCardReadItemSchema = lazySchema("linkCardReadItemSchema", () => {
   const url = z.string().refine((value) => !!publicPreviewUrl(value));
-  const app = z.object({ id: z.string().min(1).max(200), name: z.string().max(300), icon: z.string().max(2000).nullable() }).strict();
+  const app = z.object({ id: z.string().min(1).max(200), name: z.string().max(300), icon: z.string().max(2000).nullable(), reviewed: z.literal(false).optional() }).strict();
   const ticket = z.string().min(1).max(4096).brand<"LinkCardReadTicket">().nullable();
   const actions = z.array(z.object({ action_id: z.string().regex(LINK_CARD_ACTION_ID), handle: z.string().min(1).max(4096).brand<"LinkCardHandle">() }).strict()).max(MAX_BUTTONS);
   return z.discriminatedUnion("kind", [
@@ -470,6 +485,17 @@ export function parseLinkCardReadAnswer(data: unknown): LinkCardReadAnswerItem[]
 export const linkCardToastSchema = lazySchema("linkCardToastSchema", () => z.object({
   tone: z.enum(["info", "success", "warning"]), text: cardText(1, 200),
 }).strict());
+
+/**
+ * The App's toast on execute's answer (`app_result: { toast }`, RFC 076 §6.3):
+ * only for a client that declared `execute.toast.v1`, which execute learns
+ * from the handle it was bound into. A client without it (an open tab of an
+ * older web, the mobile App) may read execute's answer strictly, so the field
+ * never reaches it; it shows Raft's fixed hint for the state, as before.
+ */
+export function linkCardExecuteToastForCapabilities<T>(toast: T | null, capabilities: readonly string[]): T | null {
+  return toast && capabilities.includes(EXECUTE_TOAST_CAPABILITY) ? toast : null;
+}
 
 /**
  * Server -> web, socket event name `link_card.operation_changed`, emitted to
@@ -570,6 +596,32 @@ export const appLinkPreviewRegistrationSchema = lazySchema("appLinkPreviewRegist
   .refine((v) => publicPreviewUrl(v.endpoint)?.origin === v.origin, "Callback must belong to the registered origin")
   .refine((v) => !v.action_endpoint || publicPreviewUrl(v.action_endpoint)?.origin === v.origin, "Action endpoint must belong to the registered origin"));
 export type AppLinkPreviewRegistration = z.infer<typeof appLinkPreviewRegistrationSchema>;
+
+/**
+ * One P-256 coordinate: 32 bytes, base64url without padding, canonical (43
+ * characters; the last one carries 4 data bits, so its 2 low bits are zero).
+ */
+const P256_COORDINATE_BASE64URL = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/;
+/** A card encryption key's `kid`: 1-64 characters, letters, digits, `.`, `_`, `-`. */
+export const APP_CARD_ENCRYPTION_KID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
+/**
+ * The public key an App registers for card SecretInputs (RFC 086 §5.2): a
+ * P-256 ECDH-ES encryption JWK and nothing else. Strict, so a private member
+ * (`d`) or any other field (`key_ops`, `x5c`, ...) is refused, never dropped.
+ * The server also checks the point is on the curve.
+ */
+export const appCardEncryptionKeySchema = lazySchema("appCardEncryptionKeySchema", () => z.object({
+  kty: z.literal("EC"),
+  crv: z.literal("P-256"),
+  use: z.literal("enc"),
+  alg: z.literal("ECDH-ES"),
+  kid: z.string().regex(APP_CARD_ENCRYPTION_KID_PATTERN),
+  x: z.string().regex(P256_COORDINATE_BASE64URL),
+  y: z.string().regex(P256_COORDINATE_BASE64URL),
+}).strict());
+export type AppCardEncryptionKey = z.infer<typeof appCardEncryptionKeySchema>;
+/** `PUT /api/oauth/link-preview/encryption-key`'s body. */
+export const appCardEncryptionKeyRegistrationSchema = lazySchema("appCardEncryptionKeyRegistrationSchema", () => z.object({ jwk: appCardEncryptionKeySchema }).strict());
 export function matchesAppPreview(url: string, registration: AppLinkPreviewRegistration): boolean {
   const parsed = publicPreviewUrl(url);
   return !!parsed && parsed.origin === registration.origin && registration.paths.some((path) =>

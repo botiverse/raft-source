@@ -6,11 +6,11 @@ import type { ILinkBotId, ILinkQrcodeHandle, ILinkUserId, WeChatContextToken } f
 import type { SyncHorizon } from "../services/syncHorizon";
 import { createAppSumoClaimId, type AppSumoClaimId, type AppSumoLicenseKey } from "../services/appSumoContracts";
 import type { SlackHumanMentionSnapshot, SlackMentionCapability, SlackMentionWriteFailures } from "../services/slackMentionReconcileState";
-import type { AppLinkPreviewRevision, AppLinkPreviewVersion } from "@botiverse/raft-shared/src/appLinkPreview";
+import type { AppCardEncryptionKey, AppLinkPreviewRevision, AppLinkPreviewVersion } from "@botiverse/raft-shared/src/appLinkPreview";
 import type { SsoConnectionConfig } from "../services/sso/ssoConnectionConfig";
 import { DISPLAY_LOCALES } from "@botiverse/raft-shared/src/displayLocales";
 import type { DisplayLocale } from "@botiverse/raft-shared/src/displayLocales";
-import type { AgentCallApprovalDecidedBy, AgentContextViewGrantId, ChannelSideLayout, ReadinessFact, ServerRole, StoredShortcutOverrides } from "@botiverse/raft-shared";
+import type { AgentCallApprovalDecidedBy, AgentContextViewGrantId, AgentVoiceCallId, ChannelSideLayout, ReadinessFact, ServerRole, StoredShortcutOverrides } from "@botiverse/raft-shared";
 import type { ActivityTurnSummary, AnnouncementAudience, AnnouncementAudienceSnapshot, AnnouncementContent, MentionDeliveryTerminalDecision } from "@botiverse/raft-shared";
 import { pgTable, pgSequence, text, timestamp, integer, bigint, bigserial, uuid, primaryKey, unique, uniqueIndex, index, json, jsonb, boolean, customType, check, date, foreignKey, smallint, type AnyPgColumn } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
@@ -385,6 +385,16 @@ export const servers = pgTable("servers", {
   // false, nobody's activity in this server is linked to an analytics_id.
   productAnalyticsEnabled: boolean("product_analytics_enabled").notNull().default(true),
   planDowngradedAt: timestamp("plan_downgraded_at", { withTimezone: true }),
+  // Task v2 (#wg-task-v2:#24): when this server was first seen with
+  // task_v2_conversations_v0 on, written once (only while NULL) by the idle
+  // task reminder and never changed after, so turning the flag off and on
+  // again keeps it. Feature flag rules keep no per-server history, so this is
+  // the only record of it. The idle task reminder chases only tasks with
+  // activity since then: turning task v2 on (or the backfill making every
+  // older task a task v2 task) must not chase every open task at once.
+  // Seeded for servers already on from their earliest task v2 task (migration
+  // servers_task_v2_on_since).
+  taskV2OnSince: timestamp("task_v2_on_since", { withTimezone: true }),
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -457,12 +467,9 @@ export const serverMembers = pgTable("server_members", {
   // The Pro step between the survey and the handoff was answered ("Upgrade" or "Not now").
   // Shown once, so either answer stamps it; which one is product analytics, not state.
   setupUpgradePromptSeenAt: timestamp("setup_upgrade_prompt_seen_at", { withTimezone: true }),
-  // Replaced the legacy server_push_muted boolean. The table still has it,
-  // kept in step with this by the server_members_push_mode_sync trigger;
-  // nothing here declares or reads it. Its drop (migration
-  // server_members_push_muted_drop) waits for the RisingWave owner:
-  // server_members is replicated to RisingWave as rw_server_members, created
-  // with (*), so the upstream column drop must be confirmed safe there first.
+  // Replaced the legacy server_push_muted boolean (dropped with its sync
+  // trigger by migration server_members_push_muted_drop, once the RisingWave
+  // owner confirmed rw_server_members takes the upstream column drop).
   serverPushMode: text("server_push_mode", { enum: ["all", "mentions", "none"] }).notNull().default("all"),
   // Legacy level counter: no longer written (user_notification_level_versions,
   // backfilled by migration notification_level_versions_backfill); reads take
@@ -945,6 +952,20 @@ export const sessionFamilies = pgTable("session_families", {
   // which every "require SSO" check reads as "not signed in by SSO".
   ssoConnectionId: uuid("sso_connection_id"),
   ssoAuthenticatedAt: timestamp("sso_authenticated_at", { withTimezone: true }),
+  // What the person's sign-in list (GET /api/me/sessions) shows for it, from
+  // the client's own headers (`X-Raft-Client-Platform`, `X-Raft-Client-Version`;
+  // services/sessionClient.ts): set by the sign-in that created the family and
+  // by every refresh that sends them (so an updated app shows its new
+  // version). Claims, not checked identity: DISPLAY ONLY, never read by any
+  // permission decision. Null for families from before the columns, and when
+  // the client sent none (a sign-in finished by a browser redirect).
+  clientPlatform: text("client_platform"),
+  clientVersion: text("client_version"),
+  // When the family last refreshed (rotateSession and the durable replay
+  // path, in the statement that already reads the family), or was created.
+  // Null for families from before the column: the list falls back to the
+  // family's newest refresh row.
+  lastActiveAt: timestamp("last_active_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
   index("idx_session_families_user_active").on(t.userId, t.revokedAt),
@@ -1221,6 +1242,10 @@ export const agents = pgTable("agents", {
   assistantReadsDms: boolean("assistant_reads_dms").notNull().default(true),
   /** RFC 077: the owner lets this assistant send messages as them (column default off; a new assistant starts on, v3.2). */
   assistantSendAsOwner: boolean("assistant_send_as_owner").notNull().default(false),
+  /** Raft voice (#wg-runtime-form:#22): whoever may edit the agent lets people ask it what it is doing and ask it side questions. */
+  voiceAskable: boolean("voice_askable").notNull().default(true),
+  /** Raft voice: whoever may edit the agent lets people call it (the call service, PR3). */
+  voiceCallable: boolean("voice_callable").notNull().default(true),
   // External agents (#wg-external-agent-ux:#2): how its person said it would connect when it was made: through an
   // existing agent's CLI login (`existing_agent`), or a program of their own with the SDK (`sdk`). Only which
   // instructions the agent page shows first; either kind may connect either way. Null: an external agent made
@@ -1843,21 +1868,51 @@ export const oauthAppLinkPreviews = pgTable("oauth_app_link_previews", {
    */
   provedClientKey: text("proved_client_key"),
   /**
-   * RFC 076 §17: the action endpoint a person with manageIntegrations on the
-   * App's own Server confirmed, exactly as they saw it. On that Server only,
-   * a card of an App that is not official may call its action endpoint while
-   * this equals `actionEndpoint` (an App that changes its endpoint needs a new
-   * confirmation) and the registration is not suspended. Not covered by
-   * `revision`: eligibility reads it live, and execute locks this row.
+   * Unread and unwritten since card buttons moved to the installation
+   * (oauth_client_installs.actions_off_at / allowed_action_endpoint); kept one
+   * release so the serving and rollback images, which name these columns,
+   * keep working, then dropped. The migration that moved them left them as
+   * they were.
    */
   ownServerActionEndpoint: text("own_server_action_endpoint"),
-  /** When it was confirmed. Who confirmed (and who withdrew it) is in the integration audit. */
   ownServerActionsConfirmedAt: timestamp("own_server_actions_confirmed_at", { withTimezone: true }),
+  /**
+   * The public key card SecretInputs are sealed to (RFC 086 §5.2): a P-256
+   * ECDH-ES JWK the App set with its own credential
+   * (`PUT /api/oauth/link-preview/encryption-key`); never a private member.
+   * A new one replaces it; it goes with the registration. Not covered by
+   * `revision`: execute compares the handle's `kid` with this one. The three
+   * columns are set and cleared together in one place
+   * (appCardEncryptionKeyService.ts), under a lock on the row, so no CHECK
+   * ties them together.
+   */
+  cardEncryptionKey: jsonb("card_encryption_key").$type<AppCardEncryptionKey>(),
+  /** The key's `kid` (equal to `card_encryption_key.kid`), for comparisons without reading the JWK. */
+  cardEncryptionKid: text("card_encryption_kid"),
+  cardEncryptionKeySetAt: timestamp("card_encryption_key_set_at", { withTimezone: true }),
 }, (t) => [
   check("oauth_app_link_previews_pending_action_endpoint", sql`(${t.pendingActionEndpoint} IS NULL) = (${t.pendingActionEndpointRequestedAt} IS NULL)`),
   check("oauth_app_link_previews_suspension", sql`(${t.suspendedAt} IS NULL) = (${t.suspendedReason} IS NULL)`),
   check("oauth_app_link_previews_own_server_actions", sql`(${t.ownServerActionEndpoint} IS NULL) = (${t.ownServerActionsConfirmedAt} IS NULL)`),
 ]);
+/**
+ * Every `kid` an App has set a card encryption key under (RFC 086 §5.2; Tenny):
+ * a new key under any of them is refused (409 KID_IN_USE), not only under the
+ * one in force, so a `kid` names one key for the App's lifetime. A press reads
+ * the key twice (the handle read's answer, then the live check's kid), and
+ * with a `kid` reused for another key the two could disagree. Kept per App,
+ * not on the registration: it outlives a deleted or taken-over registration.
+ * Written with the key, under the registration row's lock
+ * (appCardEncryptionKeyService.ts); never deleted while the App exists.
+ */
+export const oauthAppCardEncryptionKids = pgTable("oauth_app_card_encryption_kids", {
+  clientId: uuid("client_id").notNull().references(() => oauthClients.id, { onDelete: "cascade" }),
+  kid: text("kid").notNull(),
+  firstSetAt: timestamp("first_set_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ columns: [t.clientId, t.kid] }),
+]);
+
 /** Why a link preview registration stopped: its origin named another App, or could not be fetched for HARD_TTL. */
 export type AppLinkPreviewSuspendReason = "proof_mismatch" | "proof_unavailable";
 
@@ -1912,6 +1967,14 @@ export const linkCardOperations = pgTable("link_card_operations", {
   firstSendDeadline: timestamp("first_send_deadline", { withTimezone: true }).notNull(),
   actionId: text("action_id").notNull(),
   requestSha256: text("request_sha256").notNull(),
+  /**
+   * RFC 086 §5.4: the execute carried a card form's values: sealed SecretInput
+   * values (`sealed_inputs`, a JWE only the App can open) and/or TextInput
+   * values (`inputs`). Only that they were sent: the values themselves are
+   * forwarded inline to the App and never stored, logged or digested.
+   */
+  sealedInputsSubmitted: boolean("sealed_inputs_submitted").notNull().default(false),
+  textInputsSubmitted: boolean("text_inputs_submitted").notNull().default(false),
   state: text("state", { enum: LINK_CARD_OPERATION_STATES }).notNull().default("requested"),
   receiptRevision: integer("receipt_revision").notNull().default(0),
   lastStatusAt: timestamp("last_status_at", { withTimezone: true }),
@@ -2172,9 +2235,28 @@ export const oauthClientInstalls = pgTable("oauth_client_installs", {
   confirmedTextRevisionId: uuid("confirmed_text_revision_id").references(() => oauthAppTextRevisions.id, { onDelete: "set null" }),
   textConfirmedByUserId: uuid("text_confirmed_by_user_id").references(() => users.id, { onDelete: "set null" }),
   textConfirmedAt: timestamp("text_confirmed_at", { withTimezone: true }),
+  /**
+   * Card buttons on this installation's Server (RFC 076 §17,
+   * linkCardExecuteEligibility.ts), for an App that is not official. On
+   * another Server than a server_local App's own: the action endpoint a
+   * person or agent with manageIntegrations here allowed, exactly the one in
+   * force then. The buttons act while it equals the endpoint in force; a
+   * change drops them to links until allowed again (or reverted). It belongs
+   * to this row: an uninstall deletes it, a reinstall starts without.
+   * Who allowed or withdrew it is in the integration audit.
+   */
+  allowedActionEndpoint: text("allowed_action_endpoint"),
+  actionsAllowedAt: timestamp("actions_allowed_at", { withTimezone: true }),
+  /**
+   * A server_local App's source installation (its own Server's row): its card
+   * buttons act there by default while it has an action endpoint; set when
+   * someone with manageIntegrations there switched them off. Unread on other rows.
+   */
+  actionsOffAt: timestamp("actions_off_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
+  check("oauth_client_installs_actions_allowed", sql`(${t.allowedActionEndpoint} IS NULL) = (${t.actionsAllowedAt} IS NULL)`),
   check("oauth_client_installs_setup_completion_valid", sql`
     (${t.setupCompletedRevision} IS NULL AND ${t.setupCompletedAt} IS NULL)
     OR (${t.setupCompletedRevision} IS NOT NULL AND ${t.setupCompletedRevision} > 0 AND ${t.setupCompletedAt} IS NOT NULL)
@@ -2190,6 +2272,25 @@ export const oauthClientInstalls = pgTable("oauth_client_installs", {
   index("idx_oauth_client_installs_status").on(t.clientId, t.status),
   check("oauth_client_installs_grant_revision_nonnegative", sql`${t.grantRevision} >= 0`),
   check("oauth_client_installs_subscription_revision_nonnegative", sql`${t.subscriptionRevision} >= 0`),
+]);
+
+// When this Server last uninstalled an App by a person's action (#proj-apps;
+// GET /api/integrations/marketplace `uninstalledHereAt`), so the Apps page
+// stops recommending an App the Server removed. Uninstalling deletes the
+// install row, and integration_audit_events has no index for "latest
+// uninstall per App on this Server", so this keeps one row per (Server, App):
+// written with the uninstall's audit event (services/oauthClientUninstalls.ts),
+// the newer time winning; never by a system uninstall (the closed-server
+// purge). Reinstalling leaves it: readers compare it with the installation.
+export const oauthClientUninstalls = pgTable("oauth_client_uninstalls", {
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  clientId: uuid("client_id").notNull().references(() => oauthClients.id, { onDelete: "cascade" }),
+  uninstalledAt: timestamp("uninstalled_at", { withTimezone: true }).notNull(),
+  actorUserId: uuid("actor_user_id").references(() => users.id, { onDelete: "set null" }),
+}, (t) => [
+  primaryKey({ columns: [t.serverId, t.clientId] }),
+  // The closed-server purge deletes a never-shared App, which cascades here.
+  index("idx_oauth_client_uninstalls_client").on(t.clientId),
 ]);
 
 // App-owned Bot identity binding. One App has at most one active Bot per
@@ -2657,9 +2758,10 @@ export type SystemAppKey = `system.${string}`;
 /**
  * Core's own system apps; first-party apps add theirs through the app
  * registry. Which of them are inbox items is inboxItemsLaunch.ts
- * NOT_ITEM_SYSTEM_APPS (RaftBench is not; the assistant is).
+ * NOT_ITEM_SYSTEM_APPS (RaftBench is not; the assistant and the onboarding
+ * instructions, services/onboardingInboxItems.ts, are).
  */
-export const CORE_SYSTEM_APPS = ["system.assistant", "system.raftbench", "system.feedback"] as const satisfies readonly SystemAppKey[];
+export const CORE_SYSTEM_APPS = ["system.assistant", "system.raftbench", "system.feedback", "system.onboarding"] as const satisfies readonly SystemAppKey[];
 export const thirdPartyAgentEvents = pgTable("third_party_agent_events", {
   id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
   serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
@@ -2670,7 +2772,8 @@ export const thirdPartyAgentEvents = pgTable("third_party_agent_events", {
   clientId: uuid("client_id").references(() => oauthClients.id, { onDelete: "cascade" }),
   // A Raft system app's event: core's own ("system.assistant", RFC 074 §2
   // assistant doorbell; "system.raftbench"; "system.feedback", the product
-  // feedback triage notice) or a first-party app's
+  // feedback triage notice; "system.onboarding", the owner briefing and #all
+  // greeting, services/onboardingInboxItems.ts) or a first-party app's
   // ("system.<id>", apps/firstPartyApps.ts). No CHECK lists the values.
   systemApp: text("system_app").$type<SystemAppKey>(),
   accessTokenId: uuid("access_token_id").references(() => oauthAccessTokens.id, { onDelete: "set null" }),
@@ -2702,9 +2805,12 @@ export const thirdPartyAgentEvents = pgTable("third_party_agent_events", {
    * How a delivered event was consumed, where an RFC 081 path set it:
    * `read` (inbox read, message read of agent-event:<id>) or `dismissed`
    * (inbox dismiss: never shown, so the Activity overview does not count it
-   * as delivered). NULL for every other delivery (/events, the daemon).
+   * as delivered), or `acted` (the agent dealt with the notice's object
+   * through its app, e.g. read or commented on that Artifact:
+   * consumeAgentObjectNotices). NULL for every other delivery (/events, the
+   * daemon).
    */
-  consumedVia: text("consumed_via", { enum: ["read", "dismissed"] }),
+  consumedVia: text("consumed_via", { enum: ["read", "dismissed", "acted"] }),
   /**
    * Set when the event came in while its inbox item already had unread
    * events (#wg-ax:#24, RFC 081 D7 "one item, one read state"): the item
@@ -2719,7 +2825,7 @@ export const thirdPartyAgentEvents = pgTable("third_party_agent_events", {
   index("idx_third_party_agent_events_agent_unconsumed_item")
     .on(t.agentId, t.clientId, t.systemApp, t.objectRef, t.createdAt)
     .where(sql`status in ('queued', 'delivering')`),
-  check("third_party_agent_events_consumed_via_known", sql`${t.consumedVia} is null or ${t.consumedVia} in ('read', 'dismissed')`),
+  check("third_party_agent_events_consumed_via_known", sql`${t.consumedVia} is null or ${t.consumedVia} in ('read', 'dismissed', 'acted')`),
   index("idx_third_party_agent_events_client").on(t.clientId),
   uniqueIndex("idx_third_party_agent_events_dedupe").on(t.clientId, t.agentId, t.externalEventId),
   // Agent panel list: one agent's events newest first (keyset on created_at, id).
@@ -3680,8 +3786,9 @@ export const jointMembershipGenerations = pgTable("joint_membership_generations"
   check("joint_membership_generation_kind",sql`${t.principalKind}='user'`),
 ]);
 
-// RFC 074 phase 3, P1: shadow membership/admission facts. Serving and local
-// operation roles still use channel_humans until their separately reviewed moves.
+// RFC 074 phase 3: authoritative human membership, computed per local entry.
+// RisingWave 081 builds the strict computed-entry subset beside the old chain;
+// its serving switch is separate. Local operation roles remain entry-local.
 // There is deliberately no canonical role: one server's appointment grants no
 // management authority on another entry.
 export const jointChannelMembers = pgTable("joint_channel_members", {
@@ -4169,6 +4276,12 @@ export const messages = pgTable("messages", {
   // naming it and the "sent by an assistant" label outlives it. Not in
   // slock_rw_publication's column list.
   delegatedByAgentId: uuid("delegated_by_agent_id"),
+  // Raft voice calls: the call (agent_voice_calls.id) that posted this message
+  // in the agent's name (`tell_user`, a late answer, the call's record). The
+  // voice model wrote it, not the agent, so the agent reads it as
+  // `posted_by=voice_call`. Set only by agentVoiceCallService. No foreign key,
+  // for the same reason as delegated_by_agent_id; the call row may be gone.
+  voiceCallId: uuid("voice_call_id"),
   // RFC 077 PR 2b: set when the owner retracted a delegated message. The row
   // stays (seq, thread anchor and inbox are untouched); its content is
   // replaced with a fixed placeholder and its search text cleared.
@@ -6562,6 +6675,20 @@ export const computerHostIdentities = pgTable("computer_host_identities", {
   machineId: uuid("daemon_id").primaryKey().references(() => machines.id, { onDelete: "cascade" }),
   hostIdHash: text("host_id_hash").notNull(),
   reportedAt: timestamp("reported_at", { withTimezone: true }).notNull(),
+});
+
+// The daemon instance (`ready` `daemonInstanceId`, one per daemon process) a
+// machine last connected with, so a `ready` can tell a restarted or upgraded
+// daemon from a plain socket reconnect of the same one, on any replica and
+// across server restarts (thirdPartyAgentEventRedelivery
+// recordMachineDaemonInstance). `previous_daemon_instance_id`: the one it
+// replaced (NULL on the first). Its own table so `ready` never writes the hot
+// `daemons` row. Deleted with the machine.
+export const machineDaemonInstances = pgTable("machine_daemon_instances", {
+  machineId: uuid("daemon_id").primaryKey().references(() => machines.id, { onDelete: "cascade" }),
+  daemonInstanceId: text("daemon_instance_id").notNull(),
+  previousDaemonInstanceId: text("previous_daemon_instance_id"),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull(),
 });
 
 // #proj-raft-computer:#68: the latest `machine:runtime_readiness` report per
@@ -8958,6 +9085,35 @@ export const agentUsageContext = pgTable("agent_usage_context", {
 ]);
 
 /**
+ * Raft voice calls (#wg-runtime-form:#22): one row per call a person made to
+ * an agent (agentVoiceCallService). The holt-live session speaks as the agent;
+ * its callbacks are signed with this call's own secret (encrypted at rest).
+ * `transcript` holds the final sentences only until the call's record is
+ * posted into the caller's DM with the agent (`record_posted_at`), then is
+ * cleared. `duration_s` comes from holt-live's `ended` callback.
+ */
+export const agentVoiceCalls = pgTable("agent_voice_calls", {
+  id: uuid("id").primaryKey().$type<AgentVoiceCallId>(),
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
+  callerUserId: uuid("caller_user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  sessionId: text("session_id").unique(),
+  state: text("state", { enum: ["starting", "live", "ended", "failed"] }).notNull().default("starting"),
+  secretCiphertext: text("secret_ciphertext").notNull(),
+  secretIv: text("secret_iv").notNull(),
+  secretAuthTag: text("secret_auth_tag").notNull(),
+  transcript: jsonb("transcript").$type<Array<{ role: "user" | "agent"; text: string; at: string }>>().notNull().default([]),
+  endReason: text("end_reason"),
+  durationS: integer("duration_s"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  endedAt: timestamp("ended_at", { withTimezone: true }),
+  recordPostedAt: timestamp("record_posted_at", { withTimezone: true }),
+}, (t) => [
+  index("idx_agent_voice_calls_agent_created").on(t.agentId, t.createdAt),
+  index("idx_agent_voice_calls_caller_created").on(t.callerUserId, t.createdAt),
+]);
+
+/**
  * Thread contract (authoritative).
  * =============================================================================
  * Thread channels split two authorities that regular channels conflate:
@@ -9350,6 +9506,15 @@ export const announcementImageAssets = pgTable("announcement_image_assets", {
 
 
 export const announcements = pgTable("announcements", {
+  // Versions (task #38): editing a published announcement creates a new row in
+  // the same series. `seriesId` is the first version's id (null on the first
+  // version itself), `version` counts from 1. Once a later published version
+  // has started it replaces every earlier one. A dismissal of any version from
+  // `dismissalFloorVersion` up to this one counts as dismissing this one, so a
+  // version published "show again" sets the floor to itself.
+  seriesId: uuid("series_id").references((): AnyPgColumn => announcements.id, { onDelete: "cascade" }),
+  version: integer("version").notNull().default(1),
+  dismissalFloorVersion: integer("dismissal_floor_version").notNull().default(1),
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
   priority: integer("priority").notNull().default(0),
   audience: jsonb("audience").$type<AnnouncementAudience>().notNull().default({ type: "all" }),
@@ -9381,6 +9546,10 @@ export const announcements = pgTable("announcements", {
   index("idx_announcements_status_starts_at_desc").on(t.status, t.startsAt),
   check("announcements_deleted_draft_only", sql`${t.deletedAt} is null or ${t.status} = 'draft'`),
   check("announcements_priority_range", sql`${t.priority} >= 0 and ${t.priority} <= 100`),
+  check("announcements_version_shape", sql`${t.version} >= 1 and ${t.dismissalFloorVersion} >= 1 and ${t.dismissalFloorVersion} <= ${t.version} and ((${t.seriesId} is null) = (${t.version} = 1))`),
+  uniqueIndex("uq_announcements_series_version").on(sql`coalesce(${t.seriesId}, ${t.id})`, t.version).where(sql`${t.deletedAt} is null`),
+  // A series has at most one draft version (1.28.0 security review, Tenny 462c1616).
+  uniqueIndex("uq_announcements_series_one_draft").on(sql`coalesce(${t.seriesId}, ${t.id})`).where(sql`${t.status} = 'draft' and ${t.deletedAt} is null`),
 ]);
 
 export const userAnnouncementDismissals = pgTable("user_announcement_dismissals", {
@@ -9412,6 +9581,7 @@ export const announcementAuditEvents = pgTable("announcement_audit_events", {
       "schedule_cancelled",
       "activated",
       "expired",
+      "version_created",
     ],
   }).notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -11155,6 +11325,19 @@ export const computerUpgradeRequests = pgTable("computer_upgrade_requests", {
   observedVersion: text("observed_version"),
   reason: text("reason"),
   resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+  // One automatic retry after a download-step failure
+  // (computerUpgradeRequestService UPGRADE_AUTO_RETRY_FAILURE_CODES). On the
+  // failed request: the allow-listed code that qualified it, when the retry is
+  // due, when a replica claimed it (once: `claimed_at IS NULL` in the claim),
+  // and what came of it (`retried` or why it was skipped). On the request the
+  // retry created: the failed request it retries (set = automatic). Text, no
+  // DB check, as `outcome`. No index: not needed at this size (about 4,600
+  // rows in production; one row per web upgrade click).
+  autoRetryFailureCode: text("auto_retry_failure_code"),
+  autoRetryDueAt: timestamp("auto_retry_due_at", { withTimezone: true }),
+  autoRetryClaimedAt: timestamp("auto_retry_claimed_at", { withTimezone: true }),
+  autoRetryResult: text("auto_retry_result"),
+  autoRetryOfRequestId: uuid("auto_retry_of_request_id"),
 }, (t) => [
   index("idx_computer_upgrade_requests_machine_outcome").on(t.machineId, t.outcome),
   index("idx_computer_upgrade_requests_deadline").on(t.deadlineAt),
@@ -11951,3 +12134,17 @@ export const raftbenchReaderGrants = pgTable("raftbench_reader_grants", {
   enabled: boolean("enabled").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, t => [index("idx_raftbench_reader_grant_subject").on(t.serverId, t.agentId, t.seq)]);
+
+// A server-built onboarding wake (the owner opener ledger, the #all greeting)
+// held for an agent whose runtime driver exits after every turn (Cursor, the
+// old Antigravity, Gemini, Copilot drivers): it goes to the agent `transient`
+// once the agent's process has exited idle, and only once (the row is deleted
+// by the delivery that takes it). See services/onboardingHeldWakes.ts.
+export const onboardingHeldWakes = pgTable("onboarding_held_wakes", {
+  agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
+  kind: text("kind", { enum: ["owner_opener_ledger", "all_channel_greeting"] }).notNull(),
+  message: jsonb("message").$type<AgentMessage>().notNull(),
+  heldAt: timestamp("held_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ columns: [t.agentId, t.kind] }),
+]);

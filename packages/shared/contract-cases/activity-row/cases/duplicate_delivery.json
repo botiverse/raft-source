@@ -1,0 +1,46 @@
+{
+  "formatVersion": 1,
+  "id": "duplicate_delivery",
+  "rule": "position",
+  "title": "The same seq delivered twice counts once",
+  "why": "A seq already applied above the position is the same message again.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/shared/src/activityRowPosition.ts (reduceActivityRow; not wired yet, step 2)"
+    ],
+    "server": [
+      "packages/server/src/services/channelService.ts (latestActivitySeqSameSource; the row's latestActivitySeq)",
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (unread_count and latest_seq from one materialized row)"
+    ]
+  },
+  "given": {
+    "row": {
+      "unreadCount": 0,
+      "hasMention": false,
+      "position": "99",
+      "mentionOnly": false
+    }
+  },
+  "steps": [
+    {
+      "act": "liveMessage",
+      "seq": "100",
+      "counts": true,
+      "mentionsViewer": false
+    },
+    {
+      "act": "liveMessage",
+      "seq": "100",
+      "counts": true,
+      "mentionsViewer": false
+    }
+  ],
+  "expect": {
+    "row": {
+      "unreadCount": 1,
+      "position": "100"
+    },
+    "reread": false
+  }
+}

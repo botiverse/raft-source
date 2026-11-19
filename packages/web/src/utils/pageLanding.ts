@@ -13,12 +13,15 @@
  * (`/s/<slug>` to its first channel): the person went nowhere.
  */
 import { getDesktopBridge } from "./desktopBridge";
+import { openInAppLinkOf } from "./openInAppTrace";
 
 export interface PageLanding {
   pathname: string;
   search: string;
   /** Opened from outside Raft: no referrer, or one from another origin. */
   fromOutside: boolean;
+  /** No referrer at all: a bookmark, the address bar, the start page, or a link in a native app. */
+  noReferrer: boolean;
 }
 
 interface LiveLanding {
@@ -65,6 +68,22 @@ export function isReferrerOutside(referrer: string, origin: string): boolean {
   }
 }
 
+/**
+ * On a computer, a load with no referrer that is only a place in the
+ * workspace (a channel, a DM, the workspace's home or another of its pages;
+ * not a message, thread, task or Artifact link) is someone coming back to the
+ * web app from a bookmark, the start page or the address bar: Raft Desktop's
+ * offer stays away. In two days on production such pages drew 246 desktop
+ * offers and not one Open (#proj-mobile:#128). The same place opened from
+ * another site's page still gets it. Phones are not asked this: there a link
+ * tapped in a chat app has no referrer either, and is the offer's main case.
+ */
+export function isComingBackToWeb(landing: PageLanding): boolean {
+  if (!landing.noReferrer) return false;
+  const kind = openInAppLinkOf(landing.pathname, landing.search);
+  return kind === "channel" || kind === "dm" || kind === "other";
+}
+
 /** This load's address and where it came from; null for a reload or Back/Forward (the person is already here). */
 export function readFirstLoad(): PageLanding | null {
   const type = navigationType();
@@ -73,6 +92,7 @@ export function readFirstLoad(): PageLanding | null {
     pathname: window.location.pathname,
     search: window.location.search,
     fromOutside: isReferrerOutside(globalThis.document?.referrer ?? "", window.location.origin),
+    noReferrer: !globalThis.document?.referrer,
   };
 }
 
@@ -154,6 +174,7 @@ export function resetPageLandingForTests(landing?: { pathname: string; search: s
       pathname: landing.pathname,
       search: landing.search,
       fromOutside: isReferrerOutside(landing.referrer ?? "", landing.origin ?? window.location.origin),
+      noReferrer: !landing.referrer,
     },
     at: landing.pathname,
     movedFrom: null,

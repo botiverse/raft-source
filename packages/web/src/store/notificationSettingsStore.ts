@@ -8,7 +8,6 @@
 import { create } from "zustand";
 import { isNotificationLevel, isNotificationLevelSetting } from "@botiverse/raft-shared";
 import type {
-  NotificationAccountSettings,
   NotificationLevel,
   NotificationLevelScope,
   NotificationLevelSetting,
@@ -20,7 +19,7 @@ import {
   patchAccountNotificationSettings,
   putNotificationLevel,
 } from "../notifications/notificationApi";
-import type { AccountNotificationSettingsPatch, PatchAccountSettingsResult } from "../notifications/notificationApi";
+import type { AccountNotificationSettingsPatch, AccountNotificationSettingsView, PatchAccountSettingsResult } from "../notifications/notificationApi";
 import { useServerStore } from "./serverStore";
 import { isAccountDeletionPending } from "./accountDeletionPending";
 
@@ -31,7 +30,7 @@ export interface ServerExplicitLevelState {
 }
 
 interface NotificationSettingsState {
-  account: NotificationAccountSettings | null;
+  account: AccountNotificationSettingsView | null;
   accountLoaded: boolean;
   /** Server levels (server_members.server_push_mode). */
   serverLevels: Record<string, NotificationLevel>;

@@ -1,6 +1,6 @@
 {
   "name": "@botiverse/raft-server",
-  "version": "1.24.0",
+  "version": "1.29.3",
   "license": "LicenseRef-Raft-License",
   "private": true,
   "type": "module",
@@ -40,6 +40,7 @@
     "ops:migrate-gravatar-avatars": "node --import @oxc-node/core/register scripts/migrate-gravatar-avatars.ts",
     "ops:external-freeze-launch-backfill": "node --import @oxc-node/core/register scripts/external-freeze-launch-backfill.ts",
     "ops:activate-joint-source-exit": "node --import @oxc-node/core/register scripts/activate-joint-source-exit.ts",
+    "ops:feature-flags-default-on-diff": "node --import @oxc-node/core/register scripts/feature-flags-default-on-diff.ts",
     "db:artifacts-legacy-import": "node --import @oxc-node/core/register scripts/artifacts-legacy-import.ts",
     "db:artifacts-page-storage-count": "node --import @oxc-node/core/register scripts/artifacts-page-storage-count.ts",
     "db:artifacts-takedown": "node --import @oxc-node/core/register scripts/artifacts-takedown.ts",
@@ -115,7 +116,8 @@
     "test:migration-0411-locks": "MIGRATION_0411_LOCKS_REAL_PG_REQUIRED=1 vitest run src/db/migration0411LockWindow.realPg.test.ts",
     "test:artifact-publish-real-pg": "ARTIFACT_PUBLISH_REAL_PG_REQUIRED=1 vitest run src/apps/artifacts/publish.realPg.test.ts",
     "test:notification-outbox-fk-indexes-real-pg": "NOTIFICATION_OUTBOX_FK_INDEXES_REAL_PG_REQUIRED=1 vitest run src/db/notificationOutboxFkIndexes.realPg.test.ts",
-    "test:mcp-default-mirror": "MCP_DEFAULT_MIRROR_REAL_PG_REQUIRED=1 vitest run src/db/managedMcpDefaultMirror.realPg.test.ts"
+    "test:mcp-default-mirror": "MCP_DEFAULT_MIRROR_REAL_PG_REQUIRED=1 vitest run src/db/managedMcpDefaultMirror.realPg.test.ts",
+    "ops:rw-joint-member-parity": "node --import @oxc-node/core/register scripts/rw-joint-member-parity.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.129.0",
@@ -126,7 +128,7 @@
     "@aws-sdk/client-ssm": "^3.1020.0",
     "@aws-sdk/credential-provider-node": "3.972.84",
     "@aws-sdk/s3-request-presigner": "^3.1020.0",
-    "@botiverse/oar": "0.103.0",
+    "@botiverse/oar": "0.107.0",
     "@botiverse/porthole": "0.16.0",
     "@botiverse/raft-runtime-form": "workspace:*",
     "@botiverse/raft-shared": "workspace:*",

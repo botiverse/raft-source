@@ -35,6 +35,7 @@ import {
 import { normalizeManagedMcpOAuthClient } from "./managedMcpOAuthClient";
 import { availableRaftOAuthClientKind, type ManagedMcpRaftOAuthClientKind } from "./managedMcpRaftOAuthClient";
 import { requireManagedMcpOAuthClientModeForApp } from "./managedMcpOAuthClientMode";
+import { notifyMcpConnectionNeedsSignIn } from "./managedMcpSignInNotice";
 import { connectionAudienceMatches } from "./managedMcpConnectionAudience";
 import {
   ManagedMcpOAuthProvider,
@@ -1334,10 +1335,17 @@ export async function withManagedMcpOAuth<T>(
     // Tokens recorded for another server are never sent, and never refreshed: the refresh grant
     // would go to whichever authorization server the CURRENT endpoint declares.
     if (storage.tokens && !connectionAudienceMatches(credential, server)) {
-      await recordConnectionOAuthStatus(server, credential.id, {
+      if (await recordConnectionOAuthStatus(server, credential.id, {
         status: "needs_auth",
         lastError: "The MCP server address changed; sign in again",
-      });
+      })) {
+        await notifyMcpConnectionNeedsSignIn({
+          trigger: "oauth_write",
+          serverId: server.serverId,
+          mcpServerId: server.id,
+          connection: { ...credential, authStatus: "needs_auth" },
+        });
+      }
       throw new ManagedMcpOAuthError(
         "MCP OAuth sign-in belongs to a different server address",
         "managed_mcp_oauth_required",
@@ -1392,6 +1400,13 @@ export async function withManagedMcpOAuth<T>(
           cause: reason.cause,
           category: reason.category,
           hadRefreshToken,
+        });
+        // Whoever can sign it in again hears of it now, not when an Agent next asks (#proj-apps:#70).
+        await notifyMcpConnectionNeedsSignIn({
+          trigger: "oauth_write",
+          serverId: server.serverId,
+          mcpServerId: server.id,
+          connection: { ...credential, authStatus: "expired", credentialVersion: snapshot.version },
         });
       }
       throw error;

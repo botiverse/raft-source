@@ -4,7 +4,7 @@
   "runner": "vitest run",
   "testFileGlob": "src/**/*.test.ts",
   "fileCount": 160,
-  "total": 1666,
+  "total": 1676,
   "files": [
     {
       "file": "src/agentApiNoBypass.test.ts",
@@ -161,7 +161,7 @@
     },
     {
       "file": "src/apps/reminder/sealGuard.test.ts",
-      "count": 3,
+      "count": 4,
       "cases": [
         {
           "name": "reminder mutation guard blocks a matching seal and permits an unsealed control"
@@ -171,6 +171,9 @@
         },
         {
           "name": "cancel guard blocks a detached seal even when no Inbox item remains"
+        },
+        {
+          "name": "parseReminderIdInput reads every id form an agent may paste"
         }
       ]
     },
@@ -524,7 +527,7 @@
     },
     {
       "file": "src/commands/action/prepare.test.ts",
-      "count": 30,
+      "count": 35,
       "cases": [
         {
           "name": "raft action prepare sends a card type this CLI does not know to the Server as written"
@@ -615,18 +618,36 @@
         },
         {
           "name": "question:ask: a question of one option is a valid card; none, or one with Other…, is not"
+        },
+        {
+          "name": "raft action prepare --list prints what can be prepared as a request card, ending with the command that prepares the first"
+        },
+        {
+          "name": "raft action prepare --list: none to prepare says why and what to do instead; a Server too old to list them says so"
+        },
+        {
+          "name": "raft action prepare: a request card echoes the summary the person sees, whom it is for, where the result arrives and how to withdraw it"
+        },
+        {
+          "name": "raft action prepare --help points at --list for request cards"
+        },
+        {
+          "name": "actionCardActionSchema keeps agent:create's suggestedRuntime; it is not for a cloud agent"
         }
       ]
     },
     {
       "file": "src/commands/action/withdraw.test.ts",
-      "count": 8,
+      "count": 9,
       "cases": [
         {
           "name": "raft action withdraw: withdrawn — the receipt names the card and who can no longer answer it; the id goes as given"
         },
         {
           "name": "raft action withdraw: already withdrawn — exit 0, nothing changed"
+        },
+        {
+          "name": "raft action withdraw: a request card (request:prepare) — the receipt says the person can no longer confirm it"
         },
         {
           "name": "raft action withdraw --json: the state, the full message id and the card's metadata"
@@ -1055,7 +1076,7 @@
           "name": "move: --to anyone-with-link is a person's step and any other --to (public included, or none) is refused, all before any request"
         },
         {
-          "name": "move: the Server's refusals in the shared words, with their codes"
+          "name": "move: the Server's refusals in its own words, with their codes"
         },
         {
           "name": "delete: DELETE …/:artifact, then what went and that it can't be undone; a refusal keeps its code"
@@ -1136,7 +1157,7 @@
           "name": "symbolic links: pull won't write through a linked folder; push leaves linked files out and says so"
         },
         {
-          "name": "push: an upload refused because the server's file storage isn't set up says nothing was pushed and not to retry"
+          "name": "push: an upload refused because the server's file storage isn't set up says so in the Server's words (retrying won't help); nothing recorded"
         },
         {
           "name": "push: an upload over core's rate limit stops it with the Server's sentence, when to retry and the same command again; nothing retried or recorded"
@@ -4616,7 +4637,7 @@
     },
     {
       "file": "src/commands/reminder/ack.test.ts",
-      "count": 15,
+      "count": 16,
       "cases": [
         {
           "name": "ack rejects a sealed exact reminder before posting the item"
@@ -4662,15 +4683,24 @@
         },
         {
           "name": "ack rejects a short id that is ambiguous across active or acknowledged reminder sources"
+        },
+        {
+          "name": "ack takes the id as raft inbox check prints it: reminder:<id>:<rev> also gives the revision"
         }
       ]
     },
     {
       "file": "src/commands/reminder/cancel.seal.test.ts",
-      "count": 1,
+      "count": 3,
       "cases": [
         {
           "name": "cancel is blocked by a reminder-id seal even when the exact Inbox item is absent"
+        },
+        {
+          "name": "cancel sends the bare id when given the id as raft inbox check prints it"
+        },
+        {
+          "name": "a seal still blocks cancel when the id is pasted as reminder:<id>:<rev>"
         }
       ]
     },

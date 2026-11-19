@@ -59,7 +59,7 @@ import { appLinkDomain, appLinkOpenHref } from "../../utils/appLinkAddress";
 import { KEEP_END, KeptEnd } from "../message/CardElements";
 import Banner from "../ui/Banner";
 import LeavingRaftMark, { opensInNewTabAriaLabel } from "../ui/LeavingRaftMark";
-import { useActionCardShown } from "../../analytics/actionCards";
+import { requestCardNamesSomeoneElse, useActionCardShown } from "../../analytics/actionCards";
 import Tooltip from "../ui/Tooltip";
 import {
   actionCardErrorText,
@@ -210,6 +210,7 @@ export function ActionCardSpecCard({ messageId, metadata, channelId, parentChann
   const isExpired = isActionCardShownExpired(metadata);
   const expiredLine = useExpiredCardLine(metadata);
   const isQuestion = metadata.action.type === "question:ask";
+  const isPreparedRequest = metadata.action.type === "request:prepare";
   // A form draft is the signed-in person's own (store/actionCardFormDrafts.ts).
   const viewerId = useAuthStore((state) => state.user?.id);
   // A question card its agent took back: ended, as an unknown state is, but named.
@@ -225,7 +226,7 @@ export function ActionCardSpecCard({ messageId, metadata, channelId, parentChann
   useActionCardShown(cardRef, {
     messageId,
     actionType: metadata.action.type,
-    actionable: canOperateCard && !done && !isFrozen && !ended,
+    actionable: canOperateCard && !done && !isFrozen && !ended && !requestCardNamesSomeoneElse(metadata.action, viewerId),
     personCard: Boolean(metadata.requesterUserId),
     serverId: currentServerId,
   });
@@ -443,10 +444,12 @@ export function ActionCardSpecCard({ messageId, metadata, channelId, parentChann
   // DS: someone who can't act gets no button (the upgrade card and a seat
   // request); the sender's ticket is theirs alone (anyone else reads the
   // result's line on where it went). A question card is answered by the
-  // person asked: anyone else reads it with no Answer button (spec §3.1).
-  const shownSpec = useMemo(() => withoutButtons(card.spec, (button) => !canOperateCard && (isQuestion
+  // person asked: anyone else reads it with no Answer button (spec §3.1), as
+  // a request card's Decide is only for the person it is for (RFC 085 §4.2).
+  const addressedToOne = isQuestion || isPreparedRequest;
+  const shownSpec = useMemo(() => withoutButtons(card.spec, (button) => !canOperateCard && (addressedToOne
     ? button.action.kind === "open_form" || button.action.kind === "execute"
-    : button.action.kind === "open" && (button.action.intent === "upgrade_dialog" || button.action.intent === "add_seats"))), [canOperateCard, card.spec, isQuestion]);
+    : button.action.kind === "open" && (button.action.intent === "upgrade_dialog" || button.action.intent === "add_seats"))), [addressedToOne, canOperateCard, card.spec]);
   const renderButton = useCallback(
     (id: string, button: ActionCardRenderedButton) => <ActionCardSpecButton key={id} id={id} button={button} context={buttonContext} />,
     [buttonContext],

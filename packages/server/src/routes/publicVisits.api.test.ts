@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { vi } from "vitest";
-import { PUBLIC_SERVER_FEATURE_FLAG_KEY, SERVER_GUEST_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
+import { PUBLIC_SERVER_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
 import { createApiTest } from "../test/integration/apiTest";
 import { tokenForHuman } from "../test/integration/credentials";
 import { getDb } from "../db/index";
@@ -411,9 +411,6 @@ test("public visits: a consenting logged-out visitor's id is kept only in produc
 test("public visits: the retired public join (404) records no join and links no visitor id, even for a joiner who shares usage data", async ({ app }) => {
   resetPublicVisitCountsForTest();
   await enableFlags();
-  await getDb().update(featureFlags)
-    .set({ enabled: true, killSwitch: false, defaultEnabled: true })
-    .where(eq(featureFlags.key, SERVER_GUEST_FEATURE_FLAG_KEY));
   const { server } = await seedPublicServer("visits-join-link");
   const store = memorySink();
   const visitors = memoryVisitorSink();

@@ -37,12 +37,22 @@ export class RuntimeModelNotFoundError extends Error {
   readonly code = "model_not_found" as const;
   readonly runtimeId: string;
   readonly model: string;
+  /**
+   * Pi: what the agent's workspace asks Pi to load that Raft no longer does
+   * (ignoredWorkspacePiCode); a model only they defined is missing. Names only.
+   */
+  readonly ignoredWorkspaceCode: readonly string[];
+  /** Pi: the agent dir the session loads host extensions from, where such code must go instead. */
+  readonly hostExtensionDir: string | null;
 
-  constructor(input: { runtimeId: string; model: string }) {
+  constructor(input: { runtimeId: string; model: string; ignoredWorkspaceCode?: readonly string[]; hostExtensionDir?: string | null }) {
+    // The message stays as it was: its fingerprint groups these failures.
     super(`Model ${input.model} is not available for the ${input.runtimeId} runtime on this computer`);
     this.name = "RuntimeModelNotFoundError";
     this.runtimeId = input.runtimeId;
     this.model = input.model;
+    this.ignoredWorkspaceCode = input.ignoredWorkspaceCode ?? [];
+    this.hostExtensionDir = input.hostExtensionDir ?? null;
   }
 }
 

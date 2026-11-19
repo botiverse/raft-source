@@ -1,5 +1,5 @@
-import { validateAnnouncementPresentation, validateAnnouncementAudience, matchesAnnouncementRules, matchesAnnouncementDevices, announcementRuleFlagKeys, type AnnouncementAudience, type AnnouncementClient, type AnnouncementRuleContext, type AnnouncementRulePlatform } from "@botiverse/raft-shared";
-import { and, asc, desc, eq, gt, inArray, isNull, lt, lte, or, sql, type SQL } from "drizzle-orm";
+import { validateAnnouncementPresentation, validateAnnouncementAudience, matchesAnnouncementRules, matchesAnnouncementDevices, announcementRuleFlagKeys, announcementRulesNeedComputers, ANNOUNCEMENT_COMPUTER_ACTIVE_DAYS, type AnnouncementAudience, type AnnouncementClient, type AnnouncementRuleContext, type AnnouncementRulePlatform } from "@botiverse/raft-shared";
+import { and, asc, desc, eq, gt, isNull, lt, lte, or, sql, type SQL } from "drizzle-orm";
 import {
   currentDate,
   DISPLAY_LOCALES,
@@ -11,6 +11,15 @@ import {
   type DisplayLocale,
   type ServerId,
 } from "@botiverse/raft-shared";
+import {
+  announcementSeriesKey,
+  effectiveAnnouncementStatus as computeEffectiveAnnouncementStatus,
+  findAnnouncementReplacement,
+  groupAnnouncementsBySeries,
+  type AnnouncementEffectiveStatus as SharedAnnouncementEffectiveStatus,
+  type AnnouncementLifecycleStatus,
+  type AnnouncementReplacement,
+} from "@botiverse/raft-shared/announcement-version-rules";
 import { getDb } from "../db/index";
 import { evaluateFeatureFlags } from "./featureFlagService";
 import {
@@ -20,6 +29,7 @@ import {
   users,
   servers,
   serverMembers,
+  machines,
 } from "../db/schema";
 
 export type {
@@ -30,8 +40,8 @@ export type {
   DisplayLocale,
 };
 
-export type AnnouncementStatus = "draft" | "published" | "expired";
-export type AnnouncementEffectiveStatus = AnnouncementStatus | "scheduled";
+export type AnnouncementStatus = AnnouncementLifecycleStatus;
+export type AnnouncementEffectiveStatus = SharedAnnouncementEffectiveStatus;
 export type AnnouncementAuditAction =
   | "deleted"
   | "created"
@@ -42,7 +52,8 @@ export type AnnouncementAuditAction =
   | "schedule_updated"
   | "schedule_cancelled"
   | "activated"
-  | "expired";
+  | "expired"
+  | "version_created";
 
 export interface AnnouncementDraftInput {
   defaultLocale: DisplayLocale;
@@ -206,20 +217,22 @@ function toAnnouncement(row: AnnouncementRow, preferredLocale?: string | null, s
 export function effectiveAnnouncementStatus(
   row: Pick<AnnouncementRow, "status" | "startsAt" | "endsAt">,
   now = currentDate(),
+  replacedBy: AnnouncementReplacement | null = null,
 ): AnnouncementEffectiveStatus {
-  if (row.status !== "published") return row.status;
-  if (row.startsAt && row.startsAt.getTime() > now.getTime()) return "scheduled";
-  if (row.endsAt && row.endsAt.getTime() <= now.getTime()) return "expired";
-  return "published";
+  return computeEffectiveAnnouncementStatus(row, now, replacedBy);
 }
 
-function toAdminAnnouncement(row: AnnouncementRow, now = currentDate()): AdminAnnouncement {
+function toAdminAnnouncement(
+  row: AnnouncementRow,
+  now = currentDate(),
+  replacedBy: AnnouncementReplacement | null = null,
+): AdminAnnouncement {
   return {
     id: row.id,
     defaultLocale: row.defaultLocale,
     content: storedContent(row),
     status: row.status,
-    effectiveStatus: effectiveAnnouncementStatus(row, now),
+    effectiveStatus: effectiveAnnouncementStatus(row, now, replacedBy),
     audience: row.audience,
     deliveryVersion: row.deliveryVersion,
     startsAt: row.startsAt?.toISOString() ?? null,
@@ -349,6 +362,74 @@ function clientEligibility(client: AnnouncementClient | null | undefined) {
   ))`;
 }
 
+/**
+ * Versions (task #38, #14892). A row is replaced once a later published or
+ * expired, undeleted version of its series has started; the replacement takes
+ * over in the same request, so there is never a gap or two versions at once.
+ * Expiring the later version does not bring an earlier one back.
+ *
+ * Mirrors `@botiverse/raft-shared/announcement-version-rules` (`findAnnouncementReplacement`
+ * / `isAnnouncementVersionActive`); pinned against the shared TypeScript predicates
+ * in `announcementVersions.test.ts`.
+ */
+function notReplaced(now: Date) {
+  return sql`not exists (
+    select 1 from announcements later
+    where coalesce(later.series_id, later.id) = coalesce(${announcements.seriesId}, ${announcements.id})
+      and later.version > ${announcements.version}
+      and later.status in ('published', 'expired')
+      and later.deleted_at is null
+      and later.starts_at <= ${now.toISOString()}::timestamptz
+  )`;
+}
+
+/**
+ * SQL predicate for whether an `announcements` row is the currently active/displayed
+ * version of its series at `now`. Shared by `listUndismissedForUser`, `dismiss`,
+ * and the SQL-vs-shared-TS equivalence test in `announcementVersions.test.ts`.
+ */
+export function announcementActiveVersionSql(now: Date): SQL {
+  return and(
+    eq(announcements.status, "published"),
+    isNull(announcements.deletedAt),
+    lte(announcements.startsAt, now),
+    or(isNull(announcements.endsAt), gt(announcements.endsAt, now)),
+    notReplaced(now),
+  )!;
+}
+
+/**
+ * A dismissal of an earlier version counts for this one from its
+ * `dismissal_floor_version` on: a version published "show again" has its own
+ * number as the floor, otherwise it inherits the previous version's floor.
+ *
+ * Mirrors `isAnnouncementDismissedBySeries` in
+ * `@botiverse/raft-shared/announcement-version-rules`; pinned in
+ * `announcementVersions.test.ts`.
+ */
+function notDismissedEarlierVersion(userId: string) {
+  return sql`(${announcements.dismissalFloorVersion} >= ${announcements.version} or not exists (
+    select 1 from ${userAnnouncementDismissals} d
+    join announcements earlier on earlier.id = d.announcement_id
+    where d.user_id = ${userId}
+      and coalesce(earlier.series_id, earlier.id) = coalesce(${announcements.seriesId}, ${announcements.id})
+      and earlier.version >= ${announcements.dismissalFloorVersion}
+      and earlier.version < ${announcements.version}
+  ))`;
+}
+
+/**
+ * SQL predicate for whether `userId` has NOT dismissed `announcements` either
+ * directly (via the `user_announcement_dismissals` left join on `(announcement_id, user_id)`)
+ * or via an earlier version at or above `dismissal_floor_version`.
+ */
+export function announcementUndismissedBySeriesSql(userId: string): SQL {
+  return and(
+    isNull(userAnnouncementDismissals.userId),
+    notDismissedEarlierVersion(userId),
+  )!;
+}
+
 /** Apply targeting before oldest-first selection; context alone never grants membership. */
 function audienceEligibility(userId: string, serverId?: ServerId, client?: AnnouncementClient | null) {
   const currentMember = serverId ? sql`exists (
@@ -405,12 +486,42 @@ export function announcementRulePlatform(platform: string | null | undefined): A
  * eligibility above and in the same priority/oldest-first order. The facts are
  * read once per request, and only when a candidate row carries rules.
  */
+/**
+ * A Server's in-use Computer versions, for the computer_version condition. Every
+ * user of a Server asks on every load, so the answer is kept per Server for a
+ * few minutes (Tenny, #raft-operations:431aa0ae); an upgrade shows up within that.
+ */
+const COMPUTER_VERSIONS_TTL_MS = 5 * 60_000;
+const COMPUTER_VERSIONS_MAX_SERVERS = 10_000;
+const computerVersionsCache = new Map<string, { at: number; versions: Array<string | null> }>();
+
+export function resetAnnouncementComputerVersionsCacheForTest(): void {
+  computerVersionsCache.clear();
+}
+
+async function serverComputerVersions(serverId: ServerId, now: Date): Promise<Array<string | null>> {
+  const cached = computerVersionsCache.get(serverId);
+  if (cached && now.getTime() - cached.at < COMPUTER_VERSIONS_TTL_MS && now.getTime() >= cached.at) return cached.versions;
+  const since = new Date(now.getTime() - ANNOUNCEMENT_COMPUTER_ACTIVE_DAYS * 24 * 60 * 60_000);
+  // A Computer that never connected has no last_heartbeat and is not "in use";
+  // a deleted Computer has no row.
+  const rows = await getDb()
+    .select({ version: machines.computerVersion })
+    .from(machines)
+    .where(and(eq(machines.serverId, serverId), sql`${machines.lastHeartbeat} >= ${since}`));
+  const versions = rows.map((row) => row.version);
+  if (computerVersionsCache.size >= COMPUTER_VERSIONS_MAX_SERVERS) computerVersionsCache.clear();
+  computerVersionsCache.set(serverId, { at: now.getTime(), versions });
+  return versions;
+}
+
 async function loadRuleContext(
   userId: string,
   serverId: ServerId | undefined,
   platform: AnnouncementRulePlatform | null,
   now: Date,
   flagKeys: string[],
+  needComputers = false,
 ): Promise<AnnouncementRuleContext | null> {
   const db = getDb();
   const [user] = await db
@@ -441,7 +552,14 @@ async function loadRuleContext(
     accountCreatedAt: user.createdAt,
     locale,
     platform,
-    server: server ? { createdAt: server.createdAt, plan: server.plan, role: server.role } : null,
+    server: server
+      ? {
+          createdAt: server.createdAt,
+          plan: server.plan,
+          role: server.role,
+          ...(needComputers && serverId ? { computerVersions: await serverComputerVersions(serverId, now) } : {}),
+        }
+      : null,
     flags: new Map(evaluations.map((evaluation) => [evaluation.key, evaluation.enabled])),
   };
 }
@@ -459,7 +577,8 @@ async function filterByRules<T extends { audience: AnnouncementAudience }>(
   const onDevice = rows.filter((row) => matchesAnnouncementDevices(row.audience.devices, platform));
   if (!onDevice.some((row) => row.audience.rules)) return onDevice;
   const flagKeys = [...new Set(onDevice.flatMap((row) => announcementRuleFlagKeys(row.audience.rules)))];
-  const ctx = await loadRuleContext(userId, serverId, platform, now, flagKeys);
+  const needComputers = onDevice.some((row) => announcementRulesNeedComputers(row.audience.rules));
+  const ctx = await loadRuleContext(userId, serverId, platform, now, flagKeys, needComputers);
   if (!ctx) return [];
   return onDevice.filter((row) => matchesAnnouncementRules(row.audience.rules, ctx));
 }
@@ -537,11 +656,8 @@ export async function listUndismissedForUser(
   // that follow it in the same order, skipping dialog rows. The client shows
   // them one at a time and records each as read only when the reader moves on.
   const eligible = and(
-    eq(announcements.status, "published"),
-    isNull(announcements.deletedAt),
-    lte(announcements.startsAt, now),
-    or(isNull(announcements.endsAt), gt(announcements.endsAt, now)),
-    isNull(userAnnouncementDismissals.userId),
+    announcementActiveVersionSql(now),
+    announcementUndismissedBySeriesSql(userId),
     audienceEligibility(userId, serverId, client),
     afterCondition,
   );
@@ -613,10 +729,7 @@ export async function dismiss(
     .where(and(
       eq(announcements.id, announcementId),
       audienceEligibility(userId, serverId, client),
-      eq(announcements.status, "published"),
-      isNull(announcements.deletedAt),
-      lte(announcements.startsAt, now),
-      or(isNull(announcements.endsAt), gt(announcements.endsAt, now)),
+      announcementActiveVersionSql(now),
     ))
     .limit(1);
   const [exists] = found ? await filterByRules([found], userId, serverId, platform, now) : [];
@@ -904,7 +1017,14 @@ export async function listAdminAnnouncements(now = currentDate()): Promise<Admin
     .from(announcements)
     .where(isNull(announcements.deletedAt))
     .orderBy(desc(announcements.createdAt));
-  return rows.map((row) => toAdminAnnouncement(row, now));
+  const bySeries = groupAnnouncementsBySeries(rows);
+  return rows.map((row) =>
+    toAdminAnnouncement(
+      row,
+      now,
+      findAnnouncementReplacement(row, bySeries.get(announcementSeriesKey(row)) ?? [row], now),
+    ),
+  );
 }
 
 export async function listAuditEvents(announcementId: string): Promise<Array<{

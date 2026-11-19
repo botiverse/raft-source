@@ -3,21 +3,30 @@ import {
 } from "@botiverse/hands-feedback-react";
 import type {
   FeedbackAttachment,
+  FeedbackClient,
   FeedbackComment,
   FeedbackKind,
   FeedbackTicketDetail,
   FeedbackTicketSummary,
   HandsFeedbackTransport,
 } from "@botiverse/hands-feedback-react";
+import type { ProductFeedbackAppSource } from "@botiverse/raft-shared";
 import type { AxiosInstance } from "axios";
-import { feedbackTicketPlatformParams } from "./feedbackTicketPlatform";
+import {
+  feedbackTicketPlatformOf,
+  feedbackTicketPlatformParams,
+  rememberFeedbackTicketPlatform,
+} from "./feedbackTicketPlatform";
 import { productFeedbackForm } from "./productFeedbackForm";
 import {
+  FEEDBACK_LIST_ALL_SOURCES,
   FEEDBACK_LIST_DEGRADED_OK,
   degradedRetryAfterMs,
+  feedbackListUnread,
   isDegradedFeedbackPage,
+  isProductFeedbackAppSource,
 } from "./productFeedbackListContract";
-import type { ApiDegradedTicketPage } from "./productFeedbackListContract";
+import type { ApiDegradedTicketPage, FeedbackListUnread, FeedbackUnreadBySource } from "./productFeedbackListContract";
 
 type ApiTicket = {
   id: string;
@@ -33,6 +42,10 @@ type ApiTicket = {
   unread_count: number;
   attachment_count: number;
   comment_count: number;
+  /** The Hands app the ticket lives in (`?sources=all`, server #14722); absent from older servers. */
+  source?: ProductFeedbackAppSource;
+  /** The Raft client it was filed from, a label only (`web|desktop|android|ios|ohos`). */
+  client?: string;
   /** List pages only; absent from detail responses and older servers. */
   latest_comment?: {
     author_type: "reporter" | "staff" | "system";
@@ -58,7 +71,10 @@ type ApiAttachment = {
 type ApiTicketPage = {
   tickets: ApiTicket[];
   next_cursor: string | null;
-  unread_total: number;
+  /** Null or absent: not known on this page (a cursor page, an app that failed); keep the last value. */
+  unread_total?: number | null;
+  /** First page of `?sources=all` only, and not yet on every server (productFeedbackListContract.ts). */
+  unread_by_source?: FeedbackUnreadBySource;
 };
 
 type ApiTicketDetail = {
@@ -100,7 +116,22 @@ function ticketKind(kind: ApiTicket["kind"]): FeedbackKind {
   return kind === "feedback" ? "feedback" : "bug";
 }
 
+const FEEDBACK_CLIENTS: readonly FeedbackClient[] = ["web", "desktop", "android", "ios", "ohos"];
+
+function feedbackClient(value: unknown): FeedbackClient | null {
+  return (FEEDBACK_CLIENTS as readonly unknown[]).includes(value) ? (value as FeedbackClient) : null;
+}
+
+/**
+ * Every call about a ticket goes to the app it lives in: a ticket of a mobile
+ * App's carries `?platform=` from now on (feedbackTicketPlatform.ts).
+ */
+function rememberTicketApp(ticket: ApiTicket) {
+  rememberFeedbackTicketPlatform(ticket.id, feedbackTicketPlatformOf(ticket.source));
+}
+
 function mapTicket(ticket: ApiTicket): FeedbackTicketSummary {
+  const client = feedbackClient(ticket.client);
   return {
     id: ticket.id,
     kind: ticketKind(ticket.kind),
@@ -114,6 +145,8 @@ function mapTicket(ticket: ApiTicket): FeedbackTicketSummary {
     unreadCount: ticket.unread_count,
     attachmentCount: ticket.attachment_count,
     commentCount: ticket.comment_count,
+    // A client this build doesn't know is dropped: the row then names none.
+    ...(client ? { client } : {}),
     ...(ticket.latest_comment === undefined
       ? {}
       : {
@@ -228,12 +261,20 @@ function createUploadProgressReporter(
 
 export function createHandsFeedbackTransport(api: AxiosInstance, options: {
   metadata?: () => Promise<Record<string, string> | null>;
-  captureUnread?: () => (count: number) => void;
   /**
-   * Like `captureUnread`, for a list page's `unread_total`: captured when the
-   * read is sent, called with a real page's total (not a degraded page's).
+   * List every Hands app's tickets (`?sources=all`), not just the caller's.
+   * Only for a caller whose own app is the web's (the web and desktop app): a
+   * ticket of the web's is then asked for without `?platform=`, which the
+   * server answers from the caller's own app.
    */
-  captureListUnread?: () => (count: number) => void;
+  allSources?: boolean;
+  /** Captured when a ticket read is sent; called with the total of the ticket's app. */
+  captureUnread?: () => (count: number, source: ProductFeedbackAppSource) => void;
+  /**
+   * Like `captureUnread`, for the first list page's unread totals: captured
+   * when the read is sent, called with a real page's (not a degraded page's).
+   */
+  captureListUnread?: () => (unread: FeedbackListUnread) => void;
   /**
    * The first page is degraded and being retried (true), or a retry ended:
    * a real page, an error, or the list went away (false). The host shows
@@ -259,9 +300,11 @@ async function getTicket(
         signal: input.signal,
       },
     );
-    // A mobile App's ticket answers with that App's unread total, not the
-    // web's: the web's count stays as it is.
-    if (platformParams.platform === undefined) updateUnread(data.unread_total);
+    rememberTicketApp(data.ticket);
+    // The total is of the ticket's app (feedbackUnreadState.ts decides whether
+    // the web's dot counts it).
+    const source = data.ticket.source;
+    updateUnread(data.unread_total, isProductFeedbackAppSource(source) ? source : platformParams.platform ?? "web");
     return mapDetail(data);
   } catch (error) {
     throw feedbackTransportError(error);
@@ -284,29 +327,56 @@ function setListDegraded(read: object, degraded: boolean) {
   options.onListDegradedChange?.(false);
 }
 
+/** How many empty pages with a next cursor one list read follows. */
+const MAX_EMPTY_PAGE_HOPS = 5;
+
+// The last total a list page knew, for a page that doesn't: the SDK takes a
+// page's `unreadTotal` as a number.
+let lastListUnreadTotal = 0;
+
 return {
   async listTickets(input) {
     const read = {};
     const updateUnread = options.captureListUnread?.() ?? (() => {});
     let retryMs: number | null = null;
+    // A merged page can come back with no tickets and a next cursor (an app's
+    // page was all filtered out). The SDK would draw an empty first page as
+    // "no feedback yet", so follow the cursor, a few pages at most, until a
+    // page has tickets or the list ends.
+    let cursor = input.cursor;
+    let emptyHops = 0;
     try {
       for (;;) {
         const { data } = await api.get<ApiTicketPage | ApiDegradedTicketPage>("/product-feedback/tickets", {
           params: {
             limit: input.limit,
+            ...(options.allSources ? FEEDBACK_LIST_ALL_SOURCES : {}),
             // Only the first page can degrade (server #12566); a later page
             // still 503s, since an empty page there would read as the end.
-            ...(input.cursor ? { cursor: input.cursor } : FEEDBACK_LIST_DEGRADED_OK),
+            ...(cursor ? { cursor } : FEEDBACK_LIST_DEGRADED_OK),
           },
           signal: input.signal,
         });
         if (!isDegradedFeedbackPage(data)) {
           if (degradedRead) setListDegraded(degradedRead, false);
-          updateUnread(data.unread_total);
+          // A cursor page's totals are null or absent: nothing to update.
+          const unread = feedbackListUnread(data);
+          updateUnread(unread);
+          // The SDK's total is the dot's number: with an app unavailable the
+          // total is null but the answering apps' shares still add up.
+          lastListUnreadTotal = unread.total
+            ?? (unread.bySource ? Object.values(unread.bySource).reduce((sum, count) => sum + count, 0) : null)
+            ?? lastListUnreadTotal;
+          data.tickets.forEach(rememberTicketApp);
+          if (data.tickets.length === 0 && data.next_cursor && emptyHops < MAX_EMPTY_PAGE_HOPS) {
+            emptyHops += 1;
+            cursor = data.next_cursor;
+            continue;
+          }
           return {
             tickets: data.tickets.map(mapTicket),
             nextCursor: data.next_cursor,
-            unreadTotal: data.unread_total,
+            unreadTotal: lastListUnreadTotal,
           };
         }
         // Not "no feedback", and unread_total is unknown (null): resolving

@@ -4,9 +4,10 @@
 // mentions), applies an update (the sender's, by message id: §4.2), writes and
 // reads a card's revisions (§4.5), and deletes them after retention.
 
-import { and, eq, lt, sql } from "drizzle-orm";
+import { and, eq, inArray, lt, sql } from "drizzle-orm";
 import {
   agentMessageCardMarker,
+  applyMessageCardActions,
   currentDate,
   extractRaftMentionHandles,
   formatMessageCardProblem,
@@ -16,24 +17,28 @@ import {
   MESSAGE_CARD_FIX_NEXT_STEP,
   MESSAGE_CARD_LIMITS,
   messageCardFallbackProblem,
+  messageCardForUser,
   messageCardMetadataAfterUpdate,
   messageCardMetadataAtSend,
   messageCardStoredContent,
   parseMessageCard,
+  refusalSentenceProblem,
   type AgentApiMessageCardUpdateResponse,
   type AgentMessageCardMarker,
   type MessageCard,
+  type MessageCardActions,
   type MessageCardMetadata,
   type MessageCardProblem,
 } from "@botiverse/raft-shared";
 import { getDb, type DatabaseExecutor } from "../db/index";
-import { messageCardRevisions, messages } from "../db/schema";
+import { messageCardRevisions, messages, users } from "../db/schema";
 import { canonicalJson } from "../lib/canonicalJson";
 import { JointChannelAccessChangedError, lockJointPostingAuthority } from "../lib/channelActorPermissions";
 import { isMessageShortId, messageIdShortPrefixConditions, UUID_RE } from "../lib/messageId";
 import { createFixedWindowCounter } from "./fixedWindowRateLimit";
 import { logMessageChanged } from "./messageChangeLog";
 import { buildSearchText } from "./searchTokenizer";
+import type { RaftAuthoredMention } from "./messageService";
 import { recordSlackCardEditIntent } from "./slackCardEditSync";
 
 /** A 400 a card send answers; nothing was posted. */
@@ -79,6 +84,32 @@ export const MESSAGE_CARD_WITH_ATTACHMENTS_REFUSAL: MessageCardRefusal = {
   },
 };
 
+/** The next step a refusal of a card's `actions` or `for` names (RFC 086 §4.1). */
+export const MESSAGE_CARD_ACTIONS_NEXT_STEP = "send the card without actions and for, or fix what the error names";
+
+/** What a refusal says of a `for` that is not a person who may press the card's buttons. */
+export const MESSAGE_CARD_FOR_NOT_ALLOWED = "for must name a person on this Server (not a guest, not an agent) who can read this conversation now.";
+const MESSAGE_CARD_ACTIONS_INVALID = "actions names 1 to 4 Button elements of the card, each with an RFC 076 execute action and its own action_id.";
+
+/**
+ * RFC 086 §4.1: `actions` or `for` that can't be stored, decided without the
+ * database (400 `message_card_actions_not_allowed`). The sentence names the
+ * request's path; one that quotes a value that can't stand in a refusal
+ * sentence (a line break, a flag-like key, too long) says the rule instead.
+ */
+export function messageCardActionsRefusal(error: string, path?: string): MessageCardRefusal {
+  const sentence = path ? `Card actions refused at ${path}: ${error}` : error;
+  return {
+    status: 400,
+    body: {
+      error: refusalSentenceProblem(sentence) === null ? sentence : MESSAGE_CARD_ACTIONS_INVALID,
+      code: MESSAGE_CARD_ERROR_CODES.actionsNotAllowed,
+      ...(path ? { path } : {}),
+      suggestedNextAction: MESSAGE_CARD_ACTIONS_NEXT_STEP,
+    },
+  };
+}
+
 /** What a card send stores: the card's metadata, the content (fallback), and whether mentions may resolve from it. */
 export interface MessageCardSend {
   card: MessageCard;
@@ -90,6 +121,12 @@ export interface MessageCardSend {
    * sender wrote no content to compare; RFC 082 §4.1).
    */
   contentMentions: boolean;
+  /**
+   * RFC 086 §4.1: the card's `for`, mentioned by Raft in the content (and
+   * appended when the content didn't mention them), bound to the person by
+   * id: it notifies them whether or not the sender wrote the content.
+   */
+  forMention: RaftAuthoredMention | null;
 }
 
 /**
@@ -106,11 +143,23 @@ export function prepareMessageCardSend(input: {
   content: string | undefined;
   mentions: readonly unknown[] | undefined;
   attachmentIds?: readonly unknown[] | undefined;
+  /** RFC 086: the card's acting buttons, as the request sent them (absent: none). */
+  actions?: unknown;
+  /** RFC 086: the request's `for` as sent (absent: none). */
+  for?: unknown;
+  /** The member of this Server `for` names, resolved by the caller (resolveMessageCardFor: an App subject through Raft's mapping), or null when it names no one. */
+  forUser?: { id: string; handle: string } | null;
   now?: Date;
 }): { ok: true; send: MessageCardSend } | { ok: false; refusal: MessageCardRefusal } {
   if (input.attachmentIds && input.attachmentIds.length > 0) return { ok: false, refusal: MESSAGE_CARD_WITH_ATTACHMENTS_REFUSAL };
   const parsed = parseMessageCard(input.card);
   if (!parsed.ok) return { ok: false, refusal: cardInvalid(parsed.problem) };
+  const acting = prepareMessageCardActing(parsed.card, input.actions);
+  if (!acting.ok) return acting;
+  if (input.for !== undefined) {
+    if (!acting.actions) return { ok: false, refusal: messageCardActionsRefusal("for names who may press the card's acting buttons, so it needs actions.", "for") };
+    if (!input.forUser) return { ok: false, refusal: messageCardActionsRefusal(MESSAGE_CARD_FOR_NOT_ALLOWED, "for") };
+  }
   const senderWrote = typeof input.content === "string" && input.content.length > 0;
   if (!senderWrote && input.mentions && input.mentions.length > 0) {
     return {
@@ -126,18 +175,43 @@ export function prepareMessageCardSend(input: {
     };
   }
   // The shared check the clients run before any request: a fallback needs a header, Text, Badge, time, Markdown or Fields to say something.
-  const fallbackProblem = messageCardFallbackProblem(parsed.card, input.content);
+  const fallbackProblem = messageCardFallbackProblem(acting.card, input.content);
   if (fallbackProblem) return { ok: false, refusal: cardInvalid(fallbackProblem) };
-  const content = messageCardStoredContent(parsed.card, input.content);
+  // RFC 086: a derived fallback reads the acting buttons as in Raft, not as the disabled reason older clients show on the card.
+  const stored = messageCardStoredContent(acting.card, input.content, acting.actions ? new Set(Object.keys(acting.actions)) : undefined);
+  // RFC 086 §4.1: the person the card is for is mentioned in the fallback, so
+  // they are notified as any mention notifies; appended when the content
+  // doesn't already mention them.
+  const forUser = input.for !== undefined ? input.forUser ?? null : null;
+  const appendFor = forUser !== null && !extractRaftMentionHandles(stored).includes(forUser.handle);
+  const content = appendFor ? `${stored}\n\n@${forUser.handle}` : stored;
   return {
     ok: true,
     send: {
-      card: parsed.card,
-      metadata: messageCardMetadataAtSend(parsed.card, input.now ?? new Date()),
+      card: acting.card,
+      metadata: messageCardMetadataAtSend(acting.card, input.now ?? new Date(), {
+        ...(acting.actions ? { actions: acting.actions } : {}),
+        // The resolved user id, never the subject as sent.
+        ...(forUser !== null ? { for: forUser.id } : {}),
+      }),
       content,
       contentMentions: senderWrote,
+      forMention: forUser !== null ? { type: "user", id: forUser.id, name: forUser.handle } : null,
     },
   };
+}
+
+/**
+ * RFC 086: a card with the request's `actions` applied (the acting buttons
+ * carry Raft's disabledReason), or the refusal naming the first problem;
+ * the card unchanged when there are none.
+ */
+function prepareMessageCardActing(card: MessageCard, actions: unknown):
+  { ok: true; card: MessageCard; actions: MessageCardActions | null } | { ok: false; refusal: MessageCardRefusal } {
+  if (actions === undefined) return { ok: true, card, actions: null };
+  const applied = applyMessageCardActions(card, actions);
+  if (!applied.ok) return { ok: false, refusal: messageCardActionsRefusal(`${applied.problem.message}.`, applied.problem.path) };
+  return { ok: true, card: applied.card, actions: applied.actions };
 }
 
 /** One revision of a message card, written in the transaction of the send (revision 1) or of the update. */
@@ -159,10 +233,13 @@ export async function insertMessageCardRevision(
 
 function cardOf(actionMetadata: unknown): string | null {
   // Through JSON first: a stored card and a freshly parsed one compare by value, whatever their key order.
-  return isMessageCardMetadata(actionMetadata) ? canonicalJson(JSON.parse(JSON.stringify(actionMetadata.card))) : null;
+  // RFC 086: the acting buttons and `for` are part of what was sent.
+  return isMessageCardMetadata(actionMetadata)
+    ? canonicalJson(JSON.parse(JSON.stringify({ card: actionMetadata.card, actions: actionMetadata.actions ?? null, for: messageCardForUser(actionMetadata) })))
+    : null;
 }
 
-/** Whether two messages' metadata carry the same card, or neither carries one (an idempotent replay compares these). */
+/** Whether two messages' metadata carry the same card (with the same acting buttons and `for`), or neither carries one (an idempotent replay compares these). */
 export function sameMessageCard(stored: unknown, requested: unknown): boolean {
   return cardOf(stored) === cardOf(requested);
 }
@@ -173,9 +250,30 @@ export function sameMessageCard(stored: unknown, requested: unknown): boolean {
  * card sent before that rendering reads the same); empty for any other
  * message.
  */
-export function agentMessageCardField(actionMetadata: unknown): { message_card?: AgentMessageCardMarker } {
-  const marker = agentMessageCardMarker(actionMetadata);
+export function agentMessageCardField(actionMetadata: unknown, forNames?: ReadonlyMap<string, string>): { message_card?: AgentMessageCardMarker } {
+  const forUser = messageCardForUser(actionMetadata);
+  const marker = agentMessageCardMarker(actionMetadata, { forName: forUser ? forNames?.get(forUser) ?? null : null });
   return marker ? { message_card: marker } : {};
+}
+
+/**
+ * The handles of the people these messages' cards are for (RFC 086 `for`),
+ * by user id, so agentMessageCardField can name them (`label (in Raft, for
+ * @name)`). One query, and none when no card names anyone.
+ */
+export async function messageCardForNames(rows: readonly { actionMetadata?: unknown }[]): Promise<ReadonlyMap<string, string>> {
+  const ids = [...new Set(rows.flatMap((row) => {
+    const id = isMessageCardMetadata(row.actionMetadata) ? messageCardForUser(row.actionMetadata) : null;
+    return id && UUID_RE.test(id) ? [id] : [];
+  }))];
+  if (ids.length === 0) return new Map();
+  const found = await getDb().select({ id: users.id, name: users.name }).from(users).where(inArray(users.id, ids));
+  return new Map(found.map((row) => [row.id, row.name]));
+}
+
+/** agentMessageCardField for one message, its `for` named. */
+export async function agentMessageCardFieldNamed(actionMetadata: unknown): Promise<{ message_card?: AgentMessageCardMarker }> {
+  return agentMessageCardField(actionMetadata, await messageCardForNames([{ actionMetadata }]));
 }
 
 // ---------------------------------------------------------------------------
@@ -245,12 +343,13 @@ export async function admitMessageCardUpdate(input: { messageId: string; senderA
  * fallback when `content` is absent). `senderWroteContent`: the content is the
  * sender's, not derived, so a replay under the update's key compares it.
  */
-export function prepareMessageCardUpdate(input: { card: unknown; content: string | undefined }):
-  { ok: true; card: MessageCard; content: string; senderWroteContent: boolean } | { ok: false; refusal: MessageCardRefusal } {
+export function prepareMessageCardUpdate(input: { card: unknown; content: string | undefined; actions?: unknown }):
+  { ok: true; card: MessageCard; content: string; senderWroteContent: boolean; actions: MessageCardActions | null } | { ok: false; refusal: MessageCardRefusal } {
   // No mentions: an update never resolves one, whatever its content says.
-  const prepared = prepareMessageCardSend({ card: input.card, content: input.content, mentions: undefined });
+  // RFC 086: the update's `actions` are read as at send; no `for` (fixed at send).
+  const prepared = prepareMessageCardSend({ card: input.card, content: input.content, mentions: undefined, actions: input.actions });
   return prepared.ok
-    ? { ok: true, card: prepared.send.card, content: prepared.send.content, senderWroteContent: prepared.send.contentMentions }
+    ? { ok: true, card: prepared.send.card, content: prepared.send.content, senderWroteContent: prepared.send.contentMentions, actions: prepared.send.metadata.actions ?? null }
     : prepared;
 }
 
@@ -285,10 +384,16 @@ export type MessageCardUpdateOutcome =
  */
 function replayMessageCardUpdate(
   earlier: { revision: number; card: unknown; content: string; createdAt: Date },
-  update: { messageId: string; channelId: string; card: MessageCard; content: string; senderWroteContent: boolean },
+  update: { messageId: string; channelId: string; card: MessageCard; content: string; senderWroteContent: boolean; actions: MessageCardActions | null },
+  /** The message's metadata now: when the key's revision is still the current one, its acting buttons are compared too (RFC 086). */
+  current: unknown,
 ): MessageCardUpdateOutcome {
+  // A revision row keeps the card (each acting button with Raft's disabledReason) and the content,
+  // not the actions; those are compared while the key's revision is still the message's current one.
+  const sameActions = !isMessageCardMetadata(current) || current.revision !== earlier.revision
+    || canonicalJson(JSON.parse(JSON.stringify(current.actions ?? null))) === canonicalJson(JSON.parse(JSON.stringify(update.actions ?? null)));
   if (canonicalJson(earlier.card) !== canonicalJson(JSON.parse(JSON.stringify(update.card)))
-    || (update.senderWroteContent && earlier.content !== update.content)) {
+    || (update.senderWroteContent && earlier.content !== update.content) || !sameActions) {
     return { kind: "idempotency_conflict" };
   }
   return {
@@ -313,15 +418,17 @@ export async function findCommittedMessageCardUpdate(input: {
   idempotencyKey: string;
   card: unknown;
   content: string | undefined;
+  actions?: unknown;
 }): Promise<MessageCardUpdateOutcome | null> {
   const id = input.messageId.trim();
   const idConditions = UUID_RE.test(id) ? [eq(messages.id, id)] : isMessageShortId(id) ? messageIdShortPrefixConditions(id) : null;
   if (!idConditions) return null;
-  const prepared = prepareMessageCardUpdate({ card: input.card, content: input.content });
+  const prepared = prepareMessageCardUpdate({ card: input.card, content: input.content, actions: input.actions });
   if (!prepared.ok) return null;
   const found = await getDb().select({
     messageId: messages.id,
     channelId: messages.channelId,
+    current: messages.actionMetadata,
     revision: messageCardRevisions.revision,
     card: messageCardRevisions.card,
     content: messageCardRevisions.content,
@@ -340,7 +447,8 @@ export async function findCommittedMessageCardUpdate(input: {
   if (!earlier || another) return null;
   return replayMessageCardUpdate(earlier, {
     messageId: earlier.messageId, channelId: earlier.channelId, card: prepared.card, content: prepared.content, senderWroteContent: prepared.senderWroteContent,
-  });
+    actions: prepared.actions,
+  }, earlier.current);
 }
 
 /**
@@ -366,6 +474,8 @@ export async function applyMessageCardUpdate(input: {
   content: string;
   /** False when `content` is the fallback Raft derived from the card: a replay under the key compares the card alone. Default true. */
   senderWroteContent?: boolean;
+  /** RFC 086: the new card's acting buttons (the route checked them); null or absent: the acting buttons end. `for` stays the send's. */
+  actions?: MessageCardActions | null;
   expectedRevision?: number;
   idempotencyKey?: string | null;
   /**
@@ -429,7 +539,8 @@ export async function applyMessageCardUpdate(input: {
       if (earlier) {
         return replayMessageCardUpdate(earlier, {
           messageId: row.id, channelId: row.channelId, card: input.card, content: input.content, senderWroteContent: input.senderWroteContent !== false,
-        });
+          actions: input.actions ?? null,
+        }, row.actionMetadata);
       }
     }
     // Under the row lock: still in the conversation the checks (and the
@@ -441,7 +552,7 @@ export async function applyMessageCardUpdate(input: {
     if (input.expectedRevision !== undefined && input.expectedRevision !== current.revision) {
       return { kind: "revision_conflict", currentRevision: current.revision };
     }
-    const next = messageCardMetadataAfterUpdate(current, input.card, now);
+    const next = messageCardMetadataAfterUpdate(current, input.card, now, input.actions ?? undefined);
     // Reply previews use updatedAt as their content revision: keep it monotonic.
     const updatedAt = new Date(Math.max(now.getTime(), row.updatedAt.getTime() + 1));
     // Compare-and-swap on the stored revision (the row lock already orders

@@ -196,7 +196,7 @@ test("move: already server-wide 409 HOME_NOT_WIDER, public 403, another agent th
   await world.make({ serverHome: true, name: plan, author: { type: "user", id: world.member.id } });
   const here = await world.make({ name: plan });
   const taken = await move(app, world.keys.a, here.id, "server");
-  assert.deepEqual([taken.status, taken.body], [409, refused("NAME_TAKEN", "Another artifact visible to the whole server already has this artifact's name, so it can't move there: ask the other one's author or a server admin whether it can be deleted, then move this one again.", { name: plan })]);
+  assert.deepEqual([taken.status, taken.body], [409, refusalBody({ code: "NAME_TAKEN", error: "Another artifact visible to the whole server already has this artifact's name, so it can't move there: ask the other one's author or a server admin whether it can be deleted, then move this one again.", next: RAFT_HINTS.artifactMove({ artifact: here.id }), details: { name: plan } })]);
   await untouched(here, "name taken");
 });
 

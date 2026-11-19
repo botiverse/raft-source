@@ -94,7 +94,7 @@ export function MembersAgentUsageOne({ usage, agent }: { usage: MembersAgentUsag
       </div>
       {summary.kind !== "ready" ? (
         <div className="flex min-h-[240px] flex-col">
-          <AgentUsageNoFigures kind={summary.kind} agentId={agent.id} range={view.range} />
+          <AgentUsageNoFigures summary={summary} agentId={agent.id} range={view.range} />
         </div>
       ) : (
         <>

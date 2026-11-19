@@ -2,7 +2,7 @@ import { raftbenchFindingsQuerySchema, raftbenchFindingsResponseSchema, type Raf
 import { raftbenchContextQuerySchema, raftbenchContextResponseSchema, raftbenchReportSchema, raftbenchSubmitResponseSchema, type RaftbenchContextQuery, type RaftbenchContextResponse, type RaftbenchReport, type RaftbenchSubmitResponse } from "./raftbenchContract";
 import { z } from "zod";
 import { lazySchema } from "./lazySchema";
-import { agentApiAssistantOwnerArtifactPublishBodySchema, agentApiAssistantOwnerArtifactPublishResponseSchema, agentApiAssistantOwnerArtifactQuerySchema, agentApiAssistantOwnerArtifactResponseSchema, type AgentApiAssistantOwnerArtifactPublishBody, type AgentApiAssistantOwnerArtifactPublishResponse, type AgentApiAssistantOwnerArtifactQuery, type AgentApiAssistantOwnerArtifactResponse } from "./agentApiArtifactsContract";
+import { agentApiAssistantOwnerArtifactPublishAsOwnerBodySchema, agentApiAssistantOwnerArtifactPublishAsOwnerResponseSchema, agentApiAssistantOwnerArtifactPublishBodySchema, agentApiAssistantOwnerArtifactPublishResponseSchema, agentApiAssistantOwnerArtifactQuerySchema, agentApiAssistantOwnerArtifactResponseSchema, type AgentApiAssistantOwnerArtifactPublishAsOwnerBody, type AgentApiAssistantOwnerArtifactPublishAsOwnerResponse, type AgentApiAssistantOwnerArtifactPublishBody, type AgentApiAssistantOwnerArtifactPublishResponse, type AgentApiAssistantOwnerArtifactQuery, type AgentApiAssistantOwnerArtifactResponse } from "./agentApiArtifactsContract";
 import { agentApiMigrationRetryResponseSchema, type AgentApiMigrationRetryResponse } from "./agentMigrationRetry";
 import { AGENT_WRITE_LANDINGS } from "./agentWriteLanding";
 
@@ -891,7 +891,9 @@ export const agentApiTaskCreateBodySchema = lazySchema("agentApiTaskCreateBodySc
      * asked for the work): full message id or 8-char short id, resolved in the
      * target channel. Many tasks may share one message. A reply in one of the
      * channel's threads resolves to that thread's root message. Required where
-     * task v2 conversations are on (400 `task_source_required` without it);
+     * task v2 conversations are on (400 `task_source_required` without it;
+     * a CLI from before Computer 1.0.53, which cannot send it, gets the
+     * agent's own message with the titles posted as the source instead);
      * refused where they are off (403 `task_v2_not_enabled`).
      */
     source_message_id: z.string().trim().min(1).optional(),
@@ -1927,6 +1929,41 @@ export const agentApiIntegrationAppManageResponseSchema = lazySchema("agentApiIn
   links: z.array(agentApiIntegrationAppShareLinkSchema).optional(),
 }));
 
+/**
+ * An App's card buttons on the agent's Server (RFC 076 §17): `show` reads
+ * them; `allow` lets them act, sending `actionEndpoint` exactly as shown
+ * (on a server_local App's own Server it switches them back on; anywhere
+ * else it allows that endpoint); `withdraw` switches them off or withdraws
+ * the allow. Needs manageIntegrations on this Server.
+ */
+export const agentApiIntegrationAppCardButtonsBodySchema = lazySchema("agentApiIntegrationAppCardButtonsBodySchema", () => passthroughObject({
+  clientKey: z.string().trim().min(1),
+  action: z.enum(["show", "allow", "withdraw"]),
+  /** allow only: the action endpoint in force, exactly as `show` returned it. */
+  actionEndpoint: optionalStringSchema,
+}));
+
+export const agentApiIntegrationAppCardButtonsResponseSchema = lazySchema("agentApiIntegrationAppCardButtonsResponseSchema", () => passthroughObject({
+  clientId: z.string(),
+  clientKey: z.string(),
+  /**
+   * Null for an approved official App (Raft reviewed it; nothing to allow) or
+   * one not installed on this Server. `mode`: `own_server` (a server_local
+   * App on its own Server, on by default) or `allow` (anywhere else).
+   */
+  cardButtons: passthroughObject({
+    mode: z.enum(["own_server", "allow"]),
+    state: z.enum(["no_endpoint", "off", "suspended", "on", "pending_review", "not_allowed", "endpoint_changed", "allowed"]),
+    inForce: z.boolean(),
+    actionEndpoint: nullableStringSchema,
+    pendingActionEndpoint: nullableStringSchema,
+    allowedActionEndpoint: nullableStringSchema,
+    changedAt: nullableStringSchema,
+    /** Who made the change `changedAt` dates, when known. */
+    changedBy: passthroughObject({ type: z.enum(["human", "agent"]), id: z.string(), name: z.string() }).nullable(),
+  }).nullable(),
+}));
+
 export const agentApiIntegrationAppLogoResponseSchema = lazySchema("agentApiIntegrationAppLogoResponseSchema", () => passthroughObject({
   clientId: z.string(),
   clientKey: z.string(),
@@ -2084,6 +2121,9 @@ export const agentApiMessageEnvelopeSchema = passthroughObject({
   senderTimezone: z.string().nullable().optional(),
   sender_timezone: z.string().nullable().optional(),
   delegated_by: z.object({ name: z.string() }).passthrough().nullable().optional(),
+  // Raft voice calls: posted in the sender agent's name by something else (`voice_call`). A string, so a later kind still parses.
+  posted_by: z.string().nullable().optional(),
+  voiceCallId: z.string().nullable().optional(),
   external_message: agentApiExternalMessageProvenanceSchema.optional(),
   mentioned: optionalBooleanSchema,
   channel_type: optionalStringSchema,
@@ -3357,6 +3397,42 @@ export const agentApiActionPrepareResponseSchema = lazySchema("agentApiActionPre
    * same conversation and gate within a day). Absent for a newly posted card.
    */
   existing: z.boolean().optional(),
+  /**
+   * A `request:prepare` card only (RFC 085 §4.2): the summary the person will
+   * see, in English with the names this agent may see; who it is for; the
+   * operation; and that its result comes back as a reply in the card's thread.
+   */
+  preparedRequest: passthroughObject({
+    summary: z.string(),
+    /** The card's title alone ("Start @builder"), with the same names; absent from an older Server. */
+    title: z.string().optional(),
+    for: z.string(),
+    operation: z.string(),
+    result: z.literal("reply"),
+  }).optional(),
+}));
+
+/**
+ * What an agent may prepare as a request card (`request:prepare`, RFC 085
+ * §4.2 discovery: `raft action prepare --list`): the server's delegable
+ * operations, each with its args, whom to ask, and what the person sees.
+ * Empty while request cards are off for the server (`enabled: false`).
+ */
+export const agentApiActionOperationsResponseSchema = lazySchema("agentApiActionOperationsResponseSchema", () => passthroughObject({
+  enabled: z.boolean(),
+  operations: z.array(passthroughObject({
+    /** The name to prepare it by (`agent:stop`). */
+    operation: z.string(),
+    /** What a confirm does, in one sentence. */
+    summary: z.string(),
+    args: z.array(passthroughObject({ name: z.string(), description: z.string(), required: z.boolean() })),
+    /** Who can confirm it: whom to address the card to. */
+    confirmer: z.string(),
+    /** The card's title and button, in English, each `<name>` standing for what the args resolve to. */
+    personSees: passthroughObject({ title: z.string(), button: z.string() }),
+    /** Example args. */
+    example: z.record(z.string(), z.string()),
+  })),
 }));
 
 /** The question card to withdraw: its message id, or at least its first 8 characters among the agent's own question cards. */
@@ -3366,6 +3442,8 @@ export const agentApiActionWithdrawParamsSchema = lazySchema("agentApiActionWith
 
 export const agentApiActionWithdrawResponseSchema = lazySchema("agentApiActionWithdrawResponseSchema", () => passthroughObject({
   messageId: z.string(),
+  /** A `request:prepare` card only (RFC 085): its one result kind for the agent, and its summary as the agent may see it. */
+  preparedRequest: passthroughObject({ outcome: z.literal("withdrawn"), summary: z.string() }).optional(),
   /** The card as the agent reads it (no `presentation.card`), now `withdrawn`. */
   metadata: passthroughObject({
     kind: z.literal("action-card"),
@@ -3949,6 +4027,16 @@ const coreAgentApiRoutes = {
     description: "Personal assistants only: publish an Artifact (a page, report or file your owner can open and comment on) into your DM with your owner, as yourself; or a new version of one you published (artifact + base, the version you read). Files inline: content, or content_base64 for bytes. Then send your owner its url. You can't push to an Artifact you didn't publish (NOT_PUBLISHED_BY_ASSISTANT), nor to one no longer in your DM with your owner (moved to a channel or the server, or from before you were given to them): that answers artifact_not_found; publish a new one, don't retry. If the answer is UNSEEN_CHANGES, read it with owner-artifact first and send the same publish with seen = the position it returned.",
     request: { body: agentApiAssistantOwnerArtifactPublishBodySchema },
     response: { body: agentApiAssistantOwnerArtifactPublishResponseSchema },
+  }),
+  assistantOwnerArtifactPublishAsOwner: route({
+    key: "assistantOwnerArtifactPublishAsOwner",
+    method: "POST",
+    path: "/assistant/owner-artifact/as-owner",
+    client: { resource: "assistant", method: "publishArtifactAsOwner" },
+    capability: "send",
+    description: "Personal assistants only, and only while your owner has \"send as me\" on: publish an Artifact AS your owner (they are its author) into a conversation they may post in now, named as they name it (home: #channel, dm:@peer, or an id); or a new version of one you published as them (artifact + base, the version you read; no home). The rules of sending as them apply: not your own DM with them (publish there as yourself with owner-artifact), a DM only while they let you read DMs, never a conversation bridged to an external chat. Any home you can't use answers the one TARGET_NOT_FOUND, whatever the reason; joint (shared) channels are not supported yet: a joint as home, or a new version of one homed in a joint, answers not-found too. Raft posts a receipt in your DM with your owner; you needn't tell them. If the answer is UNSEEN_CHANGES, read it with owner-artifact first and send the same publish with seen = the position it returned: the same publish without seen is held again.",
+    request: { body: agentApiAssistantOwnerArtifactPublishAsOwnerBodySchema },
+    response: { body: agentApiAssistantOwnerArtifactPublishAsOwnerResponseSchema },
   }),
   assistantOwnerActivity: route({
     key: "assistantOwnerActivity",
@@ -4634,6 +4722,16 @@ const coreAgentApiRoutes = {
     request: {},
     response: { body: agentApiIntegrationAppListResponseSchema },
   }),
+  integrationAppCardButtons: route({
+    key: "integrationAppCardButtons",
+    method: "POST",
+    path: "/integrations/app/card-buttons",
+    client: { resource: "integrations", method: "cardButtons" },
+    capability: "read",
+    description: "Read or set whether an App's card buttons act on this Server (needs manageIntegrations here). An App Raft did not review acts on its own Server by default (withdraw switches that off, allow switches it on again); anywhere else only once allowed, for the exact action endpoint in force: show first, then allow with actionEndpoint exactly as shown. If the App changes its endpoint, it only opens links until allowed again.",
+    request: { body: agentApiIntegrationAppCardButtonsBodySchema },
+    response: { body: agentApiIntegrationAppCardButtonsResponseSchema },
+  }),
   integrationAppStatus: route({
     key: "integrationAppStatus",
     method: "GET",
@@ -4663,6 +4761,16 @@ const coreAgentApiRoutes = {
     description: "Withdraw a question card the bound agent posted, while nobody has answered it; only the agent that asked may. Answered first: 409 ALREADY_ANSWERED with the card's metadata.",
     request: { params: agentApiActionWithdrawParamsSchema },
     response: { body: agentApiActionWithdrawResponseSchema },
+  }),
+  actionOperations: route({
+    key: "actionOperations",
+    method: "GET",
+    path: "/prepare-action/operations",
+    client: { resource: "actions", method: "operations" },
+    capability: "tasks",
+    description: "List the operations the bound agent may prepare as a request card (request:prepare) on its server: each with its args, whom to ask and what the person sees. Empty while request cards are off for the server.",
+    request: {},
+    response: { body: agentApiActionOperationsResponseSchema },
   }),
   attachmentUpload: route({
     key: "attachmentUpload",
@@ -5266,6 +5374,7 @@ export type AgentApiOkResponse = z.infer<typeof agentApiOkResponseSchema>;
 export type AgentApiChannelLeaveResponse = z.infer<typeof agentApiChannelLeaveResponseSchema>;
 export type AgentApiActionPrepareResponse = z.infer<typeof agentApiActionPrepareResponseSchema>;
 export type AgentApiActionWithdrawResponse = z.infer<typeof agentApiActionWithdrawResponseSchema>;
+export type AgentApiActionOperationsResponse = z.infer<typeof agentApiActionOperationsResponseSchema>;
 
 export type AgentApiAgentContextResponse = z.infer<typeof agentApiAgentContextResponseSchema>;
 export type AgentApiServerInfoResponse = z.infer<typeof agentApiServerInfoResponseSchema>;
@@ -5305,6 +5414,8 @@ export type AgentApiIntegrationAppUpdateResponse = z.infer<typeof agentApiIntegr
 export type AgentApiIntegrationAppManageBody = z.infer<typeof agentApiIntegrationAppManageBodySchema>;
 export type AgentApiIntegrationAppManageResponse = z.infer<typeof agentApiIntegrationAppManageResponseSchema>;
 export type AgentApiIntegrationAppLogoResponse = z.infer<typeof agentApiIntegrationAppLogoResponseSchema>;
+export type AgentApiIntegrationAppCardButtonsBody = z.infer<typeof agentApiIntegrationAppCardButtonsBodySchema>;
+export type AgentApiIntegrationAppCardButtonsResponse = z.infer<typeof agentApiIntegrationAppCardButtonsResponseSchema>;
 export type AgentApiOwnedIntegrationApp = z.infer<typeof agentApiOwnedIntegrationAppSchema>;
 export type AgentApiIntegrationAppListResponse = z.infer<typeof agentApiIntegrationAppListResponseSchema>;
 export type AgentApiIntegrationAppStatusResponse = z.infer<typeof agentApiIntegrationAppStatusResponseSchema>;
@@ -5365,6 +5476,7 @@ type CoreAgentApiRequestParamsByRoute = {
   assistantSearchForwardTargets: never;
   assistantOwnerArtifact: never;
   assistantOwnerArtifactPublish: never;
+  assistantOwnerArtifactPublishAsOwner: never;
   assistantOwnerActivity: never;
   assistantNotify: never;
   assistantOwnerResolve: never;
@@ -5430,9 +5542,11 @@ type CoreAgentApiRequestParamsByRoute = {
   integrationAppManage: never;
   integrationAppLogoUpdate: never;
   integrationAppList: never;
+  integrationAppCardButtons: never;
   integrationAppStatus: never;
   actionPrepare: never;
   actionWithdraw: AgentApiActionWithdrawParams;
+  actionOperations: never;
   attachmentUpload: never;
   attachmentUploadCapabilities: never;
   attachmentUploadSessionCreate: never;
@@ -5498,6 +5612,7 @@ type CoreAgentApiRequestQueryByRoute = {
   assistantSearchForwardTargets: AgentApiAssistantSearchForwardTargetsQuery;
   assistantOwnerArtifact: AgentApiAssistantOwnerArtifactQuery;
   assistantOwnerArtifactPublish: never;
+  assistantOwnerArtifactPublishAsOwner: never;
   assistantOwnerActivity: AgentApiAssistantOwnerActivityQuery;
   assistantNotify: never;
   assistantOwnerResolve: AgentApiAssistantOwnerResolveQuery;
@@ -5563,9 +5678,11 @@ type CoreAgentApiRequestQueryByRoute = {
   integrationAppManage: never;
   integrationAppLogoUpdate: never;
   integrationAppList: never;
+  integrationAppCardButtons: never;
   integrationAppStatus: AgentApiIntegrationAppStatusQuery;
   actionPrepare: never;
   actionWithdraw: never;
+  actionOperations: never;
   attachmentUpload: never;
   attachmentUploadCapabilities: never;
   attachmentUploadSessionCreate: never;
@@ -5631,6 +5748,7 @@ type CoreAgentApiRequestBodyByRoute = {
   assistantSearchForwardTargets: never;
   assistantOwnerArtifact: never;
   assistantOwnerArtifactPublish: AgentApiAssistantOwnerArtifactPublishBody;
+  assistantOwnerArtifactPublishAsOwner: AgentApiAssistantOwnerArtifactPublishAsOwnerBody;
   assistantOwnerActivity: never;
   assistantNotify: AgentApiAssistantNotifyBody;
   assistantOwnerResolve: never;
@@ -5696,9 +5814,11 @@ type CoreAgentApiRequestBodyByRoute = {
   integrationAppManage: AgentApiIntegrationAppManageBody;
   integrationAppLogoUpdate: never;
   integrationAppList: never;
+  integrationAppCardButtons: AgentApiIntegrationAppCardButtonsBody;
   integrationAppStatus: never;
   actionPrepare: AgentApiActionPrepareBody;
   actionWithdraw: never;
+  actionOperations: never;
   attachmentUpload: never;
   attachmentUploadCapabilities: never;
   attachmentUploadSessionCreate: z.infer<typeof createAttachmentUploadSessionRequestSchema>;
@@ -5764,6 +5884,7 @@ type CoreAgentApiResponseByRoute = {
   assistantSearchForwardTargets: AgentApiAssistantSearchForwardTargetsResponse;
   assistantOwnerArtifact: AgentApiAssistantOwnerArtifactResponse;
   assistantOwnerArtifactPublish: AgentApiAssistantOwnerArtifactPublishResponse;
+  assistantOwnerArtifactPublishAsOwner: AgentApiAssistantOwnerArtifactPublishAsOwnerResponse;
   assistantOwnerActivity: AgentApiAssistantOwnerActivityResponse;
   assistantNotify: AgentApiAssistantNotifyResponse;
   assistantOwnerResolve: AgentApiAssistantOwnerResolveResponse;
@@ -5829,9 +5950,11 @@ type CoreAgentApiResponseByRoute = {
   integrationAppManage: AgentApiIntegrationAppManageResponse;
   integrationAppLogoUpdate: AgentApiIntegrationAppLogoResponse;
   integrationAppList: AgentApiIntegrationAppListResponse;
+  integrationAppCardButtons: AgentApiIntegrationAppCardButtonsResponse;
   integrationAppStatus: AgentApiIntegrationAppStatusResponse;
   actionPrepare: AgentApiActionPrepareResponse;
   actionWithdraw: AgentApiActionWithdrawResponse;
+  actionOperations: AgentApiActionOperationsResponse;
   attachmentUpload: AgentApiAttachmentUploadResponse;
   attachmentUploadCapabilities: AgentApiAttachmentUploadCapabilitiesResponse;
   attachmentUploadSessionCreate: AgentApiAttachmentUploadSessionCreateResponse;

@@ -43,9 +43,11 @@ import {
   getRuntimeProviderDisplayName,
   builtInPresetProviderModelId,
   isBuiltInRuntimeCustomModelPresetProviderId,
+  builtInPresetTypedModelReasons,
   isBuiltInRuntimeGatewayProviderId,
   BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS,
   isRuntimeDeprecated,
+  normalizeBuiltInPresetCustomModel,
   PI_BUILTIN_PROVIDER_DEFAULT_MODELS,
   PI_BUILTIN_PROVIDER_ENV_KEYS,
   PI_BUILTIN_PROVIDER_MODELS,
@@ -60,6 +62,7 @@ import {
   type AgentCreateFormOptionSource,
   type RuntimeConfig,
   type RuntimeFormV2Marker,
+  type RuntimeModelConfig,
   type RuntimeModelInfo,
   type RuntimeModelSet,
   type RuntimeModelSourceOutcome,
@@ -357,8 +360,13 @@ export interface RuntimeFormV2Entry {
     envVars: Record<string, string> | null,
     options: RuntimeFormValuesOptions,
   ): RuntimeConfigBuild;
-  /** Stored runtimeConfig → field values for edit; writeOnly fields never included. Null: not editable here. */
-  valuesFromRuntimeConfig(runtimeConfig: Record<string, unknown>): Record<string, unknown> | null;
+  /**
+   * Stored runtimeConfig → field values for edit; writeOnly fields never
+   * included. Null: not editable here. `context.connectionProviderId`: the
+   * provider of the saved connection the config is bound to, when the caller
+   * resolved it.
+   */
+  valuesFromRuntimeConfig(runtimeConfig: Record<string, unknown>, context?: RuntimeFormValuesContext): Record<string, unknown> | null;
   writeOnlySecrets?: readonly RuntimeConfigWriteOnlySecret[];
   /**
    * v2 submit only: reconcile the validated runtimeConfig with the Computer's
@@ -463,6 +471,46 @@ const envVarsOf = (runtimeConfig: Record<string, unknown>) =>
   isPlainRecord(runtimeConfig.envVars) ? runtimeConfig.envVars : {};
 
 /**
+ * The Built-in model a submit stores for a provider, chosen directly or
+ * through a saved connection to it (same rule for both). A gateway always
+ * stores a custom model. On a preset provider that takes a typed id (task
+ * #10) the limits are explicit overrides for any model: a listed model
+ * without one is its preset; a listed model with one is a custom model named
+ * by its Pi id (the catalog id minus Raft's `<provider>/`); an unlisted typed
+ * id is custom. The shared parser applies the same rule to every write path
+ * (normalizeBuiltInPresetCustomModel). `modelSource` is the static model
+ * source; the target Computer's catalog is checked by the route.
+ */
+function builtInModelFromValues(
+  providerId: string,
+  gateway: boolean,
+  modelValue: string,
+  values: Record<string, unknown>,
+  effort: string | null,
+  modelSource: Extract<AgentCreateFormOptionSource, { kind: "dependent_select" }>,
+): { ok: true; model: RuntimeModelConfig } | { ok: false; build: RuntimeConfigBuild } {
+  const refuse = (code: string, key: string) => ({ ok: false as const, build: formValueIssue(code, key) });
+  const customAllowed = modelSource.customValueAllowedByValue[providerId] === true;
+  const listed = (modelSource.optionsByValue[providerId] ?? []).some((candidate) => candidate.value === modelValue);
+  if (!customAllowed && !listed) return refuse("select_valid_provider_model", "model");
+  const presetTypable = !gateway && customAllowed && isBuiltInRuntimeCustomModelPresetProviderId(providerId);
+  const listedOverride = presetTypable && listed && hasModelLimitValues(values);
+  const customModel = gateway || (presetTypable && (!listed || listedOverride));
+  if (!gateway && !listed && !customModel) return refuse("select_valid_provider_model", "model");
+  // A typed id runs with reasoning only where the provider's catalog says
+  // every model reasons (builtInPresetTypedModelReasons); elsewhere an
+  // effort would be clamped to off without a word, so it is refused.
+  if (presetTypable && !listed && effort !== null && !builtInPresetTypedModelReasons(providerId)) {
+    return refuse("reasoning_effort_not_supported", "reasoningEffort");
+  }
+  const limits = readModelLimitValues(values, customModel);
+  if (!limits.ok) return limits;
+  if (!customModel) return { ok: true, model: { kind: "preset", id: modelValue } };
+  const name = listedOverride ? builtInPresetProviderModelId(providerId, modelValue) : modelValue;
+  return { ok: true, model: { kind: "custom", name, ...limits.limits } };
+}
+
+/**
  * Extend a catalog-filtered Built-in source with the server's saved provider
  * connections: saved options lead the provider list, and the model maps are
  * keyed by the same `connection:<id>` values (one key space, contract). All
@@ -470,13 +518,19 @@ const envVarsOf = (runtimeConfig: Record<string, unknown>) =>
  * connection by id in the current server scope and re-checks flag, credential
  * and model compatibility. A gateway connection keeps the direct gateway's
  * custom-model semantics: the Computer's catalog never narrows what it may
- * type. Connections that are not selectable right now stay listed as
- * `unavailable` so an edit of a bound agent can show the binding and block a
- * silent rewrite.
+ * type. A preset connection takes what its provider takes here (its list, and
+ * a typed id where the provider's own key allows one), except that a typed id
+ * also needs a Computer that runs it through a connection
+ * (`connectionTypedProviderIds`, the catalog's
+ * customModelConnectionProviderIds; null when no Computer answered, as the
+ * direct providers then keep the bundled rule). Connections that are not
+ * selectable right now stay listed as `unavailable` so an edit of a bound
+ * agent can show the binding and block a silent rewrite.
  */
 async function withSavedConnectionOptions(
   serverId: string,
   source: AgentCreateFormOptionSource,
+  connectionTypedProviderIds: ReadonlySet<string> | null,
 ): Promise<AgentCreateFormOptionSource> {
   const connections = await listProviderConnections(serverId);
   if (source.kind === "select" && source.pointer === `/${SAVED_CONNECTION_FIELD}`) {
@@ -510,7 +564,8 @@ async function withSavedConnectionOptions(
       optionsByValue[key] = optionsByValue[connection.providerId] ?? [];
       const presetDefault = defaultValueByValue[connection.providerId];
       if (typeof presetDefault === "string" && presetDefault) defaultValueByValue[key] = presetDefault;
-      customValueAllowedByValue[key] = false;
+      customValueAllowedByValue[key] = customValueAllowedByValue[connection.providerId] === true
+        && (connectionTypedProviderIds === null || connectionTypedProviderIds.has(connection.providerId));
     }
     return { ...source, optionsByValue, defaultValueByValue, customValueAllowedByValue };
   }
@@ -532,7 +587,7 @@ function builtInModelLimitProviderIds(typedPresetProviderIds: Iterable<string>):
  * task #10: the Built-in v2 definition for one Computer. The limit fields show
  * for a preset provider only when that Computer runs a typed id for it (its
  * catalog's customModelProviderIds, as the filtered model source reports):
- * on an older Computer, a listed OpenRouter model with a limit would be a
+ * on an older Computer, a listed model of such a provider with a limit would be a
  * custom model it cannot run, so the fields are hidden there and the save is
  * refused (builtin_custom_model_upgrade_required) anyway.
  */
@@ -632,7 +687,7 @@ const builtinEntry: RuntimeFormV2Entry = {
     };
     localization.model = {
       ...localization.model,
-      hint: "Use a model ID the selected provider supports.",
+      hint: "Pick a model from the list. Where the provider allows it, you can also type a model ID.",
     };
     uiSchema.localization = localization;
     form.uiSchema = uiSchema;
@@ -694,7 +749,10 @@ const builtinEntry: RuntimeFormV2Entry = {
     // (agentOrchestrator, builtin_catalog_*), so an unsupported pick fails there.
     // Saved-connection enrichment still applies on this path: the connections
     // are server data, independent of the Computer's liveness.
-    const withEnrichment = async (sourceIn: AgentCreateFormOptionSource | null): Promise<RuntimeFormOptionSourceResolution> => {
+    const withEnrichment = async (
+      sourceIn: AgentCreateFormOptionSource | null,
+      connectionTypedProviderIds: ReadonlySet<string> | null = null,
+    ): Promise<RuntimeFormOptionSourceResolution> => {
       // task #10: a client that does not advertise
       // dependent_select.custom_value_with_options would render a listed
       // provider that takes a typed id as a blank text box (losing the
@@ -705,7 +763,7 @@ const builtinEntry: RuntimeFormV2Entry = {
       if (!revisioned || !savedConnectionsEnabled || !context.connectionsVisible || !context.serverId || !source) {
         return { kind: "source", source };
       }
-      return { kind: "source", source: await withSavedConnectionOptions(context.serverId, source) };
+      return { kind: "source", source: await withSavedConnectionOptions(context.serverId, source, connectionTypedProviderIds) };
     };
     // Only the model source carries a status (v2): the provider select is static.
     const withStatus = (source: AgentCreateFormOptionSource | null, reason: RuntimeFormV2OptionSourceReason | null) =>
@@ -742,7 +800,7 @@ const builtinEntry: RuntimeFormV2Entry = {
     const source = unfilteredSource
       ? filterBuiltInPiFormOptionSourceForCatalog(unfilteredSource, catalog.supportedModelIds, catalog.customModelProviderIds)
       : null;
-    return withEnrichment(withStatus(source, null));
+    return withEnrichment(withStatus(source, null), catalog.customModelConnectionProviderIds);
   },
   runtimeConfigFromValues(values, envVars, options) {
     const effort = piEffort(values, "reasoningEffort");
@@ -770,32 +828,45 @@ const builtinEntry: RuntimeFormV2Entry = {
       }
       const connectionModel = typeof values.model === "string" ? values.model.trim() : "";
       if (!connectionModel) return formValueIssue("model_required", "model");
-      // The model kind follows the connection's server-resolved provider, not
-      // the typed name: a gateway connection always stores a custom model
-      // (even when the name collides with a built-in preset id), and a preset
-      // connection only accepts a model from its own list. Without a resolved
-      // provider (unit-level calls) the static lists are the fallback; the
-      // route's per-connection check remains the final authority either way.
-      const connectionGateway = options.savedConnectionProviderId !== undefined
-        && isBuiltInRuntimeGatewayProviderId(options.savedConnectionProviderId);
-      const connectionPresetModels = options.savedConnectionProviderId !== undefined && !connectionGateway
-        ? PI_BUILTIN_PROVIDER_MODELS[options.savedConnectionProviderId as keyof typeof PI_BUILTIN_PROVIDER_MODELS]
-        : undefined;
-      const presetKnown = connectionGateway
-        ? false
-        : connectionPresetModels
-          ? connectionPresetModels.some((candidate) => candidate.id === connectionModel)
-          : Object.values(PI_BUILTIN_PROVIDER_MODELS)
-              .some((models) => models.some((candidate) => candidate.id === connectionModel));
-      const connectionLimits = readModelLimitValues(values, !presetKnown);
-      if (!connectionLimits.ok) return connectionLimits.build;
+      // The model follows the connection's server-resolved provider, not the
+      // typed name, by the same rule as that provider chosen directly
+      // (builtInModelFromValues): a gateway connection always stores a custom
+      // model (even when the name collides with a built-in preset id); a
+      // preset connection takes a listed model, and a typed id and limits
+      // where its provider does. The route's per-connection and catalog checks
+      // remain the final authority. Without a resolved provider (unit-level
+      // calls) the static lists are the fallback.
+      const connectionProviderId = options.savedConnectionProviderId;
+      let connectionModelConfig: RuntimeModelConfig;
+      if (connectionProviderId !== undefined) {
+        const decided = builtInModelFromValues(
+          connectionProviderId,
+          isBuiltInRuntimeGatewayProviderId(connectionProviderId),
+          connectionModel,
+          values,
+          effort.value,
+          model,
+        );
+        if (!decided.ok) return decided.build;
+        // The parser normalizes a direct preset's typed id; only the server
+        // knows a connection's provider, so it does so here.
+        connectionModelConfig = decided.model.kind === "custom" && isBuiltInRuntimeCustomModelPresetProviderId(connectionProviderId)
+          ? normalizeBuiltInPresetCustomModel(connectionProviderId, decided.model)
+          : decided.model;
+      } else {
+        const presetKnown = Object.values(PI_BUILTIN_PROVIDER_MODELS)
+          .some((models) => models.some((candidate) => candidate.id === connectionModel));
+        const connectionLimits = readModelLimitValues(values, !presetKnown);
+        if (!connectionLimits.ok) return connectionLimits.build;
+        connectionModelConfig = presetKnown ? { kind: "preset", id: connectionModel } : { kind: "custom", name: connectionModel, ...connectionLimits.limits };
+      }
       return {
         ok: true,
         runtimeConfig: {
           version: RUNTIME_CONFIG_VERSION,
           runtime: "builtin",
           provider: { kind: "connection", connectionId },
-          model: presetKnown ? { kind: "preset", id: connectionModel } : { kind: "custom", name: connectionModel, ...connectionLimits.limits },
+          model: connectionModelConfig,
           mode: { kind: "default" },
           reasoningEffort: effort.value,
           envVars,
@@ -815,27 +886,11 @@ const builtinEntry: RuntimeFormV2Entry = {
     if (!apiKey && !apiKeyMayBeBlank) return formValueIssue("api_key_required", "apiKey");
     const modelValue = typeof values.model === "string" ? values.model.trim() : "";
     if (!modelValue) return formValueIssue("model_required", "model");
-    const customAllowed = model.customValueAllowedByValue[providerId] === true;
-    const listed = (model.optionsByValue[providerId] ?? []).some((candidate) => candidate.value === modelValue);
-    if (!customAllowed && !listed) {
-      return formValueIssue("select_valid_provider_model", "model");
-    }
     const gateway = option.providerKind === "gateway";
-    // A gateway always stores a custom model. On a preset provider that takes
-    // a typed id (task #10: OpenRouter) the limits are explicit overrides for
-    // any model: a listed model without one is its preset; a listed model with
-    // one is a custom model named by its Pi id (the catalog id minus Raft's
-    // `openrouter/`); an unlisted typed id is custom. The shared parser
-    // applies the same rule to every write path (normalizeBuiltInPresetCustomModel).
-    const presetTypable = !gateway && customAllowed && isBuiltInRuntimeCustomModelPresetProviderId(providerId);
-    const listedOverride = presetTypable && listed && hasModelLimitValues(values);
-    const customModel = gateway || (presetTypable && (!listed || listedOverride));
-    if (!gateway && !listed && !customModel) return formValueIssue("select_valid_provider_model", "model");
+    const decided = builtInModelFromValues(providerId, gateway, modelValue, values, effort.value, model);
+    if (!decided.ok) return decided.build;
     const baseUrl = typeof values.baseUrl === "string" ? values.baseUrl.trim() : "";
     if (gateway && !/^https?:\/\//i.test(baseUrl)) return formValueIssue("base_url_invalid", "baseUrl");
-    const limits = readModelLimitValues(values, customModel);
-    if (!limits.ok) return limits.build;
-    const customName = listedOverride ? builtInPresetProviderModelId(providerId, modelValue) : modelValue;
     return {
       ok: true,
       runtimeConfig: {
@@ -844,7 +899,7 @@ const builtinEntry: RuntimeFormV2Entry = {
         provider: gateway
           ? { kind: "gateway", providerId, baseUrl, ...(apiKey ? { apiKey } : {}), supportsImageInput: values.supportsImageInput === true }
           : { kind: "preset", providerId, ...(apiKey ? { apiKey } : {}) },
-        model: customModel ? { kind: "custom", name: customName, ...limits.limits } : { kind: "preset", id: modelValue },
+        model: decided.model,
         mode: { kind: "default" },
         reasoningEffort: effort.value,
         envVars,
@@ -853,16 +908,20 @@ const builtinEntry: RuntimeFormV2Entry = {
       },
     };
   },
-  valuesFromRuntimeConfig(runtimeConfig) {
+  valuesFromRuntimeConfig(runtimeConfig, context) {
     const reasoningEffort = typeof runtimeConfig.reasoningEffort === "string" ? runtimeConfig.reasoningEffort : "";
     const provider = isPlainRecord(runtimeConfig.provider) ? runtimeConfig.provider : null;
     // A bound saved connection edits through the same v2 form: the provider
     // field carries the connection option value; the credential itself is
-    // connection-owned and never appears in the values (writeOnly rule).
+    // connection-owned and never appears in the values (writeOnly rule). Its
+    // model reads back as on its provider directly (a listed model saved with
+    // limits shows as that listed model) once its provider is known.
     if (provider && provider.kind === "connection" && typeof provider.connectionId === "string" && provider.connectionId) {
       return {
         providerId: `${SAVED_CONNECTION_VALUE_PREFIX}${provider.connectionId}`,
-        model: modelValueOf(runtimeConfig),
+        model: context?.connectionProviderId
+          ? listedModelValueOf(context.connectionProviderId, runtimeConfig)
+          : modelValueOf(runtimeConfig),
         ...modelLimitValuesOf(runtimeConfig),
         reasoningEffort,
         loadLocalPlugins: runtimeConfig.loadLocalPlugins === true,
@@ -1798,18 +1857,6 @@ const qoderEntry = reasoningModelFormEntry("qoder", {
   modelHint: "Models available to this computer's Qoder login (qodercli login). You can also type a model ID.",
 });
 
-// CodeBuddy Code, OAR-only like Qwen Code and Qoder: the models
-// the Computer's CodeBuddy login offers (OAR listModels, a new ACP session's
-// model menu), a typed id allowed. The effort is CodeBuddy's ACP thought
-// level, which it reports for its current model only, so it is offered only
-// for a model whose levels the Computer listed (as Antigravity's).
-const codebuddyEntry = reasoningModelFormEntry("codebuddy", {
-  customModel: true,
-  fastMode: false,
-  reasoning: true,
-  modelHint: "Models available to this computer's CodeBuddy Code login. You can also type a model ID.",
-});
-
 // Antigravity on the OAR host: the models the Computer's `agy` login offers
 // (OAR listModels), a typed id allowed, and "AGY configured default" (`default`,
 // no model passed) kept first and preselected, so a stored default still means
@@ -2161,11 +2208,9 @@ const REGISTRY = new Map<string, RuntimeFormV2Entry>([
   [copilotEntry.runtimeId, copilotEntry],
   // Batch 4: Pi. No v1 form.
   [piEntry.runtimeId, piEntry],
-  // OAR-only runtimes: offered where a Computer reports them, no server flag
-  // (runtimeAdmissionService.ts).
+  // OAR-only runtimes; admitted per server flag (runtimeAdmissionService.ts).
   [qwenEntry.runtimeId, qwenEntry],
   [qoderEntry.runtimeId, qoderEntry],
-  [codebuddyEntry.runtimeId, codebuddyEntry],
 ]);
 
 export function runtimeFormV2Entry(runtimeId: unknown): RuntimeFormV2Entry | null {
@@ -2246,9 +2291,10 @@ export async function buildRuntimeFormV2EditBodyForServer(
   runtimeConfig: unknown,
   serverId: string,
   clientCapabilities: readonly string[] = [],
+  valuesContext: RuntimeFormValuesContext,
 ): Promise<RuntimeFormV2Definition | null> {
   const entry = runtimeFormV2Entry(runtimeId);
-  const values = runtimeFormValuesFromRuntimeConfig(runtimeConfig);
+  const values = runtimeFormValuesFromRuntimeConfig(runtimeConfig, valuesContext);
   if (!entry || !values) return null;
   const base = await buildRuntimeFormV2ForServer(runtimeId, serverId, clientCapabilities) ?? entry.buildForm();
   const keep = runtimeFormV2WriteOnlyKeepRequiresUnchanged(runtimeId);
@@ -2257,30 +2303,72 @@ export async function buildRuntimeFormV2EditBodyForServer(
 
 /**
  * task #10: a stored Built-in config a newer client wrote on a preset provider
- * that takes a typed id (OpenRouter): a custom model, either a typed id or a
- * listed model saved with limit overrides. Null for every other config.
+ * that takes a typed id, directly or through a saved connection to it
+ * (`connectionProviderId`: that connection's provider, resolved by the
+ * route): a custom model, either a typed id or a listed model saved with
+ * limit overrides. Null for every other config.
  */
-function storedBuiltInPresetCustomModel(runtimeConfig: unknown): {
+function storedBuiltInPresetCustomModel(runtimeConfig: unknown, connectionProviderId: string | null): {
+  /** The provider field's value: the provider, or `connection:<id>`. */
   providerId: string;
-  /** The Model value the edit form shows (listedModelValueOf). */
+  viaConnection: boolean;
+  /** The preset provider the model runs on. */
+  catalogProviderId: string;
+  /** The Model value the edit form shows (valuesFromRuntimeConfig). */
   modelValue: string;
-  /** A typed id no catalog entry has: a list-only client cannot show it. */
+  /** A value no catalog entry has: a list-only client cannot show it. */
   unlisted: boolean;
   hasLimits: boolean;
 } | null {
   if (!isPlainRecord(runtimeConfig) || runtimeConfig.runtime !== "builtin") return null;
   const provider = isPlainRecord(runtimeConfig.provider) ? runtimeConfig.provider : null;
   const model = isPlainRecord(runtimeConfig.model) ? runtimeConfig.model : null;
-  if (provider?.kind !== "preset" || typeof provider.providerId !== "string" || model?.kind !== "custom") return null;
-  if (!isBuiltInRuntimeCustomModelPresetProviderId(provider.providerId)) return null;
-  const modelValue = listedModelValueOf(provider.providerId, runtimeConfig);
-  const unlisted = !(PI_BUILTIN_PROVIDER_MODELS[provider.providerId] ?? []).some((candidate) => candidate.id === modelValue);
+  if (model?.kind !== "custom") return null;
+  const viaConnection = provider?.kind === "connection" && typeof provider.connectionId === "string";
+  const catalogProviderId = provider?.kind === "preset" && typeof provider.providerId === "string"
+    ? provider.providerId
+    : viaConnection ? connectionProviderId : null;
+  if (!catalogProviderId || !isBuiltInRuntimeCustomModelPresetProviderId(catalogProviderId)) return null;
+  const modelValue = listedModelValueOf(catalogProviderId, runtimeConfig);
+  const unlisted = !(PI_BUILTIN_PROVIDER_MODELS[catalogProviderId] ?? []).some((candidate) => candidate.id === modelValue);
   return {
-    providerId: provider.providerId,
+    providerId: viaConnection ? `${SAVED_CONNECTION_VALUE_PREFIX}${provider!.connectionId as string}` : catalogProviderId,
+    viaConnection,
+    catalogProviderId,
     modelValue,
     unlisted,
     hasLimits: typeof model.contextWindow === "number" || typeof model.maxOutputTokens === "number",
   };
+}
+
+/**
+ * task #10: the preset providers a client and Computer take a typed model id
+ * (and so the limits) for: directly (`presets`, the v2 limit rule) and
+ * through a saved connection to one (`connections`, which v3 lists in that
+ * rule; a Computer may run the first and not the second).
+ */
+export interface BuiltInTypedModelProviders {
+  presets: readonly string[];
+  connections: readonly string[];
+}
+
+/**
+ * task #10: an edit form also shows the limit fields for the agent's own
+ * provider while it HAS a stored limit, whatever the client and Computer say:
+ * a hidden field is left out of the submit, and a save without it would
+ * silently delete the limit. Through a saved connection the provider counts
+ * for both: v2 clients show a connection's fields by its underlying
+ * provider, v3 lists the connection.
+ */
+export function withStoredLimitProvider(
+  typed: BuiltInTypedModelProviders,
+  storedRuntimeConfig: unknown,
+  storedConnectionProviderId: string | null,
+): BuiltInTypedModelProviders {
+  const stored = storedBuiltInPresetCustomModel(storedRuntimeConfig, storedConnectionProviderId);
+  if (!stored?.hasLimits) return typed;
+  const add = (ids: readonly string[]) => ids.includes(stored.catalogProviderId) ? ids : [...ids, stored.catalogProviderId];
+  return { presets: add(typed.presets), connections: stored.viaConnection ? add(typed.connections) : typed.connections };
 }
 
 /**
@@ -2291,7 +2379,7 @@ function storedBuiltInPresetCustomModel(runtimeConfig: unknown): {
  *   limit: a hidden field is left out of the submit, and a save without it
  *   would silently delete the limit.
  * - A client without `dependent_select.custom_value_with_options` gets a
- *   stored typed OpenRouter id it cannot show in a list-only Model field
+ *   stored typed preset-provider id it cannot show in a list-only Model field
  *   hidden for that provider, so a save that does not touch the model keeps
  *   it (guardBuiltInEditFromClient fills it back in); choosing another
  *   provider shows the field again.
@@ -2301,11 +2389,15 @@ export function withBuiltInEditVisibility(
   typedPresetProviderIds: readonly string[],
   clientCapabilities: readonly string[],
   storedRuntimeConfig: unknown,
+  /** The stored saved connection's provider, when it has one. */
+  storedConnectionProviderId: string | null,
 ): RuntimeFormV2Definition {
-  const stored = storedBuiltInPresetCustomModel(storedRuntimeConfig);
-  const limitProviders = stored?.hasLimits && !typedPresetProviderIds.includes(stored.providerId)
-    ? [...typedPresetProviderIds, stored.providerId]
-    : [...typedPresetProviderIds];
+  const stored = storedBuiltInPresetCustomModel(storedRuntimeConfig, storedConnectionProviderId);
+  const limitProviders = withStoredLimitProvider(
+    { presets: typedPresetProviderIds, connections: [] },
+    storedRuntimeConfig,
+    storedConnectionProviderId,
+  ).presets;
   let next = withBuiltInModelLimitVisibility(form, limitProviders);
   if (stored?.unlisted && !clientRendersDependentCustomWithOptions(clientCapabilities)) {
     const providers = (buildBuiltInPiFormOptionSource("provider") as { options?: Array<{ value: string }> } | null)?.options ?? [];
@@ -2315,7 +2407,7 @@ export function withBuiltInEditVisibility(
         ...next.uiSchema,
         visibility: [
           ...(next.uiSchema?.visibility ?? []),
-          { pointer: "/model", when: { pointer: "/providerId", in: providers.map((option) => option.value).filter((value) => value !== stored.providerId) } },
+          { pointer: "/model", when: { pointer: "/providerId", in: providers.map((option) => option.value).filter((value) => value !== stored.catalogProviderId) } },
         ],
       },
     };
@@ -2330,7 +2422,7 @@ export const RUNTIME_FORM_CLIENT_UPGRADE_REQUIRED_MESSAGE =
 /**
  * task #10: an edit save from a client without
  * `dependent_select.custom_value_with_options` of an agent a newer client
- * saved with a typed OpenRouter id or limit overrides.
+ * saved with a typed preset-provider id or limit overrides.
  * - Same provider and model (or, for a stored typed id whose Model field was
  *   hidden, the model left out): saved, with the stored model filled back in,
  *   so nothing a newer client set is lost.
@@ -2344,9 +2436,11 @@ export function guardBuiltInEditFromClient(
   values: unknown,
   storedRuntimeConfig: unknown,
   clientCapabilities: readonly string[],
+  /** The stored saved connection's provider, when it has one. */
+  storedConnectionProviderId: string | null,
 ): { ok: true; values: unknown } | { ok: false; issue: AgentCreateFormIssue; message: string } {
   if (clientRendersDependentCustomWithOptions(clientCapabilities) || !isPlainRecord(values)) return { ok: true, values };
-  const stored = storedBuiltInPresetCustomModel(storedRuntimeConfig);
+  const stored = storedBuiltInPresetCustomModel(storedRuntimeConfig, storedConnectionProviderId);
   if (!stored) return { ok: true, values };
   const refuse = (key: string) => ({
     ok: false as const,
@@ -2498,9 +2592,15 @@ export function formValuesPointerForRuntimeConfigPointer(runtimeId: unknown, poi
  * included. Null when the config is not one a v2 form can edit (runtimes
  * without a v2 form, managed provider connections).
  */
-export function runtimeFormValuesFromRuntimeConfig(runtimeConfig: unknown): Record<string, unknown> | null {
+export function runtimeFormValuesFromRuntimeConfig(runtimeConfig: unknown, context?: RuntimeFormValuesContext): Record<string, unknown> | null {
   if (!isPlainRecord(runtimeConfig)) return null;
-  return runtimeFormV2Entry(runtimeConfig.runtime)?.valuesFromRuntimeConfig(runtimeConfig) ?? null;
+  return runtimeFormV2Entry(runtimeConfig.runtime)?.valuesFromRuntimeConfig(runtimeConfig, context) ?? null;
+}
+
+/** What the edit values of a stored config may depend on beyond the config itself. */
+export interface RuntimeFormValuesContext {
+  /** The provider of the saved connection the config is bound to (resolved by the route); null when none. */
+  connectionProviderId: string | null;
 }
 
 function valueAt(record: Record<string, unknown>, path: readonly string[]): unknown {

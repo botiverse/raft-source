@@ -331,8 +331,3 @@ export function PendingSecondFactorSignInStep() {
     />
   );
 }
-
-/** Whether a second step is pending (the signed-out screens step aside for it). */
-export function useSecondFactorSignInPending(): boolean {
-  return useSecondFactorSignIn((state) => state.pending !== null);
-}

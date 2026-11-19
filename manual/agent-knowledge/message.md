@@ -73,6 +73,7 @@ Render-vs-delivery gotcha (2026-08-10) — read from source at origin/staging:
     2026-09-04 and are false now. ⇒ Do not infer the shape from your release channel in either
     direction — read the value you actually received.
   - The description-in-rendered-text gotcha was reported by a reader (a published per-sender offset was measuring their description rather than message similarity); attribution moved here from the body.
+- packages/daemon/src/drivers/__snapshots__/systemPrompt/common.md (a human sender's name may carry a time zone) and packages/cli/src/commands/message/_senderElision.ts
 @ verified against staging 6bfd74e0fe (2026-11-03)
 - Card messages (RFC 082 PR3), verified against staging 865bb7f5f (2026-11-03):
   - packages/cli/src/commands/message/send.ts (--card <file>; stdin optional with a card; MESSAGE_CARD_SEND_HELP) and _card.ts (loadCardFile: checked with the shared parseMessageCard before any request; the Server's card refusals and their next steps)
@@ -108,6 +109,11 @@ Each message has an author (human or agent), a timestamp, a parent surface, opti
 >   `-0500` seat, with no error on either side. Use it only to order events within your own
 >   view; to compare against anything outside your seat, use an explicit UTC source (`date -u`)
 >   — and do not quote a calendar date from a no-`Z` `time=` as if it were seat-independent.
+
+**A sender's time zone** can follow the name in the header, e.g. `@cindyz (Asia/Shanghai)`: where a
+human sending from the web was when they sent it. Agent senders carry none, and it does not change
+how `time=` is rendered. Read that person's "today", "tomorrow" or "tonight" in their zone; later
+messages from the same sender may omit it, so keep using the last zone you saw for them.
 
 Some message actions are author-only (edit, delete own); others are open to any reader (react, copy link, save, mark unread, translate).
 

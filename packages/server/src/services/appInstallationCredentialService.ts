@@ -6,6 +6,7 @@ import {
   oauthAppInstallationTokens,
   oauthClientInstalls,
   oauthClients,
+  servers,
 } from "../db/schema";
 import * as integrationAuditService from "./integrationAuditService";
 import {
@@ -47,6 +48,9 @@ export type VerifiedAppInstallationCredential = {
 export type ActiveAppInstallationDiscovery = {
   installationId: string;
   serverId: string;
+  /** The Server's URL slug and display name now (read with the installation, never cached). */
+  serverSlug: string;
+  serverName: string;
 };
 
 export class AppInstallationDiscoveryInvariantError extends Error {
@@ -70,8 +74,11 @@ export async function discoverActiveAppInstallation(input: {
   const rows = await dbOrTx.select({
     installationId: oauthClientInstalls.id,
     serverId: oauthClientInstalls.serverId,
+    serverSlug: servers.slug,
+    serverName: servers.name,
   }).from(oauthClientInstalls)
     .innerJoin(oauthClients, eq(oauthClients.id, oauthClientInstalls.clientId))
+    .innerJoin(servers, eq(servers.id, oauthClientInstalls.serverId))
     .where(and(
       eq(oauthClientInstalls.clientId, input.clientId),
       eq(oauthClientInstalls.serverId, input.serverId),

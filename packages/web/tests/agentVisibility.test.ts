@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { getServerCapabilities } from "@botiverse/raft-shared";
-import { agentRuntimePermissions, canViewAgentPrivateSurfaces } from "../src/utils/agentVisibility";
+import { agentRuntimePermissions, canEditAgentRuntimeConfig, canViewAgentPrivateSurfaces } from "../src/utils/agentVisibility";
 
 test("agent private surfaces are visible to server agent managers", () => {
   assert.equal(
@@ -48,4 +48,21 @@ test("runtime permissions: none for an external agent or a bounded projection; S
     { canControlAgentRuntime: true, canStopAgent: true, canResetAgentWorkspace: true },
     "its creator may",
   );
+});
+
+// The profile's Runtime config pencil rule, read by the Members page's Edit agent.
+test("runtime config editing: an owner/admin or the creator; never an external, archived, App or bounded agent", () => {
+  const agent = { creatorType: "user" as const, creatorId: "user-1", deletedAt: null, managedByAppInstallId: null, external: false, runtime: "claude" };
+  const admin = getServerCapabilities("admin");
+  const owner = getServerCapabilities("owner");
+  const member = getServerCapabilities("member");
+  assert.equal(canEditAgentRuntimeConfig(agent, "user-2", admin), true);
+  assert.equal(canEditAgentRuntimeConfig(agent, "user-2", owner), true);
+  assert.equal(canEditAgentRuntimeConfig(agent, "user-1", member), true, "its creator may");
+  assert.equal(canEditAgentRuntimeConfig(agent, "user-2", member), false, "another member may not");
+  assert.equal(canEditAgentRuntimeConfig({ ...agent, external: true }, "user-2", admin), false);
+  assert.equal(canEditAgentRuntimeConfig({ ...agent, runtime: "external" }, "user-2", admin), false);
+  assert.equal(canEditAgentRuntimeConfig({ ...agent, deletedAt: "2026-01-01T00:00:00Z" }, "user-1", admin), false);
+  assert.equal(canEditAgentRuntimeConfig({ ...agent, managedByAppInstallId: "install-1" }, "user-1", admin), false);
+  assert.equal(canEditAgentRuntimeConfig(agent, "user-1", admin, { isBoundedPublicProjection: true }), false);
 });

@@ -6,7 +6,9 @@ import { enableTaskV2ConversationsForServer } from "../test/integration/taskV2Fl
  * (#wg-task-v2:#23).
  *  - an agent's create without `source_message_id` is refused
  *    (`task_source_required`, with the create left to fill as `next`) on the
- *    Agent API and the legacy agent route; flag off it still works;
+ *    Agent API and the legacy agent route; flag off it still works; from a CLI
+ *    too old to send one (before Computer 1.0.53) it posts the agent's own
+ *    message as the source instead, as the web does (#wg-task-v2:#25);
  *  - a reply in one of the channel's threads stands for the thread's root
  *    (`sourceThreadReplyId` names the reply given); a message elsewhere is
  *    still no source;
@@ -23,10 +25,11 @@ import { and, eq } from "drizzle-orm";
 
 import { getDb } from "../db/index";
 import { channels, messageMentions, messages, serverMembers, tasks, users } from "../db/schema";
+import { __setAgentApiWriteBudgetsForTests } from "../services/agentApiWriteLimits";
 import { mintAgentCredential } from "../services/agentCredentialService";
 import { createAgent } from "../services/agentService";
 import { addAgent, addHuman, createChannel, findOrCreateDM, getOrCreateThreadForChannel } from "../services/channelService";
-import { registerMachine } from "../services/machineService";
+import { recordMachineComputerVersion, registerMachine } from "../services/machineService";
 import { createMessage } from "../services/messageService";
 import { createServer } from "../services/serverService";
 import * as taskService from "../services/taskService";
@@ -181,6 +184,115 @@ test("legacy agent route create without a source on a task v2 server: 400 task_s
   });
   assertSourceRequired({ status: res.status, body: await res.json() }, fx.board);
   assert.deepEqual(await tasksIn(fx.channel.id), [], "nothing was created");
+});
+
+/** The agent on a Computer that last reported `computerVersion`; its key still works (minted by no machine). */
+async function placeAgentOnComputer(fx: Awaited<ReturnType<typeof setup>>, computerVersion: string) {
+  const { machine } = await registerMachine(fx.server.id, fx.owner.id, `computer-${randomUUID().slice(0, 6)}`);
+  await placeAgentOnMachine(fx.agent.id, machine.id);
+  assert.ok(await recordMachineComputerVersion(machine.id, computerVersion));
+  return machine;
+}
+
+/** An agent-api POST as the `raft` CLI says it is: `X-Raft-Client: cli`, and `X-Raft-Client-Version` when given (since 1.0.55). */
+async function cliPost(baseUrl: string, apiKey: string, path: string, body: unknown, cliVersion?: string) {
+  const res = await fetch(`${baseUrl}/internal/agent-api/${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+      "X-Raft-Client": "cli",
+      ...(cliVersion ? { "X-Raft-Client-Version": cliVersion } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+  return { status: res.status, body: await res.json() as any };
+}
+
+test("agent-api create without a source from a CLI too old to send one (Computer before 1.0.53): the agent's own message is posted and is the task's source", async ({ app }) => {
+  const fx = await setup("req-old-cli");
+  installRecordingOrchestrator(app.app);
+  // Computer 1.0.52's CLI sends no version and knows no --message-id.
+  await placeAgentOnComputer(fx, "1.0.52");
+  const before = await chatMessagesIn(fx.channel.id);
+
+  const created = await cliPost(app.baseUrl, fx.key, "tasks", { channel: fx.board, tasks: [{ title: "fix the login page" }] });
+  assert.equal(created.status, 200, JSON.stringify(created.body));
+  const after = await chatMessagesIn(fx.channel.id);
+  assert.equal(after.length, before.length + 1, "exactly one new message in the channel");
+  const posted = after.at(-1)!;
+  assert.deepEqual([posted.senderType, posted.senderId, posted.content], ["agent", fx.agent.id, "fix the login page"]);
+  // The agent API answers with task numbers, not ids.
+  const row = (await tasksIn(fx.channel.id)).find((task) => task.taskNumber === created.body.tasks[0].taskNumber);
+  assert.ok(row, "the task exists");
+  assert.equal(row!.sourceMessageId, posted.id, "the posted message is its source");
+  assert.equal(row!.messageId, null, "a task v2 task, no host message");
+  assert.equal(created.body.tasks[0].sourceMessageId, posted.id, "the answer names it too");
+
+  // Several titles: one list message, every task under it, as the web's New task.
+  const batch = await cliPost(app.baseUrl, fx.key, "tasks", { channel: fx.board, tasks: [{ title: "a" }, { title: "b" }] });
+  assert.equal(batch.status, 200, JSON.stringify(batch.body));
+  const latest = await chatMessagesIn(fx.channel.id);
+  assert.equal(latest.length, after.length + 1, "one message for the batch");
+  assert.equal(latest.at(-1)!.content, "- a\n- b");
+  const batchRows = (await tasksIn(fx.channel.id)).filter((task) => batch.body.tasks.some((made: { taskNumber: number }) => made.taskNumber === task.taskNumber));
+  assert.deepEqual(batchRows.map((task) => task.sourceMessageId), [latest.at(-1)!.id, latest.at(-1)!.id]);
+});
+
+test("agent-api create without a source from an old CLI spends the agent's message budget: past it, 429 and nothing posted or created", async ({ app }) => {
+  const fx = await setup("req-old-cli-budget");
+  installRecordingOrchestrator(app.app);
+  await placeAgentOnComputer(fx, "1.0.52");
+  const before = await chatMessagesIn(fx.channel.id);
+  // Only the message budget is enforced: one message a minute for this agent.
+  __setAgentApiWriteBudgetsForTests({ messages: { perAgent: 1, perServer: 1000 } });
+  try {
+    const first = await cliPost(app.baseUrl, fx.key, "tasks", { channel: fx.board, tasks: [{ title: "first" }] });
+    assert.equal(first.status, 200, JSON.stringify(first.body));
+    const second = await cliPost(app.baseUrl, fx.key, "tasks", { channel: fx.board, tasks: [{ title: "second" }] });
+    assert.equal(second.status, 429, JSON.stringify(second.body));
+    assert.equal(second.body.code, "RATE_LIMITED");
+    assert.equal(second.body.details.operation, "taskCreate");
+    assert.equal((await chatMessagesIn(fx.channel.id)).length, before.length + 1, "only the first create posted");
+    assert.deepEqual((await tasksIn(fx.channel.id)).map((task) => task.title), ["first"], "only the first create made a task");
+  } finally {
+    __setAgentApiWriteBudgetsForTests(null);
+  }
+});
+
+test("agent-api create without a source from a CLI that sends one (1.0.53 or later): still 400 task_source_required, nothing posted or created", async ({ app }) => {
+  const fx = await setup("req-new-cli");
+  installRecordingOrchestrator(app.app);
+  const machine = await placeAgentOnComputer(fx, "1.0.52");
+  const before = await chatMessagesIn(fx.channel.id);
+
+  // The CLI's own version decides first, even on a Computer that last reported an older one.
+  const versioned = await cliPost(app.baseUrl, fx.key, "tasks", { channel: fx.board, tasks: [{ title: "no source" }] }, "1.0.69");
+  assertSourceRequired(versioned, fx.board);
+
+  // Computer 1.0.53's CLI sends a source but no version: its Computer's says it is current.
+  assert.ok(await recordMachineComputerVersion(machine.id, "1.0.53"));
+  const unversioned = await cliPost(app.baseUrl, fx.key, "tasks", { channel: fx.board, tasks: [{ title: "no source either" }] });
+  assertSourceRequired(unversioned, fx.board);
+
+  assert.equal((await chatMessagesIn(fx.channel.id)).length, before.length, "nothing posted");
+  assert.deepEqual(await tasksIn(fx.channel.id), [], "nothing was created");
+});
+
+test("agent-api create without a source from an old CLI where the agent may not post: refused as a message send would be, nothing posted or created", async ({ app }) => {
+  const fx = await setup("req-old-cli-noperm");
+  installRecordingOrchestrator(app.app);
+  await placeAgentOnComputer(fx, "1.0.52");
+  // A channel of the same server the agent is not in: it may not post there.
+  const elsewhere = await createChannel(fx.server.id, `req-noperm-${randomUUID().slice(0, 6)}`);
+  await addHuman(elsewhere.id, fx.owner.id);
+  const before = await chatMessagesIn(elsewhere.id);
+
+  const refused = await cliPost(app.baseUrl, fx.key, "tasks", { channel: `#${elsewhere.name}`, tasks: [{ title: "not mine to post" }] });
+  assert.ok([403, 404].includes(refused.status), JSON.stringify(refused));
+  assert.notEqual(refused.body.code, "task_source_required", "refused for where it posts, not for the source");
+  assert.equal((await chatMessagesIn(elsewhere.id)).length, before.length, "nothing posted");
+  assert.deepEqual(await tasksIn(elsewhere.id), [], "nothing was created");
 });
 
 test("flag off: an agent's create without a source still works", async ({ app }) => {

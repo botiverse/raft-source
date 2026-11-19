@@ -172,7 +172,7 @@ test("resume overflow falls back to full hydrate and converges to the same termi
     });
     await flushAsyncWork();
 
-    assert.deepEqual(harness.getCalls(), ["/messages/channel/channel-1?limit=50"]);
+    assert.deepEqual(harness.getCalls(), ["/messages/channel/channel-1?limit=50&threadPreviewChars=200"]);
     assert.deepEqual(harness.messages(CHANNEL_ID).map((item) => item.id), ["m-1", "m-2", "m-3", "m-4"]);
     assert.equal(harness.messages(CHANNEL_ID).filter((item) => item.id === "m-4").length, 1);
     assert.equal(useMessageStore.getState().lastSeq, 4);

@@ -636,10 +636,12 @@ type ActivityView = "overview" | "raw" | "subagents";
  * The Activity tab: it opens on the per-turn Overview (task #17), with the
  * raw log one toggle away.
  */
-export default function AgentActivityLog({ agentId, machineId, canStopSubagents = false }: {
+export default function AgentActivityLog({ agentId, machineId, canStopSubagents = false, hasSubagents = false }: {
   agentId: string;
   machineId?: string | null;
-  /** #proj-runtime:#41: the viewer may stop a running subagent (Stop turn's authority, a runtime that can: Codex, Claude Code). */
+  /** The agent's runtime can start sub-agents (`runtimeHasSubagents`): the Sub-agents view is always offered, with 0 too. */
+  hasSubagents?: boolean;
+  /** #proj-runtime:#41: the viewer may stop a running subagent (Stop turn's authority, a runtime that can: `canStopSubagentsOf`). */
   canStopSubagents?: boolean;
 }) {
   const { formatMessage } = useIntl();
@@ -671,8 +673,10 @@ export default function AgentActivityLog({ agentId, machineId, canStopSubagents 
   useEffect(() => {
     void loadTrajectoryLog(agentId);
   }, [agentId, loadTrajectoryLog]);
-  // The Sub-agents segment appears once the agent has had one.
-  const showSubagents = subagents.length > 0 || view === "subagents";
+  // A runtime that can start sub-agents always offers the Sub-agents segment, with 0 too, so the
+  // switch keeps its shape and the place to look is there before the first one (stdrc, 2026-11-14).
+  // Any other runtime shows it only once a sub-agent has appeared.
+  const showSubagents = hasSubagents || subagents.length > 0 || view === "subagents";
   return (
     <div className="flex flex-1 flex-col min-h-0">
       {/* The view switch is the only control here, so it is no bar of its own:

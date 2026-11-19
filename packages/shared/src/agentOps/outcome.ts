@@ -170,9 +170,10 @@ const REFUSAL_SENTENCE_MAX_CHARS = 500;
  * the agent (why it refused, and what to change), so it is shown as sent,
  * whether or not this client knows the code: a rule added on a newer Server
  * still reads on an older client. One bounded line with a space in it, else
- * null (the default sentence stands).
+ * null (the default sentence stands). Also read, by the Artifacts' operations
+ * only, for the 503s their Server words deliberately (agentOps/artifacts.ts).
  */
-function refusalSentence(response: unknown): string | null {
+export function refusalSentence(response: unknown): string | null {
   if (!response || typeof response !== "object") return null;
   const raw = (response as { error?: unknown }).error;
   if (typeof raw !== "string") return null;

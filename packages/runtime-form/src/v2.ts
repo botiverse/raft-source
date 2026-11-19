@@ -82,8 +82,8 @@ export type RuntimeFormV2ClientCapability = (typeof RUNTIME_FORM_V2_RESERVED_CLI
  * - `dependent_select.custom_value_with_options`: a dependent_select value that
  *   has listed options AND allows a typed value renders as a combobox starting
  *   at defaultValueByValue (runtimeFormV2Choices), not as a blank text box.
- *   Without it the server keeps such a value list-only (task #10: Built-in
- *   OpenRouter).
+ *   Without it the server keeps such a value list-only (task #10: a Built-in
+ *   preset provider such as OpenRouter or Qwen Token Plan).
  */
 export const RUNTIME_FORM_V2_ADVERTISED_CLIENT_CAPABILITIES = [
   "dependent_select.custom_value_with_options",

@@ -5,7 +5,6 @@ import { dismissOwnerOnboarding } from "../../fixtures/session";
 import {
   clickSelectModeMoreAction,
   clickShareMessagesMenu,
-  openSelectModeMoreMenu,
 } from "../../fixtures/contextMenu";
 
 // Captures the share-preview contract: image sharing starts at one generic
@@ -43,13 +42,10 @@ test("non-contiguous selection renders real Share preview content with two artif
   await page.getByText(`${tag} 2:`).first().click();
   await page.getByText(`${tag} 4:`).first().click();
   await expect(page.getByTestId("select-mode-count")).toHaveText("3 selected");
-  await expect(page.getByTestId("select-mode-more")).toBeVisible();
+  await expect(page.getByTestId("select-mode-share-open")).toBeEnabled();
+  await expect(page.getByTestId("select-mode-copy-md")).toBeEnabled();
 
-  await openSelectModeMoreMenu(page);
-  await expect(page.getByTestId("select-mode-share-open")).toBeVisible();
-  await expect(page.getByTestId("select-mode-copy-md")).toBeVisible();
-
-  await page.getByTestId("select-mode-share-open").click();
+  await clickSelectModeMoreAction(page, "select-mode-share-open");
   const lightbox = page.getByTestId("select-share-lightbox");
   await expect(lightbox).toBeVisible({ timeout: 10000 });
 
@@ -95,8 +91,7 @@ test("select mode → Copy MD → clipboard contains **sender**: content format"
 
   await clickSelectModeMoreAction(page, "select-mode-copy-md");
 
-  // The More menu closes after the action; reopening shows the copied affordance.
-  await openSelectModeMoreMenu(page);
+  // The action (in the row, or in More, which renders the same label) says it copied.
   await expect(page.getByTestId("select-mode-copy-md")).toHaveText(/Copied MD/);
 
   const clip = await page.evaluate(() => navigator.clipboard.readText());

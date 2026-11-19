@@ -17,11 +17,13 @@ import {
   AGENT_ARCHIVE_WORKSPACE_CHOICES,
   AGENT_CONTEXT_VIEW_FEATURE_FLAG_KEY,
   type AgentContextViewRecordList,
+  type AgentVoiceQuestionRecordList,
   agentMigrationSupportRefSchema,
   currentDate,
   type AgentArchiveWorkspaceChoice,
   type AgentMigrationTransferProgress,
   type AgentMigrationUserErrorCode,
+  type AgentVoiceCallRefusalCode,
 } from "@botiverse/raft-shared";
 import { emitAgentApprovalCards } from "../services/agentRuntimeApprovalService";
 import { respondInvalidOrExpiredToken } from "../middleware/auth";
@@ -180,6 +182,7 @@ import {
   buildRuntimeFormV2EditBodyForServer,
   guardBuiltInEditFromClient,
   withBuiltInEditVisibility,
+  withStoredLimitProvider,
   formValuesPointerForRuntimeConfigPointer,
   SAVED_CONNECTION_VALUE_PREFIX,
   reconcileRuntimeFormV2SubmissionWithLiveModels,
@@ -207,6 +210,7 @@ import {
 import { APP_BOT_LIFECYCLE_MANAGED } from "../services/appBotIdentityService";
 import {
   assertProviderConnectionModelCompatible,
+  providerConnectionProviderId,
   ProviderConnectionError,
   SAVED_CONNECTION_ID_SHAPE,
   resolveProviderConnectionSelection,
@@ -269,6 +273,8 @@ import { newAuditOperationId, recordIntegrationAuditEvent, recordIntegrationAudi
 import { isRuntimeErrorDetailActivity, type AgentRuntimeErrorState, type RuntimeErrorCode } from "@botiverse/raft-shared";
 import { projectRuntimeErrorActivityDetail, projectRuntimeErrorState, type RuntimeErrorViewer } from "../services/agentRuntimeErrorVisibility";
 import { AGENT_CONNECTION_CONNECTOR_ID_RE, type AgentBlockedReason, isAgentConnectionProvider, refusalSentenceProblem, type AgentConnectionProvider, type AgentConnectionRemovedView, type ServerId, type TraceAttributes } from "@botiverse/raft-shared";
+import { agentVoiceSettings, listAgentVoiceQuestions } from "../services/agentVoiceService";
+import { hangUpAgentVoiceCall, renewAgentVoiceCallToken, startAgentVoiceCall } from "../services/agentVoiceCallService";
 import { refuse } from "../lib/refusal";
 import { isAgentRuntimeProviderKillSwitched } from "../services/agentRuntimeProviderFeature";
 
@@ -462,6 +468,31 @@ type AgentSkillsListFailureReason =
   | "daemon_error"
   | "orchestrator_unavailable"
   | "unknown";
+
+/**
+ * Binding a saved Provider connection hands an agent the team's key, so it
+ * needs `manageExternalAuth`: the form lists connections only to those who
+ * hold it, and a connection id is visible in other agents' runtimeConfig.
+ * Keeping the connection an agent already has needs nothing more. Sends the
+ * 403 and returns false when the caller may not bind `connectionId`.
+ */
+async function mayBindProviderConnection(
+  req: Request,
+  res: Response,
+  connectionId: string,
+  storedRuntimeConfig: { runtime: string; provider?: { kind: string; connectionId?: string } } | null,
+): Promise<boolean> {
+  const stored = storedRuntimeConfig?.runtime === "builtin" && storedRuntimeConfig.provider?.kind === "connection"
+    ? storedRuntimeConfig.provider.connectionId
+    : undefined;
+  if (stored === connectionId) return true;
+  if (await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "manageExternalAuth")) return true;
+  refuse(res, 403, {
+    code: "provider_connection_manage_auth_required",
+    error: "Choosing a saved Provider connection needs the `manageExternalAuth` capability.",
+  });
+  return false;
+}
 
 function sendProviderConnectionsDisabled(res: Response): void {
   res.status(404).json({
@@ -1288,6 +1319,16 @@ export async function canInspectAgentPrivateSurfaces(
  * direct flow. Flag off or not a connection submit: undefined, and the static
  * fallback in the registry applies.
  */
+/** The provider of the saved connection a stored Built-in config is bound to; null for any other config. */
+async function storedConnectionProviderId(serverId: string, runtimeConfig: unknown): Promise<string | null> {
+  const config = runtimeConfig !== null && typeof runtimeConfig === "object"
+    ? (runtimeConfig as { runtime?: unknown; provider?: { kind?: unknown; connectionId?: unknown } })
+    : null;
+  const provider = config?.runtime === "builtin" ? config.provider : undefined;
+  if (provider?.kind !== "connection" || typeof provider.connectionId !== "string") return null;
+  return providerConnectionProviderId(serverId, provider.connectionId);
+}
+
 async function savedConnectionProviderIdForSubmit(req: Request): Promise<string | undefined> {
   const ref = req.body?.formDefinitionRef as { protocolVersion?: unknown; runtimeId?: unknown } | undefined;
   if (!isRuntimeFormV2SubmitProtocol(ref?.protocolVersion) || ref?.runtimeId !== "builtin") return undefined;
@@ -1334,7 +1375,7 @@ function keepStoredCustomModelLimits(runtimeConfig: unknown, existing: Parameter
 function adoptRuntimeFormV2Submission(
   req: Request,
   res: Response,
-  options: RuntimeFormValuesOptions & { editing: boolean },
+  options: RuntimeFormValuesOptions & { editing: boolean; storedConnectionProviderId: string | null },
 ): { runtimeConfig: Record<string, unknown>; formDefinitionRef: RuntimeFormV2SubmitRef } | "handled" | undefined {
   const ref = req.body?.formDefinitionRef as { protocolVersion?: unknown; runtimeId?: unknown } | undefined;
   // protocolVersion 2 or 3: the same formValues semantics (v3 only changes the form's shape).
@@ -1364,12 +1405,17 @@ function adoptRuntimeFormV2Submission(
     }
   }
   let formValues: unknown = req.body?.formValues;
-  // task #10: an edit save from a client that cannot show a typed OpenRouter
-  // model or its limits keeps what a newer client stored, or is refused when
+  // task #10: an edit save from a client that cannot show a typed model on a
+  // preset provider or its limits keeps what a newer client stored, or is refused when
   // it changes the target (guardBuiltInEditFromClient).
   if (ref.runtimeId === "builtin" && options.editing) {
     const clientCapabilities = parseRuntimeFormV2ClientCapabilities(req.query[RUNTIME_FORM_V2_CLIENT_CAPABILITIES_QUERY]);
-    const guard = guardBuiltInEditFromClient(formValues, options.existing, clientCapabilities);
+    const guard = guardBuiltInEditFromClient(
+      formValues,
+      options.existing,
+      clientCapabilities,
+      options.storedConnectionProviderId,
+    );
     if (!guard.ok) {
       refuse(res, 409, { code: guard.issue.code, error: guard.message, details: { issues: [guard.issue] } });
       return "handled";
@@ -1715,6 +1761,7 @@ agentRouter.post("/", async (req, res) => {
       const v2 = adoptRuntimeFormV2Submission(req, res, {
         editing: false,
         savedConnectionProviderId: await savedConnectionProviderIdForSubmit(req),
+        storedConnectionProviderId: null,
       });
       if (v2 === "handled") return;
       if (v2) ({ runtimeConfig, formDefinitionRef } = v2);
@@ -2083,6 +2130,7 @@ agentRouter.post("/", async (req, res) => {
         sendProviderConnectionsDisabled(res);
         return;
       }
+      if (!await mayBindProviderConnection(req, res, normalizedConfig.runtimeConfig.provider.connectionId, null)) return;
       providerConnection = await resolveProviderConnectionSelection(
         req.serverId!,
         normalizedConfig.runtimeConfig.provider.connectionId,
@@ -2094,7 +2142,7 @@ agentRouter.post("/", async (req, res) => {
 
     let releaseCatalogAuthority: () => void = () => undefined;
     if (
-      isBuiltInCatalogCheckedSelection(normalizedConfig.runtimeConfig)
+      isBuiltInCatalogCheckedSelection(normalizedConfig.runtimeConfig, providerConnection?.providerId ?? null)
     ) {
       if (!assignedMachine) {
         res.status(409).json({
@@ -2121,6 +2169,7 @@ agentRouter.post("/", async (req, res) => {
           agentOrchestrator,
           assignedMachine.id,
           normalizedConfig.runtimeConfig,
+          providerConnection?.providerId ?? null,
         );
       if (validation) {
         releaseCatalogAuthority =
@@ -2751,6 +2800,156 @@ agentRouter.get("/:id/context-views", async (req, res) => {
   } catch (err) {
     console.error("[agents] context views failed", serializeErrorForLog(err));
     res.status(500).json({ error: "Failed to list the context views" });
+  }
+});
+
+// Raft voice (#wg-runtime-form:#22): whether people may ask the agent and call
+// it, to the people who may edit it (agentVoiceSettings). PUT `{askable?,
+// callable?}` changes them. Every refusal is the unknown-agent 404.
+agentRouter.get("/:id/voice-settings", async (req, res) => {
+  try {
+    const settings = await agentVoiceSettings({ serverId: req.serverId!, userId: req.userId!, agentId: String(req.params.id) });
+    if (!settings) {
+      refuse(res, 404, { code: "agent_not_found", error: "Agent not found." });
+      return;
+    }
+    res.setHeader("Cache-Control", "no-store");
+    res.json(settings);
+  } catch (err) {
+    console.error("[agents] voice settings failed", serializeErrorForLog(err));
+    res.status(500).json({ error: "Failed to read the agent's voice settings" });
+  }
+});
+
+agentRouter.put("/:id/voice-settings", async (req, res) => {
+  try {
+    const askable: unknown = req.body?.askable;
+    const callable: unknown = req.body?.callable;
+    if ((askable !== undefined && typeof askable !== "boolean") || (callable !== undefined && typeof callable !== "boolean")) {
+      refuse(res, 400, { code: "invalid_voice_settings", error: "askable and callable must be true or false." });
+      return;
+    }
+    const agentId = String(req.params.id);
+    const current = await agentVoiceSettings({ serverId: req.serverId!, userId: req.userId!, agentId });
+    if (!current) {
+      refuse(res, 404, { code: "agent_not_found", error: "Agent not found." });
+      return;
+    }
+    // Written under the actor's authority fence, as PATCH /agents/:id is; never a guest (View Context's rule).
+    const settings = askable === undefined && callable === undefined
+      ? current
+      : await withFencedAgentAuthority(req.serverId!, req.userId!, agentId, "editAgents", async (tx, lockedRole) => {
+        if (lockedRole === "guest") throw new FencedAuthorizationDeniedError("forbidden");
+        const [updated] = await tx.update(agents).set({
+          ...(askable !== undefined ? { voiceAskable: askable } : {}),
+          ...(callable !== undefined ? { voiceCallable: callable } : {}),
+        }).where(eq(agents.id, agentId)).returning({ askable: agents.voiceAskable, callable: agents.voiceCallable });
+        return updated!;
+      }).catch((error: unknown) => {
+        if (error instanceof FencedAuthorizationDeniedError) return null;
+        throw error;
+      });
+    if (!settings) {
+      refuse(res, 404, { code: "agent_not_found", error: "Agent not found." });
+      return;
+    }
+    addTraceEvent("agent.voice_settings_changed", {
+      agent_id: agentId,
+      server_id: req.serverId!,
+      user_id: req.userId!,
+      askable: settings.askable,
+      callable: settings.callable,
+    });
+    res.json(settings);
+  } catch (err) {
+    console.error("[agents] voice settings update failed", serializeErrorForLog(err));
+    res.status(500).json({ error: "Failed to change the agent's voice settings" });
+  }
+});
+
+// Raft voice calls (#wg-runtime-form:#22; agentVoiceCallService): the caller
+// starts a call and gets the room grant, renews its token, and hangs up. Every
+// refusal of who may call is the unknown-agent 404; why a call could not start
+// is a 409 `{code}`.
+agentRouter.post("/:id/voice/calls", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  try {
+    const result = await startAgentVoiceCall({
+      orchestrator: req.app.get("agentOrchestrator") as AgentOrchestrator,
+      io: req.app.get("io") as SocketServer,
+      serverId: req.serverId!,
+      userId: req.userId!,
+      agentId: String(req.params.id),
+    });
+    if (result.ok) {
+      res.status(201).json(result.started);
+    } else if (result.code === "not_found") {
+      refuse(res, 404, { code: "agent_not_found", error: "Agent not found." });
+    } else if (result.code === "rate_limited") {
+      res.setHeader("Retry-After", String(result.retryAfterSeconds));
+      refuse(res, 429, { code: "voice_rate_limited", error: "Too many calls. Try again later.", retryAfterSeconds: result.retryAfterSeconds });
+    } else {
+      refuse(res, 409, { code: result.code, error: VOICE_CALL_REFUSALS[result.code] });
+    }
+  } catch (err) {
+    console.error("[agents] voice call start failed", serializeErrorForLog(err));
+    res.status(500).json({ error: "Failed to start the call" });
+  }
+});
+
+agentRouter.post("/:id/voice/calls/:callId/token", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  try {
+    const grant = await renewAgentVoiceCallToken({ serverId: req.serverId!, userId: req.userId!, agentId: String(req.params.id), callId: String(req.params.callId) });
+    if (!grant) {
+      refuse(res, 404, { code: "agent_not_found", error: "Agent not found." });
+      return;
+    }
+    res.json(grant);
+  } catch (err) {
+    console.error("[agents] voice call token failed", serializeErrorForLog(err));
+    res.status(500).json({ error: "Failed to renew the call" });
+  }
+});
+
+agentRouter.post("/:id/voice/calls/:callId/hang-up", async (req, res) => {
+  try {
+    const found = await hangUpAgentVoiceCall(
+      { orchestrator: req.app.get("agentOrchestrator") as AgentOrchestrator, io: req.app.get("io") as SocketServer },
+      { serverId: req.serverId!, userId: req.userId!, agentId: String(req.params.id), callId: String(req.params.callId) },
+    );
+    if (!found) {
+      refuse(res, 404, { code: "agent_not_found", error: "Agent not found." });
+      return;
+    }
+    res.status(204).end();
+  } catch (err) {
+    console.error("[agents] voice call hang-up failed", serializeErrorForLog(err));
+    res.status(500).json({ error: "Failed to hang up" });
+  }
+});
+
+const VOICE_CALL_REFUSALS: Record<AgentVoiceCallRefusalCode, string> = {
+  voice_call_unavailable: "Calls aren't available right now.",
+  agent_offline: "The agent's Computer didn't answer. Send it a message instead.",
+  unsupported_runtime: "This agent can't take calls.",
+};
+
+// Raft voice (#wg-runtime-form:#22): who asked the agent side questions, when
+// and through which App (never the question or the answer), to the people who
+// may ask it. Every refusal is the unknown-agent 404.
+agentRouter.get("/:id/voice-questions", async (req, res) => {
+  try {
+    const questions = await listAgentVoiceQuestions({ serverId: req.serverId!, userId: req.userId!, agentId: String(req.params.id) });
+    if (!questions) {
+      refuse(res, 404, { code: "agent_not_found", error: "Agent not found." });
+      return;
+    }
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ questions } satisfies AgentVoiceQuestionRecordList);
+  } catch (err) {
+    console.error("[agents] voice questions failed", serializeErrorForLog(err));
+    res.status(500).json({ error: "Failed to list the agent's voice questions" });
   }
 });
 
@@ -3804,7 +4003,9 @@ agentRouter.get("/:id/runtime-form", async (req, res) => {
     // revision token (services/runtimeFormV2Registry).
     const clientCapabilities = parseRuntimeFormV2ClientCapabilities(req.query[RUNTIME_FORM_V2_CLIENT_CAPABILITIES_QUERY]);
     const hydrated = hydrateRuntimeConfig(existing);
-    let body = await buildRuntimeFormV2EditBodyForServer(existing.runtime, hydrated, req.serverId!, clientCapabilities);
+    const connectionProviderId = await storedConnectionProviderId(req.serverId!, hydrated);
+    let body = await buildRuntimeFormV2EditBodyForServer(existing.runtime, hydrated, req.serverId!, clientCapabilities, { connectionProviderId });
+    let typedConnectionProviderIds: readonly string[] = [];
     if (body && existing.runtime === "builtin") {
       // task #10: the same client + Computer gate as the create form, plus
       // the agent's own stored limits / typed model (withBuiltInEditVisibility).
@@ -3817,7 +4018,8 @@ agentRouter.get("/:id/runtime-form", async (req, res) => {
         clientCapabilities,
       });
       if (typed === "handled") return;
-      body = withBuiltInEditVisibility(body, typed, clientCapabilities, hydrated);
+      body = withBuiltInEditVisibility(body, typed.presets, clientCapabilities, hydrated, connectionProviderId);
+      typedConnectionProviderIds = withStoredLimitProvider(typed, hydrated, connectionProviderId).connections;
     }
     if (!body) {
       res.status(404).json({
@@ -3832,6 +4034,7 @@ agentRouter.get("/:id/runtime-form", async (req, res) => {
         runtimeId: existing.runtime,
         serverId: req.serverId!,
         clientCapabilities,
+        typedConnectionProviderIds,
         connectionsVisible: await actorHasServerCapabilityInServer(req.serverId!, "user", req.userId!, "manageExternalAuth"),
       });
     }
@@ -3872,11 +4075,13 @@ agentRouter.patch("/:id", async (req, res) => {
     let v2Submitted = false;
     let v2SubmittedReasoningEffort: unknown = null;
     if (!isExternalAgentRuntime(existing.runtime)) {
+      const hydratedExisting = hydrateRuntimeConfig(existing);
       const v2 = adoptRuntimeFormV2Submission(req, res, {
         editing: true,
         // Fields a v2 form does not show keep their stored value.
-        existing: hydrateRuntimeConfig(existing),
+        existing: hydratedExisting,
         savedConnectionProviderId: await savedConnectionProviderIdForSubmit(req),
+        storedConnectionProviderId: await storedConnectionProviderId(req.serverId!, hydratedExisting),
       });
       if (v2 === "handled") return;
       if (v2) ({ runtimeConfig, formDefinitionRef } = v2);
@@ -4145,6 +4350,7 @@ agentRouter.patch("/:id", async (req, res) => {
         sendProviderConnectionsDisabled(res);
         return;
       }
+      if (!await mayBindProviderConnection(req, res, normalizedRuntimeConfig.provider.connectionId, existingRuntimeConfig)) return;
       providerConnection = await resolveProviderConnectionSelection(
         req.serverId!,
         normalizedRuntimeConfig.provider.connectionId,
@@ -4156,10 +4362,11 @@ agentRouter.patch("/:id", async (req, res) => {
     let releaseCatalogAuthority: () => void = () => undefined;
     if (
       normalizedRuntimeConfig &&
-      isBuiltInCatalogCheckedSelection(normalizedRuntimeConfig) &&
+      isBuiltInCatalogCheckedSelection(normalizedRuntimeConfig, providerConnection?.providerId ?? null) &&
       builtInPresetSelectionChanged(
         existingRuntimeConfig,
         normalizedRuntimeConfig,
+        providerConnection?.providerId ?? null,
       )
     ) {
       if (!existing.machineId) {
@@ -4187,6 +4394,7 @@ agentRouter.patch("/:id", async (req, res) => {
           agentOrchestrator,
           existing.machineId,
           normalizedRuntimeConfig,
+          providerConnection?.providerId ?? null,
         );
       if (validation) {
         releaseCatalogAuthority =

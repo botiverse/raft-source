@@ -24,8 +24,10 @@ import {
   SplashScopeContext,
   useArtifactSplashAppeared,
   useArtifactSplashAppearedAt,
+  useArtifactSplashShownIcon,
   useArtifactSplashStart,
 } from "./artifactSplash";
+import { artifactSplashDone, holdArtifactSplashCover } from "./artifactSplashHost";
 import type { ArtifactSplashIcon, ArtifactSplashSize, ArtifactSplashStage } from "./artifactSplash";
 
 /**
@@ -61,6 +63,11 @@ import type { ArtifactSplashIcon, ArtifactSplashSize, ArtifactSplashStage } from
  * - `prefers-reduced-motion`: the complete icon, still, with its line; loaded removes it at once.
  * - The cover is `role="status"`, named by its line ("Getting the page"); the pixels are
  *   `aria-hidden`.
+ *
+ * - The kind learned while the icon loops (opened from a bare link: `doc` until the data says): the
+ *   new icon waits for the cycle's end (useArtifactSplashShownIcon), across parts too.
+ * - In the App (host shell): it draws this same splash natively over the page and plays its ending
+ *   when the page writes `hostLoaded=1` (artifactSplashHost.ts), so one splash is seen, never two.
  *
  * The parameters (named constants, for the native App to mirror), the icons and the clock are in
  * artifactSplash.ts.
@@ -173,6 +180,15 @@ export function ArtifactLoadingSplash({ stage, kind, done = false, startedAt: ow
   // The page is there under it by then: the ending takes no taps or scrolls.
   const ending = done && appeared && !reduced;
   const [end, setEnd] = useState<"filling" | "fading" | "gone">("filling");
+  const icon = useArtifactSplashShownIcon(artifactSplashIcon(kind), startedAt, appeared && !reduced && !prerendered && !ending);
+  // The App's native splash (host shell) waits on this: done, or gone without being done (a failure's own screen).
+  useLayoutEffect(() => {
+    if (done) {
+      artifactSplashDone();
+      return;
+    }
+    return holdArtifactSplashCover();
+  }, [done]);
   useEffect(() => {
     if (!ending) return;
     const fade = window.setTimeout(() => setEnd("fading"), ARTIFACT_SPLASH_FILL_MS + ARTIFACT_SPLASH_HOLD_MS);
@@ -201,7 +217,7 @@ export function ArtifactLoadingSplash({ stage, kind, done = false, startedAt: ow
     >
       {appeared ? (
         <>
-          <SplashPixels icon={artifactSplashIcon(kind)} size={size} motion={reduced || prerendered ? "still" : ending ? "settle" : "loop"} startedAt={startedAt} />
+          <SplashPixels icon={icon} size={size} motion={reduced || prerendered ? "still" : ending ? "settle" : "loop"} startedAt={startedAt} />
           {/* The line is drawn under the icon, a stage's ("Getting the page", "Starting the page") or a screen's
               own: it says which step the opening is at, so a slow one doesn't look stuck (xxchan, Kirby; not
               helper text, so not #250's cut). */}

@@ -8,7 +8,7 @@ import EmptyState from "../../components/ui/EmptyState";
 import { useOpenAgentComputer } from "../../components/agent/useOpenAgentComputer";
 import { useTimeFormatter } from "../../hooks/useTimeFormatter";
 import { UsageSwatch } from "./AgentUsageDayBars";
-import { cacheShareOfInput, chartTokens, tokensPerTurn, totalTokens } from "./agentUsage";
+import { USAGE_UNREPORTED_STATE, cacheShareOfInput, chartTokens, tokensPerTurn, totalTokens } from "./agentUsage";
 import type { AgentUsageRange, AgentUsageSummary, AgentUsageView } from "./agentUsage";
 import { UsageChange, UsageFact as Fact } from "./AgentUsageParts";
 import { useUsageFormat } from "./agentUsageHooks";
@@ -174,22 +174,27 @@ export function AgentUsageModels({ summary }: { summary: ReadyUsageSummary }) {
   );
 }
 
-/** No figures to draw: the agent's Computer sends no usage (Update, with a way to it), or the range has none. */
-export function AgentUsageNoFigures({ kind, agentId, range }: { kind: "unsupported" | "empty"; agentId: string; range: AgentUsageRange }) {
+/** No figures to draw: no turn has reported usage (why, and the way to the Computer when updating it helps), or the range has none. */
+export function AgentUsageNoFigures({ summary, agentId, range }: {
+  summary: Exclude<AgentUsageSummary, { kind: "ready" }>;
+  agentId: string;
+  range: AgentUsageRange;
+}) {
   const { formatMessage } = useIntl();
   const { open: openComputer } = useOpenAgentComputer(agentId);
-  if (kind === "unsupported") {
+  if (summary.kind === "unsupported") {
+    const state = USAGE_UNREPORTED_STATE[summary.reason];
     return (
       <EmptyState
         className="flex flex-1 flex-col items-center justify-center"
         icon={<ChartColumn size={36} />}
-        title={formatMessage({ id: "agent.usage.updateComputer" })}
-        action={openComputer ? (
+        title={formatMessage({ id: state.titleId })}
+        action={state.offersComputer && openComputer ? (
           <Button variant="outline" size="md" type="button" onClick={openComputer}>
             {formatMessage({ id: "agent.usage.openComputer" })}
           </Button>
         ) : undefined}
-        data-testid="agent-usage-unsupported"
+        data-testid={state.testId}
       />
     );
   }

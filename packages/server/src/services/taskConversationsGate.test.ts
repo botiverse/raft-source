@@ -7,7 +7,10 @@ import type { DatabaseExecutor } from "../db";
 import { evaluateFeatureFlag } from "./featureFlagService";
 import { isTaskV2ConversationsEnabled, isTaskV2ConversationsEnabledForRequest, readTaskV2ConversationsEnabled } from "./taskConversationsGate";
 
-vi.mock("./featureFlagService", () => ({
+// Partial: modules this gate pulls in (actionCardsService -> runtimeAdmissionService)
+// read other exports of featureFlagService at load.
+vi.mock("./featureFlagService", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./featureFlagService")>()),
   evaluateFeatureFlag: vi.fn(async () => ({ key: "task_v2_conversations_v0", enabled: false, reason: "default" })),
 }));
 

@@ -24,6 +24,7 @@ import { getSearchRelativeTimeParts } from "./searchGrouping";
 import { SearchHighlight } from "./SearchHighlight";
 import type { MessageSearchResult, SearchSenderMember } from "./searchResultTypes";
 import { SEARCH_HIT_AVATAR_BOX, SEARCH_HIT_TEXT_INSET } from "./searchHitGeometry";
+import { messageCardFallbackText } from "../../utils/messageCardFallbackText";
 
 /** One message hit, top-level or nested inside a thread group. */
 export function MessageHitRow({
@@ -118,7 +119,7 @@ export function MessageHitRow({
           {formatMessage({ id: "message.delegated.retracted" })}
         </span>
       ) : (
-        <SearchHighlight text={result.snippet} query={query} />
+        <SearchHighlight text={messageCardFallbackText(result.snippet)} query={query} />
       )}
     </SearchMessageResultBody>
     </Result>

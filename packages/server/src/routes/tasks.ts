@@ -16,12 +16,11 @@ import { announceTaskClaim, announceTasksCreatedFromSourceMessages, buildLegacyT
 import { ensureTaskConversationAndBroadcast, withTaskConversationEnsured } from "../services/taskMutationBroadcast";
 import { taskV2WebConvertRefusal } from "../services/taskV2UseCreate";
 import { isTaskV2ConversationsEnabled } from "../services/taskConversationsGate";
+import { creatorSourceMessageContent, postTaskCreatorSourceMessage, TASK_SOURCE_MESSAGE_TOO_LONG_REFUSAL, taskCreatorSourceSendRefusal } from "../services/taskCreatorSourceMessage";
 import { checkHumanPostAdmission, HUMAN_POST_REFUSALS } from "../services/humanPostAdmission";
 import { channelBillingReadOnlyBody } from "../services/planService";
 import { MAX_MESSAGE_LENGTH } from "./messages";
 import { notePaywallHit } from "./paywallHit";
-import { DmPeerNotMemberError } from "../services/dmSendPolicy";
-import { JointChannelAccessChangedError } from "../lib/channelActorPermissions";
 import { getUserTaskConversationFollowStates, listTaskConversationsByParentChannel } from "../services/taskConversationService";
 import { actorHasServerCapabilityInServer, getActorServerRoleInServer } from "../lib/actorPermissions";
 import {
@@ -52,12 +51,46 @@ async function withConversationFollowed<T extends { id: string; conversationAnch
   localChannelId: string,
   tasks: T[],
 ): Promise<Array<T & { conversationFollowed?: boolean }>> {
+  return withConversationFollowedFor({ userId: req.userId!, serverId: req.serverId! }, localChannelId, tasks);
+}
+
+async function withConversationFollowedFor<T extends { id: string; conversationAnchored?: boolean }>(
+  viewer: TaskListViewer,
+  localChannelId: string,
+  tasks: T[],
+): Promise<Array<T & { conversationFollowed?: boolean }>> {
   if (tasks.length === 0) return tasks;
-  const flagOn = await isTaskV2ConversationsEnabled(req.serverId!);
+  const flagOn = await isTaskV2ConversationsEnabled(viewer.serverId);
   const reported = flagOn ? tasks : tasks.filter((task) => task.conversationAnchored === true);
   if (reported.length === 0) return tasks;
-  const followed = await getUserTaskConversationFollowStates(req.userId!, localChannelId, reported.map((task) => task.id));
+  const followed = await getUserTaskConversationFollowStates(viewer.userId, localChannelId, reported.map((task) => task.id));
   return tasks.map((task) => (followed.has(task.id) ? { ...task, conversationFollowed: followed.get(task.id) ?? false } : task));
+}
+
+/** A human reading task lists in a server. */
+export type TaskListViewer = { userId: string; serverId: ServerId };
+
+/** The task surface of `channelId` when this viewer may read its tasks; null answers 404 (no such channel, or no access). */
+export async function resolveReadableTaskSurface(viewer: TaskListViewer, channelId: string) {
+  const surface = await resolveTaskChannelSurface(viewer.serverId, channelId);
+  if (!surface) return null;
+  if (!await channelService.canUserAccessChannel(surface.localChannel.id, viewer.userId, viewer.serverId)) return null;
+  return surface;
+}
+
+/**
+ * The rows of GET /api/tasks/channel/:id for this viewer, narrowed to
+ * `taskIds` when given. GET /api/sync/changes rebuilds a changed task with it,
+ * so a synced task is the list's row.
+ */
+export async function listChannelTaskRows(
+  viewer: TaskListViewer,
+  surface: NonNullable<Awaited<ReturnType<typeof resolveReadableTaskSurface>>>,
+  opts: { status?: TaskStatus; taskIds?: readonly string[] } = {},
+) {
+  const tasks = await taskService.listTasks(surface.storageChannelId, opts.status, { ...(opts.taskIds && { taskIds: opts.taskIds }) });
+  const projected = taskService.projectTasksToChannel(tasks, surface.localChannel);
+  return withConversationFollowedFor(viewer, surface.localChannel.id, projected);
 }
 
 async function rejectIfNoTaskReadAccess(channelId: string, userId: string, serverId: ServerId, res: Response): Promise<boolean> {
@@ -72,12 +105,12 @@ async function rejectIfNoTaskReadAccess(channelId: string, userId: string, serve
 // List tasks for a channel
 taskRouter.get("/channel/:channelId", async (req, res) => {
   try {
-    const surface = await resolveTaskChannelSurface(req.serverId!, req.params.channelId);
+    const viewer = { userId: req.userId!, serverId: req.serverId! };
+    const surface = await resolveReadableTaskSurface(viewer, req.params.channelId);
     if (!surface) {
       res.status(404).json({ error: "Channel not found" });
       return;
     }
-    if (await rejectIfNoTaskReadAccess(surface.localChannel.id, req.userId!, req.serverId!, res)) return;
     // Validate + narrow the optional ?status filter (was an `as TaskStatus` cast).
     // A present value must be a known TaskStatus string, else 400 (fail closed —
     // covers repeated/array params); absent = no filter.
@@ -90,9 +123,7 @@ taskRouter.get("/channel/:channelId", async (req, res) => {
       }
       statusFilter = statusParam;
     }
-    const tasks = await taskService.listTasks(surface.storageChannelId, statusFilter);
-    const projected = taskService.projectTasksToChannel(tasks, surface.localChannel);
-    res.json({ tasks: await withConversationFollowed(req, surface.localChannel.id, projected) });
+    res.json({ tasks: await listChannelTaskRows(viewer, surface, { ...(statusFilter && { status: statusFilter }) }) });
   } catch {
     res.status(500).json({ error: "Failed to list tasks" });
   }
@@ -703,23 +734,6 @@ taskRouter.post("/channel/:channelId", async (req, res) => {
 });
 
 /**
- * The text of the message a person's sourceless create posts as the tasks'
- * source: one title (and its description) as written, or several as a list.
- */
-export function creatorSourceMessageContent(items: readonly { title: string; description?: string | null }[]): string {
-  if (items.length === 1) {
-    const [item] = items;
-    return item!.description ? `${item!.title}\n\n${item!.description}` : item!.title;
-  }
-  return items
-    .map((item) => {
-      const description = item.description ? `\n${item.description.split("\n").map((line) => `  ${line}`).join("\n")}` : "";
-      return `- ${item.title}${description}`;
-    })
-    .join("\n");
-}
-
-/**
  * Task v2, a person creating tasks without a source message (the New task
  * dialog of a channel's Tasks card or the Tasks page): post their own ordinary
  * channel message saying what the tasks are, the source every one of them
@@ -748,7 +762,7 @@ async function postCreatorSourceMessage(
   }
   const content = creatorSourceMessageContent(input.items);
   if (content.length > MAX_MESSAGE_LENGTH) {
-    refuse(res, 400, { code: "task_source_message_too_long", error: "These tasks are too long to post as one message: shorten the titles or create fewer at once." });
+    refuse(res, 400, TASK_SOURCE_MESSAGE_TOO_LONG_REFUSAL);
     return null;
   }
   const refuseKeyReused = () => refuse(res, 409, {
@@ -782,23 +796,11 @@ async function postCreatorSourceMessage(
   }
   const user = await userService.getUser(userId);
   try {
-    // An ordinary message of the person's (not a system line): broadcast,
-    // delivered and replied to like any other, except that it mentions
-    // nobody: the person typed task titles, not a chat message, so an
-    // `@name` in a title pings no one. Sent through the local channel; on a
-    // joint channel broadcastAndDeliver stores it in the canonical (storage)
-    // channel, where createTasks requires the source.
-    // slack-bridge-ordinary-message-producer: tasks.create_source
-    const message = await messageService.broadcastAndDeliver(input.io, input.agentOrchestrator, {
-      channelId: localChannelId,
-      senderType: "user",
-      senderId: userId,
-      senderName: user?.displayName || user?.name || "User",
+    const message = await postTaskCreatorSourceMessage(input.io, input.agentOrchestrator, {
+      localChannelId,
+      creator: { type: "user", id: userId, name: user?.displayName || user?.name || "User" },
+      taskCount: input.items.length,
       content,
-      contentMentions: false,
-      // Agents get it before the tasks exist: say what it is, so an agent
-      // doesn't take the titles as a new request to make into tasks itself.
-      agentContentPrefix: `[Posted automatically as the source of the ${input.items.length === 1 ? "task" : "tasks"} this person is creating from it in Raft now; ${input.items.length === 1 ? "it is" : "they are"} not yours unless assigned to you.]`,
       ...(input.randomId ? { randomId: input.randomId } : {}),
     });
     // A concurrent request with the same key won the insert: same rule.
@@ -812,12 +814,9 @@ async function postCreatorSourceMessage(
       refuseKeyReused();
       return null;
     }
-    if (err instanceof DmPeerNotMemberError || err instanceof JointChannelAccessChangedError) {
-      refuse(res, err.status, { code: err.code, error: err.message });
-      return null;
-    }
-    if (err instanceof channelService.ChannelArchivedError) {
-      refuse(res, 409, { code: "channel_archived", error: "This channel is archived: unarchive it before creating tasks in it." });
+    const refusal = taskCreatorSourceSendRefusal(err);
+    if (refusal) {
+      refuse(res, refusal.status, refusal.refusal);
       return null;
     }
     throw err;

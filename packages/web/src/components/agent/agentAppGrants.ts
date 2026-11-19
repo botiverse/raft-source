@@ -25,7 +25,6 @@ export interface AgentAppGrantGroup {
   name: string;
   description: string | null;
   homepageUrl: string | null;
-  agentManifestUrl: string | null;
   logoUrl: string | null;
   /** The earliest grant: when the App first got access. */
   since: string;
@@ -48,7 +47,6 @@ export function groupGrantsByApp(items: readonly AgentIntegrationItem[]): AgentA
       name: item.clientName,
       description: item.clientDescription,
       homepageUrl: item.clientHomepageUrl,
-      agentManifestUrl: item.clientAgentManifestUrl,
       logoUrl: item.clientLogoUrl ?? null,
       since: item.createdAt,
       grants: [item],
@@ -60,7 +58,8 @@ export function groupGrantsByApp(items: readonly AgentIntegrationItem[]): AgentA
 /**
  * What an App can do for an Agent, in plain words. Every scope the platform grants an App
  * (`RAFT_OAUTH_SCOPE_CATALOG` in @botiverse/raft-shared, the only scopes `oauthService` accepts)
- * belongs to one; the identity scopes together are one ability, signing in as the Agent.
+ * belongs to one, except `app:read` and `agent:voice`, which no Agent can use; the identity scopes together are one
+ * ability, signing in as the Agent.
  * `short` reads after "Can …" in the row's one line; `long` names it on its own (details, confirm).
  */
 const ABILITIES = [

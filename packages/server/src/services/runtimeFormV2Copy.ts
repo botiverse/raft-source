@@ -23,8 +23,6 @@ const ZH_CN: Readonly<Record<string, string>> = Object.freeze({
     "这台电脑上 Qwen Code 设置里的模型。也可以直接填写模型 ID。Qwen Code 没有登录：在环境变量里用 OPENAI_API_KEY、OPENAI_BASE_URL 和 OPENAI_MODEL 设置它的模型服务。",
   "Models available to this computer's Qoder login (qodercli login). You can also type a model ID.":
     "这台电脑上 Qoder 登录（qodercli login）可用的模型。也可以直接填写模型 ID。",
-  "Models available to this computer's CodeBuddy Code login. You can also type a model ID.":
-    "这台电脑上 CodeBuddy Code 登录可用的模型。也可以直接填写模型 ID。",
   "Models available to this computer's Antigravity login. AGY configured default lets Antigravity choose. You can also type a model ID.":
     "这台电脑上 Antigravity 登录可用的模型。选择 AGY configured default 则由 Antigravity 自行决定。也可以直接填写模型 ID。",
   // Field labels
@@ -81,7 +79,7 @@ const ZH_CN: Readonly<Record<string, string>> = Object.freeze({
     "这台电脑上 Pi 配置中可用的模型。也可以直接填写模型 ID。",
   "Models the selected provider offers.": "所选提供方提供的模型。",
   "These will be injected into the runtime command environment.": "这些变量会注入到运行时命令的环境中。",
-  "Use a model ID the selected provider supports.": "请填写所选提供方支持的模型 ID。",
+  "Pick a model from the list. Where the provider allows it, you can also type a model ID.": "从列表里选一个模型。提供方支持时，也可以直接填写模型 ID。",
   // Choice descriptions. Effort level names stay English, as in the web app.
   // Translated, unlike the other level names: it says what the level does.
   "No reasoning": "不推理",
@@ -113,8 +111,6 @@ const JA: Readonly<Record<string, string>> = Object.freeze({
     "このコンピューターの Qwen Code 設定にあるモデルです。モデル ID を直接入力することもできます。Qwen Code にはログインがありません。環境変数の OPENAI_API_KEY、OPENAI_BASE_URL、OPENAI_MODEL でプロバイダーを設定してください。",
   "Models available to this computer's Qoder login (qodercli login). You can also type a model ID.":
     "このコンピューターの Qoder ログイン（qodercli login）で使えるモデルです。モデル ID を直接入力することもできます。",
-  "Models available to this computer's CodeBuddy Code login. You can also type a model ID.":
-    "このコンピューターの CodeBuddy Code ログインで使えるモデルです。モデル ID を直接入力することもできます。",
   "Models available to this computer's Antigravity login. AGY configured default lets Antigravity choose. You can also type a model ID.":
     "このコンピューターの Antigravity ログインで使えるモデルです。AGY configured default を選ぶと Antigravity が選びます。モデル ID を直接入力することもできます。",
   // Field labels
@@ -171,7 +167,7 @@ const JA: Readonly<Record<string, string>> = Object.freeze({
     "このコンピューターの Pi の設定で使えるモデルです。モデル ID を直接入力することもできます。",
   "Models the selected provider offers.": "選択したプロバイダーが提供するモデルです。",
   "These will be injected into the runtime command environment.": "ランタイムのコマンド環境に注入されます。",
-  "Use a model ID the selected provider supports.": "選択したプロバイダーが対応しているモデル ID を入力してください。",
+  "Pick a model from the list. Where the provider allows it, you can also type a model ID.": "一覧からモデルを選んでください。プロバイダーが対応していれば、モデル ID を直接入力することもできます。",
   // Choice descriptions. Effort level names stay English, as in the web app.
   "No reasoning": "推論なし",
   "Answers directly, without a thinking phase": "思考せずに直接回答",
@@ -202,8 +198,6 @@ const ES: Readonly<Record<string, string>> = Object.freeze({
     "Modelos de la configuración de Qwen Code en este equipo. También puedes escribir un ID de modelo. Qwen Code no tiene inicio de sesión: configura su proveedor con OPENAI_API_KEY, OPENAI_BASE_URL y OPENAI_MODEL en Variables de entorno.",
   "Models available to this computer's Qoder login (qodercli login). You can also type a model ID.":
     "Modelos disponibles para el inicio de sesión de Qoder en este equipo (qodercli login). También puedes escribir un ID de modelo.",
-  "Models available to this computer's CodeBuddy Code login. You can also type a model ID.":
-    "Modelos disponibles para el inicio de sesión de CodeBuddy Code en este equipo. También puedes escribir un ID de modelo.",
   "Models available to this computer's Antigravity login. AGY configured default lets Antigravity choose. You can also type a model ID.":
     "Modelos disponibles para el inicio de sesión de Antigravity en este equipo. AGY configured default deja que Antigravity elija. También puedes escribir un ID de modelo.",
   // Field labels
@@ -268,7 +262,7 @@ const ES: Readonly<Record<string, string>> = Object.freeze({
   "Models the selected provider offers.": "Modelos que ofrece el proveedor seleccionado.",
   "These will be injected into the runtime command environment.":
     "Se inyectarán en el entorno del comando del runtime.",
-  "Use a model ID the selected provider supports.": "Usa un ID de modelo que admita el proveedor seleccionado.",
+  "Pick a model from the list. Where the provider allows it, you can also type a model ID.": "Elige un modelo de la lista. Si el proveedor lo permite, también puedes escribir un ID de modelo.",
   // Choice descriptions. Effort level names stay English, as in the web app.
   "No reasoning": "Sin razonamiento",
   "Answers directly, without a thinking phase": "Responde directamente, sin una fase de razonamiento",
@@ -301,8 +295,6 @@ const PT_BR: Readonly<Record<string, string>> = Object.freeze({
     "Modelos das configurações do Qwen Code neste computador. Você também pode digitar um ID de modelo. O Qwen Code não tem login: configure o provedor com OPENAI_API_KEY, OPENAI_BASE_URL e OPENAI_MODEL em Variáveis de ambiente.",
   "Models available to this computer's Qoder login (qodercli login). You can also type a model ID.":
     "Modelos disponíveis para o login do Qoder neste computador (qodercli login). Você também pode digitar um ID de modelo.",
-  "Models available to this computer's CodeBuddy Code login. You can also type a model ID.":
-    "Modelos disponíveis para o login do CodeBuddy Code neste computador. Você também pode digitar um ID de modelo.",
   "Models available to this computer's Antigravity login. AGY configured default lets Antigravity choose. You can also type a model ID.":
     "Modelos disponíveis para o login do Antigravity neste computador. AGY configured default deixa o Antigravity escolher. Você também pode digitar um ID de modelo.",
   // Field labels
@@ -368,7 +360,7 @@ const PT_BR: Readonly<Record<string, string>> = Object.freeze({
   "Models the selected provider offers.": "Modelos oferecidos pelo provedor selecionado.",
   "These will be injected into the runtime command environment.":
     "Elas serão injetadas no ambiente do comando do runtime.",
-  "Use a model ID the selected provider supports.": "Use um ID de modelo compatível com o provedor selecionado.",
+  "Pick a model from the list. Where the provider allows it, you can also type a model ID.": "Escolha um modelo da lista. Se o provedor permitir, você também pode digitar um ID de modelo.",
   // Choice descriptions. Effort level names stay English, as in the web app.
   "No reasoning": "Sem raciocínio",
   "Answers directly, without a thinking phase": "Responde diretamente, sem uma etapa de raciocínio",
@@ -401,8 +393,6 @@ const RU: Readonly<Record<string, string>> = Object.freeze({
     "Модели из настроек Qwen Code на этом компьютере. Можно также ввести ID модели. Входа в Qwen Code нет: задайте провайдера через OPENAI_API_KEY, OPENAI_BASE_URL и OPENAI_MODEL в разделе «Переменные окружения».",
   "Models available to this computer's Qoder login (qodercli login). You can also type a model ID.":
     "Модели, доступные аккаунту Qoder, под которым выполнен вход на этом компьютере (qodercli login). Можно также ввести ID модели.",
-  "Models available to this computer's CodeBuddy Code login. You can also type a model ID.":
-    "Модели, доступные аккаунту CodeBuddy Code, под которым выполнен вход на этом компьютере. Можно также ввести ID модели.",
   "Models available to this computer's Antigravity login. AGY configured default lets Antigravity choose. You can also type a model ID.":
     "Модели, доступные аккаунту Antigravity, под которым выполнен вход на этом компьютере. AGY configured default оставляет выбор за Antigravity. Можно также ввести ID модели.",
   // Field labels
@@ -467,7 +457,7 @@ const RU: Readonly<Record<string, string>> = Object.freeze({
   "Models the selected provider offers.": "Модели, которые предлагает выбранный провайдер.",
   "These will be injected into the runtime command environment.":
     "Эти переменные будут добавлены в окружение команды среды выполнения.",
-  "Use a model ID the selected provider supports.": "Укажите ID модели, который поддерживает выбранный провайдер.",
+  "Pick a model from the list. Where the provider allows it, you can also type a model ID.": "Выберите модель из списка. Если провайдер это позволяет, можно также ввести ID модели.",
   // Choice descriptions. Effort level names stay English, as in the web app.
   "No reasoning": "Без рассуждений",
   "Answers directly, without a thinking phase": "Отвечает сразу, без этапа размышлений",
@@ -500,8 +490,6 @@ const KO: Readonly<Record<string, string>> = Object.freeze({
     "이 컴퓨터의 Qwen Code 설정에 있는 모델입니다. 모델 ID를 직접 입력할 수도 있습니다. Qwen Code에는 로그인이 없습니다. 환경 변수의 OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL로 공급자를 설정하세요.",
   "Models available to this computer's Qoder login (qodercli login). You can also type a model ID.":
     "이 컴퓨터의 Qoder 로그인(qodercli login)으로 사용할 수 있는 모델입니다. 모델 ID를 직접 입력할 수도 있습니다.",
-  "Models available to this computer's CodeBuddy Code login. You can also type a model ID.":
-    "이 컴퓨터의 CodeBuddy Code 로그인으로 사용할 수 있는 모델입니다. 모델 ID를 직접 입력할 수도 있습니다.",
   "Models available to this computer's Antigravity login. AGY configured default lets Antigravity choose. You can also type a model ID.":
     "이 컴퓨터의 Antigravity 로그인으로 사용할 수 있는 모델입니다. AGY configured default를 고르면 Antigravity가 선택합니다. 모델 ID를 직접 입력할 수도 있습니다.",
   // Field labels
@@ -558,7 +546,7 @@ const KO: Readonly<Record<string, string>> = Object.freeze({
     "이 컴퓨터의 Pi 설정에서 사용할 수 있는 모델이에요. 모델 ID를 직접 입력할 수도 있어요.",
   "Models the selected provider offers.": "선택한 제공업체가 제공하는 모델이에요.",
   "These will be injected into the runtime command environment.": "런타임 명령 환경에 주입돼요.",
-  "Use a model ID the selected provider supports.": "선택한 제공업체가 지원하는 모델 ID를 입력하세요.",
+  "Pick a model from the list. Where the provider allows it, you can also type a model ID.": "목록에서 모델을 선택하세요. 제공업체가 허용하면 모델 ID를 직접 입력할 수도 있습니다.",
   // Choice descriptions. Effort level names stay English, as in the web app.
   "No reasoning": "추론 안 함",
   "Answers directly, without a thinking phase": "생각 단계 없이 바로 답해요",
@@ -589,8 +577,6 @@ const ZH_TW: Readonly<Record<string, string>> = Object.freeze({
     "這台電腦上 Qwen Code 設定裡的模型。也可以直接填寫模型 ID。Qwen Code 沒有登入：在環境變數裡用 OPENAI_API_KEY、OPENAI_BASE_URL 和 OPENAI_MODEL 設定它的模型服務。",
   "Models available to this computer's Qoder login (qodercli login). You can also type a model ID.":
     "這台電腦上 Qoder 登入（qodercli login）可用的模型。也可以直接填寫模型 ID。",
-  "Models available to this computer's CodeBuddy Code login. You can also type a model ID.":
-    "這台電腦上 CodeBuddy Code 登入可用的模型。也可以直接填寫模型 ID。",
   "Models available to this computer's Antigravity login. AGY configured default lets Antigravity choose. You can also type a model ID.":
     "這台電腦上 Antigravity 登入可用的模型。選擇 AGY configured default 則由 Antigravity 自行決定。也可以直接填寫模型 ID。",
   // Field labels
@@ -647,7 +633,7 @@ const ZH_TW: Readonly<Record<string, string>> = Object.freeze({
     "這台電腦的 Pi 設定中可用的模型。你也可以直接輸入模型 ID。",
   "Models the selected provider offers.": "所選供應商提供的模型。",
   "These will be injected into the runtime command environment.": "這些變數會注入執行環境的指令環境中。",
-  "Use a model ID the selected provider supports.": "請使用所選供應商支援的模型 ID。",
+  "Pick a model from the list. Where the provider allows it, you can also type a model ID.": "請從清單中選擇模型。供應商支援時，也可以直接輸入模型 ID。",
   // Choice descriptions. Effort level names stay English, as in the web app.
   "No reasoning": "不推理",
   "Answers directly, without a thinking phase": "直接回答，不經過思考階段",

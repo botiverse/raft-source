@@ -3,9 +3,11 @@ import { useIntl } from "react-intl";
 import { Button, TextLink, TextLinkDownloadIcon } from "@botiverse/raft-ui";
 import type { MessageId } from "../../i18n/messages";
 import api from "../../api/client";
+import { trackDesktopDownloadClicked } from "../../analytics/appDownload";
 import {
   DEFAULT_DESKTOP_PLATFORMS,
   desktopDownloadUrl,
+  desktopPlatformsFrom,
   desktopTargetOs,
   detectDesktopOs,
   detectMacArch,
@@ -16,7 +18,7 @@ import type { DesktopDownloadKind, DesktopOs, DesktopPlatforms, DesktopTarget } 
 
 async function loadDesktopPlatforms(): Promise<DesktopPlatforms> {
   const response = await api.get("/desktop-download/platforms");
-  return response.data as DesktopPlatforms;
+  return desktopPlatformsFrom(response.data);
 }
 
 let loader: () => Promise<DesktopPlatforms> = loadDesktopPlatforms;
@@ -152,6 +154,7 @@ export default function DesktopDownloadOptions() {
                 aria-label={formatMessage({ id: recommended.labelId })}
                 data-testid="desktop-download-recommended"
                 data-target={recommended.target}
+                onClick={() => trackDesktopDownloadClicked("settings_about", recommended.target, "same_tab")}
               />
             )}
             nativeButton={false}
@@ -175,7 +178,14 @@ export default function DesktopDownloadOptions() {
             <li key={option.target}>
               {option.available ? (
                 <TextLink
-                  render={<a href={desktopDownloadUrl(option.target)} aria-label={formatMessage({ id: option.labelId })} data-testid={`desktop-download-${option.target}`} />}
+                  render={(
+                    <a
+                      href={desktopDownloadUrl(option.target)}
+                      aria-label={formatMessage({ id: option.labelId })}
+                      data-testid={`desktop-download-${option.target}`}
+                      onClick={() => trackDesktopDownloadClicked("settings_about", option.target, "same_tab")}
+                    />
+                  )}
                 >
                   {formatMessage({ id: option.labelId })}
                   <TextLinkDownloadIcon />

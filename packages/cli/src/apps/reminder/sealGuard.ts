@@ -16,8 +16,24 @@ export function isReminderDueItem(item: AgentInboxAppItem): boolean {
     && item.sourceRef.revision !== undefined;
 }
 
+/**
+ * A reminder id as an agent may paste it: a full id, a short prefix, the
+ * Inbox item `reminder:<id>` that `raft inbox check` prints, or one firing
+ * `reminder:<id>:<rev>`. Returns the bare id and the revision when the paste
+ * carried one. Without this, the pasted form reached the Server as an id and
+ * came back as "not found" for a reminder that exists.
+ */
+export function parseReminderIdInput(raw: string | undefined): { id: string; revision?: string } {
+  let id = (raw ?? "").trim();
+  if (id.toLowerCase().startsWith("reminder:")) id = id.slice("reminder:".length);
+  const firing = /^([^:]+):([1-9][0-9]*)$/.exec(id);
+  if (firing) return { id: firing[1]!, revision: firing[2]! };
+  return { id };
+}
+
 export function matchesReminderId(sourceId: string, query: string): boolean {
-  return sourceId === query || sourceId.startsWith(query) || `reminder:${sourceId}` === query;
+  const id = parseReminderIdInput(query).id;
+  return id.length > 0 && sourceId.startsWith(id);
 }
 
 export async function readLocalReminderState(ctx: CommandContext): Promise<{

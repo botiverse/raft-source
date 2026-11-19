@@ -7,8 +7,9 @@ import { mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, rmSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
-import { describeNetworkError, INSTALLER_DOWNLOAD_ATTEMPTS, setInstallerDownloadRetryDelayForTests, installerArgs, installerCommand, readInstallerUpgradeEvidence, readInstallerVersion, readLastRemoteUpgradeReceipt, recordRemoteUpgradeLaunch, waitForRemoteUpgradeFailureReceipt, watchRemoteUpgradeOutcome } from "./externalInstaller";
-import { appendRemoteUpgradeStep, collectRemoteUpgradeSteps, noteServiceTransitionForRemoteUpgrade, noteStartCommandForRemoteUpgrade, startReadinessSummary, traceSafeDiagnostic } from "./remoteUpgradeTrace";
+import { describeNetworkError, INSTALLER_DOWNLOAD_ATTEMPTS, setInstallerDownloadRetryDelayForTests, installerArgs, installerCommand, installerDiagnosticCode, readInstallerUpgradeEvidence, readInstallerVersion, readLastRemoteUpgradeReceipt, recordRemoteUpgradeLaunch, recordRemoteUpgradeRefusal, remoteUpgradeInstallerFailure, waitForRemoteUpgradeFailureReceipt, watchRemoteUpgradeOutcome } from "./externalInstaller";
+import { computerUpgradeInstallerReportOfError } from "@botiverse/raft-shared";
+import { appendRemoteUpgradeStep, collectRemoteUpgradeSteps, installerPhasesMs, noteServiceTransitionForRemoteUpgrade, noteStartCommandForRemoteUpgrade, startReadinessSummary, traceSafeDiagnostic, upgradeErrorCode } from "./remoteUpgradeTrace";
 import { existsSync, utimesSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { bindUpgradeReadyAcknowledgement, prepareResidentLifecycleBridge, probeServiceIpc } from "./residentLifecycleBridge";
@@ -631,6 +632,134 @@ test("remote upgrade: a restored service reports the receipt its installer write
 });
 
 
+// The receipt as raft-computer-installer 0.4.2 writes it (rust/report.rs
+// Receipt: top-level `reason` + `code`, the engine's error in
+// `detail.diagnostic`; rust/operation.rs for the codes).
+const installerReceipt = (id: string, fields: Record<string, unknown>) => JSON.stringify({
+  protocol: "raft-computer-installer/v3", installerVersion: "raft-computer-installer/0.4.2", id, operation: "upgrade", presence: "unattended",
+  targetVersion: "1.0.60", fromVersion: "1.0.59", approvedBy: `remote:${id}`, line: "…", nextStep: null, finishedAtMs: 1, detail: {}, ...fields,
+});
+
+test("installerDiagnosticCode: only the engine's leading error class, never its text", () => {
+  assert.equal(installerDiagnosticCode("DOWNLOAD_FAILED: overall timeout"), "DOWNLOAD_FAILED");
+  assert.equal(installerDiagnosticCode("upgrade still requires recovery: DOWNLOAD_FAILED: idle timeout"), "DOWNLOAD_FAILED");
+  assert.equal(installerDiagnosticCode("SHA256_MISMATCH"), "SHA256_MISMATCH");
+  for (const value of ["release source returned HTTP 404", "error: DOWNLOAD_FAILED: x", "DOWNLOAD_FAILED-ish", `${"A".repeat(65)}: x`, "", undefined, 42, { code: "DOWNLOAD_FAILED" }]) {
+    assert.equal(installerDiagnosticCode(value), null, JSON.stringify(value));
+  }
+});
+
+test("remote upgrade: the installer receipt's outcome and codes go out as fixed fields on both paths, the text unchanged", async () => {
+  const home = mkdtempSync(join(tmpdir(), "ru-fields-"));
+  try {
+    // The release lookup failed (rust/operation.rs: Outcome::Failed, FailureCode::ReleaseResolutionFailed).
+    writeFileSync(receiptPath(home, "req-lookup"), installerReceipt("req-lookup", {
+      outcome: "failed", exitCode: 1, reason: "The requested Raft Computer release could not be resolved.", code: "release_resolution_failed",
+      detail: { diagnostic: "release source returned HTTP 503" },
+    }));
+    // The engine failed the download before the handover (FailureCode::InstallFailed, K's error in detail.diagnostic).
+    writeFileSync(receiptPath(home, "req-download"), installerReceipt("req-download", {
+      outcome: "failed", exitCode: 1, reason: "Raft Computer could not be upgraded to 1.0.60.", code: "install_failed",
+      detail: { diagnostic: "DOWNLOAD_FAILED: overall timeout" },
+    }));
+    writeFileSync(receiptPath(home, "req-rb"), installerReceipt("req-rb", {
+      outcome: "rolled-back", exitCode: 1, reason: "1.0.60 didn't start correctly.", code: "candidate_start_failed",
+      detail: { diagnostic: "DOWNLOAD_FAILED: idle timeout" },
+    }));
+    // Not a code: free text in `code` is dropped, never relayed.
+    writeFileSync(receiptPath(home, "req-odd"), installerReceipt("req-odd", {
+      outcome: "failed", exitCode: 1, reason: "x", code: "the release server could not be reached", detail: { diagnostic: "not a class" },
+    }));
+    const sleep = async () => {};
+
+    // Normal path: the launching runner's readback and the error it throws to the daemon.
+    const lookup = await waitForRemoteUpgradeFailureReceipt(home, "req-lookup", { sleep });
+    assert.deepEqual(lookup, { targetVersion: "1.0.60", outcome: "failed", reason: "The requested Raft Computer release could not be resolved.", code: "release_resolution_failed" });
+    const lookupError = remoteUpgradeInstallerFailure(lookup!);
+    assert.equal(lookupError.message, "UPGRADE_INSTALLER_FAILED: The requested Raft Computer release could not be resolved.", "the text older Servers read, unchanged");
+    assert.deepEqual(computerUpgradeInstallerReportOfError(lookupError), { installerOutcome: "failed", installerCode: "release_resolution_failed" });
+
+    const download = await waitForRemoteUpgradeFailureReceipt(home, "req-download", { sleep });
+    assert.deepEqual(computerUpgradeInstallerReportOfError(remoteUpgradeInstallerFailure(download!)), {
+      installerOutcome: "failed", installerCode: "install_failed", installerDiagnosticCode: "DOWNLOAD_FAILED",
+    });
+    const rolledBack = await waitForRemoteUpgradeFailureReceipt(home, "req-rb", { sleep });
+    assert.deepEqual(computerUpgradeInstallerReportOfError(remoteUpgradeInstallerFailure(rolledBack!)), {
+      installerOutcome: "rolled_back", installerCode: "candidate_start_failed", installerDiagnosticCode: "DOWNLOAD_FAILED",
+    });
+    const odd = await waitForRemoteUpgradeFailureReceipt(home, "req-odd", { sleep });
+    assert.deepEqual(odd, { targetVersion: "1.0.60", outcome: "failed", reason: "x" });
+    assert.deepEqual(computerUpgradeInstallerReportOfError(remoteUpgradeInstallerFailure(odd!)), { installerOutcome: "failed" });
+    // The Computer's own refusal receipt (recordRemoteUpgradeRefusal) has no code: only the outcome.
+    await recordRemoteUpgradeRefusal(home, { requestId: "req-refused", targetVersion: "1.0.60", reason: "external supervisor" });
+    assert.deepEqual(await waitForRemoteUpgradeFailureReceipt(home, "req-refused", { sleep }), { targetVersion: "1.0.60", outcome: "failed", reason: "external supervisor" });
+
+    // Late-receipt path: the successor's watch returns the codes for the daemon to send.
+    await recordRemoteUpgradeLaunch(home, { requestId: "req-late", targetVersion: "1.0.60", originServerId: "srv-a" });
+    const late = watchRemoteUpgradeOutcome(home, "srv-a", {
+      sleep: async () => {
+        writeFileSync(receiptPath(home, "req-late"), installerReceipt("req-late", {
+          outcome: "failed", exitCode: 1, reason: "Raft Computer could not be upgraded to 1.0.60.", code: "install_failed",
+          detail: { diagnostic: "upgrade still requires recovery: DOWNLOAD_FAILED: idle timeout" },
+        }));
+      },
+    });
+    assert.deepEqual(await late, {
+      requestId: "req-late", outcome: "failed", reason: "Raft Computer could not be upgraded to 1.0.60.", code: "install_failed", diagnosticCode: "DOWNLOAD_FAILED",
+    });
+    // And `ready` carries the same codes on lastUpgradeReceipt.
+    assert.deepEqual(await readLastRemoteUpgradeReceipt(home), {
+      targetVersion: "1.0.60", outcome: "failed", reason: "Raft Computer could not be upgraded to 1.0.60.", code: "install_failed", diagnosticCode: "DOWNLOAD_FAILED",
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// 9081e716 (Computer 1.25.3, 11-15): a successful upgrade's receipt came
+// after the new version's `ready`, and its steps waited for the next
+// reconnect (still unsent 1.5 h later). The successor's watch now resolves a
+// promotion too, so the daemon sends them then; sending twice sends each step
+// once. RED proof: return null for a promotion again and `succeeded` is
+// missing; drop the per-step ack and the second collect repeats them.
+test("remote upgrade: a promotion after the successor's ready is reported to the watch, and its steps are sent once", async () => {
+  const home = mkdtempSync(join(tmpdir(), "ru-watch-ok-"));
+  try {
+    await recordRemoteUpgradeLaunch(home, { requestId: "req-ok", targetVersion: "1.0.60", originServerId: "srv-a" });
+    const now = Date.now();
+    await appendRemoteUpgradeStep(home, { requestId: "req-ok", originServerId: "srv-a", step: "received", outcome: "ok", atMs: now - 60_000 });
+    await appendRemoteUpgradeStep(home, { requestId: "req-ok", originServerId: "srv-a", step: "installer_spawned", outcome: "ok", atMs: now - 50_000 });
+    await noteServiceTransitionForRemoteUpgrade(home, "service_stopped", "1.0.59", now - 40_000);
+    await noteServiceTransitionForRemoteUpgrade(home, "service_started", "1.0.60", now - 30_000);
+    await noteStartCommandForRemoteUpgrade(home, { version: "1.0.60", outcome: "ok", readiness: null }, now - 20_000);
+    let polls = 0;
+    const watched = watchRemoteUpgradeOutcome(home, "srv-a", {
+      sleep: async () => {
+        polls += 1;
+        writeFileSync(receiptPath(home, "req-ok"), installerReceipt("req-ok", { outcome: "promoted", exitCode: 0, reason: "Raft Computer 1.0.60 is running.", finishedAtMs: now - 10_000 }));
+      },
+    });
+    assert.deepEqual(await watched, { requestId: "req-ok", succeeded: true });
+    assert.equal(polls, 1);
+    // Already there when the watch starts (it raced the ready): still a promotion to send.
+    assert.deepEqual(await watchRemoteUpgradeOutcome(home, "srv-a", { sleep: async () => {} }), { requestId: "req-ok", succeeded: true });
+
+    const first = await collectRemoteUpgradeSteps(home, { serverId: "srv-a", nowMs: now });
+    const byStep = new Map(first.events.map((event) => [event.step, event]));
+    assert.deepEqual([...byStep.keys()].sort(), ["installer_finished", "installer_spawned", "new_version_started", "received", "service_started", "service_stopped", "start_command"]);
+    // Each step's own time, and the gap since the step before it.
+    assert.equal(byStep.get("new_version_started")?.atMs, now - 10_000);
+    assert.deepEqual([byStep.get("service_stopped")?.sinceStep, byStep.get("service_stopped")?.sinceStepMs], ["installer_spawned", 10_000]);
+    assert.deepEqual([byStep.get("service_started")?.sinceStep, byStep.get("service_started")?.sinceStepMs], ["service_stopped", 10_000]);
+    assert.deepEqual([byStep.get("start_command")?.sinceStep, byStep.get("start_command")?.sinceStepMs], ["service_started", 10_000]);
+    await first.ack();
+    const second = await collectRemoteUpgradeSteps(home, { serverId: "srv-a", nowMs: now + 5_000 });
+    assert.deepEqual(second.events, [], "a second flush sends nothing again");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("installer download: a network failure is named by its cause, not just `fetch failed`", () => {
   const reset = Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error("other side closed"), { code: "UND_ERR_SOCKET", cause: Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }) }) });
   assert.equal(describeNetworkError(reset), "UND_ERR_SOCKET/ECONNRESET");
@@ -809,6 +938,59 @@ test("upgrade step log: a failed receipt carries the installer's own error and i
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+// raft-computer-installer#82: a refusal behind an EARLIER unresolved
+// installation is `earlier_recovery_pending` (outcome failed, exit 1), not
+// unresolved; its code reaches the Server on computer:upgrade:done and the
+// step log carries the per-phase durations and the request's own code.
+test("an earlier_recovery_pending receipt: failed with its code on the wire; the step log carries phasesMs and requestCode, bounded", async () => {
+  const home = mkdtempSync(join(tmpdir(), "ru-earlier-"));
+  try {
+    const now = Date.now();
+    const sleep = async () => {};
+    await appendRemoteUpgradeStep(home, { requestId: "req-earlier", originServerId: "srv-a", step: "installer_spawned", outcome: "ok", atMs: now - 60_000 });
+    writeFileSync(receiptPath(home, "req-earlier"), JSON.stringify({
+      protocol: "raft-computer-installer/v3", installerVersion: "0.4.3", id: "req-earlier", operation: "upgrade", outcome: "failed", exitCode: 1,
+      targetVersion: "1.0.60", code: "earlier_recovery_pending", finishedAtMs: now - 1_000,
+      reason: "An earlier installation on this computer is unfinished and needs a repair, so nothing was changed.",
+      detail: { requestCode: "release_resolution_failed", phasesMs: JSON.stringify({ release_resolution: 812, lock_wait: 3 }) },
+    }));
+    const earlier = await waitForRemoteUpgradeFailureReceipt(home, "req-earlier", { sleep });
+    assert.equal(earlier?.outcome, "failed");
+    assert.deepEqual(computerUpgradeInstallerReportOfError(remoteUpgradeInstallerFailure(earlier!)), { installerOutcome: "failed", installerCode: "earlier_recovery_pending" });
+    const finished = (await collectRemoteUpgradeSteps(home, { serverId: "srv-a", nowMs: now })).events.find((event) => event.step === "installer_finished");
+    assert.deepEqual([finished?.errorCode, finished?.installerPhasesMs, finished?.installerRequestCode], [
+      "earlier_recovery_pending", JSON.stringify({ release_resolution: 812, lock_wait: 3 }), "release_resolution_failed",
+    ]);
+
+    // A candidate that timed out its first check: its own code; anything malformed in detail is dropped, not sent.
+    await appendRemoteUpgradeStep(home, { requestId: "req-check", originServerId: "srv-a", step: "installer_spawned", outcome: "ok", atMs: now - 60_000 });
+    writeFileSync(receiptPath(home, "req-check"), JSON.stringify({
+      protocol: "raft-computer-installer/v3", id: "req-check", operation: "upgrade", outcome: "failed", exitCode: 1, targetVersion: "1.0.60",
+      code: "candidate_check_timed_out", finishedAtMs: now - 1_000, reason: "The new Raft Computer version did not answer its first check in time; this is often the operating system scanning a newly downloaded file. Try again.",
+      detail: { requestCode: "Not A Code", phasesMs: JSON.stringify({ "/home/alice": 1 }) },
+    }));
+    const check = (await collectRemoteUpgradeSteps(home, { serverId: "srv-a", nowMs: now })).events.find((event) => event.requestId === "req-check" && event.step === "installer_finished");
+    assert.equal(check?.errorCode, "candidate_check_timed_out");
+    assert.equal("installerPhasesMs" in check!, false);
+    assert.equal("installerRequestCode" in check!, false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("installerPhasesMs keeps only a bounded object of phase names to whole milliseconds", () => {
+  assert.equal(installerPhasesMs(JSON.stringify({ candidate_check: 41_250, stop_product: 3_100 })), "{\"candidate_check\":41250,\"stop_product\":3100}");
+  for (const value of [
+    undefined, 42, "", "not json", "[]", "{}", "null",
+    JSON.stringify({ candidate_check: -1 }),
+    JSON.stringify({ candidate_check: 1.5 }),
+    JSON.stringify({ candidate_check: "41250" }),
+    JSON.stringify({ candidate_check: 7 * 24 * 60 * 60 * 1000 + 1 }),
+    JSON.stringify({ "Candidate-Check": 1 }),
+    JSON.stringify(Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`phase_${String.fromCharCode(97 + i)}`, i]))),
+  ]) assert.equal(installerPhasesMs(value), null, String(value));
 });
 
 const installerFile = (home: string, ...parts: string[]) => {
@@ -1034,4 +1216,52 @@ test("installer operation variables: scrubbed in place, configuration kept", () 
     RAFT_COMPUTER_NON_INTERACTIVE: "1", RAFT_COMPUTER_INSTALLER_CALLER: "waiting-cli-v1" };
   assert.equal(externalInstaller.scrubInstallerOperationEnv(env), env);
   assert.deepEqual(env, { PATH: "/usr/bin", RAFT_COMPUTER_INSTALLER_CHANNEL: "alpha" });
+});
+
+test("#67: the detached installer spawn is retried once with a fresh log file; two failures are one installer_launch_failed naming what failed", async () => {
+  const { EventEmitter } = await import("node:events");
+  const home = mkdtempSync(join(tmpdir(), "raft-launch-retry-"));
+  try {
+    const resolveCommand = (async () => ({ command: "/fake/raft-computer-installer", args: ["upgrade"] })) as typeof externalInstaller.installerCommand;
+    // Node throws EBADF (and every errno but EACCES/EAGAIN/EMFILE/ENFILE/ENOENT) from spawn() itself;
+    // ENOENT comes later as an 'error' event with no pid. The fake does both, like Node 24.
+    const fakeSpawn = (plan: Array<"EBADF" | "ENOENT" | "ok">) => {
+      const calls: Array<{ stdio: unknown }> = [];
+      const impl = ((_command: string, _args: readonly string[], options: { stdio: unknown }) => {
+        calls.push({ stdio: options.stdio });
+        const step = plan.shift() ?? "ok";
+        if (step === "EBADF") throw Object.assign(new Error("spawn EBADF"), { code: "EBADF", errno: -9, syscall: "spawn" });
+        const child = Object.assign(new EventEmitter(), { pid: step === "ok" ? 4321 : undefined, unref() { /* detached */ } });
+        setImmediate(() => {
+          if (step === "ok") child.emit("spawn");
+          else child.emit("error", Object.assign(new Error("spawn ENOENT"), { code: "ENOENT", errno: -2, syscall: "spawn", path: "/fake/raft-computer-installer" }));
+        });
+        return child;
+      }) as unknown as typeof import("node:child_process").spawn;
+      return { impl, calls };
+    };
+
+    const firstFails = fakeSpawn(["EBADF", "ok"]);
+    const stats: externalInstaller.InstallerDownloadStats = {};
+    const pid = await externalInstaller.launchInstallerDetached(home, ["upgrade"], "req-retry", {}, stats, undefined,
+      { spawnImpl: firstFails.impl, resolveCommand, retryDelayMs: 0 });
+    assert.equal(pid, 4321);
+    assert.equal(firstFails.calls.length, 2, "one retry");
+    // Each attempt opens the log file itself (the first open is closed before the retry; a reused fd number is fine).
+    assert.deepEqual(firstFails.calls.map((call) => typeof (call.stdio as unknown[])[1]), ["number", "number"]);
+    assert.equal(stats.spawnRetriedAfter, "spawn EBADF", "the hidden first failure stays on record");
+
+    const bothFail = fakeSpawn(["EBADF", "ENOENT"]);
+    await assert.rejects(
+      externalInstaller.launchInstallerDetached(home, ["upgrade"], "req-retry-2", {}, undefined, undefined,
+        { spawnImpl: bothFail.impl, resolveCommand, retryDelayMs: 0 }),
+      (error: unknown) => error instanceof externalInstaller.InstallerLaunchError
+        && error.message === "installer_launch_failed: spawn EBADF,spawn ENOENT (2 attempts)",
+    );
+    assert.equal(bothFail.calls.length, 2, "no third attempt");
+    assert.equal(upgradeErrorCode(new externalInstaller.InstallerLaunchError(["spawn EBADF", "spawn EBADF"], 2)), "installer_launch_failed");
+    assert.equal(new externalInstaller.InstallerLaunchError(["spawn EBADF", "spawn EBADF"], 2).message, "installer_launch_failed: spawn EBADF (2 attempts)");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });

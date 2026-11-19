@@ -1,4 +1,6 @@
 import type { DesktopWebPreviewBridge } from "@botiverse/raft-shared";
+import { getDesktopBridge } from "../../utils/desktopBridge";
+import { browserOf, useBrowserTabsStore } from "./browserTabsStore";
 import { openWebPreviewBeside, openWebPreviewInNewTab, webPreviewHostOf, webPreviewTarget } from "./webPreviewStore";
 
 /**
@@ -19,6 +21,22 @@ export function canOpenWebLinkBeside(href: string, from: Element | null, raftHos
 export function openWebLinkBeside(href: string, from: HTMLElement | null, raftHostnames: readonly string[]): void {
   const anchor = from?.isConnected ? from : null;
   if (!openWebPreviewBeside(href, anchor, anchor, raftHostnames, true)) openWebPreviewInNewTab(href);
+}
+
+/**
+ * Opens the link in a new tab of the conversation's built-in browser, behind the tab in front (Ctrl/Cmd-click, a
+ * middle click); with no browser open yet, or on a shell without tabs, as openWebLinkBeside.
+ */
+export function openWebLinkBehind(href: string, from: HTMLElement | null, raftHostnames: readonly string[]): void {
+  const anchor = from?.isConnected ? from : null;
+  const target = webPreviewTarget(href, raftHostnames);
+  const conversationId = webPreviewHostOf(anchor);
+  const browsers = useBrowserTabsStore.getState();
+  if (target && conversationId && getDesktopBridge()?.webPreview?.tabs && browserOf(browsers, conversationId)) {
+    browsers.openUrlInTab(conversationId, target.href, { background: true });
+    return;
+  }
+  openWebLinkBeside(href, from, raftHostnames);
 }
 
 interface OfferedLink {

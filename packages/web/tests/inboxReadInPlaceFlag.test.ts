@@ -300,3 +300,94 @@ test("flag on: live messages and thread replies still re-read", async () => {
     ]);
   } finally { restore(); }
 });
+
+// #244 (`mention=1/0` with `unread=0/0` after a skipped read): a task
+// conversation counts its chat replies only, while the server's @ is any
+// mention past the read cursor, so a lifecycle line that mentions the person
+// lists the row with an @ and no unread. Reading it must take the @ too: the
+// skipped re-read never brings the server's answer.
+test("flag on: reading a row with an @ on an uncounted message clears the @ (no mention drift)", async () => {
+  const task = {
+    kind: "thread",
+    threadChannelId: "thread-244",
+    parentMessageId: "parent-1",
+    parentChannelId: "channel-244",
+    latestActivityMessageId: "line-1",
+    latestActivitySeq: "50",
+    replyCount: 1,
+    unreadCount: 0,
+    hasMention: true,
+    firstUnreadMessageId: null,
+    firstMentionMessageId: "line-1",
+    lastActivityAt: "2026-11-11T10:00:00.000Z",
+    lastReplyAt: "2026-11-11T10:00:00.000Z",
+  } as unknown as InboxItem;
+  reset([task], true);
+  useInboxStore.setState({ totalUnreadCount: 0, activeUnreadCount: 0 });
+  api.post = (async () => ({ data: {}, headers: {} })) as typeof api.post;
+  try {
+    useThreadStore.getState().clearThreadUnread("thread-244");
+    await vi.advanceTimersByTimeAsync(0);
+    const row = useInboxStore.getState().items[0] as Extract<InboxItem, { kind: "thread" }>;
+    assert.equal(row.unreadCount, 0);
+    assert.equal(row.hasMention, false, "the read took the @");
+    assert.ok(row.firstMentionMessageId === null, "and its jump target");
+    assert.equal(useInboxStore.getState().totalUnreadCount, 0);
+    assert.deepEqual(reads, [], "a row showing the read skips its re-read");
+
+    // The next answer (the server's: read, no @) agrees.
+    served = [{ ...task, hasMention: false, firstMentionMessageId: null } as unknown as ChannelItem];
+    requestInboxBackgroundRefresh("message_new");
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(traces.length, 1);
+    assert.equal(traces[0].outcome, "noop");
+    assert.match(traces[0].detail, /;result=match;unread=0\/0;mention=0\/0;/);
+  } finally { restore(); }
+});
+
+test("flag on: a mention-only row (no count, its first unread is the @) keeps its @ through a read, and re-reads", async () => {
+  const mentionOnly = channelRow({ unreadCount: 0, hasMention: true, firstUnreadMessageId: "message-1", firstMentionMessageId: "message-1" });
+  reset([mentionOnly], true);
+  useInboxStore.setState({ totalUnreadCount: 0, activeUnreadCount: 0 });
+  try {
+    readAndPersist();
+    const row = useInboxStore.getState().items[0] as ChannelItem;
+    assert.equal(row.hasMention, true);
+    assert.equal(row.firstMentionMessageId, "message-1");
+    served = [mentionOnly];
+    await vi.advanceTimersByTimeAsync(0);
+    assert.deepEqual(reads, [{ reason: "realtime_fallback", trigger: "read_persisted" }], "a row still showing an @ is not the read's answer");
+  } finally { restore(); }
+});
+
+// #244 / #triage:#367: `served_ahead` with ahead=0 and unread, @ and order all
+// equal was sent as a conflict; nothing on screen differs from the answer.
+test("an answer at a newer message that agrees on unread, @ and order is a match, not served_ahead", async () => {
+  reset([channelRow()], true);
+  try {
+    readAndPersist();
+    await vi.advanceTimersByTimeAsync(0);
+    assert.deepEqual(reads, []);
+    served = [channelRow({ lastMessageId: "message-2", latestActivitySeq: "101", unreadCount: 0, firstUnreadMessageId: null })];
+    requestInboxBackgroundRefresh("message_new");
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(traces.length, 1);
+    assert.equal(traces[0].outcome, "noop");
+    assert.equal(traces[0].attrs["inbox.inplace.result"], "match");
+    assert.match(traces[0].detail, /;result=match;unread=0\/0;mention=0\/0;order=0\/0;ahead=0;served_ahead=1;/);
+  } finally { restore(); }
+});
+
+test("an answer at a newer message that disagrees still reports served_ahead with the drift", async () => {
+  reset([channelRow()], true);
+  try {
+    readAndPersist();
+    await vi.advanceTimersByTimeAsync(0);
+    served = [channelRow({ lastMessageId: "message-2", latestActivitySeq: "101", unreadCount: 1, firstUnreadMessageId: "message-2" })];
+    requestInboxBackgroundRefresh("message_new");
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(traces.length, 1);
+    assert.equal(traces[0].outcome, "conflict");
+    assert.equal(traces[0].attrs["inbox.inplace.result"], "served_ahead+unread");
+  } finally { restore(); }
+});

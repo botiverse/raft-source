@@ -424,6 +424,18 @@ export const RAFT_HINTS = {
   /** Prose naming the prepare command (a question card asked again): the card and where it goes are the caller's. */
   actionPrepareName: (): RaftHint => hint(["action", "prepare"], { name: "actions.prepare", args: {} }, ["target", "action"]),
   /**
+   * Prepare a card whose JSON is known (a request card, `raft action prepare --list`): the CLI form gives it on
+   * stdin as a quoted heredoc over three lines, as `--help` and the Manual write it (an apostrophe in the JSON
+   * can't end it; the JSON is one line, so never the delimiter). The tool form leaves `action` to fill: a card
+   * type the operation's documented schema doesn't list yet (a request card, behind its flag) is still the
+   * Server's to check, so the hint never claims it is a complete, valid call.
+   */
+  actionPrepareCard: ({ target, action }: { target: string; action: Record<string, unknown> }): RaftHint => hint(
+    ["action", "prepare", "--target", q(target), `<<'RAFTACTION'\n${JSON.stringify(action)}\nRAFTACTION`],
+    { name: "actions.prepare", args: { target } },
+    ["action"],
+  ),
+  /**
    * Fetch a Manual topic. The server refuses a fetch without a real intent and reason (12 to 500
    * characters each), so the hint always carries the text to send: the caller's own (a search's),
    * or a pointer's own words (agentText/artifacts.ts `ARTIFACT_PAGE_MANUAL_CONTEXT`). Never `…`:

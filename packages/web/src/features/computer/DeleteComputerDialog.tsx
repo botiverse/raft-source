@@ -6,10 +6,9 @@
  * agent is on it, so while the list shows one the dialog only says so.
  *
  * The person's own computer (#triage:d10ace06, Tenny; server #12858): a
- * Computer whose machine row is theirs (`userId`), the same test the server's
- * revoke uses. Not `computerAttachedByCurrentUser`: for a legacy machine an
- * admin adopted, the attacher and the row's owner differ, and the server
- * then takes the admin path (no 409, everything stays bound, DELETE refuses).
+ * Computer attached by them (`computerAttachedByCurrentUser`), the same test
+ * the server's revoke uses (servers.ts computerControllerUserId). After an
+ * adoption that is the adopter, not the machine row's previous owner.
  * only their own agents (ones they created, or their personal assistant) have
  * to go first, as DELETE still refuses them. Other people's agents, which only
  * their owners can move, don't: confirming revokes the Computer's key first
@@ -69,7 +68,7 @@ export function DeleteComputerDialog({ machine, agents, onClose }: {
   const currentUserId = useAuthStore((s) => s.user?.id ?? null);
   const serverId = useServerStore((s) => s.current?.id ?? null);
   const deleteMachine = useMachineStore((s) => s.deleteMachine);
-  const attachedByMe = machine.isComputer === true && !!currentUserId && machine.userId === currentUserId;
+  const attachedByMe = machine.isComputer === true && machine.computerAttachedByCurrentUser === true;
   const holding = attachedByMe ? agents.filter((agent) => isOwnAgent(agent, currentUserId)) : agents;
   const [phase, setPhase] = useState<Phase>({ kind: "confirm" });
   const finished = useRef(false);
@@ -166,7 +165,7 @@ export function DeleteComputerDialog({ machine, agents, onClose }: {
   }
   return (
     <ConfirmDialog
-      title={formatMessage({ id: "machine.detail.deleteComputer" })}
+      title={formatMessage({ id: "machine.detail.deleteComputerTitle" })}
       message={formatMessage({ id: "machine.detail.deleteComputerMessage" }, { name: machine.name })}
       confirmLabel={formatMessage({ id: "machine.detail.deleteComputer" })}
       loadingLabel={formatMessage({ id: "machine.detail.deleting" })}

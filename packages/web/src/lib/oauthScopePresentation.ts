@@ -5,11 +5,16 @@ export type RaftOAuthScopeId =
   | "profile"
   | "email"
   | "agent:read"
+  | "app:read"
   | "identity"
   | "agent:event:write"
-  | "agent:notification:write";
+  | "agent:notification:write"
+  | "agent:voice";
 
-export type OAuthScopeTier = "identity" | "agent_directory" | "agent_messaging";
+export type OAuthScopeTier = "identity" | "agent_directory" | "app_directory" | "agent_messaging" | "agent_voice";
+
+/** The tiers in the order every scope list shows them. */
+export const OAUTH_SCOPE_TIERS: readonly OAuthScopeTier[] = ["identity", "agent_directory", "app_directory", "agent_messaging", "agent_voice"];
 
 export type OAuthScopePresentation = {
   scope: RaftOAuthScopeId;
@@ -32,6 +37,7 @@ export type OAuthScopePresentation = {
 export const IDENTITY_OAUTH_SCOPES: RaftOAuthScopeId[] = ["openid", "profile", "identity"];
 export const OPTIONAL_IDENTITY_OAUTH_SCOPES: RaftOAuthScopeId[] = ["email"];
 export const AGENT_DIRECTORY_OAUTH_SCOPES: RaftOAuthScopeId[] = ["agent:read"];
+export const APP_DIRECTORY_OAUTH_SCOPES: RaftOAuthScopeId[] = ["app:read"];
 export const AGENT_INBOUND_OAUTH_SCOPES: RaftOAuthScopeId[] = ["agent:event:write", "agent:notification:write"];
 export const DEFAULT_DECLARED_OAUTH_SCOPES: RaftOAuthScopeId[] = [...IDENTITY_OAUTH_SCOPES];
 
@@ -74,6 +80,12 @@ export const OAUTH_SCOPE_PRESENTATION: Record<RaftOAuthScopeId, OAuthScopePresen
     copyId: "oauth.scope.agentRead.copy",
     requiresResource: false,
   },
+  "app:read": {
+    scope: "app:read",
+    tier: "app_directory",
+    copyId: "oauth.scope.appRead.copy",
+    requiresResource: false,
+  },
   "agent:event:write": {
     scope: "agent:event:write",
     tier: "agent_messaging",
@@ -85,6 +97,12 @@ export const OAUTH_SCOPE_PRESENTATION: Record<RaftOAuthScopeId, OAuthScopePresen
     tier: "agent_messaging",
     copyId: "oauth.scope.agentNotificationWrite.copy",
     requiresResource: true,
+  },
+  "agent:voice": {
+    scope: "agent:voice",
+    tier: "agent_voice",
+    copyId: "oauth.scope.agentVoice.copy",
+    requiresResource: false,
   },
 };
 
@@ -119,5 +137,7 @@ export function hasAgentInboundOAuthScope(scopes: readonly string[]): boolean {
 
 export function scopeGroupLabelId(tier: OAuthScopeTier): MessageId {
   return tier === "identity" ? "oauth.scopeGroup.identity"
-    : tier === "agent_directory" ? "oauth.scopeGroup.agentDirectory" : "oauth.scopeGroup.agentMessaging";
+    : tier === "agent_directory" ? "oauth.scopeGroup.agentDirectory"
+    : tier === "app_directory" ? "oauth.scopeGroup.appDirectory"
+    : tier === "agent_voice" ? "oauth.scopeGroup.agentVoice" : "oauth.scopeGroup.agentMessaging";
 }

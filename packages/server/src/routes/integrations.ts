@@ -65,8 +65,8 @@ import {
   type AppPromptText,
 } from "../services/appPromptTextService";
 import {
-  appsOnLinkPreviewVersion1, confirmOwnServerLinkCardActions, getActionEndpointReviewState, withdrawOwnServerLinkCardActions,
-  type OwnServerLinkCardActionsResult,
+  allowCardButtons, appsOnLinkPreviewVersion1, cardButtonsView, getActionEndpointState, withdrawCardButtons,
+  type ActionEndpointState, type CardButtonsChangeResult, type CardButtonsView,
 } from "../services/appLinkPreviewService";
 import {
   allowLinkPreviews,
@@ -330,6 +330,10 @@ integrationRouter.post("/clients", async (req, res) => {
     });
     res.json(created);
   } catch (err: any) {
+    if (err instanceof RefusalError) {
+      refuse(res, err.status, err.refusal);
+      return;
+    }
     const message = err?.message || "Failed to create OAuth client";
     if (err instanceof OAuthClientKeyTakenError) {
       res.status(409).json({ error: "Client ID is already taken" });
@@ -632,27 +636,31 @@ integrationRouter.post("/clients/:clientId/prompt-text/review", async (req, res)
   }
 });
 
-// Interactive link cards (RFC 076 §4): the App's own Server admins read its
-// action endpoint, the one in force and an added or changed one waiting for
-// marketplace review (decided in App Admin), with the last reject reason.
+// Interactive link cards (RFC 076 §4, §17): a Server's admins (manageIntegrations)
+// read an App's action endpoint and its card buttons there. On the App's own
+// Server, also the added or changed endpoint waiting for marketplace review
+// (decided in App Admin) and the last reject reason; on a Server it is
+// actively installed on, the endpoints without the reject reason (the
+// developer's). Anyone else, or an App with no link-preview registration: 404.
 integrationRouter.get("/clients/:clientId/action-endpoint", async (req, res) => {
   try {
-    const state = await getActionEndpointReviewState(req.params.clientId);
-    const isSourceAdmin = Boolean(state)
-      && state!.serverId === req.serverId
-      && await currentUserHasServerCapability(req, "manageIntegrations");
-    if (!state || !isSourceAdmin) {
+    const state = await currentUserHasServerCapability(req, "manageIntegrations")
+      ? await getActionEndpointState(req.params.clientId, req.serverId!)
+      : null;
+    if (!state) {
       res.status(404).json({ error: "App not found" });
       return;
     }
     res.setHeader("Cache-Control", "private, no-store");
+    const { own_server_actions, card_buttons } = cardButtonsAnswer(state);
     res.json({
       origin: state.origin,
       action_endpoint: state.live,
       pending_action_endpoint: state.pending,
       requested_at: state.requestedAt?.toISOString() ?? null,
-      reject_reason: state.rejectReason,
-      own_server_actions: ownServerActionsView(state),
+      reject_reason: state.source ? state.rejectReason : null,
+      own_server_actions,
+      card_buttons,
     });
   } catch (error) {
     sendJsonServerError(req, res, { error: "Failed to load the app's action endpoint", logPrefix: "Read app action endpoint error:", err: error });
@@ -660,47 +668,76 @@ integrationRouter.get("/clients/:clientId/action-endpoint", async (req, res) => 
 });
 
 /**
- * RFC 076 §17, for a server_local App only (null otherwise): what its own
- * Server's admins confirmed, when and by whom, whether its card buttons may act
- * on this Server now, and `state`, so a screen draws one case without
- * inferring it:
- * - `no_endpoint`: the App has no action endpoint in force;
- * - `not_allowed`: nothing confirmed;
- * - `endpoint_changed`: the confirmed endpoint is not the one in force (allow again);
- * - `suspended`: confirmed and in force, but the link-preview registration is
- *   suspended (its domain proof failed or names another App); it acts again
- *   once the registration is resumed;
- * - `allowed`: in force.
+ * The card-button fields of the read above and of the writes below:
+ * - `card_buttons` (cardButtonsView; null for an official App or one not
+ *   installed here): `mode`, `state`, `in_force`, `action_endpoint` (the one
+ *   in force, which an allow sends exactly), `pending_action_endpoint` (not
+ *   allowable), `allowed_action_endpoint`, `changed_at`, `changed_by`
+ *   (`{ type: "human" | "agent", id, name }` or null);
+ * - `own_server_actions`, the shape the web read before card buttons moved to
+ *   the installation (server_local Apps on their own Server only, else null):
+ *   on is `allowed` (or `suspended`) with the endpoint in force as
+ *   `confirmed_action_endpoint`, off is `not_allowed`;
+ * - `confirmed_action_endpoint` / `confirmed_at` (the writes only), what they
+ *   answered before: what acts here now (the endpoint on; the allowed one), or null.
  */
-function ownServerActionsView(state: NonNullable<Awaited<ReturnType<typeof getActionEndpointReviewState>>>) {
-  if (state.appType !== "server_local") return null;
-  const confirmed = state.ownServerActionEndpoint;
-  const view = state.live === null ? "no_endpoint"
-    : confirmed === null ? "not_allowed"
-      : confirmed !== state.live ? "endpoint_changed"
-        : state.suspended ? "suspended" : "allowed";
+function cardButtonsAnswer(state: ActionEndpointState) {
+  const view = cardButtonsView(state);
+  const legacy = view?.mode === "own_server" ? legacyOwnServerActionsView(state, view) : null;
+  const confirmed = view?.mode === "allow" ? { endpoint: view.allowedActionEndpoint, at: view.changedAt?.toISOString() ?? null }
+    : { endpoint: legacy?.confirmed_action_endpoint ?? null, at: legacy?.confirmed_at ?? null };
   return {
-    state: view,
-    confirmed_action_endpoint: confirmed,
-    confirmed_at: state.ownServerActionsConfirmedAt?.toISOString() ?? null,
-    confirmed_by: state.ownServerActionsConfirmedBy,
-    in_force: view === "allowed",
+    own_server_actions: legacy,
+    card_buttons: view && {
+      mode: view.mode,
+      state: view.state,
+      in_force: view.inForce,
+      action_endpoint: view.actionEndpoint,
+      pending_action_endpoint: view.pendingActionEndpoint,
+      allowed_action_endpoint: view.allowedActionEndpoint,
+      changed_at: view.changedAt?.toISOString() ?? null,
+      changed_by: view.changedBy,
+    },
+    confirmed_action_endpoint: confirmed.endpoint,
+    confirmed_at: confirmed.at,
+  };
+}
+
+/**
+ * `own_server_actions` for the web client that reads it (useOwnServerCardButtons):
+ * its `confirmed_at` is when the buttons were last switched on (or confirmed
+ * before the move), else the registration's last change, and
+ * `confirmed_by` who did that, when known.
+ */
+function legacyOwnServerActionsView(state: ActionEndpointState, view: CardButtonsView) {
+  const on = view.state === "on" || view.state === "suspended";
+  const switchedOn = state.lastChange && state.lastChange.eventType !== "app.link_card_actions_off" ? state.lastChange : null;
+  return {
+    state: view.state === "no_endpoint" ? "no_endpoint" as const : view.state === "off" ? "not_allowed" as const : view.state === "suspended" ? "suspended" as const : "allowed" as const,
+    confirmed_action_endpoint: on ? view.actionEndpoint : null,
+    confirmed_at: on ? (switchedOn?.at ?? state.updatedAt).toISOString() : null,
+    confirmed_by: on && switchedOn?.by ? { id: switchedOn.by.id, name: switchedOn.by.name } : null,
+    in_force: view.inForce,
   };
 }
 
 const OWN_SERVER_ACTIONS_INVALID = "OWN_SERVER_ACTIONS_INVALID";
-const OWN_SERVER_ACTIONS_NOT_SERVER_LOCAL = "OWN_SERVER_ACTIONS_NOT_SERVER_LOCAL";
 const OWN_SERVER_ACTIONS_NO_ENDPOINT = "OWN_SERVER_ACTIONS_NO_ENDPOINT";
 const OWN_SERVER_ACTIONS_ENDPOINT_CHANGED = "OWN_SERVER_ACTIONS_ENDPOINT_CHANGED";
-/** The same answer as GET .../action-endpoint for anyone who isn't the App's own Server's admin. */
+const OWN_SERVER_ACTIONS_PENDING_REVIEW = "OWN_SERVER_ACTIONS_PENDING_REVIEW";
+const OWN_SERVER_ACTIONS_OFFICIAL_APP = "OWN_SERVER_ACTIONS_OFFICIAL_APP";
+/** The same answer as GET .../action-endpoint for anyone who isn't this Server's admin, or an App not from or installed on it. */
 const OWN_SERVER_APP_NOT_FOUND = { code: "APP_NOT_FOUND", error: "No App with this id belongs to this Server." };
 
-// RFC 076 §17: the App's own Server's admins (a person with manageIntegrations
-// there; this router takes no agent credential) let a server_local App's card
-// buttons call its action endpoint on this Server, or withdraw that. The body
-// names the endpoint exactly as shown: if the App changed it meanwhile, 409
-// with the one in force, and nothing is confirmed. Anyone else, another
-// Server, an unknown App: 404, the same as the read above.
+// RFC 076 §17: a person with manageIntegrations on this Server (this router
+// takes no agent credential; agents use the agent API's card-buttons route)
+// sets the App's card buttons on its installation here. PUT: on a
+// server_local App's own Server, switch them on; anywhere else, allow them
+// for the endpoint in force. DELETE: switch off, or withdraw the allow. The
+// PUT body names the endpoint exactly as shown: if the App changed it
+// meanwhile, 409 with nothing written (a change still waiting for review:
+// 409 OWN_SERVER_ACTIONS_PENDING_REVIEW). Not this Server's admin, an App not
+// actively installed here, an unknown App: 404, the same as the read above.
 integrationRouter.put("/clients/:clientId/action-endpoint/own-server-actions", async (req, res) => {
   res.setHeader("Cache-Control", "private, no-store");
   try {
@@ -713,10 +750,10 @@ integrationRouter.put("/clients/:clientId/action-endpoint/own-server-actions", a
       refuse(res, 404, OWN_SERVER_APP_NOT_FOUND);
       return;
     }
-    const result = await confirmOwnServerLinkCardActions({ clientId: req.params.clientId, serverId: req.serverId!, userId: req.userId!, actionEndpoint });
-    sendOwnServerActionsResult(res, result);
+    const result = await allowCardButtons({ clientId: req.params.clientId, serverId: req.serverId!, actor: { type: "human", id: req.userId! }, actionEndpoint });
+    await sendCardButtonsResult(res, req.params.clientId, req.serverId!, result);
   } catch (error) {
-    sendJsonServerError(req, res, { error: "Failed to allow the app's card actions", logPrefix: "Confirm own-server card actions error:", err: error });
+    sendJsonServerError(req, res, { error: "Failed to allow the app's card actions", logPrefix: "Allow card actions error:", err: error });
   }
 });
 
@@ -727,20 +764,17 @@ integrationRouter.delete("/clients/:clientId/action-endpoint/own-server-actions"
       refuse(res, 404, OWN_SERVER_APP_NOT_FOUND);
       return;
     }
-    const result = await withdrawOwnServerLinkCardActions({ clientId: req.params.clientId, serverId: req.serverId!, userId: req.userId! });
-    sendOwnServerActionsResult(res, result);
+    const result = await withdrawCardButtons({ clientId: req.params.clientId, serverId: req.serverId!, actor: { type: "human", id: req.userId! } });
+    await sendCardButtonsResult(res, req.params.clientId, req.serverId!, result);
   } catch (error) {
-    sendJsonServerError(req, res, { error: "Failed to withdraw the app's card actions", logPrefix: "Withdraw own-server card actions error:", err: error });
+    sendJsonServerError(req, res, { error: "Failed to withdraw the app's card actions", logPrefix: "Withdraw card actions error:", err: error });
   }
 });
 
-function sendOwnServerActionsResult(res: Response, result: OwnServerLinkCardActionsResult) {
+async function sendCardButtonsResult(res: Response, clientId: string, serverId: string, result: CardButtonsChangeResult) {
   switch (result.kind) {
     case "not_found":
       refuse(res, 404, OWN_SERVER_APP_NOT_FOUND);
-      return;
-    case "not_server_local":
-      refuse(res, 409, { code: OWN_SERVER_ACTIONS_NOT_SERVER_LOCAL, error: "Only an App made on this Server and not published can have its card actions allowed here." });
       return;
     case "no_action_endpoint":
       refuse(res, 409, { code: OWN_SERVER_ACTIONS_NO_ENDPOINT, error: "This App has no action endpoint to allow yet." });
@@ -749,12 +783,18 @@ function sendOwnServerActionsResult(res: Response, result: OwnServerLinkCardActi
       // The one in force is in the GET above; the person reads it again before allowing it.
       refuse(res, 409, { code: OWN_SERVER_ACTIONS_ENDPOINT_CHANGED, error: "The App changed its action endpoint, so check the new one and allow it again." });
       return;
-    case "confirmed":
-      res.json({ confirmed_action_endpoint: result.actionEndpoint, confirmed_at: result.confirmedAt.toISOString() });
+    case "pending_review":
+      refuse(res, 409, { code: OWN_SERVER_ACTIONS_PENDING_REVIEW, error: "This action endpoint is waiting for Raft's review. Only the reviewed one in force can be allowed." });
       return;
-    case "withdrawn":
-      res.json({ confirmed_action_endpoint: null, confirmed_at: null });
+    case "official":
+      refuse(res, 409, { code: OWN_SERVER_ACTIONS_OFFICIAL_APP, error: "This is an official App: Raft decides its card buttons on every Server, so there is nothing to allow here." });
       return;
+    case "changed": {
+      const state = await getActionEndpointState(clientId, serverId);
+      const { confirmed_action_endpoint, confirmed_at, card_buttons } = state ? cardButtonsAnswer(state) : { confirmed_action_endpoint: null, confirmed_at: null, card_buttons: null };
+      res.json({ confirmed_action_endpoint, confirmed_at, card_buttons });
+      return;
+    }
   }
 }
 

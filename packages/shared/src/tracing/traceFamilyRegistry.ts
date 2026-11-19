@@ -26,6 +26,7 @@ export type TraceFamilyName =
   | "slock.web.boot_timing"
   | "slock.web.shell_keep_failed"
   | "slock.context_view"
+  | "slock.open_in_app"
   | "server.db.query";
 
 export const TRACE_JOIN_KEYS = ["clientEventId"] as const;
@@ -125,6 +126,19 @@ export const TRACE_FAMILY_REGISTRY = [
       {
         what: "Why View Context sometimes looks unresponsive (#wg-ax:#28): the check's state when the menu opens and how long it took, clicks, and each answer's outcome and time from the click",
         how: "otel.logs query over 'slock.context_view' events grouped by step/status/outcome, with wait_ms and total_ms percentiles; joined by time with server.agent_context_view.answered",
+        whoRuns: "AndyLok",
+        runbook: "docs/observability/reading-telemetry.md",
+      },
+    ],
+  },
+  {
+    family: "slock.open_in_app",
+    privacyTier: "fleet-detection",
+    entityFilterableDimensions: [],
+    consumers: [
+      {
+        what: "Whether opening a Raft link in the app works (#proj-mobile:#128, deep_links_v1 on for everyone 11-13): offers shown, Open taken, and the app taking over (handed_over vs not_handed), app_missing and downloads, by surface, platform and kind of link",
+        how: "otel.logs query over 'slock.open_in_app' events grouped by step × surface × platform (× link, signed_in); funnel offered → open → handed_over per surface and platform",
         whoRuns: "AndyLok",
         runbook: "docs/observability/reading-telemetry.md",
       },

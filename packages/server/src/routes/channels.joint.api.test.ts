@@ -1444,6 +1444,77 @@ test("joint create connects directly without email when the inviter administers 
   assert.deepEqual((await pending.json() as { invites: unknown[] }).invites, []);
 });
 
+test("a joint thread reply reaches a two-server follower once per server room, each with that server's thread id", async ({ app }) => {
+  const db = getDb();
+  const admin = await seedUser("joint-thread-two-server@slock.test", "joint-thread-two-server");
+  const hostServer = await createServer("Joint Thread Two Server Host", "botiverse", admin.id);
+  const targetServer = await createServer("Joint Thread Two Server Target", "joint-thread-two-server-target", admin.id);
+  const adminToken = await tokenForHuman(admin.email);
+
+  const createRes = await fetch(`${app.baseUrl}/api/channels`, {
+    method: "POST",
+    headers: headers(adminToken, hostServer.id),
+    body: JSON.stringify({
+      name: "two-server-thread-room",
+      visibility: "joint",
+      jointInvites: [{ targetServerSlug: targetServer.slug, invitedPeople: [`@${admin.name}`], sameAdmin: true }],
+    }),
+  });
+  assert.equal(createRes.status, 200);
+  const hostProjection = await createRes.json() as { id: string };
+
+  const parentRes = await fetch(`${app.baseUrl}/api/messages`, {
+    method: "POST",
+    headers: headers(adminToken, hostServer.id),
+    body: JSON.stringify({ channelId: hostProjection.id, content: "two-server parent" }),
+  });
+  assert.equal(parentRes.status, 200);
+  const parent = await parentRes.json() as { id: string };
+  const threadRes = await fetch(`${app.baseUrl}/api/channels/${hostProjection.id}/threads`, {
+    method: "POST",
+    headers: headers(adminToken, hostServer.id),
+    body: JSON.stringify({ parentMessageId: parent.id, content: "two-server first reply" }),
+  });
+  assert.equal(threadRes.status, 200);
+  const hostThreadId = (await threadRes.json() as { threadChannelId: string }).threadChannelId;
+  const [hostThreadRow] = await db
+    .select({ jointChannelId: jointChannelServers.jointChannelId })
+    .from(jointChannelServers)
+    .where(eq(jointChannelServers.localChannelId, hostThreadId));
+  assert.ok(hostThreadRow);
+  const [targetThreadRow] = await db
+    .select({ localChannelId: jointChannelServers.localChannelId })
+    .from(jointChannelServers)
+    .where(and(eq(jointChannelServers.jointChannelId, hostThreadRow.jointChannelId), eq(jointChannelServers.serverId, targetServer.id)));
+  assert.ok(targetThreadRow, "fixture: the joint thread is projected on the target server");
+  const targetThreadId = targetThreadRow.localChannelId;
+  assert.notEqual(targetThreadId, hostThreadId);
+  // The person follows the thread on both of their servers.
+  await recordThreadFollow("user", admin.id, hostThreadId, parent.id, "replied");
+  await recordThreadFollow("user", admin.id, targetThreadId, parent.id, "replied");
+
+  const events = installFakeIo(app.app);
+  const replyRes = await fetch(`${app.baseUrl}/api/messages`, {
+    method: "POST",
+    headers: headers(adminToken, hostServer.id),
+    body: JSON.stringify({ channelId: hostThreadId, content: "two-server follow-up" }),
+  });
+  assert.equal(replyRes.status, 200);
+
+  const replyCopies = events.filter((event) => (
+    event.event === "message:new" && (event.payload as { content?: string }).content === "two-server follow-up"
+  ));
+  const copiesIn = (room: string) => replyCopies
+    .filter((event) => event.room === room)
+    .map((event) => (event.payload as { channelId: string }).channelId);
+  assert.deepEqual(copiesIn(`user:${admin.id}:server:${hostServer.id}`), [hostThreadId],
+    "the person's host-server sockets get the host thread copy only");
+  assert.deepEqual(copiesIn(`user:${admin.id}:server:${targetServer.id}`), [targetThreadId],
+    "the person's target-server sockets get the target thread copy only");
+  assert.deepEqual(copiesIn(`user:${admin.id}`), [],
+    "a per-projection copy never goes to the user-wide room, where the other server's sockets would drop it as out of scope");
+});
+
 test("joint same-admin is opt-in, inviter-only and re-checks target authority", async ({ app }) => {
   const db = getDb();
   const admin = await seedUser("joint-same-admin-gate@slock.test", "joint-same-admin-gate");
@@ -2386,7 +2457,7 @@ test("joint channel threads use per-server local thread projections over canonic
     assert.ok(targetAgentFollow, "peer agent follow should be recorded against the peer local thread projection");
     assert.ok(
       events.some((event) => (
-        event.room === `user:${targetOwner.id}`
+        event.room === `user:${targetOwner.id}:server:${targetServer.id}`
         && event.event === "message:new"
         && (event.payload as any).channelId === targetThreadProjection.localChannelId
         && (event.payload as any).content === `hello @${targetAgent.name} @${targetOwner.name}`
@@ -2580,7 +2651,7 @@ test("joint channel threads use per-server local thread projections over canonic
     );
     assert.ok(
       events.some((event) => (
-        event.room === `user:${targetOwner.id}`
+        event.room === `user:${targetOwner.id}:server:${targetServer.id}`
         && event.event === "message:new"
         && (event.payload as any).channelId === targetThreadProjection.localChannelId
         && (event.payload as any).content === "ordinary joint thread follow-up"

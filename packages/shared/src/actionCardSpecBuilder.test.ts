@@ -40,7 +40,7 @@ const FIXTURES: Record<ActionCardActionType, { action: StoredActionCardAction; r
     result: { kind: "channel", id: ID.created, name: "launch-plan" },
   },
   "agent:create": {
-    action: { type: "agent:create", name: "scribe", description: "Takes meeting notes.", suggestedComputer: ID.mac, draftHint: "You asked for a note taker." },
+    action: { type: "agent:create", name: "scribe", description: "Takes meeting notes.", suggestedComputer: ID.mac, suggestedRuntime: "codex", draftHint: "You asked for a note taker." },
     result: { kind: "agent", id: ID.created, name: "scribe" },
   },
   "agent:migrate": {
@@ -336,7 +336,7 @@ function biggest(name: number, prose: number, scope: number, groups: number): Re
       result: { kind: "channel", id: ID.created, name: cjk(Math.min(name, 80)) },
     },
     "agent:create": {
-      action: { type: "agent:create", name: cjk(Math.min(name, 60)), description: text(500), requiredComputer: ID.mac, hosting: undefined, draftHint: text(2000) },
+      action: { type: "agent:create", name: cjk(Math.min(name, 60)), description: text(500), requiredComputer: ID.mac, suggestedRuntime: "kimi-sdk", hosting: undefined, draftHint: text(2000) },
       result: { kind: "agent", id: ID.created, name: cjk(Math.min(name, 60)) },
     },
     "channel:add_member": {

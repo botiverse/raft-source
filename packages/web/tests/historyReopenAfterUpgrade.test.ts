@@ -35,7 +35,7 @@ test("reopening a cut channel drops its paywall state and loads the page before 
     assert.equal(h.windowMeta(id).historyLimited, false, "the paywall goes at once");
     assert.ok(!(id in useHiddenHistoryStore.getState().byChannel));
     await flushAsyncWork();
-    assert.equal(h.getCalls().at(-1), `/messages/channel/${id}?limit=50&before=200`);
+    assert.equal(h.getCalls().at(-1), `/messages/channel/${id}?limit=50&before=200&threadPreviewChars=200`);
     assert.equal(h.messages(id)[0].seq, 150, "the older messages are above");
 
     // Not cut: nothing to reopen, nothing fetched.

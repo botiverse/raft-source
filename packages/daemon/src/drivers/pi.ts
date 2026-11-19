@@ -7,10 +7,12 @@ import { PiProviderCallTracker } from "./piProviderCallTracker";
 import { PI_ANTHROPIC_REQUEST_SOURCE, PiAnthropicRequestMeter } from "./piAnthropicRequests";
 import { readGatewayModelLimits, type GatewayModelLimits, type GatewayModelLimitsResult } from "../gatewayModelLimits";
 import "../bundledPiOAuth";
+import { createBuiltInSettingsManager, createPiRuntimeSettingsManager, ignoredWorkspacePiCode } from "./piBuiltInSessionInputs";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
   createAgentSessionFromServices,
   createAgentSessionServices,
@@ -26,7 +28,10 @@ import {
   type AgentSessionEvent,
 } from "@earendil-works/pi-coding-agent";
 import {
+  InMemoryCredentialStore,
+  InMemoryModelsStore,
   isContextOverflow,
+  type Api,
   type Model,
   type ModelThinkingLevel,
   type ThinkingLevel,
@@ -43,6 +48,7 @@ import {
   hydrateRuntimeConfig,
   BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS,
   isBuiltInRuntimeCustomModelPresetProviderId,
+  builtInPresetTypedModelReasons,
   PI_BUILTIN_PROVIDER_CONNECTION_PROBES,
   isBuiltInRuntimeGatewayProviderId,
   isBuiltInRuntimeProviderId,
@@ -74,6 +80,13 @@ import {
 import { buildRuntimeErrorActivityDiagnostic } from "../runtimeErrorDiagnostics";
 import { buildCliTransportSystemPrompt, prepareCliTransport } from "./cliTransport";
 import { formatBuiltInDefaultModelLimitsNote, withSystemPromptSection } from "./piModelLimitsNote";
+import {
+  agentsDirOfWorkspace,
+  assertBuiltInModelTransport,
+  piBaseUrlOrigin,
+  piCatalogProviderOrigins,
+  syncBuiltInFilteredModelsJson,
+} from "./piBuiltInModelsJson";
 import { buildPiTokenUsageEvent } from "./piEventNormalizer";
 import { createManagedMcpPiTools } from "./managedMcpTools";
 import { createPiCommandTool } from "./piCommandTool";
@@ -580,7 +593,7 @@ export function resolvePiModelFromRegistry(
   // the provider's own id (it may contain "/"), registered under exactly that
   // provider by configureBuiltInPresetCustomModel. Same rule as above: no
   // fallback, so an unregistered name fails as RuntimeModelNotFoundError.
-  const presetCustom = resolveBuiltInPresetCustomModel(runtimeConfig);
+  const presetCustom = resolveBuiltInPresetCustomModel(runtimeConfig, providerConnection);
   if (presetCustom) return modelRegistry.find(presetCustom.providerId, presetCustom.modelId);
   const [provider, ...modelParts] = modelId.split("/");
   if (provider && modelParts.length > 0) {
@@ -761,6 +774,26 @@ export function resolveBuiltInGatewayLaunch(
   return null;
 }
 
+/**
+ * The origins a Built-in session's model may send the provider key Raft
+ * seeded to: the configured gateway's endpoint, else the origins Pi's static
+ * catalog runs that provider's models on (a typed id is registered on one of
+ * them). Null for other runtimes, whose Pi config is the host's own.
+ */
+export function builtInModelTransportOrigins(
+  runtimeConfig: RuntimeConfig,
+  providerConnection: ProviderConnectionLaunchProjection | null,
+  model: { provider: string },
+): ReadonlySet<string> | null {
+  if (runtimeConfig.runtime !== "builtin") return null;
+  const gateway = resolveBuiltInGatewayLaunch(runtimeConfig, providerConnection);
+  if (gateway) {
+    const origin = piBaseUrlOrigin(gateway.baseUrl);
+    return new Set(origin ? [origin] : []);
+  }
+  return piCatalogProviderOrigins(model.provider);
+}
+
 /** What the gateway registration decided for the model's thinking contract. */
 export interface BuiltInGatewayRegistration {
   /** The on-record contract applied to this (endpoint, id) pair; null when the SDK catalog knew the pair or nothing was on record. */
@@ -897,6 +930,9 @@ export async function readBuiltInGatewayModelLimits(
  * Preset providers whose own model list follows the gateway contract
  * (docs.raft.build/developers/gateway-model-limits): OpenRouter's
  * `<base>/models` lists `context_length` and `top_provider.max_completion_tokens`.
+ * Every other provider that takes a typed id is not read (its list either
+ * carries no limits or has a shape Raft does not know): its typed model takes
+ * the agent's declared limits, else Raft's defaults.
  */
 const PRESET_MODEL_LIST_PROVIDER_IDS: ReadonlySet<string> = new Set(["openrouter"]);
 
@@ -912,24 +948,31 @@ export function builtInPresetModelListBaseUrl(providerId: string): string | null
 }
 
 /**
- * #proj-runtime:#53 follow-up to task #10: read OpenRouter's model list for a
- * typed OpenRouter model whose agent config lacks a limit, with the agent's
- * own OpenRouter key and the gateway reader's rules (5 s, 2 MB, no
- * redirects, an hour's cache per URL and key). The model is looked up by the
- * API id the config stores (normalizeBuiltInPresetCustomModel). Never throws
- * and never blocks a start.
+ * #proj-runtime:#53 follow-up to task #10: read a preset provider's model list
+ * (OpenRouter's only, PRESET_MODEL_LIST_PROVIDER_IDS) for a typed model whose
+ * agent config lacks a limit, at the provider's own catalog base URL with the
+ * agent's own key for that provider (the config's, or its saved connection's)
+ * and the gateway reader's rules (5 s, 2 MB, no redirects, an hour's cache
+ * per URL and key). The model is looked up by the API id the config stores
+ * (normalizeBuiltInPresetCustomModel). Never throws and never blocks a start;
+ * skipped for every other provider.
  */
 export async function readBuiltInPresetCustomModelLimits(
   runtimeConfig: RuntimeConfig,
   fetchImpl: typeof globalThis.fetch,
+  providerConnection: ProviderConnectionLaunchProjection | null = null,
+  launchEnvVars: Record<string, string> | null = null,
 ): Promise<GatewayModelLimitsResult & { baseUrl: string | null }> {
   const skipped = { limits: null, outcome: "skipped" as const, cached: false, baseUrl: null };
-  const presetCustom = resolveBuiltInPresetCustomModel(runtimeConfig);
-  if (!presetCustom || runtimeConfig.runtime !== "builtin" || runtimeConfig.provider.kind !== "preset") return skipped;
+  const presetCustom = resolveBuiltInPresetCustomModel(runtimeConfig, providerConnection);
+  if (!presetCustom || runtimeConfig.runtime !== "builtin") return skipped;
   const { model } = presetCustom;
   if (typeof model.contextWindow === "number" && typeof model.maxOutputTokens === "number") return skipped;
   const baseUrl = builtInPresetModelListBaseUrl(presetCustom.providerId);
-  const apiKey = runtimeConfig.provider.apiKey;
+  // The key the session itself is seeded with (seedPiSessionModelRuntime).
+  const apiKey = runtimeConfig.provider.kind === "preset"
+    ? runtimeConfig.provider.apiKey
+    : launchEnvVars?.[BUILTIN_RUNTIME_PROVIDER_ENV_KEYS[presetCustom.providerId]];
   if (!baseUrl || !apiKey) return skipped;
   const result = await readGatewayModelLimits({
     kind: "openai-compatible",
@@ -943,28 +986,45 @@ export async function readBuiltInPresetCustomModelLimits(
 
 /**
  * task #10: a Built-in agent on a preset provider that accepts a typed model id
- * (BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS, i.e. OpenRouter) whose model
- * is that typed id; null for every other config. Saved connections are not
- * covered: their model stays list-only.
+ * (BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS) whose model
+ * is that typed id; null for every other config. The provider is the
+ * config's own, or a saved preset connection's (resolved for this launch):
+ * the connection supplies only the key, so the typed id runs exactly as on
+ * the direct provider.
  */
 export function resolveBuiltInPresetCustomModel(
   runtimeConfig: RuntimeConfig,
+  providerConnection: ProviderConnectionLaunchProjection | null = null,
 ): { providerId: BuiltInRuntimeProviderId; modelId: string; model: Extract<RuntimeModelConfig, { kind: "custom" }> } | null {
   if (runtimeConfig.runtime !== "builtin" || runtimeConfig.model.kind !== "custom") return null;
-  if (runtimeConfig.provider.kind !== "preset") return null;
-  if (!isBuiltInRuntimeCustomModelPresetProviderId(runtimeConfig.provider.providerId)) return null;
-  return { providerId: runtimeConfig.provider.providerId, modelId: runtimeConfig.model.name, model: runtimeConfig.model };
+  const providerId = runtimeConfig.provider.kind === "preset"
+    ? runtimeConfig.provider.providerId
+    : runtimeConfig.provider.kind === "connection" && providerConnection && isBuiltInRuntimeProviderId(providerConnection.providerId)
+      ? providerConnection.providerId
+      : null;
+  if (!providerId || !isBuiltInRuntimeCustomModelPresetProviderId(providerId)) return null;
+  return { providerId, modelId: runtimeConfig.model.name, model: runtimeConfig.model };
 }
 
 /**
  * task #10: register a typed model id under its preset provider so the launch
- * can resolve it. Transport settings (api, base URL, headers, compat) come
- * from the catalog entry with that exact id when there is one, else from any
- * catalog model of the same provider. Limits follow the gateway order: the
- * agent's declared value, else `reportedLimits` (the provider's own model
- * list, readBuiltInPresetCustomModelLimits), else the exact catalog entry, else Raft's
- * default; a `modelOverrides` value in the agent dir's models.json wins over
- * all of them (effectiveModelLimits). Null limits when nothing was registered.
+ * can resolve it. An id the catalog lists keeps that entry's metadata
+ * (transport, compat, reasoning, thinking levels, input, limits). An id outside
+ * it gets only what the provider shares, never a sibling model's guesses:
+ * - the api, base URL and headers every catalog model of the provider shares,
+ *   and only the compat settings they all agree on (reasoning ones included);
+ * - reasoning only where every catalog model of the provider reasons
+ *   (builtInPresetTypedModelReasons; the form refuses an effort elsewhere),
+ *   text input only, no thinking levels;
+ * - limits: the agent's declared value, else `reportedLimits` (the provider's
+ *   own model list, readBuiltInPresetCustomModelLimits), else Raft's default,
+ *   which the default-limits note then names.
+ * OpenRouter, which took typed ids before the providers that share one
+ * transport did, registers an unlisted id exactly as it always has: its first
+ * catalog entry's transport and compat (its catalog mixes its Anthropic and
+ * OpenAI endpoints), reasoning on, text input, Raft's default limits.
+ * A `modelOverrides` value in the agent dir's models.json wins over all of
+ * them (effectiveModelLimits). Null limits when nothing was registered.
  */
 export function configureBuiltInPresetCustomModel(
   modelRegistry: Pick<ModelRegistry, "getAll" | "find" | "registerProvider">,
@@ -973,18 +1033,24 @@ export function configureBuiltInPresetCustomModel(
   // from the host this registration's model calls go to.
   reportedLimits: GatewayModelLimits | null = null,
   reportedFromBaseUrl: string | null = null,
+  // A saved preset connection's provider (resolveBuiltInPresetCustomModel).
+  providerConnection: ProviderConnectionLaunchProjection | null = null,
 ): { modelLimits: ModelLimits | null } {
-  const presetCustom = resolveBuiltInPresetCustomModel(runtimeConfig);
+  const presetCustom = resolveBuiltInPresetCustomModel(runtimeConfig, providerConnection);
   if (!presetCustom) return { modelLimits: null };
   const { providerId, modelId, model } = presetCustom;
   const exact = modelRegistry.find(providerId, modelId);
-  const template = exact ?? modelRegistry.getAll().find((model) => model.provider === providerId);
+  const catalog = modelRegistry.getAll().filter((candidate) => candidate.provider === providerId);
+  const template = exact ?? catalog[0];
   // No catalog model of this provider at all: nothing to copy the transport
   // from. Leave the registry alone so the launch fails as model-not-found.
   if (!template) return { modelLimits: null };
-  // OpenRouter serves one model list for every transport it offers (Pi's
-  // catalog has both `<host>/api` and `<host>/api/v1`), so the list counts
-  // when it came from the host this registration's model calls go to.
+  // Agents already running an unlisted OpenRouter id keep their exact model.
+  const asBefore = providerId === PRESET_CUSTOM_MODEL_PROVIDER_BEFORE_SHARED_TRANSPORT;
+  const compat = exact ? exact.compat : asBefore ? template.compat : sharedCompat(catalog);
+  // A provider may serve one model list for every transport it offers
+  // (OpenRouter: `<host>/api` and `<host>/api/v1`), so the list counts when it
+  // came from the host this registration's model calls go to.
   const sameOrigin = (a: string, b: string) => {
     try {
       return new URL(a).origin === new URL(b).origin;
@@ -1011,18 +1077,36 @@ export function configureBuiltInPresetCustomModel(
     models: [{
       id: modelId,
       name: exact?.name ?? modelId,
-      reasoning: exact?.reasoning ?? true,
+      reasoning: exact?.reasoning ?? builtInPresetTypedModelReasons(providerId),
       thinkingLevelMap: exact?.thinkingLevelMap,
       input: exact?.input ?? ["text"],
       cost: exact?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: modelLimits.contextWindow.value,
       maxTokens: modelLimits.maxTokens.value,
-      ...(template.compat ? { compat: template.compat } : {}),
+      ...(compat ? { compat } : {}),
     }],
   });
   return {
     modelLimits: effectiveModelLimits(modelLimits, loadedModelOverride(modelRegistry, providerId, modelId), modelRegistry.find(providerId, modelId)),
   };
+}
+
+/** The preset provider that took a typed model id before the shared-transport rule (task #10). */
+const PRESET_CUSTOM_MODEL_PROVIDER_BEFORE_SHARED_TRANSPORT: BuiltInRuntimeProviderId = "openrouter";
+
+/**
+ * The compat settings every given catalog model has with the same value: what
+ * the provider's transport needs (e.g. `maxTokensField`), never one model's
+ * own settings. Undefined when they share none.
+ */
+function sharedCompat(models: readonly Model<Api>[]): Model<Api>["compat"] {
+  const [first, ...rest] = models;
+  if (!first?.compat) return undefined;
+  const shared = Object.entries(first.compat).filter(([key, value]) =>
+    rest.every((model) => isDeepStrictEqual((model.compat as Record<string, unknown> | undefined)?.[key], value)));
+  // Pi's compat is a per-api union of optional settings: a subset of one
+  // model's own settings is a valid compat for the same api.
+  return shared.length > 0 ? Object.fromEntries(shared) as Model<Api>["compat"] : undefined;
 }
 
 export function configureBuiltInGatewayCustomModel(
@@ -1934,8 +2018,11 @@ function installProviderHttpClient(
   providerCallTracker?: PiProviderCallTracker,
   requestLog?: { log: PiRequestLog; sessionId: () => string | null },
   anthropicRequests?: PiAnthropicRequestMeter,
+  /** Throws when the model must not be called (a Built-in model off its provider's endpoint). */
+  assertModelTransport?: (model: Parameters<ModelRuntime["stream"]>[0]) => void,
 ): void {
   const fetchForModel = (model: Parameters<ModelRuntime["stream"]>[0]) => {
+    assertModelTransport?.(model);
     const prefix = model.id.split("/")[0];
     const provider = customEndpoint ? "custom" : isBuiltInRuntimeProviderId(model.provider) ? model.provider
       : isBuiltInRuntimeProviderId(prefix) ? prefix : "custom";
@@ -2073,35 +2160,64 @@ export async function openPiAgentSessionForContext(
     const spawnEnv = await buildPiSpawnEnv(ctx);
     const agentDir = opts.agentDir ?? spawnEnv.PI_CODING_AGENT_DIR ?? getAgentDir();
     mkdirSync(agentDir, { recursive: true });
-    const settingsManager = SettingsManager.create(ctx.workingDirectory, agentDir);
-    // Resolve only enabled host extensions. Keep host auth, models and other
-    // settings out of the managed Built-in session, and never install packages.
+    const builtIn = runtimeConfig.runtime === "builtin";
+    // No code or installs from the workspace; Built-in takes no credentials or
+    // settings from it either (piBuiltInSessionInputs.ts).
+    const settingsManager = builtIn
+      ? createBuiltInSettingsManager(ctx.workingDirectory, agentDir)
+      : createPiRuntimeSettingsManager(ctx.workingDirectory, agentDir);
+    const providerEnvScope = opts.isolateHostProviderEnv ? BUILTIN_BLOCKED_HOST_PROVIDER_ENV_KEYS : undefined;
+    const sessionCreateEnvPatch = buildPiSessionCreateEnvPatch(runtimeConfig, launchRuntimeFields.envVars);
+    // The session loads no extension from its package manager (noExtensions):
+    // host extensions come in as explicit paths, resolved without the
+    // workspace. Built-in takes them only when its owner opted in, and never
+    // installs a missing package; the Pi runtime always, as it always has.
     let localExtensionPaths: string[] = [];
-    if (runtimeConfig.runtime === "builtin" && runtimeConfig.loadLocalPlugins === true) {
-      const hostAgentDir = spawnEnv.PI_CODING_AGENT_DIR ?? getAgentDir();
+    if (runtimeConfig.runtime !== "builtin" || runtimeConfig.loadLocalPlugins === true) {
+      const hostAgentDir = builtIn ? spawnEnv.PI_CODING_AGENT_DIR ?? getAgentDir() : agentDir;
       const hostSettings = SettingsManager.create(ctx.workingDirectory, hostAgentDir, { projectTrusted: false });
       const hostPackages = new DefaultPackageManager({
         cwd: ctx.workingDirectory,
         agentDir: hostAgentDir,
         settingsManager: hostSettings,
       });
-      const resources = await hostPackages.resolve(async () => "skip");
+      // A Pi runtime install runs with the session's env, as the session's own resolve does.
+      const resources = await withProcessEnvPatch(
+        sessionCreateEnvPatch,
+        () => hostPackages.resolve(builtIn ? async () => "skip" : undefined),
+        { removeFirst: providerEnvScope },
+      );
       localExtensionPaths = resources.extensions.filter((entry) => entry.enabled).map((entry) => entry.path);
     }
-    const providerEnvScope = opts.isolateHostProviderEnv ? BUILTIN_BLOCKED_HOST_PROVIDER_ENV_KEYS : undefined;
-    const sessionCreateEnvPatch = buildPiSessionCreateEnvPatch(runtimeConfig, launchRuntimeFields.envVars);
+    // Refreshed from the workspace file at every session build.
+    const builtInModelsPath = runtimeConfig.runtime === "builtin"
+      ? syncBuiltInFilteredModelsJson(path.join(agentDir, "models.json"), agentsDirOfWorkspace(ctx.workingDirectory), ctx.agentId)
+      : null;
+    const transportOrigins = new Map<string, ReadonlySet<string> | null>();
+    const assertModelTransport = (model: { provider: string; id: string; baseUrl: string }): void => {
+      if (!transportOrigins.has(model.provider)) {
+        transportOrigins.set(model.provider, builtInModelTransportOrigins(runtimeConfig, managedProviderConnection, model));
+      }
+      const allowed = transportOrigins.get(model.provider);
+      if (allowed) assertBuiltInModelTransport(model, allowed);
+    };
     // #proj-runtime:#53: the gateway's model list is read while the session's
     // services are built, through a client routed like its model calls (the
     // proxy env snapshot is taken here, with the session's env patch).
-    // A typed OpenRouter model (task #10) reads OpenRouter's list the same way.
-    type ModelListRead = GatewayModelLimitsResult & { providerKind: "gateway" | "openrouter"; baseUrl: string | null };
+    // A typed model on a preset provider (task #10) reads that provider's list
+    // the same way, where Raft reads one (readBuiltInPresetCustomModelLimits).
+    // `providerKind` (the trace's `provider_kind`) is `gateway`, else the
+    // preset provider's id (`openrouter`, as it has always been traced).
+    type ModelListRead = GatewayModelLimitsResult & { providerKind: "gateway" | BuiltInRuntimeProviderId; baseUrl: string | null };
     const gatewayLimitsRead = ((): Promise<ModelListRead> => {
       const gateway = Boolean(resolveBuiltInGatewayLaunch(runtimeConfig, managedProviderConnection));
-      const presetCustom = !gateway && resolveBuiltInPresetCustomModel(runtimeConfig) !== null;
-      if (!gateway && !presetCustom) {
+      const presetCustom = gateway ? null : resolveBuiltInPresetCustomModel(runtimeConfig, managedProviderConnection);
+      // A preset provider whose list Raft does not read gets no client either
+      // (nothing to trace, not even a client that failed to start).
+      if (!gateway && (!presetCustom || !builtInPresetModelListBaseUrl(presetCustom.providerId))) {
         return Promise.resolve({ limits: null, outcome: "skipped", cached: false, providerKind: "gateway", baseUrl: null });
       }
-      const providerKind = gateway ? "gateway" as const : "openrouter" as const;
+      const providerKind = presetCustom?.providerId ?? "gateway";
       let client: ProviderHttpClient;
       try {
         client = createProviderHttpClient({ ...process.env, ...(sessionCreateEnvPatch ?? {}) }, `pi-gateway-limits:${randomUUID()}`);
@@ -2112,7 +2228,8 @@ export async function openPiAgentSessionForContext(
       const read: Promise<ModelListRead> = gateway
         ? readBuiltInGatewayModelLimits(runtimeConfig, managedProviderConnection, launchRuntimeFields.envVars, client.fetch)
           .then((result) => ({ ...result, providerKind, baseUrl: null }))
-        : readBuiltInPresetCustomModelLimits(runtimeConfig, client.fetch).then((result) => ({ ...result, providerKind }));
+        : readBuiltInPresetCustomModelLimits(runtimeConfig, client.fetch, managedProviderConnection, launchRuntimeFields.envVars)
+          .then((result) => ({ ...result, providerKind }));
       return read.finally(() => client.dispose());
     })();
     const sessionServices = await withProcessEnvPatch(sessionCreateEnvPatch, async () => {
@@ -2123,9 +2240,14 @@ export async function openPiAgentSessionForContext(
       );
       try {
         const modelRuntime = await ModelRuntime.create({
-          authPath: path.join(agentDir, "auth.json"),
-          // The user's file as is: pi-ai's default Anthropic message threads apply (#runtime-watch:#1).
-          modelsPath: path.join(agentDir, "models.json"),
+          ...(builtIn ? { credentials: new InMemoryCredentialStore() } : { authPath: path.join(agentDir, "auth.json") }),
+          // Pi: the user's file as is: pi-ai's default Anthropic message threads apply (#runtime-watch:#1).
+          // Built-in: the agent writes its models.json; Pi reads only Raft's filtered
+          // copy outside the workspace (modelOverrides limits and metadata), and no
+          // cached catalog from the workspace (piBuiltInModelsJson.ts).
+          ...(builtInModelsPath
+            ? { modelsPath: builtInModelsPath, modelsStore: new InMemoryModelsStore() }
+            : { modelsPath: path.join(agentDir, "models.json") }),
           allowModelNetwork: false,
         });
         installProviderHttpClient(modelRuntime, sessionProviderHttpClient,
@@ -2138,7 +2260,8 @@ export async function openPiAgentSessionForContext(
             }),
             sessionId: () => liveSessionId,
           } : undefined,
-          anthropicRequests);
+          anthropicRequests,
+          assertModelTransport);
         // Request-time credentials and proxy routing must be session-local.
         // Holding a process.env patch across an async SDK turn serializes every
         // Pi agent in this runner. The short create-time scope also keeps
@@ -2157,6 +2280,7 @@ export async function openPiAgentSessionForContext(
           settingsManager,
           resourceLoaderOptions: {
             additionalExtensionPaths: localExtensionPaths,
+            noExtensions: true,
             // Keeps an oversized compaction request inside the model limit (task #10).
             // Named so session rotation can tell it from a user extension.
             extensionFactories: [{ name: PI_DAEMON_EXTENSION_NAME, factory: createPiCompactionFitExtension() }],
@@ -2192,12 +2316,13 @@ export async function openPiAgentSessionForContext(
       contractDeps,
       gatewayLimits.providerKind === "gateway" ? gatewayLimits.limits : null,
     );
-    // A typed OpenRouter model (task #10) reports its limits on the same frame as a gateway one.
+    // A typed model on a preset provider (task #10) reports its limits on the same frame as a gateway one.
     const presetCustomRegistration = configureBuiltInPresetCustomModel(
       modelRegistry,
       runtimeConfig,
-      gatewayLimits.providerKind === "openrouter" ? gatewayLimits.limits : null,
+      gatewayLimits.providerKind !== "gateway" ? gatewayLimits.limits : null,
       gatewayLimits.baseUrl,
+      managedProviderConnection,
     );
     const registeredModelLimits = gatewayRegistration.modelLimits ?? presetCustomRegistration.modelLimits;
     applyPiDaemonSettingsOverrides(services.settingsManager);
@@ -2244,9 +2369,13 @@ export async function openPiAgentSessionForContext(
         requestedModel,
         modelRegistry.getAvailable().length,
       );
+      // The Pi runtime only: Built-in's models come from Raft's own presets.
+      const ignoredWorkspaceCode = builtIn ? [] : ignoredWorkspacePiCode(ctx.workingDirectory);
       traceSpan?.addEvent(`${traceEventPrefix}.missing_model`, {
         available_models_count: modelRegistry.getAvailable().length,
         requested_model: requestedModel,
+        // Names only: what the workspace asks Pi to load that Raft doesn't (a model only it defined is the missing one).
+        ...(ignoredWorkspaceCode.length > 0 ? { ignored_workspace_pi_code: ignoredWorkspaceCode.join(",") } : {}),
         ...launchTraceEvidenceAttrs,
       });
       traceSpan?.end("error", {
@@ -2259,8 +2388,12 @@ export async function openPiAgentSessionForContext(
           ...launchTraceEvidenceAttrs,
         },
       });
-      throw new RuntimeModelNotFoundError({ runtimeId: ctx.config.runtime || "pi", model: launchRuntimeFields.model });
+      throw new RuntimeModelNotFoundError({ runtimeId: ctx.config.runtime || "pi", model: launchRuntimeFields.model, ignoredWorkspaceCode, hostExtensionDir: agentDir });
     }
+    // Defence in depth behind the filtered models.json: a Built-in model whose
+    // endpoint is not its provider's (or the gateway's) never starts; every
+    // provider call checks again (installProviderHttpClient).
+    if (model) assertModelTransport(model);
 
     const toolSpawnEnv = { ...spawnEnv };
     if (opts.exposeLaunchEnvToTools === false) {
@@ -3464,8 +3597,10 @@ export class BuiltInDriver extends PiDriver {
           protocolVersion: 1,
           runtime: "builtin",
           runtimeVersion: PI_SDK_VERSION,
-          // task #10: this Computer runs a typed model id on these preset providers.
+          // task #10: this Computer runs a typed model id on these preset providers,
+          // directly and through a saved connection to one.
           customModelProviderIds: [...BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS],
+          customModelConnectionProviderIds: [...BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS],
         },
       },
     };

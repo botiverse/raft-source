@@ -82,7 +82,8 @@ export function formatRelativeTime(value: string | null | undefined, locale: str
 /**
  * How long ago, as short as it gets ("9d ago", "9 天前"), for a phone's tight lines. The same steps as
  * `formatRelativeTime`, with `numeric: "always"`: its "this minute" and "yesterday" are the long forms here. A clock
- * a little behind the server's reads as just now, never "in 0m" (the negated zero is what says past). Where a locale's
+ * a little behind the server's reads as just now, never "in 0m". Under half a minute it says "now" (the locale's own
+ * word, `numeric: "auto"` on zero seconds), not "0m ago": a zero count says nothing a reader wants. Where a locale's
  * narrow form only marks the past with a minus (Russian: "-9 дн."), which reads as a sum, it says `short` ("9 дн. назад").
  */
 export function formatShortRelativeTime(value: string | null | undefined, locale: string | string[]): string | null {
@@ -92,6 +93,7 @@ export function formatShortRelativeTime(value: string | null | undefined, locale
   const age = Math.max(0, currentTimeMs() - date.getTime());
   const { unit, ms } = relativeStep(age);
   const count = -Math.round(age / ms);
+  if (count === 0) return formatRelativeTimeParts(0, "second", locale, { numeric: "auto", style: "narrow" });
   const narrow = formatRelativeTimeParts(count, unit, locale, { numeric: "always", style: "narrow" });
   return /^[-\u2212]/.test(narrow) ? formatRelativeTimeParts(count, unit, locale, { numeric: "always", style: "short" }) : narrow;
 }

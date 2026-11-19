@@ -25,6 +25,8 @@ const {
 const { BOOT_FETCH_TAKE_WITHIN_MS, __resetBootFetchesForTest, bootSentHistoryRead } = await import("../src/boot/bootPrefetch");
 const { default: api } = await import("../src/api/client");
 const { CHANNEL_DETAIL_REASON_HEADER } = await import("../src/store/channelDetailReason");
+const { THREAD_PREVIEW_PARAM, latestPagePath } = await import("../src/store/channelPageQuery");
+const { latestPageRequest } = await import("../src/store/messagePagePrefetch");
 const { WEB_APP_VERSION } = await import("../src/utils/webAppVersion");
 const { clientRequestHeaders } = await import("../src/utils/clientPlatformHint");
 const { __setWebHttpClientTraceSinkForTest } = await import("../src/utils/webHttpClientTrace");
@@ -109,7 +111,7 @@ describe("the boot script's prefetch", () => {
       "/auth/me",
       "/servers",
       `/channels/${CHANNEL_ID}`,
-      `/messages/channel/${CHANNEL_ID}?limit=50`,
+      `/messages/channel/${CHANNEL_ID}?limit=50&threadPreviewChars=200`,
       "/channels?archived=include",
       "/channels/dm",
       `/servers/${SERVER_ID}/sidebar-order`,
@@ -134,7 +136,7 @@ describe("the boot script's prefetch", () => {
     runBootScript(`/s/acme/dm/${CHANNEL_ID}`, { fetch, target: {} });
     assert.deepEqual(paths(sent), ["/auth/me", "/servers"]);
     await flush();
-    assert.deepEqual(paths(sent).slice(2, 4), [`/channels/${CHANNEL_ID}`, `/messages/channel/${CHANNEL_ID}?limit=50`]);
+    assert.deepEqual(paths(sent).slice(2, 4), [`/channels/${CHANNEL_ID}`, `/messages/channel/${CHANNEL_ID}?limit=50&threadPreviewChars=200`]);
     assert.equal(sent.at(-1)?.headers["X-Server-Id"], SERVER_ID);
   });
 
@@ -189,7 +191,7 @@ describe("on the server's root", () => {
         "/auth/me",
         "/servers",
         `/channels/${GUESS_ID}`,
-        `/messages/channel/${GUESS_ID}?limit=50`,
+        `/messages/channel/${GUESS_ID}?limit=50&threadPreviewChars=200`,
         "/channels?archived=include",
         "/channels/dm",
         `/servers/${SERVER_ID}/sidebar-order`,
@@ -222,11 +224,11 @@ describe("on the server's root", () => {
 
   test("a guess the list lands on is taken; one it doesn't land on is never taken, and the real conversation is asked for", async () => {
     rememberedRoot();
-    runBootScript("/s/acme", { fetch: fakeFetch({ [`/messages/channel/${GUESS_ID}?limit=50`]: { body: { messages: ["guessed"] } } }).fetch, wide: true });
-    const real = await api.get(`/messages/channel/${REAL_ID}?limit=50`, { headers: { "X-Server-Id": SERVER_ID } });
+    runBootScript("/s/acme", { fetch: fakeFetch({ [`/messages/channel/${GUESS_ID}?limit=50&threadPreviewChars=200`]: { body: { messages: ["guessed"] } } }).fetch, wide: true });
+    const real = await api.get(`/messages/channel/${REAL_ID}?limit=50&threadPreviewChars=200`, { headers: { "X-Server-Id": SERVER_ID } });
     assert.deepEqual(real.data, { from: "network" });
-    assert.deepEqual(network, [`/messages/channel/${REAL_ID}?limit=50`]);
-    const guessed = await api.get(`/messages/channel/${GUESS_ID}?limit=50`, { headers: { "X-Server-Id": SERVER_ID } });
+    assert.deepEqual(network, [`/messages/channel/${REAL_ID}?limit=50&threadPreviewChars=200`]);
+    const guessed = await api.get(`/messages/channel/${GUESS_ID}?limit=50&threadPreviewChars=200`, { headers: { "X-Server-Id": SERVER_ID } });
     assert.deepEqual(guessed.data, { messages: ["guessed"] }, "the guessed page is kept for its own request only");
     assert.equal(network.length, 1);
   });
@@ -259,11 +261,70 @@ describe("the API client adopts it", () => {
     assert.equal(paths(boot.sent).filter((path) => path === "/auth/me").length, 1);
   });
 
+  /** The page on a cold device: the conversation URL, a token, no theme cache; the boot's /servers answers when `release` is called. */
+  function coldBoot(answers: Parameters<typeof fakeFetch>[0] = {}) {
+    Object.defineProperty(globalThis, "location", { configurable: true, value: new URL(`${PAGE}/s/acme/channel/${CHANNEL_ID}`) });
+    storage.setItem("slock_access_token", jwt(600));
+    const boot = fakeFetch({ "/servers": { body: [{ id: SERVER_ID, slug: "acme" }] }, ...answers });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const fetch = (url: string, init: { headers: Record<string, string> }) =>
+      url.endsWith("/api/servers") ? gate.then(() => boot.fetch(url, init)) : boot.fetch(url, init);
+    runBootScript(`/s/acme/channel/${CHANNEL_ID}`, { fetch });
+    return { boot, release };
+  }
+  afterEach(() => {
+    Object.defineProperty(globalThis, "location", { configurable: true, value: new URL(`${PAGE}/s/acme/channel/c1`) });
+  });
+
+  test("without the server's id on the device, the boot's read the app asks for first waits for the boot's own instead of racing it", async () => {
+    const { boot, release } = coldBoot({ [`/messages/channel/${CHANNEL_ID}?limit=50&threadPreviewChars=200`]: { body: { messages: [{ id: "m1" }] } } });
+    const asked = api.get(`/messages/channel/${CHANNEL_ID}?limit=50&threadPreviewChars=200`, { headers: { "X-Server-Id": SERVER_ID } });
+    assert.deepEqual(network, [], "waiting, not sent");
+    release();
+    const { data } = await asked;
+    assert.deepEqual(data, { messages: [{ id: "m1" }] }, "the boot's answer");
+    assert.deepEqual(network, [], "the app sent nothing itself");
+    assert.equal(paths(boot.sent).filter((path) => path.startsWith("/messages/")).length, 1, "one messages read in all");
+  });
+
+  test("every other request still leaves inside the call, even while the boot's wait is on", async () => {
+    const { release } = coldBoot();
+    const first = api.get(`/servers/${SERVER_ID}/machines`, { headers: { "X-Server-Id": SERVER_ID } });
+    assert.deepEqual(network, [`/servers/${SERVER_ID}/machines`], "a server read the boot doesn't send: sent before api.get returns");
+    const second = api.get("/release-notes");
+    assert.equal(network.at(-1), "/release-notes", "no server header: sent before api.get returns");
+    const otherConversation = api.get("/messages/channel/someone-else?limit=50&threadPreviewChars=200", { headers: { "X-Server-Id": SERVER_ID } });
+    assert.equal(network.at(-1), "/messages/channel/someone-else?limit=50&threadPreviewChars=200", "another conversation's messages: not the boot's, no wait");
+    release();
+    await Promise.all([first, second, otherConversation]);
+  });
+
+  test("a request aborted while it waits leaves the boot's answer for the next ask", async () => {
+    const read = `/messages/channel/${CHANNEL_ID}?limit=50&threadPreviewChars=200`;
+    const { release } = coldBoot({ [read]: { body: { messages: [{ id: "m1" }] } } });
+    const controller = new AbortController();
+    const aborted = api.get(read, { headers: { "X-Server-Id": SERVER_ID }, signal: controller.signal });
+    controller.abort();
+    await aborted.catch(() => undefined);
+    release();
+    await flush();
+    const before = network.length; // the aborted ask reaches the network adapter, which cancels it (as before this wait)
+    const { data } = await api.get(read, { headers: { "X-Server-Id": SERVER_ID } });
+    assert.deepEqual(data, { messages: [{ id: "m1" }] }, "the boot's answer, still there");
+    assert.equal(network.length, before, "the next ask took it: nothing sent");
+  });
+
+  test("with no boot script, a GET leaves inside the call", () => {
+    void api.get("/release-notes");
+    assert.deepEqual(network, ["/release-notes"]);
+  });
+
   test("a server-scoped read is taken only with the same server; the answer's headers come along", async () => {
-    bootOnChannel({ [`/messages/channel/${CHANNEL_ID}?limit=50`]: { body: { messages: [] }, headers: { "x-sync-horizon": "42" } } });
-    const other = await api.get(`/messages/channel/${CHANNEL_ID}?limit=50`, { headers: { "X-Server-Id": "1b6f3c2e-1d5a-4e8b-9c7f-2a4d6e8f0a1b" } });
+    bootOnChannel({ [`/messages/channel/${CHANNEL_ID}?limit=50&threadPreviewChars=200`]: { body: { messages: [] }, headers: { "x-sync-horizon": "42" } } });
+    const other = await api.get(`/messages/channel/${CHANNEL_ID}?limit=50&threadPreviewChars=200`, { headers: { "X-Server-Id": "1b6f3c2e-1d5a-4e8b-9c7f-2a4d6e8f0a1b" } });
     assert.deepEqual(other.data, { from: "network" }, "another server: asked itself");
-    const same = await api.get(`/messages/channel/${CHANNEL_ID}?limit=50`, { headers: { "X-Server-Id": SERVER_ID } });
+    const same = await api.get(`/messages/channel/${CHANNEL_ID}?limit=50&threadPreviewChars=200`, { headers: { "X-Server-Id": SERVER_ID } });
     assert.deepEqual(same.data, { messages: [] });
     assert.equal(same.headers.get?.("x-sync-horizon") ?? same.headers["x-sync-horizon"], "42");
     assert.equal(network.length, 1);
@@ -277,6 +338,15 @@ describe("the API client adopts it", () => {
     storage.setItem("slock_access_token", jwt(900));
     await api.get("/servers");
     assert.deepEqual(network, [`/channels/${CHANNEL_ID}`, "/servers"]);
+  });
+
+  test("the boot script's latest page is the app's own first page (the same URL), so the app takes it", async () => {
+    const boot = bootOnChannel({ [latestPagePath(CHANNEL_ID)]: { body: { messages: [{ id: "m1" }] } } });
+    assert.ok(paths(boot.sent).includes(latestPageRequest(CHANNEL_ID).url), "the boot sends loadMessages' latest page");
+    assert.ok(paths(boot.sent).includes(`/messages/channel/${CHANNEL_ID}?limit=50&${THREAD_PREVIEW_PARAM}`), "50 messages, previews cut");
+    const { data } = await api.get(latestPageRequest(CHANNEL_ID).url, { headers: { "X-Server-Id": SERVER_ID } });
+    assert.deepEqual(data, { messages: [{ id: "m1" }] }, "taken, not sent again");
+    assert.deepEqual(network, []);
   });
 
   test("a failed or 401 boot answer is never surfaced: the app's own request goes out (and takes the usual 401 path)", async () => {

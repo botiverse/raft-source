@@ -60,6 +60,7 @@ import {
   DAEMON_CAPABILITY_SEQUENCED_STATUS,
   DAEMON_CAPABILITY_INTERRUPT_SUBAGENT,
   DAEMON_CAPABILITY_INTERRUPT_TURN,
+  DAEMON_CAPABILITY_AGENT_SIDE_ASK,
   DAEMON_CAPABILITY_RUNTIME_AUTH,
   DAEMON_CAPABILITY_RUNTIME_AUTH_V2,
   DAEMON_CAPABILITY_RUNTIME_AUTH_QWEN_PROVIDER,
@@ -68,7 +69,6 @@ import {
   DAEMON_CAPABILITY_RUNTIME_AUTH_PI,
   DAEMON_CAPABILITY_RUNTIME_AUTH_GROK,
   DAEMON_CAPABILITY_RUNTIME_AUTH_OPENCODE,
-  DAEMON_CAPABILITY_RUNTIME_AUTH_CODEBUDDY,
   DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET,
   DAEMON_CAPABILITY_RUNTIME_ACCOUNT_USAGE_ANTIGRAVITY,
   DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET_CLAUDE_KINDS,
@@ -103,6 +103,7 @@ import {
   DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CODEX,
   DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR,
   DAEMON_CAPABILITY_RUNTIME_HOST_OAR_GROK,
+  DAEMON_CAPABILITY_RUNTIME_HOST_OAR_OPENCODE,
   DAEMON_CAPABILITY_AGENT_CONTEXT_VIEW_V0,
   DAEMON_CAPABILITY_AGENT_CONTEXT_SEARCH_V0,
   DAEMON_CAPABILITY_AGENT_CONTEXT_VIEW_CODEX_ROOT_V1,
@@ -124,6 +125,7 @@ import {
   SERVER_CAPABILITY_START_SPAWN_ERROR_V1,
   SERVER_CAPABILITY_SERVER_FEATURES_V1,
   SERVER_CAPABILITY_MIGRATION_BACKUP_IGNORE_SOURCES_V1,
+  SERVER_CAPABILITY_MIGRATION_IGNORED_PARTIAL_V1,
   SERVER_CAPABILITY_MIGRATION_USER_IGNORE_RECEIPT_V1,
   SERVER_CAPABILITY_MIGRATION_SOURCE_DRAIN_PROGRESS_V1,
   type AgentMigrationSourceDrainWaitingFor,
@@ -223,7 +225,7 @@ import {
   runProviderProbeCanary,
   type ProbeMaterialization,
 } from "./providerProbe";
-import { isProviderProbeRuntime } from "@botiverse/raft-shared";
+import { computerUpgradeInstallerReportOfError, isProviderProbeRuntime, parseComputerUpgradeInstallerReport } from "@botiverse/raft-shared";
 import { VERSION as PI_SDK_VERSION } from "@earendil-works/pi-coding-agent";
 import { asProviderProbeId } from "@botiverse/raft-shared";
 import { assertLegacyDaemonKeyNotAdoptedByComputer } from "./computerMigrationGuard";
@@ -421,7 +423,7 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
   // closed sets only, never the account). These four were emitted since #11069
   // but missing here, so the filter dropped them (#oar-raft:eea998ea).
   "daemon.runtime_auth.status.reported": {
-    spanAttrs: ["trigger", ...(["claude", "codex", "kimi", "qoder", "qwen", "antigravity", "pi", "grok", "opencode", "codebuddy"] as const).flatMap((runtime) => [
+    spanAttrs: ["trigger", ...(["claude", "codex", "kimi", "qoder", "qwen", "antigravity", "pi", "grok", "opencode"] as const).flatMap((runtime) => [
       runtime,
       `${runtime}_method`,
       `${runtime}_plan`,
@@ -486,11 +488,12 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
   // Never the key. Claude adds the kind clicked and whether Claude's older
   // program spent its 5-hour reset unasked; `operation: "read"` is a read of
   // the resets held, with Claude Code's version and counts of kinds by state.
-  // Never screen text.
+  // A failed Claude Code start adds OAR's word for its last screen
+  // (`startup_screen`, e.g. `prompt_with_text`). Never screen text.
   "daemon.runtime_account_usage.limit_reset": {
     spanAttrs: [
       "outcome", "provider", "reason", "snapshot_sent", "limit_resets_available", "duration_ms",
-      "operation", "reset_kind", "claude_version", "oar_outcome", "program", "five_hour_spent", "available_kinds", "unknown_kinds",
+      "operation", "reset_kind", "claude_version", "oar_outcome", "startup_screen", "program", "five_hour_spent", "available_kinds", "unknown_kinds",
     ],
   },
   "daemon.app_config.receive": {
@@ -859,14 +862,29 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
   // receipt_outcome, the engine's own error (engine_diagnostic, redacted like
   // `diagnostic`), K's operation phase/outcome/reason (engine_*), and the
   // installer's last start (last_start_*: slot candidate/previous, version,
-  // succeeded, failure class and exit code; never stderr).
+  // succeeded, failure class and exit code; never stderr), and from
+  // raft-computer-installer#82 on the installer's per-phase durations
+  // (installer_phases_ms: JSON of phase names to ms, at most 16, validated on
+  // the Computer) and the code the request itself failed with behind an
+  // earlier installation (installer_request_code).
   // `installer_receipt_updated` is a later rewrite of an unresolved receipt;
   // `after_receipt` marks a service stop/start after the receipt existed.
+  // `at_ms` is when the step happened on the Computer (epoch ms), not when it
+  // was reported; `since_step` / `since_step_ms` say how long after the step
+  // before it (drain end → installer_spawned → service_stopped →
+  // service_started → start_command); `waited_for` / `not_quiet` / `runners`
+  // on `drain` are what the runners' drain ended with.
   "daemon.computer_upgrade.step": {
     spanAttrs: [
       "request_id",
       "step",
       "outcome",
+      "at_ms",
+      "since_step",
+      "since_step_ms",
+      "waited_for",
+      "not_quiet",
+      "runners",
       "from_version",
       "target_version",
       "duration_ms",
@@ -876,6 +894,8 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
       "after_deadline",
       "supervisor",
       "kill_mode",
+      "channel",
+      "installer_channel",
       "bytes",
       "version",
       "phase",
@@ -885,6 +905,8 @@ export const DAEMON_CORE_TRACE_ATTR_CONTRACTS = {
       "start_exit_code",
       "installer_version",
       "receipt_outcome",
+      "installer_phases_ms",
+      "installer_request_code",
       "engine_diagnostic",
       "engine_phase",
       "engine_outcome",
@@ -1831,9 +1853,15 @@ export interface DaemonCoreOptions {
    * After a `ready` without the receipt of a web upgrade still inside its
    * deadline: resolves with the installer's failure once its receipt appears,
    * or null. A rolled-back installer restarts this (old) service before it
-   * writes the receipt, so that `ready` could not carry it.
+   * writes the receipt, so that `ready` could not carry it. A promoted
+   * receipt resolves `{ succeeded: true }`: the new version's `ready` came
+   * before it, and its steps are sent then.
    */
-  watchComputerUpgradeOutcome?: () => Promise<{ requestId: string; outcome: string; reason: string } | null>;
+  watchComputerUpgradeOutcome?: () => Promise<
+    | { requestId: string; succeeded: true }
+    | { requestId: string; outcome: string; reason: string; code?: string; diagnosticCode?: string }
+    | null
+  >;
   /** Durable managed-Computer operation acknowledgements waiting for receipt. */
   getComputerLifecycleAcks?: () => ComputerLifecycleExecutionAck[];
   /** Fresh, async machine attestation used only for ready-phase evidence. */
@@ -1951,6 +1979,9 @@ export interface ComputerUpgradeStepTrace {
   reason?: string;
   supervisor?: string;
   killMode?: string;
+  /** On `received`: the Computer's release channel and the installer channel it fetches from. */
+  channel?: string;
+  installerChannel?: string;
   bytes?: number;
   version?: string;
   phase?: string;
@@ -1960,6 +1991,8 @@ export interface ComputerUpgradeStepTrace {
   startExitCode?: number;
   installerVersion?: string;
   receiptOutcome?: string;
+  installerPhasesMs?: string;
+  installerRequestCode?: string;
   engineDiagnostic?: string;
   enginePhase?: string;
   engineOutcome?: string;
@@ -1970,6 +2003,13 @@ export interface ComputerUpgradeStepTrace {
   lastStartFailure?: string;
   lastStartExitCode?: number;
   afterReceipt?: boolean;
+  /** The step before this one on the way to the new service, and how long after it this one happened. */
+  sinceStep?: string;
+  sinceStepMs?: number;
+  /** On `drain`: agents the runners waited for, agents not quiet at the end, runners drained. */
+  waitedFor?: number;
+  notQuiet?: number;
+  runners?: number;
 }
 
 export interface ComputerControlContext {
@@ -2287,6 +2327,9 @@ function summarizeIncomingMessage(msg: ServerToMachineMessage): string {
       return `(agent=${msg.agentId}, runtime=${msg.config?.runtime}, model=${msg.config?.model}, revision=${msg.revision})`;
     case "agent:stop":
       return `(agent=${msg.agentId})`;
+    case "agent:side-ask":
+      // Never the question or the asker: the kind only.
+      return `(agent=${msg.agentId}, kind=${msg.kind}, request=${msg.requestId.slice(0, 8)})`;
     case "agent:wake:outcome":
       return `(agent=${msg.agentId}, wake=${msg.wakeRequestId.slice(0, 8)}, outcome=${msg.outcome}${msg.reason ? `, reason=${msg.reason}` : ""})`;
     case "agent:reset-workspace":
@@ -2409,6 +2452,20 @@ export function migrationSummaryMayReportIgnoreSources(
   lease: Pick<AgentMigrationTransportLeaseMessage, "targetAcceptsIgnoreSources">,
 ): boolean {
   return serverAccepts && lease.targetAcceptsIgnoreSources === true;
+}
+
+/**
+ * Whether a migration source may mark its ignored totals partial
+ * (`excludedIgnoredPartial`). Both ends must accept it, as with
+ * migrationSummaryMayReportIgnoreSources: the Server (capability
+ * `migration:ignored-partial-v1`) and the target (the source lease's
+ * `targetAcceptsIgnoredPartial`).
+ */
+export function migrationSummaryMayReportIgnoredPartial(
+  serverAccepts: boolean,
+  lease: Pick<AgentMigrationTransportLeaseMessage, "targetAcceptsIgnoredPartial">,
+): boolean {
+  return serverAccepts && lease.targetAcceptsIgnoredPartial === true;
 }
 
 /**
@@ -3472,13 +3529,20 @@ export class DaemonCore {
     return this.computerUpgradeStepFlush;
   }
 
-  private recordComputerUpgradeStep(event: Omit<ComputerUpgradeStepTrace, "atMs">): void {
+  private recordComputerUpgradeStep(event: ComputerUpgradeStepTrace): void {
     this.recordDaemonEvent("daemon.computer_upgrade.step", {
       request_id: event.requestId,
       step: event.step,
       outcome: event.outcome,
+      // When it happened; the event's own time is when it was reported.
+      ...(Number.isFinite(event.atMs) ? { at_ms: event.atMs } : {}),
       delivered_late_ms: event.deliveredLateMs,
       after_deadline: event.afterDeadline,
+      ...(event.sinceStep !== undefined ? { since_step: event.sinceStep } : {}),
+      ...(event.sinceStepMs !== undefined ? { since_step_ms: event.sinceStepMs } : {}),
+      ...(event.waitedFor !== undefined ? { waited_for: event.waitedFor } : {}),
+      ...(event.notQuiet !== undefined ? { not_quiet: event.notQuiet } : {}),
+      ...(event.runners !== undefined ? { runners: event.runners } : {}),
       ...(event.fromVersion !== undefined ? { from_version: event.fromVersion } : {}),
       ...(event.targetVersion !== undefined ? { target_version: event.targetVersion } : {}),
       ...(event.durationMs !== undefined ? { duration_ms: event.durationMs } : {}),
@@ -3486,6 +3550,8 @@ export class DaemonCore {
       ...(event.reason !== undefined ? { reason: event.reason } : {}),
       ...(event.supervisor !== undefined ? { supervisor: event.supervisor } : {}),
       ...(event.killMode !== undefined ? { kill_mode: event.killMode } : {}),
+      ...(event.channel !== undefined ? { channel: event.channel } : {}),
+      ...(event.installerChannel !== undefined ? { installer_channel: event.installerChannel } : {}),
       ...(event.bytes !== undefined ? { bytes: event.bytes } : {}),
       ...(event.version !== undefined ? { version: event.version } : {}),
       ...(event.phase !== undefined ? { phase: event.phase } : {}),
@@ -3495,6 +3561,8 @@ export class DaemonCore {
       ...(event.startExitCode !== undefined ? { start_exit_code: event.startExitCode } : {}),
       ...(event.installerVersion !== undefined ? { installer_version: event.installerVersion } : {}),
       ...(event.receiptOutcome !== undefined ? { receipt_outcome: event.receiptOutcome } : {}),
+      ...(event.installerPhasesMs !== undefined ? { installer_phases_ms: event.installerPhasesMs } : {}),
+      ...(event.installerRequestCode !== undefined ? { installer_request_code: event.installerRequestCode } : {}),
       ...(event.engineDiagnostic !== undefined ? { engine_diagnostic: event.engineDiagnostic } : {}),
       ...(event.enginePhase !== undefined ? { engine_phase: event.enginePhase } : {}),
       ...(event.engineOutcome !== undefined ? { engine_outcome: event.engineOutcome } : {}),
@@ -3514,6 +3582,7 @@ export class DaemonCore {
       requestId,
       step: "reported",
       outcome: sent ? "ok" : "failed",
+      atMs: Date.now(),
       deliveredLateMs: 0,
       afterDeadline: false,
       via,
@@ -3532,6 +3601,16 @@ export class DaemonCore {
       .then(() => watch())
       .then((failure) => {
         if (!failure) return;
+        // A successful upgrade's receipt came after this version's `ready`:
+        // send its steps now, not at the next reconnect (once; the flush
+        // acknowledges each step, so a later one sends nothing again). That
+        // flush removes the finished log, so the next reconnect's `reported`
+        // (via ready) never comes: this one says the success reached a
+        // connected runner.
+        if ("succeeded" in failure) {
+          this.recordComputerUpgradeReported(failure.requestId, "late_receipt", this.connection.connected);
+          return this.flushComputerUpgradeSteps(false);
+        }
         const sent = this.connection.connected;
         if (sent) {
           this.connection.send({
@@ -3540,6 +3619,12 @@ export class DaemonCore {
             ok: false,
             code: failure.outcome === "rolled_back" ? "upgrade_rolled_back" : "upgrade_installer_failed",
             reason: failure.reason.replace(/[\u0000-\u001f\u007f]+/gu, " ").slice(0, 2048),
+            // The receipt's own outcome and codes as fixed fields (validated; absent when malformed).
+            ...parseComputerUpgradeInstallerReport({
+              installerOutcome: failure.outcome,
+              installerCode: failure.code,
+              installerDiagnosticCode: failure.diagnosticCode,
+            }),
           });
         }
         this.recordComputerUpgradeReported(failure.requestId, "late_receipt", sent);
@@ -4032,6 +4117,7 @@ export class DaemonCore {
       signal,
       onProgress: this.createMigrationSourceProgressReporter(lease, signal, userIgnoreReceipt),
       reportIgnoredBySource: () => migrationSummaryMayReportIgnoreSources(this.serverAcceptsMigrationIgnoreSources(), lease),
+      reportIgnoredPartial: () => migrationSummaryMayReportIgnoredPartial(this.serverAcceptsMigrationIgnoredPartial(), lease),
       uploadChunk: (chunk, bytes) => this.uploadStreamedMigrationChunk(lease, chunk, bytes, signal),
     });
     if (streamed.resizedEntryCount > 0) {
@@ -5902,10 +5988,12 @@ export class DaemonCore {
           ...(acceptance.processInstanceId ? { processInstanceId: acceptance.processInstanceId } : {}),
         });
       }
-      await startPromise;
+      const startOutcome = await startPromise;
 
       this.coreStartingAgentIds.delete(msg.agentId);
-      if (wakeDeliveryAck && !wakeDeliveryAck.mentionDelivery) {
+      // A start a stop or the shutdown cancelled (one a drain held, say) never
+      // gave its wake to a process: that delivery stays the server's.
+      if (wakeDeliveryAck && !wakeDeliveryAck.mentionDelivery && startOutcome !== "cancelled") {
         this.sendDeliveryAck(wakeDeliveryAck);
       }
       for (const delivery of replayDeliveries) {
@@ -6070,6 +6158,19 @@ export class DaemonCore {
           (error: unknown) => {
             logger.warn(`[Agent ${agentId}] Stopping the current turn failed: ${error instanceof Error ? error.message : String(error)}`);
             this.connection.send({ type: "agent:interrupt-turn:result", agentId, requestId, outcome: "not_running" });
+          },
+        );
+        break;
+      }
+
+      case "agent:side-ask": {
+        // #wg-runtime-form:#22: status now, or one question to a read-only fork; the server decided who may ask.
+        const { agentId, requestId } = msg;
+        void this.agentHosts.sideAsk(msg).then(
+          (result) => this.connection.send({ type: "agent:side-ask:result", agentId, requestId, ...result }),
+          (error: unknown) => {
+            logger.warn(`[Agent ${agentId}] Side ask failed: ${error instanceof Error ? error.message : String(error)}`);
+            this.connection.send({ type: "agent:side-ask:result", agentId, requestId, outcome: "failed" });
           },
         );
         break;
@@ -6419,6 +6520,7 @@ export class DaemonCore {
             this.localScheduleRuntime.onAgentWorkspaceDeleted(msg.directoryName);
             // A workspace directory is named by its agent id: the agent is gone.
             void this.stopProcJobsForAgent(msg.directoryName, "agent_deleted");
+            this.agentHosts.stopSideAsk(msg.directoryName);
           }
           this.connection.send({ type: "machine:workspace:delete_result", directoryName: msg.directoryName, success });
         });
@@ -6737,6 +6839,8 @@ export class DaemonCore {
                 ok: false,
                 code: failure,
                 reason: message.replace(/[\u0000-\u001f\u007f]+/gu, " ").slice(0, 2048),
+                // An installer receipt relayed by the Computer: its outcome and codes as fixed fields.
+                ...computerUpgradeInstallerReportOfError(err),
               });
               if (action === "upgrade") {
                 this.recordComputerUpgradeReported(requestId, "upgrade_done", sent);
@@ -6938,6 +7042,13 @@ export class DaemonCore {
     return capabilities.has(SERVER_CAPABILITY_MIGRATION_BACKUP_IGNORE_SOURCES_V1);
   }
 
+  /** The server's migration summary accepts `excludedIgnoredPartial`. Context wins over the handshake header. */
+  private serverAcceptsMigrationIgnoredPartial(): boolean {
+    if (this.machineContextConflict) return false;
+    const capabilities = this.serverContextCapabilities ?? new Set(this.connection.handshakeServerCapabilities);
+    return capabilities.has(SERVER_CAPABILITY_MIGRATION_IGNORED_PARTIAL_V1);
+  }
+
   /** The server's source-progress report accepts `userIgnoreAdditions`. Context wins over the handshake header. */
   private serverAcceptsMigrationUserIgnoreReceipt(): boolean {
     if (this.machineContextConflict) return false;
@@ -7016,7 +7127,9 @@ export class DaemonCore {
       ...(snapshot?.accounts[0]?.limitResetsAvailable !== undefined ? { limit_resets_available: snapshot.accounts[0].limitResetsAvailable } : {}),
       ...(kind ? { reset_kind: kind } : {}),
       ...(result.kind === "unknown" && result.fiveHourSpent ? { five_hour_spent: true } : {}),
+      ...(report.claudeVersion ? { claude_version: report.claudeVersion } : {}),
       ...(report.oarOutcome ? { oar_outcome: report.oarOutcome } : {}),
+      ...(report.startupScreen ? { startup_screen: report.startupScreen } : {}),
       duration_ms: currentTimeMs() - startedAt,
     });
   }
@@ -7051,6 +7164,7 @@ export class DaemonCore {
       } : {}),
       ...(report.claudeVersion ? { claude_version: report.claudeVersion } : {}),
       ...(report.oarOutcome ? { oar_outcome: report.oarOutcome } : {}),
+      ...(report.startupScreen ? { startup_screen: report.startupScreen } : {}),
       duration_ms: currentTimeMs() - startedAt,
     });
   }
@@ -7366,6 +7480,8 @@ export class DaemonCore {
         DAEMON_CAPABILITY_SEQUENCED_STATUS,
         DAEMON_CAPABILITY_INTERRUPT_TURN,
         DAEMON_CAPABILITY_INTERRUPT_SUBAGENT,
+        // #wg-runtime-form:#22: status now and side questions (agentSideAsk.ts).
+        DAEMON_CAPABILITY_AGENT_SIDE_ASK,
         DAEMON_CAPABILITY_RUNTIME_AUTH,
         // Kimi and Qoder sign in and out too (RUNTIME_AUTH_RUNTIMES).
         DAEMON_CAPABILITY_RUNTIME_AUTH_V2,
@@ -7380,8 +7496,6 @@ export class DaemonCore {
         DAEMON_CAPABILITY_RUNTIME_AUTH_GROK,
         // OpenCode 2's sign-ins per provider: status, OAuth login, logout, API key (OAR 0.100 createOpencodeProviderAuth).
         DAEMON_CAPABILITY_RUNTIME_AUTH_OPENCODE,
-        // CodeBuddy Code's status, sign-in link and logout (OAR's codebuddy runtime).
-        DAEMON_CAPABILITY_RUNTIME_AUTH_CODEBUDDY,
         // Spends an account's limit reset from the web (OAR `redeemLimitReset`, Codex).
         DAEMON_CAPABILITY_RUNTIME_LIMIT_RESET,
         // Reads Antigravity's account usage: the bundled OAR (0.103+) has
@@ -7405,6 +7519,8 @@ export class DaemonCore {
         ...(this.oarHostEnabled ? [DAEMON_CAPABILITY_RUNTIME_HOST_OAR, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CODEX, DAEMON_CAPABILITY_RUNTIME_HOST_OAR_GROK] : []),
         // #oar-raft:#10: Cursor through the SDK, only on Linux outside the SEA build with the SDK installed.
         ...(this.oarHostEnabled && cursorSdkAvailable() ? [DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CURSOR] : []),
+        // OpenCode on the OAR host: Linux and macOS (the OAR host runs only Codex on Windows).
+        ...(this.oarHostEnabled && this.platform !== "win32" ? [DAEMON_CAPABILITY_RUNTIME_HOST_OAR_OPENCODE] : []),
         // View Context v0: answers `agent:context_view_request` with one result
         // POST and sends `agent:context_view_availability` (agentContextView/),
         // for agents whose config has `agentContextView` on.

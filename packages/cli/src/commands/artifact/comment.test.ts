@@ -254,8 +254,9 @@ test("comment --image on a Server from before images: the upload's 404 without a
       "",
     ].join("\n"));
     // A 404 with the Artifacts' code is the Artifact's, in its own words.
-    const hidden = await run(["artifact", "comment", "pt_abc", "--image", "./a.png"], "look", noRequest, () => ({ ok: false, status: 404, data: null, error: "artifact not visible", errorCode: "NOT_VISIBLE", errorBody: { error: "artifact not visible", code: "NOT_VISIBLE" } }));
-    assert.ok(hidden.stderr.startsWith(`Error: No artifact "pt_abc" that you can see (by that id, link or exact title).\nCode: NOT_VISIBLE\n`), hidden.stderr);
+    const notVisible = "No artifact you can see has that id, link or title: it may not exist, may have been deleted, or may not be shared with you.";
+    const hidden = await run(["artifact", "comment", "pt_abc", "--image", "./a.png"], "look", noRequest, () => ({ ok: false, status: 404, data: null, error: notVisible, errorCode: "NOT_VISIBLE", errorBody: { error: notVisible, code: "NOT_VISIBLE" } }));
+    assert.ok(hidden.stderr.startsWith(`Error: ${notVisible}\nCode: NOT_VISIBLE\n`), hidden.stderr);
   });
 });
 
@@ -278,6 +279,15 @@ test("comment --image: the Server refusing one image names which --image it was;
       "Error: --image ./a.png: The image didn't arrive whole (12 bytes sent, 8 received). Nothing was posted.",
       "Code: SIZE_MISMATCH",
       "Next action: Run the same command again; if it's refused again, tell a human (it's a client bug).",
+      "",
+    ].join("\n"));
+    // Storage not set up (a deliberate 503): the image named and nothing posted, around the Server's sentence.
+    const unset = "This server's file storage for Artifacts isn't set up, so artifact files can't be stored or read here: tell an admin of this server, since retrying won't help.";
+    const storage = await run(["artifact", "comment", "pt_abc", "--image", "./a.png"], "look", noRequest, () => ({ ok: false, status: 503, data: null, error: unset, errorCode: "ARTIFACTS_STORAGE_UNAVAILABLE", errorBody: { error: unset, code: "ARTIFACTS_STORAGE_UNAVAILABLE" } }));
+    assert.equal(storage.stderr, [
+      `Error: --image ./a.png: ${unset} Nothing was posted.`,
+      "Code: ARTIFACTS_STORAGE_UNAVAILABLE",
+      "Next action: Do what the error says.",
       "",
     ].join("\n"));
   });

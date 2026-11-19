@@ -39,11 +39,11 @@ export function McpServerUrlForm({
         label={formatMessage({ id: "settings.mcpApp.server.urlLabel" })}
        
         size="compact"
-        required
       >
         <div className="flex flex-col gap-2 sm:flex-row">
           <Input
             type="url"
+            aria-required="true"
             value={endpointUrl}
             onChange={handleChange}
             className="min-w-0 flex-1 font-mono"

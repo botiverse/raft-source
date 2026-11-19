@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 
 import { createAgentApiClient, type AgentApiClient } from "../agentApiClient";
 import { formatArtifactCheck } from "../agentText/artifacts";
+import { RAFT_HINTS } from "./hint";
 import { ARTIFACT_CHECK_POLL_MS, ARTIFACT_CHECK_WAIT_MS, artifactCommentImageUploaderForFetch, artifactsCheck, artifactsCheckShot, artifactsComment, artifactsCommentImage, artifactsCommentImageUpload, artifactsComments, artifactsDelete, artifactsFile, artifactsFileContent, artifactsList, artifactsMatchQuery, artifactsMove, artifactsPublish, ARTIFACTS_PROBE_GRACE_MS, artifactsRead, artifactsReview, artifactsReviewRefusal, artifactsFollow, artifactsSaveAttachment, artifactsUnfollow, artifactsUpload, artifactUploaderForFetch, artifactUploadFailure, searchMessages } from "./index";
 
 type Call = { method: string; path: string };
@@ -25,7 +26,13 @@ function client(script: (path: string) => Response, calls: Call[] = []): AgentAp
 }
 
 const refuse = (status: number, code: string, details?: object) => () => Response.json({ error: code.toLowerCase(), code, ...(details ? { details } : {}) }, { status });
+/** A refusal as the Server words it: its sentence, and its structured next step when it has one. */
+const refuseSaying = (status: number, code: string, error: string, more: { next?: object; details?: object } = {}) => () => Response.json({ error, code, ...more }, { status });
 const BASE = "/internal/agent-api/artifacts";
+// The Server's sentences for its deliberate 503s (apiCommon STORAGE_UNAVAILABLE_ERROR, routes.ts's download link, save.ts).
+const STORAGE_UNSET = "This server's file storage for Artifacts isn't set up, so artifact files can't be stored or read here: tell an admin of this server, since retrying won't help.";
+const NO_LINK_NOW = "This server's file storage for Artifacts can't hand out download links right now: read the file again in a minute, and tell an admin of this server if it keeps failing.";
+const NOT_SAVED_FULL = "Nothing was saved: this server's artifact storage can't take more files right now, so try again later, and tell an admin of this server if it keeps failing.";
 const BYTES = new Uint8Array([1, 2, 3]);
 /** sha256 of [1, 2, 3]. */
 const SHA = "039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81";
@@ -83,14 +90,19 @@ test("refs: a link is sent as its id, a /v/<n> link pins the version, an explici
 });
 
 test("Server codes: standard classification, the Artifacts' sentence and next step, in tool style too", async () => {
-  const hidden = await artifactsRead(client(refuse(404, "NOT_VISIBLE")), { artifact: "pt_zzz" }, { hints: "tool" });
+  // The Server words NOT_VISIBLE as well as a client could (#wg-ax:#13 P3): its sentence, its step in the caller's style.
+  const notVisible = "No artifact you can see has that id, link or title: it may not exist, may have been deleted, or may not be shared with you.";
+  const hidden = await artifactsRead(client(refuseSaying(404, "NOT_VISIBLE", notVisible, { next: RAFT_HINTS.artifactList({}) })), { artifact: "pt_zzz" }, { hints: "tool" });
   assert.ok(!hidden.ok);
   assert.equal(hidden.error.code, "NOT_FOUND");
   assert.equal(hidden.error.serverCode, "NOT_VISIBLE");
   assert.equal(hidden.error.status, 404);
-  assert.equal(hidden.error.message, `No artifact "pt_zzz" that you can see (by that id, link or exact title).`);
-  assert.equal(hidden.error.nextAction, "List the ones you can: artifacts_list({})");
-  assert.ok(hidden.text.includes("Next action: List the ones you can: artifacts_list({})"));
+  assert.equal(hidden.error.message, notVisible);
+  assert.equal(hidden.error.nextAction, "artifacts_list({})");
+  assert.ok(hidden.text.includes("Next action: artifacts_list({})"), hidden.text);
+  const hiddenCli = await artifactsRead(client(refuseSaying(404, "NOT_VISIBLE", notVisible, { next: RAFT_HINTS.artifactList({}) })), { artifact: "pt_zzz" });
+  assert.ok(!hiddenCli.ok);
+  assert.equal(hiddenCli.error.nextAction, "raft artifact list");
 
   const off = await artifactsList(client(refuse(403, "ARTIFACTS_NOT_ENABLED")), {});
   assert.ok(!off.ok);
@@ -98,24 +110,37 @@ test("Server codes: standard classification, the Artifacts' sentence and next st
   assert.equal(off.error.serverCode, "ARTIFACTS_NOT_ENABLED");
   assert.equal(off.error.nextAction, "To read one: raft artifact read <artifact>. To share a file, send it as an attachment, and each later version as a new attachment in the same thread: raft attachment upload --path <file> --target <conversation>");
 
-  const storage = await artifactsFileContent(client(refuse(503, "ARTIFACTS_STORAGE_UNAVAILABLE")), { artifact: "pt_abc", path: "a.png" });
-  assert.ok(!storage.ok);
-  assert.equal(storage.error.code, "UNAVAILABLE");
+  // A deliberate 503 (storage not set up, no download link now): the Server's sentence, which says whether retrying
+  // helps, read as a 4xx's is; its step that sentence, never the generic "Retry in a moment."
+  for (const [sentence, hints] of [[STORAGE_UNSET, "cli"], [NO_LINK_NOW, "tool"]] as const) {
+    const storage = await artifactsFileContent(client(refuseSaying(503, "ARTIFACTS_STORAGE_UNAVAILABLE", sentence)), { artifact: "pt_abc", path: "a.png" }, { hints });
+    assert.ok(!storage.ok);
+    assert.deepEqual([storage.error.code, storage.error.serverCode, storage.error.status], ["UNAVAILABLE", "ARTIFACTS_STORAGE_UNAVAILABLE", 503]);
+    assert.equal(storage.error.message, sentence);
+    assert.equal(storage.error.nextAction, "Do what the error says.");
+    assert.ok(storage.text.includes(`Error: ${sentence}\n`) && storage.text.includes("Next action: Do what the error says."), storage.text);
+  }
+  // With a step of its own, that step in each style.
+  for (const [hints, step] of [["cli", "raft artifact read pt_abc --files"], ["tool", `artifacts_read({ artifact: "pt_abc", files: true })`]] as const) {
+    const stepped = await artifactsFileContent(client(refuseSaying(503, "ARTIFACTS_STORAGE_UNAVAILABLE", NO_LINK_NOW, { next: RAFT_HINTS.artifactRead({ artifact: "pt_abc", files: true }) })), { artifact: "pt_abc", path: "a.png" }, { hints });
+    assert.ok(!stepped.ok);
+    assert.deepEqual([stepped.error.message, stepped.error.nextAction], [NO_LINK_NOW, step]);
+  }
+  // No sentence in the body (a bare code, a proxy's 503): the generic sentence and its retry.
+  const bare = await artifactsFileContent(client(refuse(503, "ARTIFACTS_STORAGE_UNAVAILABLE")), { artifact: "pt_abc", path: "a.png" });
+  assert.ok(!bare.ok);
+  assert.deepEqual([bare.error.code, bare.error.message, bare.error.nextAction], ["UNAVAILABLE", "The Raft Server could not serve this operation right now.", "Retry in a moment."]);
+  // Only those two codes: another 5xx's sentence is not read (outcome.ts reads only a 4xx's).
+  const otherSaying = await artifactsRead(client(refuseSaying(503, "NOT_VISIBLE", "Something the Server said about it.")), { artifact: "pt_abc" });
+  assert.ok(!otherSaying.ok);
+  assert.deepEqual([otherSaying.error.message, otherSaying.error.nextAction], ["The Raft Server could not serve this operation right now.", "Retry in a moment."]);
 
-  const ambiguous = await artifactsRead(client(refuse(409, "AMBIGUOUS_ARTIFACT_NAME", { ref: "report", candidates: ["pt_a", "pt_b"] })), { artifact: "report" });
+  const several = "2 artifacts you can see are called that: pass the id of the one you mean instead (pt_a, pt_b).";
+  const ambiguous = await artifactsRead(client(refuseSaying(409, "AMBIGUOUS_ARTIFACT_NAME", several, { next: RAFT_HINTS.artifactRead({ artifact: "pt_a" }), details: { ref: "report", candidates: ["pt_a", "pt_b"] } })), { artifact: "report" });
   assert.ok(!ambiguous.ok);
   assert.equal(ambiguous.error.code, "CONFLICT");
-  assert.equal(ambiguous.error.message, `Several artifacts you can see are called "report": pt_a, pt_b.`);
-  assert.equal(ambiguous.error.nextAction, "Pass the id instead, e.g. raft artifact read pt_a");
-
-  // Several with one title: each candidate by id and title, the next step by id.
-  const titled = await artifactsRead(client(refuse(409, "AMBIGUOUS_ARTIFACT_NAME", {
-    ref: "Q3 report",
-    candidates: [{ id: "pt_a", title: "Q3 report", home: { kind: "server" } }, { id: "pt_b", title: "q3 Report", home: { kind: "conversation", conversation: { id: "c", type: "channel", target: "#ops" } } }],
-  })), { artifact: "Q3 report" });
-  assert.ok(!titled.ok);
-  assert.equal(titled.error.message, `Several artifacts you can see are called "Q3 report": pt_a "Q3 report" (home: the whole server), pt_b "q3 Report" (home: #ops).`);
-  assert.equal(titled.error.nextAction, "Pass the id instead, e.g. raft artifact read pt_a");
+  assert.equal(ambiguous.error.message, several);
+  assert.equal(ambiguous.error.nextAction, "raft artifact read pt_a");
 
   const file = await artifactsComments(client(refuse(404, "TARGET_NOT_FOUND")), { artifact: "pt_abc" });
   assert.ok(!file.ok);
@@ -303,10 +328,12 @@ test("SDK uploader: PUT …/uploads/:sha256 with the raw bytes and auth; refusal
   assert.deepEqual(ok.data, { sha256: SHA, size: 3 });
   assert.deepEqual(seen[0], { url: `https://raft.example${BASE}/uploads/${SHA}`, method: "PUT", type: "application/octet-stream", auth: "Bearer sk_agent_test", body: [1, 2, 3] });
 
-  const quota = await artifactUploaderForFetch(transport(413, { error: "quota", code: "UPLOAD_QUOTA_EXCEEDED", details: { used: 1073741824, limit: 1073741824 } }), "tool")(SHA, BYTES);
+  // The Server's own sentence (#wg-ax:#13 P3), its step in it.
+  const full = "This server holds 1 GiB of uploaded files no version uses yet, against a limit of 1 GiB: try again later (unused uploads are removed after a day), or tell an admin of this server.";
+  const quota = await artifactUploaderForFetch(transport(413, { error: full, code: "UPLOAD_QUOTA_EXCEEDED", details: { used: 1073741824, limit: 1073741824 } }), "tool")(SHA, BYTES);
   assert.ok(!quota.ok);
   assert.equal(quota.failure.error.serverCode, "UPLOAD_QUOTA_EXCEEDED");
-  assert.equal(quota.failure.error.message, "This server holds too many uploaded files that no version uses yet (1024 MiB of 1024 MiB).");
+  assert.equal(quota.failure.error.message, full);
 
   const billingUrl = "https://app.raft.build/s/team/settings/billing";
   const monthlyQuota = { plan: "free", limitBytes: 100 * 1024 * 1024, usedBytes: 100 * 1024 * 1024 };
@@ -323,6 +350,22 @@ test("SDK uploader: PUT …/uploads/:sha256 with the raw bytes and auth; refusal
   assert.equal(monthly.failure.error.status, 403);
   assert.ok(monthly.failure.error.message.startsWith("Not stored: this server's monthly file upload quota is used up (100 MiB of 100 MiB used this month)."));
   assert.ok(monthly.failure.error.nextAction.includes(billingUrl));
+
+  // An upload cut short names no file (path null): the Server's sentence and its step, not `"" is listed as …`.
+  const cutShort = "The upload didn't arrive whole (its bytes don't match its Content-Length): upload the same bytes again, and if it keeps failing it is a client bug to report.";
+  for (const style of ["cli", "tool"] as const) {
+    const cut = await artifactUploaderForFetch(transport(400, { error: cutShort, code: "SIZE_MISMATCH", details: { path: null, sha256: SHA, size: 3, actual: 2 } }), style)(SHA, BYTES);
+    assert.ok(!cut.ok);
+    assert.equal(cut.failure.error.serverCode, "SIZE_MISMATCH");
+    assert.deepEqual([cut.failure.error.message, cut.failure.error.nextAction], [cutShort, "Do what the error says."]);
+  }
+  // A push's listed file the Server names keeps the push's words.
+  const listed = artifactUploadFailure(400, { error: "x y", code: "SIZE_MISMATCH", details: { path: "a.html", size: 12, actual: 8 } }, "cli");
+  assert.equal(listed.error.message, `"a.html" is listed as 12 bytes, but the bytes for its sha256 are 8.`);
+  // Storage not set up: the Server's sentence (a 503 read as a 4xx's is), in either style.
+  const unset = await artifactUploaderForFetch(transport(503, { error: STORAGE_UNSET, code: "ARTIFACTS_STORAGE_UNAVAILABLE" }), "tool")(SHA, BYTES);
+  assert.ok(!unset.ok);
+  assert.deepEqual([unset.failure.error.code, unset.failure.error.message, unset.failure.error.nextAction], ["UNAVAILABLE", STORAGE_UNSET, "Do what the error says."]);
 
   const other = artifactUploadFailure(500, { error: "boom" }, "cli");
   assert.equal(other.error.code, "UNAVAILABLE");
@@ -349,9 +392,11 @@ test("comment: body, path, reply and version go to the Server; a bad path is ref
   const bad = await artifactsComment(api, { artifact: "pt_abc", body: "x", path: "../a" });
   assert.ok(!bad.ok && bad.error.serverCode === "INVALID_PATH");
   assert.equal(calls.length, 1);
-  const missing = await artifactsComment(client(refuse(404, "COMMENT_NOT_FOUND", { replyTo: "c_404" })), { artifact: "pt_abc", body: "x", replyTo: "c_404" });
+  const gone = "No comment of this artifact has that id: find the one to reply to in its comments.";
+  const missing = await artifactsComment(client(refuseSaying(404, "COMMENT_NOT_FOUND", gone, { next: RAFT_HINTS.artifactComments({ artifact: "pt_abc", all: true }), details: { replyTo: "c_404" } })), { artifact: "pt_abc", body: "x", replyTo: "c_404" });
   assert.ok(!missing.ok);
-  assert.equal(missing.error.message, `"c_404" isn't a comment of "pt_abc".`);
+  assert.equal(missing.error.message, gone);
+  assert.equal(missing.error.nextAction, "raft artifact comments pt_abc --all");
 });
 
 test("follow / unfollow: PUT and DELETE, the state as text", async () => {
@@ -422,11 +467,14 @@ test("review: one call with every comment; local refusals name the comment; a Se
   const past = await artifactsReview(client(refuse(404, "FILE_NOT_FOUND", { index: 7, path: "z.html", version: 12 })), { artifact: "pt_abc", comments: [{ body: "a" }] });
   assert.ok(!past.ok && !past.error.message.startsWith("Comment 8"), past.ok ? "" : past.error.message);
 
-  const refused = await artifactsReview(client(refuse(404, "FILE_NOT_FOUND", { index: 1, path: "b.html", version: 12 })), { artifact: "pt_abc", comments: [{ body: "a" }, { body: "b", path: "b.html" }] }, { hints: "tool" });
+  // The Server names the comment itself ("Comment 2 of 2 of the review, …"): its sentence as sent, no second
+  // frame around it (#wg-ax:#13 P3); its step in the caller's style.
+  const placed = "Comment 2 of 2 of the review, nothing of which was posted: Version 12 of this artifact has no file at that path: use a path exactly as its file list shows it.";
+  const refused = await artifactsReview(client(refuseSaying(404, "FILE_NOT_FOUND", placed, { next: RAFT_HINTS.artifactRead({ artifact: "pt_abc", version: 12, files: true }), details: { index: 1, path: "b.html", version: 12 } })), { artifact: "pt_abc", comments: [{ body: "a" }, { body: "b", path: "b.html" }] }, { hints: "tool" });
   assert.ok(!refused.ok);
   assert.equal(refused.error.serverCode, "FILE_NOT_FOUND");
-  assert.equal(refused.error.message, `Comment 2 of 2 (b.html): v12 of "pt_abc" has no file "b.html". Nothing of the review was posted.`);
-  assert.equal(refused.error.nextAction, `Fix comment 2, then make the same review call again. Its files: artifacts_read({ artifact: "pt_abc", files: true })`);
+  assert.equal(refused.error.message, placed);
+  assert.equal(refused.error.nextAction, `artifacts_read({ artifact: "pt_abc", version: 12, files: true })`);
   // Without an index the refusal is the review's own.
   const held = await artifactsReview(client(refuse(409, "UNSEEN_CHANGES", { unseen: { comments: [], commentCount: 0, commentsCursor: null }, seen: 3, skipped: {} })), { artifact: "pt_abc", comments: [{ body: "a" }] }, { hints: "tool" });
   assert.ok(!held.ok && held.error.message.startsWith("Held — nothing of the review was posted.") && held.error.nextAction.includes("make the same review call again"), held.ok ? "" : held.error.message);
@@ -660,14 +708,21 @@ test("move / delete: POST …/home { to: server } and DELETE, a link sent as its
   }
   assert.deepEqual(sent, []);
 
-  const forbidden = await artifactsDelete(client(refuse(403, "FORBIDDEN", { title: "Proto", author: { type: "user", name: "xxchan" } })), { artifact: "pt_abc" });
+  // The Server's own sentences (#wg-ax:#13 P3): who may, already that wide, a name taken.
+  const onlyAuthor = "Only the artifact's author, the person who manages an agent author, and the server's owners and admins can delete it: ask one of them to.";
+  const forbidden = await artifactsDelete(client(refuseSaying(403, "FORBIDDEN", onlyAuthor, { details: { title: "Proto", author: { type: "user", name: "xxchan" } } })), { artifact: "pt_abc" });
   assert.ok(!forbidden.ok);
-  assert.deepEqual([forbidden.error.serverCode, forbidden.error.message], ["FORBIDDEN", `You can't delete "Proto": only its author (@xxchan), the person who manages an agent author, and the server's owners and admins can.`]);
-  const wide = await artifactsMove(client(refuse(409, "HOME_NOT_WIDER", { title: "Proto", home: "server", to: "server" })), { artifact: "pt_abc", to: "server" });
+  assert.deepEqual([forbidden.error.serverCode, forbidden.error.message], ["FORBIDDEN", onlyAuthor]);
+  // No step of the Server's own: the sentence holds it, not the generic "change what the error says, then try again".
+  assert.equal(forbidden.error.nextAction, "Do what the error says.");
+  assert.ok(forbidden.text.includes("Next action: Do what the error says."), forbidden.text);
+  const already = "Nothing changed: the whole server can already see this artifact.";
+  const wide = await artifactsMove(client(refuseSaying(409, "HOME_NOT_WIDER", already, { next: RAFT_HINTS.artifactRead({ artifact: "pt_abc" }), details: { title: "Proto", home: "server", to: "server" } })), { artifact: "pt_abc", to: "server" }, { hints: "tool" });
   assert.ok(!wide.ok);
-  assert.deepEqual([wide.error.code, wide.error.serverCode, wide.error.message], ["CONFLICT", "HOME_NOT_WIDER", `"Proto" is already visible to the whole server; nothing changed.`]);
-  const taken = await artifactsMove(client(refuse(409, "NAME_TAKEN", { name: "proto" })), { artifact: "pt_abc", to: "server" });
-  assert.ok(!taken.ok && taken.error.message === `Another artifact visible to the whole server is already named "proto", so this one can't move there.`, JSON.stringify(taken));
+  assert.deepEqual([wide.error.code, wide.error.serverCode, wide.error.message, wide.error.nextAction], ["CONFLICT", "HOME_NOT_WIDER", already, `artifacts_read({ artifact: "pt_abc" })`]);
+  const nameTaken = "Another artifact visible to the whole server already has this artifact's name, so it can't move there: ask the other one's author or a server admin whether it can be deleted, then move this one again.";
+  const taken = await artifactsMove(client(refuseSaying(409, "NAME_TAKEN", nameTaken, { details: { name: "proto" } })), { artifact: "pt_abc", to: "server" });
+  assert.ok(!taken.ok && taken.error.message === nameTaken, JSON.stringify(taken));
 });
 
 test("save an attachment: POST …/save-attachment { attachmentId } trimmed, saved or already saved; a refusal in the Artifacts' words, the tool style naming operations", async () => {
@@ -700,6 +755,13 @@ test("save an attachment: POST …/save-attachment { attachmentId } trimmed, sav
   assert.equal(missing.error.nextAction, `Check the id: it is the one after the file name, (id:…), when you read the conversation: messages_read({ target: "<conversation>" }). If the id is right, attachments_download_url({ attachmentId: "${id}" }) answers HISTORY_LIMITED when its message is older than the history limit.`);
   const hidden = await artifactsSaveAttachment(client(refuse(409, "ALREADY_SAVED", { attachmentId: id })), { attachmentId: id });
   assert.ok(!hidden.ok && hidden.error.serverCode === "ALREADY_SAVED" && hidden.error.message === "That attachment was already saved as an artifact you can't see; nothing new was made.", JSON.stringify(hidden));
+  // Storage that can't take it now (a deliberate 503): the Server's sentence, which says whether to try again; no command in tool style.
+  for (const hints of ["cli", "tool"] as const) {
+    const unstored = await artifactsSaveAttachment(client(refuseSaying(503, "CONTENT_UNAVAILABLE", NOT_SAVED_FULL)), { attachmentId: id }, { hints });
+    assert.ok(!unstored.ok);
+    assert.deepEqual([unstored.error.code, unstored.error.serverCode, unstored.error.message, unstored.error.nextAction], ["UNAVAILABLE", "CONTENT_UNAVAILABLE", NOT_SAVED_FULL, "Do what the error says."]);
+    assert.ok(!/\braft [a-z]/.test(unstored.text), unstored.text);
+  }
 });
 
 test("429 RATE_LIMITED (core's per-agent write limit): the Server's sentence, the wait, retryable, no command in tool style; an upload's too; anything else unchanged", async () => {
@@ -736,6 +798,9 @@ test("429 RATE_LIMITED (core's per-agent write limit): the Server's sentence, th
 // ---- publish check (#130) ---------------------------------------------------------
 
 /** A Server answering the check route from a script of answers (the last one repeats), recording each request with its query. */
+/** The Server's SCREENSHOT_NOT_FOUND (checkRead.ts), its step the version's check. */
+const NO_SHOT = "Version 13 of this artifact has no phone screenshot: only a finished publish check has screenshots, and only the newest three checked versions keep them, so read the version's check first.";
+
 function checkServer(answers: Array<object>, calls: Call[] = []): AgentApiClient {
   let n = 0;
   return createAgentApiClient({
@@ -748,7 +813,7 @@ function checkServer(answers: Array<object>, calls: Call[] = []): AgentApiClient
         if (url.pathname.endsWith("/check/phone") || url.pathname.endsWith("/check/desktop")) {
           return url.pathname.endsWith("/desktop")
             ? new Response(BYTES, { headers: { "content-type": "image/png" } })
-            : Response.json({ error: "screenshot not found", code: "SCREENSHOT_NOT_FOUND", details: { shot: "phone", version: 13 } }, { status: 404 });
+            : Response.json({ error: NO_SHOT, code: "SCREENSHOT_NOT_FOUND", next: RAFT_HINTS.artifactCheck({ artifact: "pt_abc", version: 13 }), details: { shot: "phone", version: 13 } }, { status: 404 });
         }
         const answer = answers[Math.min(n, answers.length - 1)]!;
         n += 1;
@@ -855,14 +920,16 @@ test("check with wait: still pending at 90 s is timedOut, and the text says to r
   assert.ok(sleeps.reduce((a, b) => a + b, 0) + sleeps.length * 1_500 >= 90_000);
 });
 
-test("check: refusals in the Artifacts' words (a refusal while waiting too); a bad request is refused before any request", async () => {
-  const hidden = await artifactsCheck(checkServer([{ status: 404, error: "not visible", code: "NOT_VISIBLE" }]), { artifact: "pt_zzz" }, fakeClock());
+test("check: refusals in the Server's words (a refusal while waiting too); a bad request is refused before any request", async () => {
+  const notVisible = "No artifact you can see has that id, link or title: it may not exist, may have been deleted, or may not be shared with you.";
+  const hidden = await artifactsCheck(checkServer([{ status: 404, error: notVisible, code: "NOT_VISIBLE" }]), { artifact: "pt_zzz" }, fakeClock());
   assert.ok(!hidden.ok);
   assert.equal(hidden.error.serverCode, "NOT_VISIBLE");
-  assert.equal(hidden.error.message, `No artifact "pt_zzz" that you can see (by that id, link or exact title).`);
-  const version = await artifactsCheck(checkServer([{ status: 404, error: "no such version", code: "VERSION_NOT_FOUND", details: { version: 40, currentVersion: 13 } }]), { artifact: "pt_abc", version: 40 }, fakeClock());
+  assert.equal(hidden.error.message, notVisible);
+  const noVersion = "This artifact has no version 40 that you can read (the current one is v13): read the current version, or name one it has.";
+  const version = await artifactsCheck(checkServer([{ status: 404, error: noVersion, code: "VERSION_NOT_FOUND", details: { version: 40, currentVersion: 13 } }]), { artifact: "pt_abc", version: 40 }, fakeClock());
   assert.ok(!version.ok);
-  assert.equal(version.error.message, `"pt_abc" has no version 40 that you can read (the current one is v13).`);
+  assert.equal(version.error.message, noVersion);
   const midWait = await artifactsCheck(checkServer([checkAnswer("pending"), { status: 404, error: "not visible", code: "NOT_VISIBLE" }]), { artifact: "pt_abc", wait: true }, fakeClock());
   assert.ok(!midWait.ok);
   assert.equal(midWait.error.serverCode, "NOT_VISIBLE");
@@ -873,7 +940,7 @@ test("check: refusals in the Artifacts' words (a refusal while waiting too); a b
   assert.deepEqual(calls, []);
 });
 
-test("checkShot: the PNG's bytes for a version; SCREENSHOT_NOT_FOUND in words, pointing at the version's check; an unknown shot is refused before any request", async () => {
+test("checkShot: the PNG's bytes for a version; SCREENSHOT_NOT_FOUND in the Server's words, its step the version's check in each style; an unknown shot is refused before any request", async () => {
   const calls: Call[] = [];
   const api = checkServer([], calls);
   const desktop = await artifactsCheckShot(api, { artifact: "pt_abc", version: 13, shot: "desktop" });
@@ -885,9 +952,12 @@ test("checkShot: the PNG's bytes for a version; SCREENSHOT_NOT_FOUND in words, p
   assert.ok(!phone.ok);
   assert.equal(phone.error.code, "NOT_FOUND");
   assert.equal(phone.error.serverCode, "SCREENSHOT_NOT_FOUND");
-  assert.equal(phone.error.message, `v13 of "pt_abc" has no phone screenshot from its publish check.`);
-  assert.equal(phone.error.nextAction, `Read the version's check: artifacts_check({ artifact: "pt_abc", version: 13 }). Only a check that is done has screenshots, and only the newest three checked versions of an Artifact keep theirs.`);
-  assert.deepEqual(calls.map((c) => c.path), [`${BASE}/pt_abc/check/desktop?version=13`, `${BASE}/pt_abc/check/phone?version=13`]);
+  assert.equal(phone.error.message, NO_SHOT);
+  assert.equal(phone.error.nextAction, `artifacts_check({ artifact: "pt_abc", version: 13 })`);
+  const phoneCli = await artifactsCheckShot(api, { artifact: "pt_abc", version: 13, shot: "phone" });
+  assert.ok(!phoneCli.ok);
+  assert.deepEqual([phoneCli.error.message, phoneCli.error.nextAction], [NO_SHOT, "raft artifact check pt_abc --rev 13"]);
+  assert.deepEqual(calls.map((c) => c.path), [`${BASE}/pt_abc/check/desktop?version=13`, `${BASE}/pt_abc/check/phone?version=13`, `${BASE}/pt_abc/check/phone?version=13`]);
   const before = calls.length;
   const tablet = await artifactsCheckShot(api, { artifact: "pt_abc", shot: "tablet" as never });
   assert.ok(!tablet.ok);
@@ -978,20 +1048,23 @@ test("comment image upload refusals: a Server without the route (404, no code) s
   const plain = await artifactsCommentImageUpload(answer(422, { error: "x", code: "IMAGE_REFUSED", details: { reason: "unsupported_type" } }), { artifact: "pt_abc", bytes: PNG_BYTES });
   assert.ok(!plain.ok && plain.error.message === "The image wasn't kept: it isn't a PNG, JPEG, WebP or GIF image.");
 
-  // NOT_VISIBLE has its Artifacts code: the Artifact's refusal, not the old Server's.
-  const hidden = await artifactsCommentImageUpload(answer(404, { error: "artifact not visible", code: "NOT_VISIBLE" }), { artifact: "pt_abc", bytes: PNG_BYTES }, named);
+  // NOT_VISIBLE has its Artifacts code: the Artifact's refusal in the Server's words, not the old Server's, and no image named.
+  const notVisible = "No artifact you can see has that id, link or title: it may not exist, may have been deleted, or may not be shared with you.";
+  const hidden = await artifactsCommentImageUpload(answer(404, { error: notVisible, code: "NOT_VISIBLE" }), { artifact: "pt_abc", bytes: PNG_BYTES }, named);
   assert.ok(!hidden.ok);
   assert.equal(hidden.error.serverCode, "NOT_VISIBLE");
-  assert.equal(hidden.error.message, `No artifact "pt_abc" that you can see (by that id, link or exact title).`);
-  const forbidden = await artifactsCommentImageUpload(answer(403, { error: "x", code: "FORBIDDEN" }), { artifact: "pt_abc", bytes: PNG_BYTES }, named);
-  assert.ok(!forbidden.ok && forbidden.error.message === `You can see "pt_abc" but can't comment on it: only members and agents of its server can.`);
+  assert.equal(hidden.error.message, notVisible);
+  const takePart = "You can see this artifact but can't comment on it: only members and agents of its own server, or of the joint channel it lives in, can, so ask one of them instead.";
+  const forbidden = await artifactsCommentImageUpload(answer(403, { error: takePart, code: "FORBIDDEN" }), { artifact: "pt_abc", bytes: PNG_BYTES }, named);
+  assert.ok(!forbidden.ok && forbidden.error.message === takePart, forbidden.ok ? "" : forbidden.error.message);
 });
 
-test("comment image download: the bytes and their type; IMAGE_NOT_FOUND in words, pointing at the comments; a blank id refused before any request", async () => {
+test("comment image download: the bytes and their type; IMAGE_NOT_FOUND in the Server's words, its step the comments in each style; a blank id refused before any request", async () => {
   const calls: Call[] = [];
+  const noImage = "No image on a comment of this artifact that you can see has that id: take the id from the comment's images in its comments.";
   const api = client((path) => (path.endsWith("/comment-images/f-1")
     ? new Response(PNG_BYTES, { headers: { "content-type": "image/png" } })
-    : Response.json({ error: "no such image", code: "IMAGE_NOT_FOUND", details: { fileId: "f-9" } }, { status: 404 })), calls);
+    : Response.json({ error: noImage, code: "IMAGE_NOT_FOUND", next: RAFT_HINTS.artifactComments({ artifact: "pt_abc", all: true }), details: { fileId: "f-9" } }, { status: 404 })), calls);
   const ok = await artifactsCommentImage(api, { artifact: "https://app.raft.build/artifacts/pt_abc", fileId: "f-1" });
   assert.ok(ok.ok);
   assert.deepEqual([...ok.data.bytes], [...PNG_BYTES]);
@@ -999,12 +1072,15 @@ test("comment image download: the bytes and their type; IMAGE_NOT_FOUND in words
   const missing = await artifactsCommentImage(api, { artifact: "pt_abc", fileId: "f-9" }, { hints: "tool" });
   assert.ok(!missing.ok);
   assert.equal(missing.error.serverCode, "IMAGE_NOT_FOUND");
-  assert.equal(missing.error.message, `No image f-9 on a comment of "pt_abc" that you can see.`);
-  assert.equal(missing.error.nextAction, `Its id is on the comment's Images line: artifacts_comments({ artifact: "pt_abc", all: true })`);
-  assert.deepEqual(calls.map((c) => c.path), [`${BASE}/pt_abc/comment-images/f-1`, `${BASE}/pt_abc/comment-images/f-9`]);
+  assert.equal(missing.error.message, noImage);
+  assert.equal(missing.error.nextAction, `artifacts_comments({ artifact: "pt_abc", all: true })`);
+  const missingCli = await artifactsCommentImage(api, { artifact: "pt_abc", fileId: "f-9" });
+  assert.ok(!missingCli.ok);
+  assert.deepEqual([missingCli.error.message, missingCli.error.nextAction], [noImage, "raft artifact comments pt_abc --all"]);
+  assert.deepEqual(calls.map((c) => c.path), [`${BASE}/pt_abc/comment-images/f-1`, `${BASE}/pt_abc/comment-images/f-9`, `${BASE}/pt_abc/comment-images/f-9`]);
   const blank = await artifactsCommentImage(api, { artifact: "pt_abc", fileId: " " });
   assert.ok(!blank.ok && blank.error.code === "INVALID_REQUEST");
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 3);
 });
 
 // ---- images in review comments (#146 phase 3b) ----------------------------------
@@ -1043,10 +1119,19 @@ test("review with images: each comment's ids go to the Server in order; with one
   assert.equal(five.error.message, "Comment 2 of 2 (b.html): A comment takes at most 4 images (5 given). Nothing of the review was posted.");
   assert.equal(five.error.nextAction, "Fix comment 2, then make the same review call again. Keep 4 in this comment and put the others in another comment of the review.");
 
-  // An id that isn't the agent's unused upload: the Server's IMAGE_NOT_FOUND names the comment, "nothing posted" said once.
-  const notFound = await artifactsReview(client(refuse(400, "IMAGE_NOT_FOUND", { fileId: "f-9", index: 0, path: "a.html" })), { artifact: "pt_abc", comments: [{ body: "", path: "a.html", images: ["f-9"] }] }, { hints: "tool" });
-  assert.ok(!notFound.ok && notFound.error.serverCode === "IMAGE_NOT_FOUND");
-  assert.equal(notFound.error.message, `Comment 1 of 1 (a.html): "f-9" isn't an image you uploaded to "pt_abc" that no comment has yet. Nothing of the review was posted.`);
+  // An id that isn't the agent's unused upload: the Server's IMAGE_NOT_FOUND names the comment and says nothing was posted;
+  // no frame again, and its step is in the sentence.
+  const unclaimable = "Comment 1 of 1 of the review, nothing of which was posted: That image id isn't an image you uploaded to this artifact that no comment has yet: upload the image again (an unused upload is gone after an hour, and each goes in one comment only), then use the new id.";
+  for (const hints of ["cli", "tool"] as const) {
+    const notFound = await artifactsReview(client(refuseSaying(400, "IMAGE_NOT_FOUND", unclaimable, { details: { fileId: "f-9", index: 0, path: "a.html" } })), { artifact: "pt_abc", comments: [{ body: "", path: "a.html", images: ["f-9"] }] }, { hints });
+    assert.ok(!notFound.ok && notFound.error.serverCode === "IMAGE_NOT_FOUND");
+    assert.deepEqual([notFound.error.message, notFound.error.nextAction], [unclaimable, "Do what the error says."]);
+  }
+  // A comment's: the Server's sentence too.
+  const claim = "That image id isn't an image you uploaded to this artifact that no comment has yet: upload the image again (an unused upload is gone after an hour, and each goes in one comment only), then use the new id.";
+  const commented = await artifactsComment(client(refuseSaying(400, "IMAGE_NOT_FOUND", claim, { details: { fileId: "f-9" } })), { artifact: "pt_abc", body: "", images: ["f-9"] });
+  assert.ok(!commented.ok);
+  assert.deepEqual([commented.error.serverCode, commented.error.message, commented.error.nextAction], ["IMAGE_NOT_FOUND", claim, "Do what the error says."]);
 });
 
 test("artifactsReviewRefusal: the review's checks without a request, its images only counted (the CLI's are file paths)", () => {
@@ -1071,8 +1156,9 @@ test("an image uploaded for a review's comment: its own refusals name the commen
   const old = await artifactsCommentImageUpload(answer(404, { error: "Not found" }), { artifact: "pt_abc", bytes: PNG_BYTES }, forReview);
   assert.ok(!old.ok && old.error.serverCode === undefined && old.error.status === 404);
   assert.deepEqual([old.error.message, old.error.nextAction], ["This Server can't take images in comments yet; nothing was posted.", "Post the review without images, or describe the images in words."]);
-  const hidden = await artifactsCommentImageUpload(answer(404, { error: "x", code: "NOT_VISIBLE" }), { artifact: "pt_abc", bytes: PNG_BYTES }, forReview);
-  assert.ok(!hidden.ok && hidden.error.message === `No artifact "pt_abc" that you can see (by that id, link or exact title). Nothing of the review was posted.`, hidden.ok ? "" : hidden.error.message);
+  const notVisible = "No artifact you can see has that id, link or title: it may not exist, may have been deleted, or may not be shared with you.";
+  const hidden = await artifactsCommentImageUpload(answer(404, { error: notVisible, code: "NOT_VISIBLE" }), { artifact: "pt_abc", bytes: PNG_BYTES }, forReview);
+  assert.ok(!hidden.ok && hidden.error.message === `${notVisible} Nothing of the review was posted.`, hidden.ok ? "" : hidden.error.message);
   const down = await artifactsCommentImageUpload(async () => null, { artifact: "pt_abc", bytes: PNG_BYTES }, forReview);
   assert.ok(!down.ok && down.error.code === "TRANSPORT_ERROR" && down.error.message.endsWith(" Nothing of the review was posted."), down.ok ? "" : down.error.message);
   // Bytes refused here: the comment's frame too.
@@ -1094,11 +1180,12 @@ test("an image uploaded for a review's comment refused for the server's sake (it
   assert.equal(quota.error.message, "Not stored: this server's monthly file upload quota is used up (100 MiB of 100 MiB used this month). The Free plan includes 100 MB of uploads a month, and comment images count against it as attachments do. Nothing of the review was posted.");
   assert.equal(quota.error.nextAction, `Say in the conversation that the image wasn't stored and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Billing: ${billingUrl}. Until then, take "images" out of the JSON and run the same command again (describe the images in words instead).`);
 
-  const storage = await artifactsCommentImageUpload(answer(503, { error: "image storage is not configured", code: "ARTIFACTS_STORAGE_UNAVAILABLE" }), { artifact: "pt_abc", bytes: PNG_BYTES }, forReview);
+  // Storage not set up (a deliberate 503): the Server's sentence, which says retrying won't help, then that nothing of the review was posted.
+  const storage = await artifactsCommentImageUpload(answer(503, { error: STORAGE_UNSET, code: "ARTIFACTS_STORAGE_UNAVAILABLE" }), { artifact: "pt_abc", bytes: PNG_BYTES }, forReview);
   assert.ok(!storage.ok);
   assert.equal(storage.error.serverCode, "ARTIFACTS_STORAGE_UNAVAILABLE");
-  assert.equal(storage.error.message, "The image couldn't be stored: this server's file storage for Artifacts isn't set up. Nothing of the review was posted.");
-  assert.equal(storage.error.nextAction, `Take "images" out of the JSON and run the same command again (describe the images in words instead), and tell a human admin of this server.`);
+  assert.equal(storage.error.message, `${STORAGE_UNSET} Nothing of the review was posted.`);
+  assert.equal(storage.error.nextAction, "Do what the error says.");
 
   const full = await artifactsCommentImageUpload(answer(413, { error: "image not kept", code: "IMAGE_REFUSED", details: { reason: "server_quota_exceeded", limit: 1024, used: 1024 } }), { artifact: "pt_abc", bytes: PNG_BYTES }, forReview);
   assert.ok(!full.ok);
@@ -1139,11 +1226,16 @@ test("an image uploaded for a review's comment refused for the server's sake (it
     "Run the same command again; if it's refused again, tell a human (it's a client bug).",
   ]);
 
-  // `raft artifact comment --image` keeps its words: the image named, nothing posted, the comment's next step.
-  const forComment = await artifactsCommentImageUpload(answer(503, { error: "image storage is not configured", code: "ARTIFACTS_STORAGE_UNAVAILABLE" }), { artifact: "pt_abc", bytes: PNG_BYTES }, { named: "--image ./a.png" });
+  // `raft artifact comment --image`: the image named and nothing posted, around the Server's sentence.
+  const forComment = await artifactsCommentImageUpload(answer(503, { error: STORAGE_UNSET, code: "ARTIFACTS_STORAGE_UNAVAILABLE" }), { artifact: "pt_abc", bytes: PNG_BYTES }, { named: "--image ./a.png" });
   assert.ok(!forComment.ok);
-  assert.deepEqual([forComment.error.message, forComment.error.nextAction], [
-    "--image ./a.png: The image couldn't be stored: this server's file storage for Artifacts isn't set up. Nothing was posted.",
-    "Post the comment without it, and tell a human admin of this server.",
-  ]);
+  assert.deepEqual([forComment.error.message, forComment.error.nextAction], [`--image ./a.png: ${STORAGE_UNSET} Nothing was posted.`, "Do what the error says."]);
+  // A program's upload (the SDK's tool style, no name): the Server's sentence alone.
+  const forTool = await artifactsCommentImageUpload(answer(503, { error: STORAGE_UNSET, code: "ARTIFACTS_STORAGE_UNAVAILABLE" }), { artifact: "pt_abc", bytes: PNG_BYTES }, { hints: "tool" });
+  assert.ok(!forTool.ok);
+  assert.deepEqual([forTool.error.message, forTool.error.nextAction], [STORAGE_UNSET, "Do what the error says."]);
+  // No sentence in the body: the generic one, framed the same, and its retry.
+  const bare = await artifactsCommentImageUpload(answer(503, { code: "ARTIFACTS_STORAGE_UNAVAILABLE" }), { artifact: "pt_abc", bytes: PNG_BYTES }, { named: "--image ./a.png" });
+  assert.ok(!bare.ok);
+  assert.deepEqual([bare.error.message, bare.error.nextAction], ["--image ./a.png: The Raft Server could not serve this operation right now. Nothing was posted.", "Retry in a moment."]);
 });

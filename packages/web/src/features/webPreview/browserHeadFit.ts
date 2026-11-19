@@ -5,7 +5,7 @@ import type { BrowserTab } from "./browserTabsStore";
  * How the built-in browser's tab row gives way as its column narrows
  * (raft-design panel.md, "A head fits its column"; the order is the switch
  * chip's design, 2026-11): the tabs behind narrow first, down to a slot that
- * still shows an icon and a few letters; then the Artifact chip's title
+ * still shows an icon, a few letters and the close button's place; then the Artifact chip's title
  * shortens and, under a few letters' room, goes (its icon stays); then the
  * tabs that no longer fit go under More tabs. The tab in front keeps its
  * title at every width, and the chip itself, New tab, Expand and Close never
@@ -21,9 +21,20 @@ export const CHIP_TITLE_MIN = 48;
 const CHIP_PAD = 34;
 /** The line after the chip: 1px, 4px on each side, and the row's gap on each side. */
 const CHIP_SEPARATOR = 1 + 8 + 2 * HEAD_ACTION_GAP;
-/** A tab behind at its narrowest (icon and a few letters), and the gap between two tabs. */
-export const TAB_MIN_WIDTH = 70;
+/**
+ * A tab behind at its narrowest, and the gap between two tabs. Every tab is [icon][title][close], so the slot is its
+ * fixed parts (63px: the edge, 10px lead, the 16px icon and its 6px gap, 28px for the close button) plus 25px of
+ * title, a few letters: narrower, tabs read as an icon and an ellipsis and can't be told apart.
+ */
+export const TAB_MIN_WIDTH = 88;
 const TAB_GAP = 2;
+/** A pinned tab: its icon alone (10px on each side of the 16px icon), at every width. */
+export const PINNED_TAB_WIDTH = 36;
+/**
+ * The free room kept after New tab for the grip that moves the panel, so it never stands over a tab: the narrow
+ * grip's 48px target (BrowserPanel sizes the grip and its room from this one number).
+ */
+export const GRIP_ROOM = 48;
 /** The tab in front where it isn't measured yet: a short title and its close button. */
 const TAB_FRONT_WIDTH = 120;
 
@@ -33,10 +44,16 @@ export interface BrowserHeadFit {
   /** The Artifact chip leads the row. */
   chip: boolean;
   tabs: number;
+  /** How many of the tabs are pinned (they lead the row, an icon each). */
+  pinned?: number;
+  /** The tab in front is a pinned one. */
+  frontPinned?: boolean;
   /** The tab in front's own width, 0 where it isn't measured. */
   frontWidth: number;
   /** Bar buttons that never fold besides New tab: Back (covering), Expand, Close. */
   controls: number;
+  /** The head carries the panel's grip (a section that can be moved in the row). */
+  grip?: boolean;
 }
 
 export interface BrowserHeadRoom {
@@ -46,13 +63,18 @@ export interface BrowserHeadRoom {
   tabsShown: number;
 }
 
-export function fitBrowserHead({ width, chip, tabs, frontWidth, controls }: BrowserHeadFit): BrowserHeadRoom {
+export function fitBrowserHead({ width, chip, tabs, pinned = 0, frontPinned = false, frontWidth, controls, grip = false }: BrowserHeadFit): BrowserHeadRoom {
   if (width <= 0) return { chipTitle: chip ? CHIP_TITLE_MAX : 0, tabsShown: tabs };
   const bar = HEAD_ACTION_WIDTH + HEAD_ACTION_GAP;
   // What the chip's button, the tabs, More tabs and New tab share.
-  const strip = width - 2 * EDGE - controls * bar - (chip ? CHIP_SEPARATOR : 0);
+  const strip = width - 2 * EDGE - controls * bar - (chip ? CHIP_SEPARATOR : 0) - (grip ? GRIP_ROOM + HEAD_ACTION_GAP : 0);
   const front = frontWidth > 0 ? frontWidth : TAB_FRONT_WIDTH;
-  const need = (shown: number) => front + (shown - 1) * (TAB_MIN_WIDTH + TAB_GAP) + (shown < tabs ? bar : 0);
+  // The row shows the first tabs, the pinned ones among them, and always the one in front (splitBrowserTabs).
+  const need = (shown: number) => {
+    const lead = Math.min(pinned, frontPinned ? shown : shown - 1);
+    const behind = shown - lead - (frontPinned ? 0 : 1);
+    return lead * PINNED_TAB_WIDTH + behind * TAB_MIN_WIDTH + (frontPinned ? 0 : front) + (shown - 1) * TAB_GAP + (shown < tabs ? bar : 0);
+  };
   // The chip's title takes what the tabs leave once the ones behind are at their narrowest.
   const titleRoom = chip ? strip - CHIP_PAD - need(tabs) - bar : 0;
   const chipTitle = titleRoom >= CHIP_TITLE_MIN ? Math.min(CHIP_TITLE_MAX, titleRoom) : 0;

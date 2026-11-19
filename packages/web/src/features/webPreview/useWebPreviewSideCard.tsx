@@ -4,9 +4,9 @@ import { Globe } from "lucide-react";
 
 import type { ArtifactCardPlace, ArtifactSideCard } from "../../apps/artifacts";
 import { BrowserPanel } from "./BrowserPanel";
-import { useBrowserTabsStore } from "./browserTabsStore";
+import { browserOf, useBrowserTabsStore } from "./browserTabsStore";
 import { attachBrowserViews } from "./browserViews";
-import { useDesktopBrowserTabs } from "./useWebPreview";
+import { useBrowserTabsList, useDesktopBrowserTabs } from "./useWebPreview";
 import { WebPreviewPanel } from "./WebPreviewPanel";
 import { useWebPreviewStore, WEB_PREVIEW_MIN_WIDTH, webPreviewUrl } from "./webPreviewStore";
 
@@ -31,12 +31,13 @@ export function useWebPreviewSideCard(channelId: string | null | undefined, arti
   const openedAt = useWebPreviewStore((s) => s.openedAt);
   const tabs = useDesktopBrowserTabs();
   const conversationId = tabs && channelId ? channelId : null;
+  useBrowserTabsList(tabs);
   useEffect(() => {
     if (!tabs || !conversationId) return;
     return attachBrowserViews(tabs, conversationId);
   }, [tabs, conversationId]);
   // Only whether there is one and when it came to the front: a tab's title or loading state never renders the channel again.
-  const browserFrontAt = useBrowserTabsStore((s) => (conversationId ? s.browsers[conversationId]?.frontAt ?? null : null));
+  const browserFrontAt = useBrowserTabsStore((s) => (conversationId ? browserOf(s, conversationId)?.frontAt ?? null : null));
   return useMemo(() => {
     const splitLabel = formatMessage({ id: "webPreview.resize" });
     if (tabs && conversationId && browserFrontAt !== null) {

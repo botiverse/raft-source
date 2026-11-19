@@ -128,7 +128,7 @@ function RemoveMemberConfirmDialog({
   const impact = useMemberRemovalImpact(serverId, memberId);
   return (
     <ConfirmDialog
-      title={formatMessage({ id: "member.detail.removeMember" })}
+      title={formatMessage({ id: "member.detail.removeMemberTitle" })}
       message={(
         <>
           {formatMessage({ id: "member.detail.removeMemberConfirmMessage" }, { name: personName })}

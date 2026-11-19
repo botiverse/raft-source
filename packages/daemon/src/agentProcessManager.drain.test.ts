@@ -421,6 +421,64 @@ test("drain: no new agent starts while it holds; the start is acked as queued an
   }, new FakeClaudeDriver(), { runtimeStartScheduler: { minStartIntervalMs: 0 } });
 });
 
+// A delivery that restarts an idle agent answers for the start that carries
+// it (machine ca4239b1, 11-15: an app event acked, then dropped at the
+// upgrade's shutdown). RED proof: resolve a cancelled queued start as a start
+// (`item.resolve("started")` in cancelAllQueuedAgentStarts or
+// cancelQueuedAgentStart) and the delivery resolves true, which core acks.
+function idleWithRestartSnapshot(ctx: Ctx, agentId: string): void {
+  (ctx.manager as any).lifecycleRecords.setRestartSnapshot(agentId, {
+    config: makeConfig({ sessionId: `session-${agentId}` }),
+    sessionId: `session-${agentId}`,
+    launchId: `launch-${agentId}`,
+  });
+}
+
+test("drain: a delivery that restarts an idle agent is not delivered when the shutdown cancels the held start", async () => {
+  await withManager(async (ctx) => {
+    idleWithRestartSnapshot(ctx, "agent-idle");
+    await ctx.manager.beginDrain({ deadlineMs: 60_000 });
+    const delivered = ctx.manager.deliverMessage("agent-idle", message(31));
+    assert.equal(await settledNow(Promise.resolve(delivered)), "pending", "the restart is queued behind the drain");
+    assert.equal(drainEvents(ctx, "auto_restart_from_idle").length, 1);
+
+    await ctx.manager.stopAll();
+    assert.equal(await delivered, false, "never delivered: the start was cancelled");
+    assert.equal(ctx.driver.spawnCalls.length, 0);
+    assert.equal(drainEvents(ctx, "auto_restart_cancelled").length, 1);
+  }, new FakeClaudeDriver(), { runtimeStartScheduler: { minStartIntervalMs: 0 } });
+});
+
+test("drain: a delivery whose held restart a stop of that agent cancels is not delivered; nothing starts at endDrain", async () => {
+  await withManager(async (ctx) => {
+    idleWithRestartSnapshot(ctx, "agent-idle");
+    await ctx.manager.beginDrain({ deadlineMs: 60_000 });
+    const delivered = ctx.manager.deliverMessage("agent-idle", message(32));
+    assert.equal(await settledNow(Promise.resolve(delivered)), "pending");
+
+    await ctx.manager.stopAgent("agent-idle");
+    assert.equal(await delivered, false);
+    ctx.manager.endDrain();
+    await flush();
+    assert.equal(ctx.driver.spawnCalls.length, 0);
+  }, new FakeClaudeDriver(), { runtimeStartScheduler: { minStartIntervalMs: 0 } });
+});
+
+test("a delivery that restarts an idle agent is delivered once the start runs (control: the drain's end, then no drain)", async () => {
+  await withManager(async (ctx) => {
+    idleWithRestartSnapshot(ctx, "agent-held");
+    await ctx.manager.beginDrain({ deadlineMs: 60_000 });
+    const held = ctx.manager.deliverMessage("agent-held", message(33));
+    ctx.manager.endDrain();
+    assert.equal(await held, true);
+
+    idleWithRestartSnapshot(ctx, "agent-idle");
+    assert.equal(await ctx.manager.deliverMessage("agent-idle", message(34)), true);
+    assert.equal(ctx.driver.spawnCalls.length, 2);
+    assert.equal(drainEvents(ctx, "auto_restart_cancelled").length, 0);
+  }, new FakeClaudeDriver(), { runtimeStartScheduler: { minStartIntervalMs: 0 } });
+});
+
 test("drain (acceptance 1): a Stop and a turn interrupt pass through at once", async () => {
   await withManager(async (ctx) => {
     await ctx.manager.startAgent("agent-busy", makeConfig({ sessionId: "session-agent-busy" }));

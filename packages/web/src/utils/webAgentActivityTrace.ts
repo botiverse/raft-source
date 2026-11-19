@@ -1,10 +1,64 @@
-import type { AgentActivity } from "@botiverse/raft-shared";
+import { isAgentActivityDetailKind } from "@botiverse/raft-shared";
+import type { AgentActivity, AgentActivityDetailKind } from "@botiverse/raft-shared";
 import { emitWebEvent } from "./webAuthTrace";
 import type { WebAgentActivityTraceEventName } from "./webAuthTrace";
 
 type ActivityTraceOutcome = "received" | "applied" | "stale_server_seq" | "invalid_activity";
 type StatusDotSurface = "sidebar" | "detail" | "member_list" | "message_input" | "search" | "unknown";
 const AGENT_ACTIVITY_VALUES = new Set<AgentActivity>(["offline", "online", "working", "thinking", "error"]);
+
+/*
+ * Q8 scrub — the rule for every attr on these events: ids are emitted only as
+ * `*_present` booleans (or closed-set relations derived from them), never raw.
+ *
+ * ONE approved exception (Tenny, privacy owner): `launch_id` and `client_seq`
+ * go out raw on `socket_received` and `store_decision`, and nothing else does.
+ * Why these two and only these: the launch id is an opaque random UUID minted
+ * per agent launch (server `planStartLaunchId` → crypto.randomUUID()) and the
+ * client seq is a per-launch counter; neither points to a person or to content,
+ * both are already raw on the server/daemon activity spans
+ * (`daemonActivityJoinTraceAttrs`, correlation_id
+ * `agent:<id>:daemonActivity:<launch_id>:<client_seq>`), and together they
+ * give an exact web ↔ server/daemon join. Each is shape-checked before it is
+ * emitted (UUID / non-negative safe integer; anything else stays boolean-only)
+ * and again by the trace-upload worker on receipt.
+ *
+ * Do NOT copy this for other ids: agent id, message id, channel id, server id,
+ * user id, probe id, server seq stay presence-only. A new raw field needs its
+ * own privacy-owner ruling (see rfcs/040-frontend-tracing-contract.md §4).
+ */
+const LAUNCH_ID_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** The raw launch id, only when it is a UUID (Q8 exception above); otherwise undefined. */
+export function traceableLaunchId(value: unknown): string | undefined {
+  return typeof value === "string" && LAUNCH_ID_UUID_RE.test(value) ? value : undefined;
+}
+
+/** The raw client seq, only when it is a non-negative safe integer (Q8 exception above); otherwise undefined. */
+export function traceableClientSeq(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+/** The two approved raw join keys, each present only when its shape is valid. */
+function joinKeyAttrs(input: { launchId?: string | null; clientSeq?: number | null }): Record<string, unknown> {
+  const launchId = traceableLaunchId(input.launchId);
+  const clientSeq = traceableClientSeq(input.clientSeq);
+  return {
+    ...(launchId !== undefined ? { launch_id: launchId } : {}),
+    ...(clientSeq !== undefined ? { client_seq: clientSeq } : {}),
+  };
+}
+
+/**
+ * `detail_kind` is a closed set: the registered activity detail kinds
+ * (`AGENT_ACTIVITY_DETAIL_KINDS` in @botiverse/raft-shared, which already
+ * includes "none" and "other"), "unknown" when absent, and "other" for any
+ * string outside the registry — a free-form value never passes through.
+ */
+export function traceDetailKind(value: string | null | undefined): AgentActivityDetailKind | "unknown" {
+  if (value == null) return "unknown";
+  return isAgentActivityDetailKind(value) ? value : "other";
+}
 
 interface ActivityTraceBase {
   agentId?: string | null;
@@ -31,7 +85,8 @@ interface StoreDecisionTrace extends ActivityTraceBase {
   /**
    * launchId under which the agent's serverSeq baseline was last applied.
    * Used only to derive the closed-set `launch_changed` / `same_launch`
-   * relation below — never emitted as a raw value (Q8 scrub). Lets a trace
+   * relation below — never emitted as a raw value (Q8 scrub; the approved
+   * exception covers only the event's own `launch_id`, not this baseline). Lets a trace
    * reader tell whether a `stale_server_seq` drop coincided with a launch
    * change, distinguishing a launch-scoped counter reset from an ordinary
    * within-launch out-of-order drop, without exposing any ids/seqs.
@@ -118,7 +173,7 @@ function baseAttrs(input: ActivityTraceBase): Record<string, unknown> {
     has_entries: Boolean(input.hasEntries),
     detail_present: input.detail != null && input.detail.length > 0,
     detail_length_bucket: detailLengthBucket(input.detail),
-    detail_kind: input.detailKind ?? "unknown",
+    detail_kind: traceDetailKind(input.detailKind),
     launch_id_present: Boolean(input.launchId),
     client_seq_present: typeof input.clientSeq === "number",
     probe_id_present: Boolean(input.probeId),
@@ -188,6 +243,7 @@ export function traceAgentActivitySocketReceived(input: ActivityTraceBase & { pr
   if (routine && !sampledRoutine()) return;
   emitAgentActivityTrace("slock.agent_activity.socket_received", {
     ...baseAttrs(input),
+    ...joinKeyAttrs(input),
     outcome: "received",
     ...(routine ? { sample_rate: ROUTINE_AGENT_ACTIVITY_TRACE_SAMPLE_RATE } : {}),
   });
@@ -201,6 +257,7 @@ export function traceAgentActivityStoreDecision(input: StoreDecisionTrace): void
   emitAgentActivityTrace("slock.agent_activity.store_decision", {
     ...(routine ? { sample_rate: ROUTINE_AGENT_ACTIVITY_TRACE_SAMPLE_RATE } : {}),
     ...baseAttrs(input),
+    ...joinKeyAttrs(input),
     outcome: input.outcome,
     previous_activity: activityAttr(input.previousActivity),
     next_activity: activityAttr(input.nextActivity),

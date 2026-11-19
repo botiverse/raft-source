@@ -50,10 +50,22 @@ export {
   formatCompactionInterruption,
   projectStructuredRuntimeTerminalFailure,
 } from "../runtimeCompactionProjection";
-export { readClaudeInstallationAsync, resolveClaudeCommand } from "./claude";
+export { claudeSideQuestionProviderEnv, readClaudeInstallationAsync, resolveClaudeCommand, startClaudeSideQuestion } from "./claude";
 export { buildCodexAppServerArgs, buildCodexInstructionShapeAttrs, buildCodexInstructionShapeStaticAttrs, type CodexInstructionObservationPhase, type CodexThreadRequestMethod, codexBlankFinalAnswerDiagnostic, codexCandidateTraceAttrs, codexMcpToolName, codexNotificationDiagnostics, parseCodexTelemetryEvent, CODEX_MANAGED_MCP_TOKEN_ENV, codexThreadFields, parseCodexJsonRpcLine, prepareCodexLaunch, resolveCodexSpawn, type CodexLaunchPreparation, type CodexThreadFields } from "./codex";
 export { ANTIGRAVITY_ENV_OVERRIDES, excludeFromWorkspaceGit, prepareAntigravityEnvironment, resolveAntigravitySpawn } from "./antigravity.deprecated";
 export { prepareGrokLaunch, type GrokLaunchPlan } from "./grok";
+export {
+  decideOpenCodeSessionResume,
+  ensureOpenCodeSessionRecordWritable,
+  openCodeSessionRecordPath,
+  prepareOpenCodeOarEnvironment,
+  readOpenCodeSessionRecord,
+  readOpenCodeVersionDetailedAsync,
+  resolveOpenCodeSpawnAsync,
+  writeOpenCodeSessionRecord,
+  type OpenCodeSessionResumeDecision,
+  type OpenCodeVersionRead,
+} from "./opencode";
 export { isOarOnlyRuntimeId, OAR_ONLY_RUNTIMES, oarOnlyInstallation, prepareOarOnlyLaunchEnv, readOarOnlyCliVersion, type OarOnlyRuntimeId } from "./oarOnly";
 
 const driverFactories: Record<string, () => RuntimeDriver> = {
@@ -81,7 +93,6 @@ const driverFactories: Record<string, () => RuntimeDriver> = {
   // Run only on the OAR host (drivers/oarOnly.ts): no legacy driver exists.
   qwen: () => new OarOnlyDriver("qwen"),
   qoder: () => new OarOnlyDriver("qoder"),
-  codebuddy: () => new OarOnlyDriver("codebuddy"),
 };
 
 /** Every runtime id `getDriver` accepts. */

@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
-import { AGENT_MIGRATION_CAPABILITY, AGENT_MIGRATION_TARGET_IGNORE_SOURCES_CAPABILITY } from "@botiverse/raft-shared";
+import {
+  AGENT_MIGRATION_CAPABILITY,
+  AGENT_MIGRATION_TARGET_IGNORE_SOURCES_CAPABILITY,
+  AGENT_MIGRATION_TARGET_IGNORED_PARTIAL_CAPABILITY,
+} from "@botiverse/raft-shared";
 import { AgentOrchestrator } from "./agentOrchestrator";
 
 // .raftbackupignore (#wg-agent-migration:7746de27): the target validates the
@@ -72,4 +76,23 @@ test("the source lease says the target accepts ignore sources only when the targ
   assert.deepEqual(h.sent[0]!.message, { ...lease("source", "target-new"), targetAcceptsIgnoreSources: true });
   assert.ok(!("targetAcceptsIgnoreSources" in h.sent[1]!.message), "an older target's source lease is unchanged");
   assert.deepEqual(h.sent.map((entry) => entry.machineId), ["source-1", "source-1", "source-1", "source-1", "target-new"]);
+});
+
+test("the source lease says the target accepts a partial ignored mark only when the target advertises it", async () => {
+  const h = harness({
+    "target-both": [AGENT_MIGRATION_CAPABILITY, AGENT_MIGRATION_TARGET_IGNORE_SOURCES_CAPABILITY, AGENT_MIGRATION_TARGET_IGNORED_PARTIAL_CAPABILITY],
+    "target-sources": [AGENT_MIGRATION_CAPABILITY, AGENT_MIGRATION_TARGET_IGNORE_SOURCES_CAPABILITY],
+  });
+
+  await send(h, "source-1", lease("source", "target-both"));
+  await send(h, "source-1", lease("source", "target-sources"));
+  await send(h, "target-both", lease("target", "target-both"));
+
+  assert.deepEqual(h.sent[0]!.message, {
+    ...lease("source", "target-both"),
+    targetAcceptsIgnoreSources: true,
+    targetAcceptsIgnoredPartial: true,
+  });
+  assert.deepEqual(h.sent[1]!.message, { ...lease("source", "target-sources"), targetAcceptsIgnoreSources: true });
+  assert.deepEqual(h.sent[2]!.message, lease("target", "target-both"), "a target lease never carries either");
 });

@@ -1,4 +1,6 @@
 import { Router } from "express";
+import { DESKTOP_DOWNLOAD_FROM_APP, DESKTOP_DOWNLOAD_FROM_PARAM, type DesktopDownloadTarget } from "@botiverse/raft-shared";
+import { recordDesktopDownloadRequested } from "../services/desktopDownloadProductEvents";
 import { mobileDownloadChooserUrl } from "./mobileDownload";
 
 /**
@@ -90,6 +92,10 @@ type Feed = "latest-mac.yml" | "latest-linux.yml" | "latest.yml";
  * `mac` prefers a universal build and falls back to Apple silicon: universal
  * installs on every Mac, and Apple silicon is what a Mac without a universal
  * build most likely is. The Intel build stays reachable as `mac-x64`.
+ *
+ * The target names are `DESKTOP_DOWNLOAD_TARGETS` of the shared package, which
+ * the `desktop_download_requested` product event also lists: a target added
+ * or removed here without it does not compile.
  */
 const TARGETS = {
   mac: { feed: "latest-mac.yml", files: [/-universal\.dmg$/, /-arm64\.dmg$/] },
@@ -98,9 +104,9 @@ const TARGETS = {
   "linux-appimage": { feed: "latest-linux.yml", files: [/-x86_64\.AppImage$/] },
   "linux-deb": { feed: "latest-linux.yml", files: [/-amd64\.deb$/] },
   windows: { feed: "latest.yml", files: [/-x64\.exe$/, /\.exe$/] },
-} as const satisfies Record<string, { feed: Feed; files: readonly RegExp[] }>;
+} as const satisfies Record<DesktopDownloadTarget, { feed: Feed; files: readonly RegExp[] }>;
 
-export type DesktopTarget = keyof typeof TARGETS;
+export type DesktopTarget = DesktopDownloadTarget;
 
 export function isDesktopTarget(value: unknown): value is DesktopTarget {
   return typeof value === "string" && Object.prototype.hasOwnProperty.call(TARGETS, value);
@@ -270,6 +276,16 @@ desktopDownloadRouter.get("/", async (req, res) => {
     // Short: a new release should reach people within minutes.
     res.setHeader("Cache-Control", "private, max-age=300");
     res.redirect(302, result.url);
+    // Only here, where an installer was handed out: not for the chooser above
+    // nor the fallbacks below. After the redirect and never awaited. In-app
+    // auto-update reads the feed itself and never comes through this route.
+    // Express answers HEAD through this GET handler; a HEAD is a link checker's
+    // or a mail scanner's probe, never a download, so it is not a request here.
+    // Nor is a link the Raft app made (`from=app`): a click inside the product
+    // is app_download_clicked's, under the person's usage-data choice, and must
+    // not add a row here for someone who turned that off.
+    const fromApp = req.query[DESKTOP_DOWNLOAD_FROM_PARAM] === DESKTOP_DOWNLOAD_FROM_APP;
+    if (req.method === "GET" && !fromApp) recordDesktopDownloadRequested(req, target);
     return;
   }
   // The links are downloads opened in the same tab, so a JSON error body would

@@ -28,6 +28,7 @@ test("HTTP acceptance stops before machine ownership is released; traces flush a
     flushTraces: async () => {
       events.push("trace_flush_started");
     },
+    closeRemainingConnections: async () => {},
     shutdownSharedState: async () => {
       events.push("shared_state_stopped");
     },
@@ -63,6 +64,7 @@ test("a synchronous HTTP stop failure does not release machine ownership", async
       },
       settleWorkers: async () => {},
       flushTraces: async () => {},
+      closeRemainingConnections: async () => {},
       shutdownSharedState: async () => {
         sharedStateStopped = true;
       },
@@ -73,4 +75,73 @@ test("a synchronous HTTP stop failure does not release machine ownership", async
 
   assert.equal(ownerReleased, false);
   assert.equal(sharedStateStopped, false);
+});
+
+// Deployment thread 3f292dc3: browser sockets still open when Redis (and the
+// Socket.IO adapter on it) shut down silently missed every cross-replica emit.
+test("remaining connections are closed before shared state shuts down, while the HTTP drain waits on them", async () => {
+  const events: string[] = [];
+  // `server.close()` resolves only once every open connection is gone, so
+  // here the HTTP drain waits for the close below: closing after the drain
+  // would never happen.
+  let connectionsClosed!: () => void;
+  const allConnectionsGone = new Promise<void>((resolve) => {
+    connectionsClosed = resolve;
+  });
+  let finishClose!: () => void;
+  const closing = new Promise<void>((resolve) => {
+    finishClose = resolve;
+  });
+
+  const shutdown = shutdownServerRuntime({
+    stopAcceptingHttp: () => allConnectionsGone.then(() => {
+      events.push("http_drained");
+    }),
+    releaseMachineOwnership: async () => {},
+    settleWorkers: async () => {},
+    flushTraces: async () => {},
+    closeRemainingConnections: () => {
+      events.push("close_remaining_started");
+      return closing.then(() => {
+        events.push("close_remaining_done");
+      });
+    },
+    shutdownSharedState: async () => {
+      events.push("shared_state_stopped");
+    },
+    warn: () => {},
+  });
+
+  assert.deepEqual(events, ["close_remaining_started"], "closing does not wait for the HTTP drain");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(events.includes("shared_state_stopped"), false);
+
+  connectionsClosed();
+  finishClose();
+  await shutdown;
+  assert.ok(events.indexOf("close_remaining_done") >= 0);
+  assert.ok(events.indexOf("close_remaining_done") < events.indexOf("shared_state_stopped"), events.join(","));
+  assert.equal(events.at(-1), "shared_state_stopped");
+});
+
+test("a failed close of the remaining connections is warned and shared state still shuts down", async () => {
+  const warnings: string[] = [];
+  let sharedStateStopped = false;
+
+  await shutdownServerRuntime({
+    stopAcceptingHttp: async () => {},
+    releaseMachineOwnership: async () => {},
+    settleWorkers: async () => {},
+    flushTraces: async () => {},
+    closeRemainingConnections: async () => {
+      throw new Error("close failed");
+    },
+    shutdownSharedState: async () => {
+      sharedStateStopped = true;
+    },
+    warn: (message) => warnings.push(message),
+  });
+
+  assert.deepEqual(warnings, ["Failed to close remaining browser connections"]);
+  assert.equal(sharedStateStopped, true);
 });

@@ -115,7 +115,7 @@ test("apps tab: events, revoke, deny, approve, grant on the agent's behalf", asy
   // Revoke sticks: the app's next request waits for a person.
   // Revoking an App grant can't be undone (#12107), so it asks first.
   await page.getByRole("button", { name: "Revoke" }).click();
-  const confirm = page.getByRole("dialog", { name: "Revoke app access" });
+  const confirm = page.getByRole("dialog", { name: "Revoke app access?" });
   await expect(confirm).toBeVisible();
   await page.getByTestId("agent-app-revoke-confirm").click();
   await expect(confirm).toHaveCount(0);

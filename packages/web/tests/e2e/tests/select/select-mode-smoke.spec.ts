@@ -8,7 +8,6 @@ import { expectTimelineRendered } from "../../fixtures/timeline";
 import {
   clickSelectModeMoreAction,
   clickShareMessagesMenu,
-  openSelectModeMoreMenu,
 } from "../../fixtures/contextMenu";
 
 async function clearNativeSelection(page: Page) {
@@ -153,12 +152,8 @@ test("select mode entry + check circles + toolbar render", async ({ page, reques
   const toolbar = page.getByTestId("select-mode-toolbar");
   await expect(toolbar).toBeVisible();
   await expect(page.getByTestId("select-mode-count")).toHaveText("1 selected");
-  // Share preview lives in More and is enabled with one selected message.
-  await expect(page.getByTestId("select-mode-more")).toBeEnabled();
-  await openSelectModeMoreMenu(page);
+  // Generate image is enabled with one selected message (in the row, or in More when narrow).
   await expect(page.getByTestId("select-mode-share-open")).toBeEnabled();
-  await page.getByTestId("select-mode-more").click();
-  await expect(page.getByTestId("select-mode-more-menu")).toHaveCount(0);
 
   // Exactly one message has the filled (yellow) check circle — the one we
   // entered select mode on. Since #7347 the circle is RUI's

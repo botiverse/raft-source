@@ -139,6 +139,7 @@ import { parsePasskeyRegistrationResponse } from "../services/secondFactor/webau
 import { approverSecondFactorCheck } from "../services/sessionIssueGate";
 import { STEP_UP_ACTIONS, recentSecondFactorCheck, type StepUpAction } from "../services/secondFactor/stepUpGate";
 import { webSessionFamilyOf } from "../services/sessionService";
+import { noteOwnerDispatchStepUp } from "../services/ownerDispatchMark";
 import { sendJsonServerError } from "./errorResponse";
 
 export const secondFactorRouter: RouterType = Router();
@@ -166,6 +167,8 @@ export async function refuseUnverifiedApprover(
   error = "Confirm it's you with your second step before approving this sign-in.",
 ): Promise<boolean> {
   if (await approverSecondFactorCheck(userId, familyId) === "ok") return false;
+  // A request:prepare card reads the refusal from here, never from the body's code (Tenny 296b02bc).
+  noteOwnerDispatchStepUp(res.req);
   res.status(403).json({
     error,
     code: "second_factor_step_up_required",
@@ -192,6 +195,7 @@ export async function refuseWithoutRecentSecondFactor(
   action: StepUpAction,
 ): Promise<boolean> {
   if (await recentSecondFactorCheck(userId, familyId) === "ok") return false;
+  noteOwnerDispatchStepUp(res.req);
   res.status(403).json({
     error: STEP_UP_ACTIONS[action],
     code: "second_factor_step_up_required",

@@ -27,6 +27,7 @@ test("both values defaulted: both are named, and the override sets both for the 
   assert.match(text, /These are not the model's real limits/);
   assert.match(text, /`\.builtin-runtime\/models\.json`/);
   assert.match(text, /Keep the file valid JSON: Pi ignores an invalid models\.json entirely, all of its settings, not only these\./);
+  assert.match(text, /Only `modelOverrides` limits and model metadata in this file apply\. Raft ignores endpoint, header, key and other transport or auth settings/);
   assert.match(text, /also overrides the Context window or Max output tokens your owner sets in your agent settings/);
   assert.match(text, /applies the next time you are started \(a restart from your page in Raft, or a restart of your Computer\), not in this session/);
   assert.doesNotMatch(text, /next session/, "a session rotation does not re-read the file");

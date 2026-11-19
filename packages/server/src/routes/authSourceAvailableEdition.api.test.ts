@@ -2,17 +2,11 @@ import assert from "node:assert/strict";
 import { users } from "../db/schema";
 import { getDb } from "../db/index";
 import { isNativeAppleSignInConfigured, isSocialAuthProviderConfigured } from "../services/socialAuthService";
+import { setEditionForTest } from "../test/edition";
 import { createApiTest } from "../test/integration/apiTest";
 import { fixturePasswordHash, tokenForHuman } from "../test/integration/credentials";
 
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
-
-// The edition line export-snapshot rewrites (edition.ts), switched per test.
-const edition = vi.hoisted(() => ({ value: "cloud" as "cloud" | "source-available" }));
-vi.mock("../edition", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../edition")>();
-  return { ...actual, socialLoginAllowed: () => actual.socialLoginAllowed(edition.value) };
-});
 
 const EMAIL = "edition-owner@slock.test";
 const PASSWORD = "edition-password-123";
@@ -34,7 +28,6 @@ function configureEveryProvider() {
 
 afterEach(() => {
   vi.unstubAllEnvs();
-  edition.value = "cloud";
 });
 
 async function seedPasswordUser() {
@@ -98,7 +91,7 @@ async function probeSocialRoutes(baseUrl: string, accessToken: string) {
 test("the source-available edition refuses every social route and offers no provider, whatever the environment configures", async ({ app }) => {
   configureEveryProvider();
   const accessToken = await seedPasswordUser();
-  edition.value = "source-available";
+  setEditionForTest("source-available");
 
   for (const provider of ["google", "github", "apple"] as const) assert.equal(isSocialAuthProviderConfigured(provider), false);
   assert.equal(isNativeAppleSignInConfigured(), false);

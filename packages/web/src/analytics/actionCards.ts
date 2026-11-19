@@ -5,10 +5,20 @@
 import { useEffect } from "react";
 import type { RefObject } from "react";
 import { isProductEventActionCardType } from "@botiverse/raft-shared";
+import type { ActionCardMetadata } from "@botiverse/raft-shared";
 import { trackEvent } from "./track";
 
 /** Once per card per page load, wherever it shows (the channel and a thread can both show it). */
 const shownThisPageLoad = new Set<string>();
+
+/**
+ * A request card (`request:prepare`) names the one person who decides it; the
+ * server refuses anyone else. For the funnel only that person "can act": a
+ * channel of thirty reading the card is not thirty people it was shown to.
+ */
+export function requestCardNamesSomeoneElse(action: ActionCardMetadata["action"], viewerId: string | undefined): boolean {
+  return action.type === "request:prepare" && action.addressee.userId.toLowerCase() !== viewerId?.toLowerCase();
+}
 
 /**
  * Records `action_card_shown` the first time half of a card is on screen while

@@ -486,7 +486,7 @@ test("Advanced starts open when any visible advanced field has a non-blank value
   assert.equal(runtimeFormV2AdvancedStartsOpen(builtin, { ...gateway, contextWindow: "128000" }), true);
   assert.equal(runtimeFormV2AdvancedStartsOpen(builtin, { ...gateway, envVars: { A: "1" } }), true, "envVars with a value opens it too");
   assert.equal(runtimeFormV2AdvancedStartsOpen(builtin, { ...gateway, loadLocalPlugins: true }), true);
-  assert.equal(runtimeFormV2AdvancedStartsOpen(builtin, { ...gateway, providerId: "anthropic", maxOutputTokens: "8192" }), false, "hidden field");
+  assert.equal(runtimeFormV2AdvancedStartsOpen(builtin, { ...gateway, providerId: "connection:c1", maxOutputTokens: "8192" }), false, "hidden field");
   // The edit fixture stores envVars: Advanced opens on edit.
   assert.equal(runtimeFormV2AdvancedStartsOpen(builtinEdit, builtinEdit.values as Record<string, never>), true);
   assert.equal(runtimeFormV2AdvancedStartsOpen(builtin, { ...gateway, model: "m" }), false, "main fields never open it");

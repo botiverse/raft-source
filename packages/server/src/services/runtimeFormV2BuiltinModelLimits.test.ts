@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { vi } from "vitest";
 import { parseRuntimeFormV2, releasedRuntimeFormDefinition, runtimeFormV2AdvancedStartsOpen } from "@botiverse/raft-runtime-form";
-import { parseRuntimeConfig } from "@botiverse/raft-shared";
+import { BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS, parseRuntimeConfig } from "@botiverse/raft-shared";
 import { localizeRuntimeFormV2 } from "./runtimeFormV2Copy";
 import { buildRuntimeConfigFromFormValues, buildRuntimeFormV2, runtimeFormValuesFromRuntimeConfig } from "./runtimeFormV2Registry";
 
@@ -11,7 +11,7 @@ vi.mock("./providerConnectionService", () => ({ listProviderConnections: vi.fn(a
 
 const gateway = { providerId: "openai-compatible", apiKey: "test-key", baseUrl: "https://gateway.example.test/v1", model: "devin/swe-2-flash" };
 
-test("the v2 form has both fields optional and in Advanced, shown for gateways and OpenRouter; the released v1 form is unchanged", () => {
+test("the v2 form has both fields optional and in Advanced, shown for gateways and the presets that take a typed id; the released v1 form is unchanged", () => {
   const raw = buildRuntimeFormV2("builtin");
   const form = parseRuntimeFormV2(raw)!;
   for (const key of ["contextWindow", "maxOutputTokens"]) {
@@ -19,7 +19,7 @@ test("the v2 form has both fields optional and in Advanced, shown for gateways a
     assert.ok(field, key);
     assert.equal(field.advanced, true);
     assert.equal(field.required, false);
-    assert.deepEqual(field.visibleWhen, [{ key: "providerId", in: ["openai-compatible", "anthropic-compatible", "openrouter"] }]);
+    assert.deepEqual(field.visibleWhen, [{ key: "providerId", in: ["openai-compatible", "anthropic-compatible", ...BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS] }]);
   }
   // Standard layout only: no bespoke keys beside `advanced`.
   assert.deepEqual(raw.uiSchema?.layout, { advanced: ["/contextWindow", "/maxOutputTokens", "/loadLocalPlugins", "/envVars"] });
@@ -28,7 +28,7 @@ test("the v2 form has both fields optional and in Advanced, shown for gateways a
   const gatewayValues = { providerId: "openai-compatible", envVars: {}, loadLocalPlugins: false, contextWindow: "", maxOutputTokens: "" };
   assert.equal(runtimeFormV2AdvancedStartsOpen(form, gatewayValues), false);
   assert.equal(runtimeFormV2AdvancedStartsOpen(form, { ...gatewayValues, maxOutputTokens: "8192" }), true);
-  assert.equal(runtimeFormV2AdvancedStartsOpen(form, { ...gatewayValues, providerId: "anthropic", contextWindow: "200000" }), false, "hidden");
+  assert.equal(runtimeFormV2AdvancedStartsOpen(form, { ...gatewayValues, providerId: "connection:c1", contextWindow: "200000" }), false, "hidden");
   const v1 = releasedRuntimeFormDefinition("builtin-pi.create.v3")!;
   assert.equal(v1.dataSchema.properties.contextWindow, undefined);
   assert.equal(v1.dataSchema.properties.maxOutputTokens, undefined);
@@ -71,13 +71,12 @@ test("a saved gateway connection's custom model takes them too", () => {
   assert.equal(runtimeFormValuesFromRuntimeConfig(built.runtimeConfig)!.contextWindow, "64000");
 });
 
-test("invalid values, output above the window, and limits on a preset model are refused on their own field", () => {
+test("invalid values and output above the window are refused on their own field", () => {
   for (const [values, pointer] of [
     [{ ...gateway, contextWindow: "lots" }, "/formValues/contextWindow"],
     [{ ...gateway, contextWindow: "0" }, "/formValues/contextWindow"],
     [{ ...gateway, contextWindow: "20000000" }, "/formValues/contextWindow"],
     [{ ...gateway, contextWindow: "8000", maxOutputTokens: "9000" }, "/formValues/maxOutputTokens"],
-    [{ providerId: "deepseek", apiKey: "k", model: "deepseek/deepseek-flash", contextWindow: "128000" }, "/formValues/contextWindow"],
   ] as const) {
     const built = buildRuntimeConfigFromFormValues("builtin", values);
     assert.equal(built.ok, false, JSON.stringify(values));

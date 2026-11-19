@@ -5,6 +5,7 @@ import { ACTION_CARD_ACTION_TYPES } from "./actionCards";
 import { NOTIFICATION_MOBILE_DELAYS, NOTIFICATION_PREVIEW_MODES } from "./notifications";
 import { RUNTIME_ACCOUNT_USAGE_PROVIDERS } from "./runtimeAccountUsage";
 import {
+  APP_SETTINGS,
   ARTIFACT_EVENT_KINDS,
   ARTIFACT_FRAMED_EVENT_KINDS,
   ARTIFACT_OPEN_SOURCES,
@@ -25,12 +26,21 @@ import {
   PRODUCT_EVENT_ACTION_CARD_TYPES,
   PRODUCT_EVENT_REGISTRY,
   DESKTOP_COMPUTER_MIGRATION_ERROR_CODE_MAX_LENGTH,
+  DESKTOP_DOWNLOAD_TARGETS,
   DESKTOP_COMPUTER_MIGRATION_ERROR_CODES,
   EXTERNAL_CONNECT_PATHS,
   EXTERNAL_CONNECT_REFUSAL_CODES,
   EXTERNAL_CONNECT_RESULTS,
+  SERVER_SETUP_ACTIONS,
+  SERVER_SETUP_BLOCK_REASONS,
+  SERVER_SETUP_GATE_BLOCK_REASONS,
+  SERVER_SETUP_START_RUNTIMES,
+  SERVER_SETUP_STEPS,
   type ProductEventSpec,
+  campaignPath,
   campaignToken,
+  isRaftSiteHost,
+  referrerHost,
   referrerHostname,
   validateProductEvent,
 } from "./productEvents";
@@ -50,8 +60,12 @@ test("the product event registry changes only on purpose", () => {
     "agent_read_progress_shown",
     "announcement_interacted",
     "announcement_shown",
+    "app_download_clicked",
+    "app_install_source_read",
     "app_opened",
     "app_rating_prompt_requested",
+    "app_setting_changed",
+    "app_settings_snapshot",
     "artifact_comment_posted",
     "artifact_frame_loaded",
     "artifact_imported",
@@ -82,10 +96,14 @@ test("the product event registry changes only on purpose", () => {
     "confirm_dialog_closed",
     "conversation_mute_changed",
     "desktop_computer_migration_finished",
+    "desktop_download_requested",
     "drafts_item_opened",
     "drafts_page_viewed",
     "email_verification_sent",
     "email_verified",
+    "external_agent_setup_action",
+    "external_agent_setup_closed",
+    "external_agent_setup_progress",
     "external_channel_connect_finished",
     "external_invite_closed",
     "external_invite_email_sent",
@@ -95,10 +113,13 @@ test("the product event registry changes only on purpose", () => {
     "external_invite_reviewed",
     "external_invite_send_finished",
     "feature_action",
+    "integration_service_requested",
     "message_action_selected",
     "nav_entry_selected",
     "notification_level_changed",
     "notification_settings_changed",
+    "onboarding_tour_ended",
+    "onboarding_tour_step_shown",
     "page_viewed",
     "paywall_action",
     "paywall_hit",
@@ -171,6 +192,34 @@ test("external invite events are server facts of enums and booleans: no address,
   assert.deepEqual(validateProductEvent("external_invite_link_opened", { likely_bot: false }, "web"), { ok: false, reason: "source_not_allowed" });
   for (const extra of ["user_agent", "invite_id", "channel_id", "host_server_id"]) {
     assert.deepEqual(validateProductEvent("external_invite_link_opened", { likely_bot: false, [extra]: "x" }, "server"), { ok: false, reason: "unknown_property", property: extra });
+  }
+});
+
+// #proj-analytics:e9009f38 (Nova): requests for a Raft Desktop installer, by target and source.
+test("desktop_download_requested: a server fact of the route's target, likely_bot and the sanitised source values, nothing identifying", () => {
+  const ok = { ok: true, event: "desktop_download_requested" };
+  for (const target of DESKTOP_DOWNLOAD_TARGETS) {
+    assert.deepEqual(validateProductEvent("desktop_download_requested", { target, likely_bot: false }, "server"), ok, target);
+  }
+  assert.deepEqual([...DESKTOP_DOWNLOAD_TARGETS].sort(), ["linux-appimage", "linux-deb", "mac", "mac-arm64", "mac-x64", "windows"]);
+  const request = { target: "mac-arm64", likely_bot: true, utm_source: "newsletter", utm_medium: "email", utm_campaign: "acme/widgets", referrer_domain: "example.com" };
+  assert.deepEqual(validateProductEvent("desktop_download_requested", request, "server"), ok);
+  for (const source of ["web", "desktop", "ios", "android", "harmonyos"] as const) {
+    assert.deepEqual(validateProductEvent("desktop_download_requested", request, source), { ok: false, reason: "source_not_allowed" }, source);
+  }
+  for (const property of ["target", "likely_bot"]) {
+    const { [property]: _left, ...rest } = request as Record<string, unknown>;
+    assert.deepEqual(validateProductEvent("desktop_download_requested", rest, "server"), { ok: false, reason: "missing_property", property });
+  }
+  for (const [property, value] of [["target", "mac_arm64"], ["target", "ios"], ["likely_bot", "yes"], ["utm_source", "Has Space"], ["utm_campaign", "a/b/c"], ["referrer_domain", "https://example.com/x"]] as const) {
+    assert.deepEqual(
+      validateProductEvent("desktop_download_requested", { ...request, [property]: value }, "server"),
+      { ok: false, reason: "invalid_property_value", property },
+      `${property}=${value}`,
+    );
+  }
+  for (const extra of ["user_agent", "ip", "version", "url", "device_id"]) {
+    assert.deepEqual(validateProductEvent("desktop_download_requested", { ...request, [extra]: "x" }, "server"), { ok: false, reason: "unknown_property", property: extra });
   }
 });
 
@@ -252,6 +301,118 @@ test("new-user journey events: account steps are server facts, setup steps web e
   assert.equal(validateProductEvent("server_setup_blocked", { step: "computer_runtime", reason: "computer_offline", native_host: true }, "web").ok, true);
   assert.equal(validateProductEvent("server_setup_step_shown", { step: "create_agent", native_host: "ios" }, "web").ok, false, "a flag, not the app's name");
   assert.equal(validateProductEvent("server_setup_step_shown", { step: "create_agent", native_host: true }, "ios").ok, false, "the app sends no setup events: its WebView's page does");
+});
+
+// stdrc via Ferry, 2026-11-14 (onboarding redesign): the new flow's values, registered before
+// anything sends them. Every value an older client sends stays valid.
+test("the new onboarding flow adds setup steps, actions and reasons, and removes none an older client sends", () => {
+  for (const step of ["computer_runtime", "create_agent", "survey", "upgrade", "display_style", "handoff"]) {
+    assert.equal(validateProductEvent("server_setup_step_shown", { step }, "web").ok, true, `old flow: ${step}`);
+  }
+  for (const action of [
+    "copy_install_and_setup_command", "copy_install_command", "copy_setup_command", "copy_runtime_install_command",
+    "use_this_computer", "next", "start_over", "switch_server", "server_settings", "use_cloud_agent", "create_cindy", "continue", "lets_go",
+  ]) {
+    assert.equal(validateProductEvent("server_setup_step_action", { step: "computer_runtime", action }, "web").ok, true, `old flow: ${action}`);
+  }
+  const gateReasons = [
+    "computer_offline", "computer_status_unknown", "runtime_not_ready", "runtime_checking", "runtime_error",
+    "runtime_status_unknown", "official_onboarding_agent_missing", "official_onboarding_agent_unusable",
+    "official_onboarding_agent_status_unknown", "resolver_error",
+  ];
+  assert.deepEqual([...SERVER_SETUP_GATE_BLOCK_REASONS], gateReasons, "the ten gate reasons, written out: none may go missing");
+  for (const reason of gateReasons) {
+    assert.equal(validateProductEvent("server_setup_blocked", { step: "computer_runtime", reason }, "web").ok, true, `old flow: ${reason}`);
+  }
+  assert.deepEqual([...SERVER_SETUP_STEPS].slice(0, 3), ["computer_runtime", "cindy_starting", "first_agent"], "the new flow's steps, in order");
+  assert.deepEqual([...SERVER_SETUP_BLOCK_REASONS], [...SERVER_SETUP_GATE_BLOCK_REASONS, "cindy_start_failed", "cindy_no_reply"]);
+  assert.equal(new Set(SERVER_SETUP_ACTIONS).size, SERVER_SETUP_ACTIONS.length, "no action listed twice");
+
+  // The new flow says so; the old flow says nothing.
+  for (const step of ["computer_runtime", "cindy_starting", "first_agent"]) {
+    assert.equal(validateProductEvent("server_setup_step_shown", { step, flow: "v2" }, "web").ok, true, step);
+    assert.equal(validateProductEvent("server_setup_step_shown", { step, flow: "v2", native_host: true }, "desktop").ok, true, step);
+  }
+  const notAFlow = { ok: false, reason: "invalid_property_value", property: "flow" };
+  assert.deepEqual(validateProductEvent("server_setup_step_shown", { step: "computer_runtime", flow: "v1" }, "web"), notAFlow, "the old flow leaves `flow` out");
+  assert.deepEqual(validateProductEvent("server_setup_step_action", { step: "computer_runtime", action: "next", flow: "v1" }, "web"), notAFlow);
+  assert.deepEqual(validateProductEvent("server_setup_blocked", { step: "computer_runtime", reason: "computer_offline", flow: "v1" }, "web"), notAFlow);
+  assert.deepEqual(validateProductEvent("server_setup_step_shown", { step: "cindy_started" }, "web"), { ok: false, reason: "invalid_property_value", property: "step" });
+
+  for (const action of ["start_this_computer", "change_model", "download_app", "open_app", "install_myself"]) {
+    assert.equal(validateProductEvent("server_setup_step_action", { step: "computer_runtime", action, flow: "v2" }, "web").ok, true, action);
+  }
+  assert.equal(validateProductEvent("server_setup_step_action", { step: "first_agent", action: "create_agent_opened", flow: "v2" }, "web").ok, true);
+  const submitted = { step: "first_agent", action: "create_agent_submitted", flow: "v2", name_changed: true, channel_changed: false, description_changed: false };
+  assert.equal(validateProductEvent("server_setup_step_action", submitted, "web").ok, true);
+  for (const property of ["name_changed", "channel_changed", "description_changed"]) {
+    assert.deepEqual(
+      validateProductEvent("server_setup_step_action", { ...submitted, [property]: "Ada" }, "web"),
+      { ok: false, reason: "invalid_property_value", property },
+      "whether it changed, never what to",
+    );
+  }
+  assert.deepEqual(validateProductEvent("server_setup_step_action", { ...submitted, name: "Ada" }, "web"), { ok: false, reason: "unknown_property", property: "name" });
+  assert.deepEqual(validateProductEvent("server_setup_step_action", { step: "first_agent", action: "create_agent_created" }, "web"), { ok: false, reason: "invalid_property_value", property: "action" }, "success is read from the agents table");
+
+  const failed = { step: "cindy_starting", reason: "cindy_start_failed", flow: "v2" };
+  assert.equal(validateProductEvent("server_setup_blocked", failed, "web").ok, true, "runtime and failure are optional");
+  for (const failure of ["quota", "not_signed_in", "other"]) {
+    assert.equal(validateProductEvent("server_setup_blocked", { ...failed, runtime: "claude", failure }, "web").ok, true, failure);
+  }
+  assert.deepEqual([...SERVER_SETUP_START_RUNTIMES], ["claude", "codex", "kimi", "pi", "other"], "Cindy's start list, written out");
+  for (const runtime of ["claude", "codex", "kimi", "pi", "other"]) {
+    assert.equal(validateProductEvent("server_setup_blocked", { ...failed, runtime, failure: "other" }, "desktop").ok, true, runtime);
+  }
+  assert.equal(validateProductEvent("server_setup_blocked", { step: "cindy_starting", reason: "cindy_no_reply", flow: "v2" }, "web").ok, true);
+  assert.deepEqual(validateProductEvent("server_setup_blocked", { ...failed, failure: "rate limit exceeded for org 42" }, "web"), { ok: false, reason: "invalid_property_value", property: "failure" }, "never the error text");
+  assert.deepEqual(validateProductEvent("server_setup_blocked", { ...failed, runtime: "grok" }, "web"), { ok: false, reason: "invalid_property_value", property: "runtime" }, "not on Cindy's start list");
+  assert.deepEqual(validateProductEvent("server_setup_blocked", { ...failed, runtime: "claude-opus" }, "web"), { ok: false, reason: "invalid_property_value", property: "runtime" }, "a runtime, not a model");
+  assert.deepEqual(validateProductEvent("server_setup_blocked", { step: "cindy_starting", reason: "cindy_timeout" }, "web"), { ok: false, reason: "invalid_property_value", property: "reason" });
+  assert.deepEqual(validateProductEvent("server_setup_blocked", { ...failed, invited: false }, "web"), { ok: false, reason: "unknown_property", property: "invited" }, "invited people do not go through setup");
+});
+
+test("account_created.first_task: how the first screen's one task was written, a category and optional", () => {
+  const created = { platform: "web", method: "email", invited: false };
+  const ok = { ok: true, event: "account_created" };
+  assert.deepEqual(validateProductEvent("account_created", created, "server"), ok, "absent: the first screen was not shown");
+  for (const first_task of ["typed", "example", "example_edited", "not_sure"]) {
+    assert.deepEqual(validateProductEvent("account_created", { ...created, first_task }, "server"), ok, first_task);
+  }
+  for (const first_task of ["skipped", "Plan my week", "", true, 1]) {
+    assert.deepEqual(
+      validateProductEvent("account_created", { ...created, first_task }, "server"),
+      { ok: false, reason: "invalid_property_value", property: "first_task" },
+      String(first_task),
+    );
+  }
+  assert.deepEqual(validateProductEvent("account_created", { ...created, first_task_text: "x" }, "server"), { ok: false, reason: "unknown_property", property: "first_task_text" });
+});
+
+test("the onboarding tour: web events with a step from 1 to 6 and a closed list of endings", () => {
+  for (const source of ["web", "desktop"] as const) {
+    for (const step of [1, 2, 3, 4, 5, 6]) {
+      assert.deepEqual(validateProductEvent("onboarding_tour_step_shown", { tour_step: step }, source), { ok: true, event: "onboarding_tour_step_shown" }, `${source} ${step}`);
+    }
+    for (const how of ["done", "skip", "left", "result_arrived"]) {
+      assert.deepEqual(validateProductEvent("onboarding_tour_ended", { at_step: 3, how }, source), { ok: true, event: "onboarding_tour_ended" }, `${source} ${how}`);
+    }
+  }
+  assert.equal(validateProductEvent("onboarding_tour_step_shown", { tour_step: 1, native_host: true }, "web").ok, true, "the mobile app's WebView");
+  assert.equal(validateProductEvent("onboarding_tour_ended", { at_step: 6, how: "done", native_host: true }, "web").ok, true);
+  for (const source of ["server", "ios", "android", "harmonyos"] as const) {
+    assert.deepEqual(validateProductEvent("onboarding_tour_step_shown", { tour_step: 1 }, source), { ok: false, reason: "source_not_allowed" }, source);
+    assert.deepEqual(validateProductEvent("onboarding_tour_ended", { at_step: 1, how: "skip" }, source), { ok: false, reason: "source_not_allowed" }, source);
+  }
+  for (const step of [0, 7, 1.5, "1", -1]) {
+    assert.deepEqual(validateProductEvent("onboarding_tour_step_shown", { tour_step: step }, "web"), { ok: false, reason: "invalid_property_value", property: "tour_step" }, String(step));
+    assert.deepEqual(validateProductEvent("onboarding_tour_ended", { at_step: step, how: "done" }, "web"), { ok: false, reason: "invalid_property_value", property: "at_step" }, String(step));
+  }
+  assert.deepEqual(validateProductEvent("onboarding_tour_step_shown", {}, "web"), { ok: false, reason: "missing_property", property: "tour_step" });
+  assert.deepEqual(validateProductEvent("onboarding_tour_ended", { how: "done" }, "web"), { ok: false, reason: "missing_property", property: "at_step" });
+  assert.deepEqual(validateProductEvent("onboarding_tour_ended", { at_step: 2 }, "web"), { ok: false, reason: "missing_property", property: "how" });
+  assert.deepEqual(validateProductEvent("onboarding_tour_ended", { at_step: 2, how: "closed" }, "web"), { ok: false, reason: "invalid_property_value", property: "how" });
+  assert.deepEqual(validateProductEvent("onboarding_tour_step_shown", { tour_step: 1, title: "Meet your agent" }, "web"), { ok: false, reason: "unknown_property", property: "title" });
 });
 
 // Gated features with no server record (tygg, #proj-o11y:a5f3094f): Drafts and agent read progress,
@@ -531,7 +692,81 @@ test("app_rating_prompt_requested: iOS and Android only, a required trigger, not
   assert.deepEqual(validateProductEvent("app_rating_prompt_requested", { trigger: "task_result_viewed", app_version: "1.25.0" }, "android"), { ok: false, reason: "unknown_property", property: "app_version" });
 });
 
+// cindyz via Nova and Lagoon, 2026-11-13 (#proj-mobile:16766892): where an Android install came from.
+test("app_install_source_read: Android only, a required store and fresh_install, campaign values optional", () => {
+  const ok = { ok: true, event: "app_install_source_read" };
+  assert.deepEqual(validateProductEvent("app_install_source_read", { store: "direct", fresh_install: true }, "android"), ok);
+  assert.deepEqual(
+    validateProductEvent("app_install_source_read", { store: "google_play", fresh_install: false, utm_source: "google-play", utm_medium: "organic" }, "android"),
+    ok,
+  );
+  assert.deepEqual(
+    validateProductEvent("app_install_source_read", { store: "google_play", fresh_install: true, utm_source: "raft_build", utm_medium: "website", utm_campaign: "botiverse/raft.js" }, "android"),
+    ok,
+  );
+  for (const source of ["ios", "harmonyos", "web", "desktop", "server"] as const) {
+    assert.deepEqual(validateProductEvent("app_install_source_read", { store: "direct", fresh_install: true }, source), { ok: false, reason: "source_not_allowed" });
+  }
+  assert.deepEqual(validateProductEvent("app_install_source_read", { store: "direct", fresh_install: "true" }, "android"), { ok: false, reason: "invalid_property_value", property: "fresh_install" });
+  // What Play sends for "no campaign" is not a campaign path: the app leaves it out, the registry would refuse it.
+  assert.deepEqual(validateProductEvent("app_install_source_read", { store: "google_play", fresh_install: true, utm_campaign: "(not set)" }, "android"), { ok: false, reason: "invalid_property_value", property: "utm_campaign" });
+  assert.deepEqual(validateProductEvent("app_install_source_read", { fresh_install: true }, "android"), { ok: false, reason: "missing_property", property: "store" });
+  assert.deepEqual(validateProductEvent("app_install_source_read", { store: "direct" }, "android"), { ok: false, reason: "missing_property", property: "fresh_install" });
+  assert.deepEqual(validateProductEvent("app_install_source_read", { store: "app_store", fresh_install: true }, "android"), { ok: false, reason: "invalid_property_value", property: "store" });
+  // A dot is a campaign path's, not a source token's; a click id or the raw referrer is not a property at all.
+  assert.deepEqual(validateProductEvent("app_install_source_read", { store: "google_play", fresh_install: true, utm_source: "raft.build" }, "android"), { ok: false, reason: "invalid_property_value", property: "utm_source" });
+  assert.deepEqual(validateProductEvent("app_install_source_read", { store: "google_play", fresh_install: true, gclid: "abc" }, "android"), { ok: false, reason: "unknown_property", property: "gclid" });
+  assert.deepEqual(validateProductEvent("app_install_source_read", { store: "google_play", fresh_install: true, referrer: "utm_source=x" }, "android"), { ok: false, reason: "unknown_property", property: "referrer" });
+});
+
 // artin, 2026-10-21 (#proj-mobile:5a014ada): native app opens and page views.
+// artin via Lagoon, approved by Nova (2026-11-14): the native apps' device settings.
+test("app_settings_snapshot and app_setting_changed: native only, fixed values, absent settings left out", () => {
+  const snapshot = {
+    message_alignment: "right",
+    compact_messages: true,
+    long_message_collapse: true,
+    new_message_menu: false,
+    activity_task_status_badges: true,
+    composer_enter_sends: false,
+    desktop_mode_large_screen: true,
+    server_drawer: false,
+    home_server_avatar: true,
+  };
+  assert.deepEqual(validateProductEvent("app_settings_snapshot", { ...snapshot, link_open_mode: "in_app_browser", multi_shell_host: false }, "android"), { ok: true, event: "app_settings_snapshot" });
+  assert.deepEqual(
+    validateProductEvent("app_settings_snapshot", { ...snapshot, link_open_mode: "system_browser", conversation_forward_gesture: true, ios_native_nav: true, ios_native_nav_chosen: false }, "ios"),
+    { ok: true, event: "app_settings_snapshot" },
+  );
+  for (const source of ["web", "desktop", "server"] as const) {
+    assert.deepEqual(validateProductEvent("app_settings_snapshot", snapshot, source), { ok: false, reason: "source_not_allowed" });
+  }
+  const { home_server_avatar: _omitted, ...missing } = snapshot;
+  assert.deepEqual(validateProductEvent("app_settings_snapshot", missing, "ios"), { ok: false, reason: "missing_property", property: "home_server_avatar" });
+  assert.deepEqual(validateProductEvent("app_settings_snapshot", { ...snapshot, message_alignment: "center" }, "ios"), { ok: false, reason: "invalid_property_value", property: "message_alignment" });
+  assert.deepEqual(validateProductEvent("app_settings_snapshot", { ...snapshot, compact_messages: "on" }, "ios"), { ok: false, reason: "invalid_property_value", property: "compact_messages" });
+  assert.deepEqual(validateProductEvent("app_settings_snapshot", { ...snapshot, thread_reverse_layout: true }, "ios"), { ok: false, reason: "unknown_property", property: "thread_reverse_layout" });
+
+  // Every setting is a snapshot property and the other way round (ios_native_nav_chosen is not a setting).
+  assert.deepEqual(
+    Object.keys(PRODUCT_EVENT_REGISTRY.app_settings_snapshot.properties).filter((name) => name !== "ios_native_nav_chosen").sort(),
+    [...APP_SETTINGS].sort(),
+  );
+
+  const changed = { setting: "message_alignment", value: "right", previous_value: "left", surface: "settings_mobile" };
+  assert.deepEqual(validateProductEvent("app_setting_changed", changed, "android"), { ok: true, event: "app_setting_changed" });
+  assert.deepEqual(
+    validateProductEvent("app_setting_changed", { setting: "new_message_menu", value: "on", previous_value: "off", surface: "settings_appearance" }, "ios"),
+    { ok: true, event: "app_setting_changed" },
+  );
+  assert.deepEqual(validateProductEvent("app_setting_changed", changed, "web"), { ok: false, reason: "source_not_allowed" });
+  assert.deepEqual(validateProductEvent("app_setting_changed", { ...changed, setting: "theme" }, "ios"), { ok: false, reason: "invalid_property_value", property: "setting" });
+  assert.deepEqual(validateProductEvent("app_setting_changed", { ...changed, value: true }, "ios"), { ok: false, reason: "invalid_property_value", property: "value" });
+  assert.deepEqual(validateProductEvent("app_setting_changed", { ...changed, surface: "settings_notifications" }, "ios"), { ok: false, reason: "invalid_property_value", property: "surface" });
+  const { previous_value: _previous, ...noPrevious } = changed;
+  assert.deepEqual(validateProductEvent("app_setting_changed", noPrevious, "ios"), { ok: false, reason: "missing_property", property: "previous_value" });
+});
+
 test("native apps: app_opened is native-only with a required start, and page_viewed takes native routes and sections", () => {
   for (const source of ["ios", "android", "harmonyos"] as const) {
     assert.deepEqual(validateProductEvent("app_opened", { start: "cold" }, source), { ok: true, event: "app_opened" });
@@ -697,6 +932,78 @@ test("account_created is server-only, with the client, method and invite require
   assert.deepEqual(validateProductEvent("account_created", { ...created, email_domain: "example" }, "server"), { ok: false, reason: "unknown_property", property: "email_domain" });
 });
 
+// artin / Edgar, 2026-11-13 (#triage:#363): the campaign link that brought a
+// web sign-up; the campaign may be a partner's repository path.
+test("account_created takes the campaign link's utm values, the campaign as a token or owner/repo", () => {
+  const created = { platform: "web", method: "email", invited: false };
+  const ok = { ok: true, event: "account_created" };
+  assert.deepEqual(validateProductEvent("account_created", { ...created, utm_source: "stamp", utm_medium: "public_repo", utm_campaign: "acme/widgets.js" }, "server"), ok);
+  assert.deepEqual(validateProductEvent("account_created", { ...created, utm_campaign: "spring_launch" }, "server"), ok);
+  assert.deepEqual(validateProductEvent("account_created", { ...created, utm_source: "stamp" }, "server"), ok);
+  for (const property of ["utm_source", "utm_medium"]) {
+    assert.deepEqual(
+      validateProductEvent("account_created", { ...created, [property]: "acme/widgets" }, "server"),
+      { ok: false, reason: "invalid_property_value", property },
+      `${property} stays a plain token`,
+    );
+  }
+  const segment = "a".repeat(128);
+  for (const value of ["acme/widgets", "acme/widgets.js", "spring_launch", "a", "my-org/.github", `${segment}/${segment}`]) {
+    assert.deepEqual(validateProductEvent("account_created", { ...created, utm_campaign: value }, "server"), ok, value);
+    assert.equal(campaignPath(value), value, value);
+  }
+  for (const value of [
+    "someone@example.com", "acme/someone@example.com", "spring sale", "acme/widgets/issues", "acme//widgets", "/widgets", "acme/",
+    "..", ".", "../widgets", "acme/..", "acme/.", "Acme/Widgets", "acme%2fwidgets", "https://github.com/acme", "acme/widgets?x=1", "acme:widgets",
+    "", `${segment}a/widgets`, `acme/${segment}a`, "a".repeat(258), 42,
+  ]) {
+    assert.deepEqual(
+      validateProductEvent("account_created", { ...created, utm_campaign: value }, "server"),
+      { ok: false, reason: "invalid_property_value", property: "utm_campaign" },
+      String(value),
+    );
+  }
+  assert.equal(campaignPath(" Acme/Widgets.JS "), "acme/widgets.js", "trimmed and lowercased, nothing else");
+  for (const value of [null, undefined, "", "someone@example.com", "spring sale", "acme/widgets/issues", "..", "acme/..", "acme%2Fwidgets", `${segment}a/widgets`]) {
+    assert.equal(campaignPath(value), null, String(value));
+  }
+  // Public page visits keep the plain token: an owner/repo is refused there.
+  assert.deepEqual(
+    validateProductEvent("public_page_viewed", { utm_campaign: "acme/widgets" }, "server"),
+    { ok: false, reason: "invalid_property_value", property: "utm_campaign" },
+  );
+});
+
+// cindyz, 2026-11-13 (#proj-analytics:72b5e0e2): the site the visitor was on
+// before Raft's landing site, a bare host name as on public_page_viewed.
+test("account_created takes the referring site as a bare host name, optional", () => {
+  const created = { platform: "web", method: "email", invited: false };
+  const ok = { ok: true, event: "account_created" };
+  assert.deepEqual(validateProductEvent("account_created", created, "server"), ok, "absent");
+  for (const value of ["x.com", "news.ycombinator.com", "google.co.uk"]) {
+    assert.deepEqual(validateProductEvent("account_created", { ...created, referrer_domain: value }, "server"), ok, value);
+    assert.equal(referrerHost(value), value, value);
+  }
+  for (const value of [
+    "https://x.com", "x.com/someone", "x.com?q=1", "x.com:8080", "someone@example.com", "192.168.1.10", "X.com", "localhost", "x .com", "", 42,
+  ]) {
+    assert.deepEqual(
+      validateProductEvent("account_created", { ...created, referrer_domain: value }, "server"),
+      { ok: false, reason: "invalid_property_value", property: "referrer_domain" },
+      String(value),
+    );
+  }
+  assert.equal(referrerHost(" WWW.Example.COM "), "example.com", "trimmed, lowercased, without www., nothing else");
+  for (const value of [null, undefined, "", "https://x.com", "x.com/someone", "x.com?q=1", "x.com:8080", "someone@example.com", "192.168.1.10", "localhost", "x .com", "[::1]"]) {
+    assert.equal(referrerHost(value), null, String(value));
+  }
+  for (const host of ["raft.build", "app.raft.build", "docs.raft.build"]) assert.equal(isRaftSiteHost(host), true, host);
+  for (const host of ["notraft.build", "raft.build.evil.com", "raft.builders.com", "x.com"]) assert.equal(isRaftSiteHost(host), false, host);
+  // The URL form goes through the same check.
+  assert.equal(referrerHostname("https://www.Example.com/a?b=1"), "example.com");
+  assert.equal(referrerHostname("https://192.168.1.10/"), null);
+});
+
 // Workspace Artifacts (xxchan, 2026-10-26, #proj-workspace:7c500d89): web only,
 // fixed values only, everything required; never an id, title, name or path.
 test("Artifact events come from the web with fixed values only, every property required", () => {
@@ -747,7 +1054,11 @@ test("the Artifact event kinds are the shared ArtifactKind and ARTIFACT_FRAMED_K
 
 test("action card events: every card type, steps only from the server, shown only from the web", () => {
   // productEvents.ts imports nothing, so it lists the types itself; a new card type must be added here too.
-  assert.deepEqual([...PRODUCT_EVENT_ACTION_CARD_TYPES].sort(), [...ACTION_CARD_ACTION_TYPES].sort());
+  // The request card is stored-only (not in ACTION_CARD_ACTION_TYPES) but agent-prepared, so it is in the funnel;
+  // the other stored-only types (a seat request, an approval, an owner action) are not.
+  assert.deepEqual([...PRODUCT_EVENT_ACTION_CARD_TYPES].sort(), [...ACTION_CARD_ACTION_TYPES, "request:prepare"].sort());
+  assert.equal(validateProductEvent("action_card_action", { action: "execute_success", action_type: "request:prepare", reported_by: "server" }, "server").ok, true);
+  assert.equal(validateProductEvent("action_card_action", { action: "open", action_type: "seats:add", reported_by: "server" }, "server").ok, false);
 
   const step = { action: "execute_fail", action_type: "agent:create", reported_by: "server", error_class: "conflict" };
   assert.deepEqual(validateProductEvent("action_card_action", step, "server"), { ok: true, event: "action_card_action" });
@@ -925,4 +1236,47 @@ test("every bounded property's own values fit its bounds", () => {
       }
     }
   }
+});
+
+// cindyz (2026-11-13, user source work, #proj-analytics:72b5e0e2): a click on a link that
+// gets the desktop or mobile app, from the web or Raft Desktop; fixed values only.
+test("app_download_clicked comes from the web clients with a target and a surface, the desktop build optional", () => {
+  const ok = { ok: true, event: "app_download_clicked" };
+  for (const target of ["mac", "windows", "linux", "ios", "google_play", "apk", "download_page"]) {
+    for (const surface of ["settings_about", "desktop_banner", "phone_sheet", "download_page", "server_setup"]) {
+      assert.deepEqual(validateProductEvent("app_download_clicked", { target, surface }, "web"), ok, `${target} ${surface}`);
+    }
+  }
+  for (const desktop_build of ["mac", "mac_arm64", "mac_x64", "windows", "linux_appimage", "linux_deb"]) {
+    assert.deepEqual(validateProductEvent("app_download_clicked", { target: "mac", surface: "settings_about", desktop_build }, "desktop"), ok, desktop_build);
+  }
+  const click = { target: "ios", surface: "settings_about" };
+  for (const source of ["server", "ios", "android", "harmonyos"] as const) {
+    assert.deepEqual(validateProductEvent("app_download_clicked", click, source), { ok: false, reason: "source_not_allowed" }, source);
+  }
+  assert.deepEqual(validateProductEvent("app_download_clicked", { surface: "settings_about" }, "web"), { ok: false, reason: "missing_property", property: "target" });
+  assert.deepEqual(validateProductEvent("app_download_clicked", { target: "ios" }, "web"), { ok: false, reason: "missing_property", property: "surface" });
+  for (const [property, value] of [["target", "testflight"], ["target", "android"], ["surface", "qr_code"], ["desktop_build", "mac-arm64"]] as const) {
+    assert.deepEqual(
+      validateProductEvent("app_download_clicked", { ...click, [property]: value }, "web"),
+      { ok: false, reason: "invalid_property_value", property },
+      `${property}=${value}`,
+    );
+  }
+  assert.deepEqual(validateProductEvent("app_download_clicked", { ...click, url: "https://apps.apple.com" }, "web"), { ok: false, reason: "unknown_property", property: "url" });
+});
+
+test("external agent setup events: web and desktop only, closed vocabularies, no free text", () => {
+  const progress = { step: "created", surface: "dialog", method: "existing_agent" };
+  assert.deepEqual(validateProductEvent("external_agent_setup_progress", progress, "web"), { ok: true, event: "external_agent_setup_progress" });
+  assert.equal(validateProductEvent("external_agent_setup_progress", { ...progress, step: "connected_seen", surface: "profile_card", method: "sdk" }, "desktop").ok, true);
+  assert.deepEqual(validateProductEvent("external_agent_setup_progress", progress, "ios"), { ok: false, reason: "source_not_allowed" });
+  assert.deepEqual(validateProductEvent("external_agent_setup_progress", { ...progress, method: "cli" }, "web"), { ok: false, reason: "invalid_property_value", property: "method" });
+  assert.equal(validateProductEvent("external_agent_setup_action", { action: "credential_copied", surface: "dialog", method: "sdk" }, "web").ok, true);
+  assert.deepEqual(validateProductEvent("external_agent_setup_action", { action: "credential_copied", method: "sdk" }, "web"), { ok: false, reason: "missing_property", property: "surface" });
+  assert.equal(validateProductEvent("external_agent_setup_closed", { result: "finish_later", method: "existing_agent" }, "web").ok, true);
+  assert.deepEqual(validateProductEvent("external_agent_setup_closed", { result: "closed", method: "existing_agent" }, "web"), { ok: false, reason: "invalid_property_value", property: "result" });
+  // The two external entries that used to be unrecorded or folded into channel_members.
+  assert.equal(validateProductEvent("agent_create_opened", { entry: "channel_members_external" }, "web").ok, true);
+  assert.equal(validateProductEvent("agent_create_opened", { entry: "link_external" }, "web").ok, true);
 });

@@ -26,14 +26,14 @@ import { and, eq, sql } from "drizzle-orm";
 import { BasicTracer, FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES, MemoryTraceSink, artifactLinkId, asArtifactId, asServerId, parseAgentApiRateLimitedBody, type CompletedTraceSpan, type ServerId } from "@botiverse/raft-shared";
 import { getAppUrl } from "../../config/appUrl";
 import { getDb } from "../../db/index";
-import { agents, channelHumans, channels, featureFlagRules, serverFileUploadUsageMonths, servers } from "../../db/schema";
+import { agents, channelHumans, channels, serverFileUploadUsageMonths, servers } from "../../db/schema";
 import { accessTokenForTest } from "../../test/integration/credentials";
 import { reserveFileUpload } from "../../platform/fileUploadQuota";
 import { refusalBody } from "../../platform/refusals";
 import { createAgent } from "../../services/agentService";
 import { AGENT_API_KEY_HMAC_SECRET_ENV, mintAgentCredential } from "../../services/agentCredentialService";
 import { addAgent, addHuman, createChannel, findOrCreateUserDM } from "../../services/channelService";
-import { SERVER_GUEST_FEATURE_FLAG_KEY, WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY } from "../../services/featureFlagService";
+import { WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY } from "../../services/featureFlagService";
 import { billingUsageMonth } from "../../services/fileUploadQuotaService";
 import { createMessage } from "../../services/messageService";
 import { createApiTest } from "../../test/integration/apiTest";
@@ -218,9 +218,6 @@ async function seedWorld(seed: ReturnType<typeof createSeed>, opts: { flag?: boo
   const peerOwner = await seed.human();
   const peer = await seed.server({ owner: peerOwner });
   __answerFlagForTests(WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY, opts.flag !== false);
-  await getDb().insert(featureFlagRules).values([
-    { flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [server.id] },
-  ]);
   const agentA = await createAgent(server.id, `imp-a-${label()}`, { runtime: "claude", model: "sonnet" });
   const pub = await createChannel(server.id, `pub-${label()}`);
   const guested = await createChannel(server.id, `guested-${label()}`);

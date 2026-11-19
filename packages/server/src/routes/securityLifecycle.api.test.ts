@@ -16,8 +16,7 @@ import * as searchService from "../services/searchService";
 import * as revocations from "../socket/accessRevocation";
 import { ensureFamilyRevokeCapability } from "../services/pushService";
 import { serializeErrorForLog } from "../tracing/safeErrorLog";
-import { channels, featureFlagRules, passwordResets, serverMembers, sessionFamilies, users } from "../db/schema";
-import { SERVER_GUEST_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
+import { channels, passwordResets, serverMembers, sessionFamilies, users } from "../db/schema";
 import { seedBoundGuest } from "../test/guestFixture";
 function disconnected(ws: WebSocket) {
   return new Promise<void>((resolve, reject) => {
@@ -166,8 +165,6 @@ test("blast radius: channel visibility changes evict only sockets that lose acce
   const outsider = await seed.human();
   const guest = await seed.human();
   const server = await seed.server({ owner, members: [member, outsider, guest] });
-  await db.insert(featureFlagRules).values({ flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [server.id],
-    });
   // A Guest bound to its own channel (#wg-rbac:#15); hiding another channel from guests still evicts every guest connection.
   await seedBoundGuest({ serverId: server.id, userId: guest.id }, db);
   const channel = await seed.channel({ server, members: [owner, member] });

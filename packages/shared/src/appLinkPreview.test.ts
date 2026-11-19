@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { z } from "zod";
-import { appLinkBlockCardLayout, appLinkBlockCardPlaces, appLinkReadUrls } from "./appLinkPreview";
+import { appCardEncryptionKeyRegistrationSchema, appCardEncryptionKeySchema, appLinkBlockCardLayout, appLinkBlockCardPlaces, appLinkReadUrls } from "./appLinkPreview";
 import {
   appLinkPreviewResponseSchema, appLinkPreviewRegistrationSchema, appLinkPreviewV2ResponseSchema, appLinkPreviewV3ResponseSchema, downgradeInlineBadgeTone, dropInvalidLinkCardBadgeColors,
   inlineBadgeDisplayTone, LINK_CARD_CAPABILITIES, LINK_CARD_INLINE_BADGE_TONES, LINK_CARD_LEGACY_INLINE_BADGE_TONES, linkCardBadgeColorsForCapabilities, linkCardInlineForCapabilities,
-  linkCardInlineToneForCapabilities, linkCardExecuteActions, linkCardPlacementForCapabilities, linkCardV2Schema, matchesAppPreview, messageBareLinks, messagePreviewUrls, messageVisibleLinks,
+  linkCardInlineToneForCapabilities, linkCardExecuteActions, linkCardExecuteToastForCapabilities, linkCardPlacementForCapabilities, linkCardV2Schema, matchesAppPreview, messageBareLinks, messagePreviewUrls, messageVisibleLinks,
   parseAppLinkPreviewV2, parseAppLinkPreviewV3, parseLinkCardReadAnswer, stripLinkCardActions, type AppLinkPreviewItem, type LinkCardActionTier, type LinkCardV2,
 } from "./appLinkPreview";
 import { parseActionCardSpec } from "./actionCardSpec";
@@ -84,6 +84,34 @@ test("declared preview versions: only 1, 2 and 3, version 1 always among them, 3
   for (const preview_versions of [[], [0], [4], [1, 4], [2], [2, 3], [1, 3], [3, 1], [1, 1], [1, 2, 2], [1.5], ['1'], [null], null, 1, '1,2', { 0: 1 }]) {
     assert.equal(appLinkPreviewRegistrationSchema.safeParse({ ...base, preview_versions }).success, false, JSON.stringify(preview_versions));
   }
+});
+test("card encryption key (RFC 086 §5.2): a public P-256 ECDH-ES encryption JWK only; private members and any other field are refused", () => {
+  // A P-256 public key (x, y: 32 bytes, base64url, no padding).
+  const jwk = { kty: "EC", crv: "P-256", use: "enc", alg: "ECDH-ES", kid: "vault-2026-11.a_1", x: "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU", y: "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0" };
+  assert.deepEqual(appCardEncryptionKeySchema.parse(jwk), jwk);
+  assert.deepEqual(appCardEncryptionKeyRegistrationSchema.parse({ jwk }), { jwk });
+  const refused: Array<[string, unknown]> = [
+    ["private member", { ...jwk, d: "jpsQnnGQmL-YBIffH1136cspYG6-0iY7X1fCE9-E9LI" }],
+    ["extra member", { ...jwk, key_ops: ["deriveBits"] }],
+    ["kty RSA", { ...jwk, kty: "RSA" }],
+    ["kty OKP", { ...jwk, kty: "OKP" }],
+    ["curve P-384", { ...jwk, crv: "P-384" }],
+    ["signature use", { ...jwk, use: "sig" }],
+    ["key wrap alg", { ...jwk, alg: "ECDH-ES+A256KW" }],
+    ["no kid", (({ kid: _kid, ...rest }) => rest)(jwk)],
+    ["empty kid", { ...jwk, kid: "" }],
+    ["long kid", { ...jwk, kid: "k".repeat(65) }],
+    ["kid with a slash", { ...jwk, kid: "a/b" }],
+    ["kid with a space", { ...jwk, kid: "a b" }],
+    ["short x", { ...jwk, x: jwk.x.slice(1) }],
+    ["padded x", { ...jwk, x: `${jwk.x}=` }],
+    ["base64 (not url) y", { ...jwk, y: jwk.y.replace("_", "/") }],
+    ["non-canonical last character", { ...jwk, x: `${jwk.x.slice(0, 42)}F` }],
+    ["no y", (({ y: _y, ...rest }) => rest)(jwk)],
+  ];
+  for (const [what, value] of refused) assert.equal(appCardEncryptionKeySchema.safeParse(value).success, false, what);
+  assert.equal(appCardEncryptionKeyRegistrationSchema.safeParse({ jwk, client_id: "x" }).success, false, "extra body field");
+  assert.equal(appCardEncryptionKeyRegistrationSchema.safeParse(jwk).success, false, "the JWK must be under jwk");
 });
 test("read-only catalog rejects scripts, dynamic expressions, actions and malformed trees", () => {
   const valid = { version: 1, title: '<script>literal</script>', card: { root: 'root', elements: { root: { type: 'Stack', props: {}, children: ['text'] }, text: { type: 'Text', props: { text: 'Ready' } } } } };
@@ -181,8 +209,12 @@ test("stripping: the provider's tier and the client's capabilities decide the bu
   assert.deepEqual(ids(stripLinkCardActions(disabled.card, { tier: 'execute', capabilities: all })), ['approve', 'merge', 'root'], 'and it stays visible');
 });
 
-test("capabilities: four plus inline.v1, inline.tone.v2, block.v1, preview.v3, badge.color.v1 and unreviewed_app.v1; relative_time.v1 is gone (addendum 1 §2, addendum 2 §3, addenda 6 and 7, RFC 076 §15, §17)", () => {
-  assert.deepEqual([...LINK_CARD_CAPABILITIES], ['card.v2', 'button.v1', 'confirm.v1', 'undo.v1', 'inline.v1', 'inline.tone.v2', 'block.v1', 'preview.v3', 'badge.color.v1', 'unreviewed_app.v1']);
+test("capabilities: four plus inline.v1, inline.tone.v2, block.v1, preview.v3, badge.color.v1, unreviewed_app.v1 and execute.toast.v1; relative_time.v1 is gone (addendum 1 §2, addendum 2 §3, addenda 6 and 7, RFC 076 §6.3, §15, §17)", () => {
+  assert.deepEqual([...LINK_CARD_CAPABILITIES], ['card.v2', 'button.v1', 'confirm.v1', 'undo.v1', 'inline.v1', 'inline.tone.v2', 'block.v1', 'preview.v3', 'badge.color.v1', 'unreviewed_app.v1', 'execute.toast.v1']);
+  const toast = { tone: 'success', text: 'Merged' };
+  assert.equal(linkCardExecuteToastForCapabilities(toast, ['card.v2', 'button.v1', 'execute.toast.v1']), toast, "the App's toast on execute's answer for a client that declared execute.toast.v1");
+  assert.equal(linkCardExecuteToastForCapabilities(toast, ['card.v2', 'button.v1', 'confirm.v1', 'undo.v1']), null, 'never for one that did not: it may read the answer strictly');
+  assert.equal(linkCardExecuteToastForCapabilities(null, ['execute.toast.v1']), null);
 });
 
 test("placement: a card answer may ask for a block; any other value, or placement on link / connect_account, is invalid (addendum 6; RFC 076 §13)", () => {
@@ -538,6 +570,15 @@ test("batched read answer: strict items read one by one, a tolerant top level", 
   }
   for (const data of [null, 'oops', {}, { items: 'x' }, { items: {} }]) assert.deepEqual(parseLinkCardReadAnswer(data), []);
   assert.equal(parseLinkCardReadAnswer({ items: Array.from({ length: 12 }, (_, n) => ({ kind: 'rate_limited', url: url(n), retry_after: 1 })) }).length, 10, 'ten links per message');
+});
+
+test("batched read answer: app.reviewed is read only as false, for an App Raft hasn't reviewed (unreviewed_app.v1, RFC 076 §17)", () => {
+  const url = (n: number) => `${origin}/pr/${n}`;
+  const card = (n: number, app: object) => ({ kind: 'v2', url: url(n), app: { id: 'app-1', name: 'Cards', icon: null, ...app }, preview: v2Card({ open }), ticket: null, actions: [] });
+  const parsed = parseLinkCardReadAnswer({ items: [card(1, { reviewed: false }), card(2, {}), card(3, { reviewed: true }), card(4, { reviewed: 'no' })] });
+  assert.deepEqual(parsed.map((item) => item.url), [url(1), url(2)], 'reviewed: true or any other value is no item, like any field the schema lacks');
+  assert.ok(parsed[0]?.kind === 'v2' && parsed[0].app.reviewed === false);
+  assert.ok(parsed[1]?.kind === 'v2' && !('reviewed' in parsed[1].app));
 });
 
 test("batched read answer, v3 items (RFC 076 §14): read like v2 ones, with unknown item types skipped; [], an invalid list or a URL off the origin is no item", () => {

@@ -26,6 +26,24 @@ export function readInboxItem(item: InboxItem): InboxItem {
   return { ...item, unreadCount: 0, firstUnreadMessageId: null, hasMention: false } as InboxItem;
 }
 
+/**
+ * A conversation row once its conversation is read here (inboxStore
+ * clearReadForChannel), or null when the read leaves it as it is. The read
+ * covers every mention up to it, also one on a message the unread does not
+ * count (a task conversation's lifecycle line, a thread line the person
+ * caused: the server's @ is any mention past the cursor, its count is not),
+ * so a row with an @ and no unread loses the @ too, and the jump target with
+ * it: a persisted read leaves the row as this makes it (#244 step 3a). A
+ * mention-only row (not a member: no count, its first unread is the @) keeps
+ * its @ through a read, as the server keeps it until Done.
+ */
+export function conversationReadInboxItem(item: InboxItem): InboxItem | null {
+  if (item.kind === "mention_action" || item.kind === "object") return null;
+  const uncountedMention = item.hasMention && item.firstUnreadMessageId === null;
+  if (item.unreadCount <= 0 && !uncountedMention) return null;
+  return { ...readInboxItem(item), firstMentionMessageId: null } as InboxItem;
+}
+
 type ThreadRow = Extract<InboxItem, { kind: "thread" }>;
 
 /**
@@ -55,4 +73,19 @@ export function savedThreadRowsOverServed(saved: readonly InboxItem[], served: r
       lastReplyAt: row.lastReplyAt,
     };
   });
+}
+
+/** RFC 077: the row with a retracted message's placeholder in place of its text. */
+export function retractInboxItemPreview(item: InboxItem, messageId: string, placeholder: string): InboxItem {
+  if ((item.kind === "channel" || item.kind === "dm") && item.lastMessageId === messageId) {
+    return { ...item, lastMessagePreview: placeholder, latestRetracted: true };
+  }
+  if (item.kind === "thread" && (item.latestActivityMessageId === messageId || item.parentMessageId === messageId)) {
+    return {
+      ...item,
+      ...(item.latestActivityMessageId === messageId ? { latestActivityPreview: placeholder, latestRetracted: true } : {}),
+      ...(item.parentMessageId === messageId ? { parentMessagePreview: placeholder, parentRetracted: true } : {}),
+    };
+  }
+  return item;
 }

@@ -106,7 +106,7 @@
       "model": {
         "label": "Model",
         "placeholder": "Model ID",
-        "hint": "Use a model ID the selected provider supports."
+        "hint": "Pick a model from the list. Where the provider allows it, you can also type a model ID."
       },
       "loadLocalPlugins": {
         "label": "Load local Pi extensions",
@@ -166,7 +166,22 @@
             "enum": [
               "openai-compatible",
               "anthropic-compatible",
-              "openrouter"
+              "openrouter",
+              "deepseek",
+              "minimax",
+              "minimax-cn",
+              "zai",
+              "zai-coding-cn",
+              "moonshotai",
+              "moonshotai-cn",
+              "kimi-coding",
+              "qwen-token-plan",
+              "qwen-token-plan-cn",
+              "openai",
+              "anthropic",
+              "google",
+              "xai",
+              "xiaomi"
             ]
           }
         }
@@ -180,7 +195,22 @@
             "enum": [
               "openai-compatible",
               "anthropic-compatible",
-              "openrouter"
+              "openrouter",
+              "deepseek",
+              "minimax",
+              "minimax-cn",
+              "zai",
+              "zai-coding-cn",
+              "moonshotai",
+              "moonshotai-cn",
+              "kimi-coding",
+              "qwen-token-plan",
+              "qwen-token-plan-cn",
+              "openai",
+              "anthropic",
+              "google",
+              "xai",
+              "xiaomi"
             ]
           }
         }

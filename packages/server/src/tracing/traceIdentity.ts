@@ -30,10 +30,17 @@ const ID_HASH_HEX_CHARS = 16;
 // job_id_hash: a channel conversion job, on the conversion worker's per-job
 // event (server.channel_conversion_worker.job, channelConversionWorker.ts);
 // found from a known id with trace:agent-id-hash --kind job.
+// launch_id_hash: an agent launch (the daemon's launch id), on the wake
+// breaker's events (wake.start_failure, wake.runtime_action_required,
+// wake.block_lifted, wake_crash_loop.exit_observed in agentOrchestrator.ts) and
+// the agent-context return event (agentContextReturnTrace.ts), so they join on
+// one launch; found from a known id with trace:agent-id-hash --kind launch.
+// context_id_hash: a model context within a launch (the daemon's context id),
+// on the agent-context return event; found with --kind context.
 // feedback_reporter_hash: the user who submitted product feedback, as the
 // inbox object ref of the triage notice (productFeedbackTriageNotice.ts) so
 // one person's submissions share one inbox row; never the raw user id.
-export type TraceIdentityKind = "agent_id_hash" | "server_id_hash" | "stale_cache_key_hash" | "conversation_id_hash" | "machine_id_hash" | "message_id_hash" | "feedback_reporter_hash" | "job_id_hash";
+export type TraceIdentityKind = "agent_id_hash" | "server_id_hash" | "stale_cache_key_hash" | "conversation_id_hash" | "machine_id_hash" | "message_id_hash" | "feedback_reporter_hash" | "job_id_hash" | "launch_id_hash" | "context_id_hash";
 
 let cachedRoot: string | null = null;
 const cachedKeys = new Map<TraceIdentityKind, Buffer>();
@@ -101,6 +108,12 @@ export function traceMachineIdHash(machineId: string | null | undefined): string
 export function agentIdHashAttrs(agentId: string | null | undefined): { agent_id_hash?: string } {
   const hash = traceAgentIdHash(agentId);
   return hash ? { agent_id_hash: hash } : {};
+}
+
+/** `{ launch_id_hash }` when hashable, else `{}` — for spreading into attrs. */
+export function launchIdHashAttrs(launchId: string | null | undefined): { launch_id_hash?: string } {
+  const hash = traceIdentityHash("launch_id_hash", launchId);
+  return hash ? { launch_id_hash: hash } : {};
 }
 
 /**

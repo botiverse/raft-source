@@ -1,0 +1,55 @@
+{
+  "formatVersion": 1,
+  "id": "duplicate_covered_by_answer_rereads",
+  "rule": "position",
+  "title": "A seq delivered again after an answer covered it re-reads the row",
+  "why": "The applied set resets when an answer replaces the row, so a later copy of a covered seq is indistinguishable from a late commit. Rare (a catch-up replay); costs one row.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/shared/src/activityRowPosition.ts (reduceActivityRow; not wired yet, step 2)"
+    ],
+    "server": [
+      "packages/server/src/services/channelService.ts (latestActivitySeqSameSource; the row's latestActivitySeq)",
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (unread_count and latest_seq from one materialized row)"
+    ]
+  },
+  "given": {
+    "row": {
+      "unreadCount": 0,
+      "hasMention": false,
+      "position": "99",
+      "mentionOnly": false
+    }
+  },
+  "steps": [
+    {
+      "act": "liveMessage",
+      "seq": "100",
+      "counts": true,
+      "mentionsViewer": false
+    },
+    {
+      "act": "answer",
+      "row": {
+        "unreadCount": 1,
+        "hasMention": false,
+        "position": "100",
+        "mentionOnly": false
+      }
+    },
+    {
+      "act": "liveMessage",
+      "seq": "100",
+      "counts": true,
+      "mentionsViewer": false
+    }
+  ],
+  "expect": {
+    "row": {
+      "unreadCount": 1,
+      "position": "100"
+    },
+    "reread": true
+  }
+}

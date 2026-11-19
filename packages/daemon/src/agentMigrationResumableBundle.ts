@@ -49,8 +49,11 @@ import {
   agentMigrationTopLevelPath,
   isNotesPath,
   listAgentMigrationWorkspace,
+  startMeasuringAgentMigrationIgnoredEntries,
   summarizeAgentMigrationTransfer,
+  type AgentMigrationExcludedIgnoredEntry,
   type AgentMigrationExportProgress,
+  type AgentMigrationIgnoredMeasurement,
 } from "./agentMigrationExport";
 import {
   assertAgentMigrationObjectStoreEntryLimit,
@@ -181,6 +184,15 @@ export interface StreamAgentMigrationResumableBundleInput {
    * summary is built, after the walk, so a reconnect meanwhile is followed.
    */
   reportIgnoredBySource?: () => boolean;
+  /**
+   * Both ends accept SERVER_CAPABILITY_MIGRATION_IGNORED_PARTIAL_V1, so a
+   * summary whose ignored totals are a lower bound may say so
+   * (`excludedIgnoredPartial`). Read when the summary is built, like
+   * reportIgnoredBySource.
+   */
+  reportIgnoredPartial?: () => boolean;
+  /** Tests only: a smaller bound than the summary's for sizing ignored files. */
+  ignoredFileMeasureLimit?: number;
   /** Uploads one sealed chunk (retrying is up to the caller); a rejection fails the bundle. */
   uploadChunk(chunk: AgentMigrationControlChunk, bytes: Buffer): Promise<void>;
 }
@@ -200,6 +212,8 @@ const READ_AHEAD_ENTRIES = 16;
 const READ_AHEAD_MAX_FILE_BYTES = 1024 * 1024;
 const RESIZED_ENTRIES_REPORTED = 20;
 const SCAN_PROGRESS_EVERY_ENTRIES = 1_000;
+/** How long a finished bundle waits for the ignored paths' sizes (finishMeasuringIgnored). */
+const IGNORED_MEASURE_GRACE_MS = 2_000;
 
 /**
  * Builds the bundle in one pass and uploads it as it goes: no temp file and no
@@ -221,19 +235,13 @@ export async function streamAgentMigrationResumableBundle(
   const workspacePath = path.resolve(input.workspacePath);
 
   let listedEntries = 0;
-  let measuredIgnoredEntries = 0;
   const countByTopLevelPath = new Map<string, number>();
-  const reportScan = () => input.onProgress?.({
-    phase: "scanning",
-    files: listedEntries + measuredIgnoredEntries,
-    bytes: 0,
-  });
+  const reportScan = () => input.onProgress?.({ phase: "scanning", files: listedEntries, bytes: 0 });
+  // Ignored paths are passed over here, not sized: sizing them is only for the
+  // summary, and goes on beside the packing below.
   const listing = await listAgentMigrationWorkspace({
     workspacePath,
-    onProgress(progress) {
-      measuredIgnoredEntries = progress.files;
-      reportScan();
-    },
+    measureIgnored: false,
     onEntry(relativePath) {
       input.signal?.throwIfAborted();
       if (relativePath === AGENT_MIGRATION_COMMIT_MARKER_PATH) return;
@@ -246,6 +254,17 @@ export async function streamAgentMigrationResumableBundle(
   assertAgentMigrationObjectStoreEntryLimit([], maxEntries, {
     entryCount: listedEntries,
     countByTopLevelPath,
+  });
+
+  // The summary's "skipped" sizes, measured while the bundle packs and uploads.
+  // A finished bundle waits for them at most IGNORED_MEASURE_GRACE_MS; then
+  // measuring stops and the totals so far (a lower bound) are reported.
+  const stopMeasuringIgnored = new AbortController();
+  const measuringIgnored = startMeasuringAgentMigrationIgnoredEntries({
+    workspacePath,
+    excludedIgnored: listing.excludedIgnored,
+    signal: stopMeasuringIgnored.signal,
+    ignoredFileMeasureLimit: input.ignoredFileMeasureLimit,
   });
 
   const chunkWriter = new StreamedChunkWriter(
@@ -316,6 +335,7 @@ export async function streamAgentMigrationResumableBundle(
   try {
     await Promise.all([archiveWrite, packing]);
   } catch (error) {
+    stopMeasuringIgnored.abort();
     if (error instanceof AgentMigrationBundleTooLargeError) {
       // Packing stopped partway, so walk the whole tree again (stat only) to
       // name the largest paths, not just the ones packed before the limit.
@@ -334,11 +354,13 @@ export async function streamAgentMigrationResumableBundle(
   // too-large error, with the largest paths, so it can be explained.
   const maxExpandedBytes = input.maxExpandedBytes ?? MAX_AGENT_MIGRATION_TRANSFER_BYTES;
   if (totals.bytes > maxExpandedBytes) {
+    stopMeasuringIgnored.abort();
     const tooLarge = `MIGRATION_OBJECT_STORE_BUNDLE_TOO_LARGE:actualBytes=${totals.bytes}:maxBytes=${maxExpandedBytes}`;
     const bytesByTopLevelPath = await measureWorkspaceBytesByTopLevelPath(workspacePath).catch(() => null);
     throw new Error(bytesByTopLevelPath ? `${tooLarge}:topEntries=${bundleTooLargeTopEntries(bytesByTopLevelPath)}` : tooLarge);
   }
 
+  const ignored = await finishMeasuringIgnored(measuringIgnored, stopMeasuringIgnored, IGNORED_MEASURE_GRACE_MS);
   const control = buildControlManifest(input, {
     bundle: {
       totalBytes: chunkWriter.totalBytes,
@@ -353,12 +375,36 @@ export async function streamAgentMigrationResumableBundle(
       memoryMdPresent: totals.memoryMdPresent,
       notesPresent: totals.notesPresent,
       excludedRegenerable: listing.excludedRegenerable,
-      excludedIgnored: listing.excludedIgnored,
+      excludedIgnored: ignored.entries,
       reportIgnoredBySource: input.reportIgnoredBySource?.() === true,
+      ignoredPartial: !ignored.complete && input.reportIgnoredPartial?.() === true,
     }),
   });
   const { sha256: controlSha256, bytes: controlBytes } = validateAgentMigrationControlManifest(control);
   return { control, controlSha256, controlBytes, resizedEntries, resizedEntryCount };
+}
+
+/**
+ * Waits up to `graceMs` for the ignored sizes, then stops measuring and takes
+ * what is counted so far, without waiting for a file-system call still under
+ * way (a hung network mount under an ignored path cannot hold the move).
+ */
+async function finishMeasuringIgnored(
+  measuring: AgentMigrationIgnoredMeasurement,
+  stop: AbortController,
+  graceMs: number,
+): Promise<{ entries: AgentMigrationExcludedIgnoredEntry[]; complete: boolean }> {
+  let timer: NodeJS.Timeout | undefined;
+  const graceOver = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, graceMs);
+  });
+  try {
+    await Promise.race([measuring.finished, graceOver]);
+  } finally {
+    clearTimeout(timer);
+    stop.abort();
+  }
+  return measuring.snapshot();
 }
 
 type PreparedWorkspaceEntry =

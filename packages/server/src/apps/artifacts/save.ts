@@ -43,6 +43,7 @@ import {
   isGitPathSegment,
   type AgentApiArtifactSaveAttachmentBody,
   type AgentApiArtifactSaved,
+  RAFT_HINTS,
 } from "@botiverse/raft-shared";
 import { AttachmentStorageUnavailableError, attachmentSource, readAttachmentForSave, type AttachmentSource } from "../../platform/attachments";
 import { AGENT_LOUNGE_PLACEMENT_REFUSAL, agentMayPlaceInConversation } from "../../platform/conversations";
@@ -272,7 +273,7 @@ export function createSaveOperations() {
       const outcome = await saveAttachment(viewActor(agent), attachmentId);
       switch (outcome.kind) {
         case "not_found": return fail(404, { code: "ATTACHMENT_NOT_FOUND", error: ATTACHMENT_NOT_FOUND_ERROR, details: { attachmentId } });
-        case "too_large": return fail(422, { code: "ATTACHMENT_NOT_SAVABLE", error: attachmentTooLargeError(outcome.limit), details: { attachmentId, reason: "too_large", limit: outcome.limit } });
+        case "too_large": return fail(422, { code: "ATTACHMENT_NOT_SAVABLE", error: attachmentTooLargeError(outcome.limit), next: RAFT_HINTS.artifactPublish({ target: "<conversation>" }), details: { attachmentId, reason: "too_large", limit: outcome.limit } });
         case "content_unavailable": return fail(503, { code: "CONTENT_UNAVAILABLE", error: outcome.error });
         // The attachments' body, as publish answers it; an upgrade card offered where the attachment was posted (a thread included).
         case "file_upload_quota_exceeded": return fileUploadQuotaRefusal(agent.serverId, outcome.error, "artifact_save_attachment", { agentId: agent.agentId, channelId: source?.channelId ?? null, subject: "saved_file" });

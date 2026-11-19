@@ -8,6 +8,7 @@
 
 import { AGENT_USAGE_MAX_RANGE_DAYS } from "@botiverse/raft-shared";
 import type { AgentUsageResponse, AgentUsageRow } from "@botiverse/raft-shared";
+import type { MessageId } from "../../i18n/messages/en";
 
 export const AGENT_USAGE_RANGES = [7, 14, 30] as const;
 export type AgentUsageRange = (typeof AGENT_USAGE_RANGES)[number];
@@ -156,9 +157,34 @@ export interface UsageFigures {
   baseDay: string | null;
 }
 
+/**
+ * Why an agent has no usage reported, from the server's
+ * `computer_reports_usage`:
+ * - "computer_too_old": it has a Computer too old to send usage (update it);
+ * - "not_run": its Computer sends usage, it just hasn't finished a turn since;
+ * - "no_computer": it runs on no Computer (hosted, external, released): nothing to update;
+ * - "unknown": an older server that doesn't say (shown as before: update).
+ * - "runtime_no_usage": its runtime gives no per-turn token counts (Antigravity,
+ *   Grok, OpenCode…; the server's `runtime_reports_usage: false`): nothing will
+ *   ever show, whatever the Computer.
+ */
+export type UsageUnreportedReason = "runtime_no_usage" | "computer_too_old" | "not_run" | "no_computer" | "unknown";
+
+/**
+ * What the Usage tab shows for each reason: the line, its test id, and
+ * whether the way to the Computer is offered (only where updating it helps).
+ */
+export const USAGE_UNREPORTED_STATE: Record<UsageUnreportedReason, { titleId: MessageId; testId: string; offersComputer: boolean }> = {
+  computer_too_old: { titleId: "agent.usage.updateComputer", testId: "agent-usage-unsupported", offersComputer: true },
+  unknown: { titleId: "agent.usage.updateComputer", testId: "agent-usage-unsupported", offersComputer: true },
+  not_run: { titleId: "agent.usage.notRun", testId: "agent-usage-not-run", offersComputer: false },
+  no_computer: { titleId: "agent.usage.noComputer", testId: "agent-usage-no-computer", offersComputer: false },
+  runtime_no_usage: { titleId: "agent.usage.runtimeNoUsage", testId: "agent-usage-runtime-no-usage", offersComputer: false },
+};
+
 export type AgentUsageSummary =
-  /** The agent's Computer does not report usage. */
-  | { kind: "unsupported" }
+  /** No turn of the agent has reported usage, and why. */
+  | { kind: "unsupported"; reason: UsageUnreportedReason }
   | { kind: "empty" }
   | (UsageFigures & { kind: "ready"; context: { used: number; window: number } | null });
 
@@ -172,9 +198,27 @@ export function usageSince(response: AgentUsageResponse, agentId: string): strin
   return declared.length > 0 ? declared.sort().at(-1)! : null;
 }
 
-/** Whether the agent's Computer reports usage at all (false: "Update Raft Computer"). */
+/** Whether any turn of the agent has reported usage (false: usageUnreportedReason says why). */
 export function usageReported(response: AgentUsageResponse, agentId: string): boolean {
   return response.agents.find((agent) => agent.agent_id === agentId)?.usage_reported !== false;
+}
+
+/**
+ * Why the agent has no usage reported (read when usageReported is false).
+ * Only true, false and null mean something on the wire; a missing field (an
+ * older server) or anything else is "unknown".
+ */
+export function usageUnreportedReason(response: AgentUsageResponse, agentId: string): UsageUnreportedReason {
+  const agent = response.agents.find((entry) => entry.agent_id === agentId);
+  // The runtime comes first: one that gives no token counts never shows usage,
+  // so neither "update the Computer" nor "after its next turn" would be true.
+  if (agent?.runtime_reports_usage === false) return "runtime_no_usage";
+  // Untrusted wire value: only true, false and null mean something.
+  const reports: unknown = agent?.computer_reports_usage;
+  if (reports === false) return "computer_too_old";
+  if (reports === true) return "not_run";
+  if (reports === null) return "no_computer";
+  return "unknown";
 }
 
 /** The agent's latest context reading, when it reported both the context and its window. */
@@ -270,7 +314,7 @@ export function summarizeAgentUsage(
   view: AgentUsageView,
   withCacheReads: boolean,
 ): AgentUsageSummary {
-  if (!usageReported(response, agentId)) return { kind: "unsupported" };
+  if (!usageReported(response, agentId)) return { kind: "unsupported", reason: usageUnreportedReason(response, agentId) };
   const rows = response.rows.filter((row) => row.agent_id === agentId);
   if (rows.length === 0) return { kind: "empty" };
   return {

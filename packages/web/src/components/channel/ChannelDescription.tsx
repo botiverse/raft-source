@@ -1,3 +1,4 @@
+import { webLinkProps } from "../../features/webPreview/webLinkRouting";
 const URL_CANDIDATE_PATTERN = /https?:\/\/[a-z\d\-._~:/?#@!$&'()*+,;=%\x5b\x5d]+/gi;
 const TRAILING_SENTENCE_PUNCTUATION = /[.,!?;:。，！？；：'"“”‘’]+$/u;
 const CLOSING_DELIMITERS = new Map([
@@ -93,6 +94,7 @@ export default function ChannelDescription({ description }: { description: strin
             href={segment.value}
             target="_blank"
             rel="noopener noreferrer"
+            {...webLinkProps}
             className="rounded-[2px] underline decoration-[1.5px] decoration-foreground-hint underline-offset-[3px] outline-none transition-colors hover:text-foreground hover:decoration-current focus-visible:text-foreground focus-visible:shadow-focus"
           >
             {segment.value}

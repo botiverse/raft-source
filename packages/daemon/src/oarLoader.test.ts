@@ -47,7 +47,7 @@ test("source guard: the daemon loads OAR one runtime at a time, never its root e
 });
 
 test("each account-usage provider and opencode load their own OAR runtime, once", async () => {
-  for (const [id, name] of [["claude", "claude"], ["codex", "codex"], ["kimi", "kimi"], ["grok", "grok"], ["opencode", "opencode"], ["qwen", "qwen"], ["qoder", "qoder"], ["codebuddy", "codebuddy"]] as const) {
+  for (const [id, name] of [["claude", "claude"], ["codex", "codex"], ["kimi", "kimi"], ["grok", "grok"], ["opencode", "opencode"], ["qwen", "qwen"], ["qoder", "qoder"]] as const) {
     const [first, second] = await Promise.all([loadOarRuntime(id), loadOarRuntime(id)]);
     assert.equal(first, second);
     assert.equal(first.id, name);
@@ -58,7 +58,7 @@ test("each account-usage provider and opencode load their own OAR runtime, once"
 
 test("agent sessions open one process per session; usage and model reads keep OAR's own runtime", async () => {
   // The runtimes the OAR host opens agent sessions on (OarLaunch.runtimeId).
-  for (const id of ["antigravity", "grok", "qwen", "qoder", "codebuddy"] as const) {
+  for (const id of ["antigravity", "grok", "qwen", "qoder"] as const) {
     const [first, second] = await Promise.all([loadOarSessionRuntime(id), loadOarSessionRuntime(id)]);
     assert.equal(first, second);
     assert.equal(first.id, id);
@@ -94,7 +94,7 @@ test("pinIsolated leaves in-process runtimes alone (they reject an explicit plac
   }
 });
 
-test("the OAR host's modules load as an antigravity, codex, grok, qwen, qoder or codebuddy launch reaches them, and Grok's, CodeBuddy's and OpenCode's sign-in modules too (what the SEA release smoke runs)", async () => {
+test("the OAR host's modules load as an antigravity, codex, grok, qwen or qoder launch reaches them, and Grok's and OpenCode's sign-in modules too (what the SEA release smoke runs)", async () => {
   const { verifyBundledOarHost } = await import("./oarLoader");
   const started = Date.now();
   await verifyBundledOarHost();
@@ -106,15 +106,6 @@ test("OAR 0.99 Grok's sign-in reads a missing grok as unknown, starting nothing 
   assert.equal(typeof grok.login, "function");
   assert.equal(typeof grok.logout, "function");
   const status = await grok.authStatus!({ kind: "available", via: "executable", command: path.join(os.tmpdir(), "raft-oar-test-no-such-grok") }, { timeoutMs: 5_000 });
-  assert.equal(status.kind, "unknown");
-});
-
-test("CodeBuddy's sign-in reads a missing codebuddy as unknown, starting nothing (the smoke's CodeBuddy sign-in check)", async () => {
-  const codebuddy = await loadOarRuntime("codebuddy");
-  assert.equal(typeof codebuddy.login, "function");
-  assert.equal(typeof codebuddy.logout, "function");
-  assert.equal(typeof codebuddy.listModels, "function");
-  const status = await codebuddy.authStatus!({ kind: "available", via: "executable", command: path.join(os.tmpdir(), "raft-oar-test-no-such-codebuddy") }, { timeoutMs: 5_000 });
   assert.equal(status.kind, "unknown");
 });
 

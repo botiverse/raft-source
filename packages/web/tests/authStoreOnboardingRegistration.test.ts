@@ -68,6 +68,44 @@ test("register creates the credential account without sending identity fields", 
   assert.equal(useAuthStore.getState().user?.profileSetupCompletedAt, null);
 });
 
+// artin / Edgar, 2026-11-13 (#triage:#363): the campaign link the tab landed on goes with the sign-up.
+test("register sends the stored campaign values and drops them only once the account exists", async () => {
+  const campaign = { utm_source: "stamp", utm_medium: "public_repo", utm_campaign: "acme/widgets", referrer_domain: "news.ycombinator.com" };
+  sessionStorage.setItem("raft.signup-campaign", JSON.stringify({ ...campaign, email: "someone@example.com" }));
+  const bodies: unknown[] = [];
+  let refuse = true;
+  vi.spyOn(api, "post").mockImplementation(async (url: string, body?: unknown) => {
+    assert.equal(url, "/auth/register");
+    bodies.push(body);
+    if (refuse) throw Object.assign(new Error("Email already registered"), { response: { status: 409, data: { error: "Email already registered" } } });
+    return { data: { user: user({ emailVerified: false }), accessToken: "access-1", refreshToken: "refresh-1" } };
+  });
+
+  try {
+    await assert.rejects(useAuthStore.getState().register("cindy@example.com", "password123", legalAcceptance()));
+    assert.ok(sessionStorage.getItem("raft.signup-campaign"), "a refused sign-up keeps them for the retry");
+
+    refuse = false;
+    await useAuthStore.getState().register("cindy2@example.com", "password123", legalAcceptance());
+    const sent = { password: "password123", ...legalAcceptance(), ...campaign };
+    assert.deepEqual(bodies, [{ email: "cindy@example.com", ...sent }, { email: "cindy2@example.com", ...sent }]);
+    assert.equal(sessionStorage.getItem("raft.signup-campaign"), null, "gone once the account exists");
+  } finally {
+    sessionStorage.removeItem("raft.signup-campaign");
+  }
+});
+
+test("logout drops a stored campaign, so the next account in the tab is not attributed to it", () => {
+  sessionStorage.setItem("raft.signup-campaign", JSON.stringify({ utm_source: "stamp" }));
+  vi.spyOn(api, "post").mockImplementation(async () => ({ data: {} }));
+  try {
+    useAuthStore.getState().logout();
+    assert.equal(sessionStorage.getItem("raft.signup-campaign"), null);
+  } finally {
+    sessionStorage.removeItem("raft.signup-campaign");
+  }
+});
+
 test("completeOnboardingProfile uploads a selected avatar before atomically completing identity", async () => {
   const calls: Array<{ method: "post"; url: string; body?: unknown }> = [];
   const avatarFile = new File(["avatar"], "avatar.png", { type: "image/png" });

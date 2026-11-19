@@ -5,7 +5,6 @@ import { AppThemeProvider } from "./theme/AppThemeProvider";
 import { LocaleProvider } from "./i18n/LocaleProvider";
 import { IntlProviderWrapper } from "./i18n/IntlProviderWrapper";
 import LocalizedToastProvider from "./components/LocalizedToastProvider";
-import { ForwardToastProvider } from "./components/message/ForwardToastProvider";
 
 /**
  * The application's root provider composition — the ONE place that defines
@@ -44,9 +43,7 @@ export function AppProviders({ children, router: Router = BrowserRouter, insideR
           <LocaleProvider>
             <IntlProviderWrapper>
               <LocalizedToastProvider>
-                <ForwardToastProvider>
-                  {children}
-                </ForwardToastProvider>
+                {children}
               </LocalizedToastProvider>
             </IntlProviderWrapper>
           </LocaleProvider>

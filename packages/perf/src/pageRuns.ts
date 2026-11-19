@@ -34,6 +34,8 @@ export interface PageRunContext {
   net: string;
   ab: string;
   verdict: string;
+  /** The measuring machine: `hostExtra` (hostHealth.ts). */
+  host: { host_cpu_count: number; host_benchmark_ms: number | null };
 }
 
 export interface PageRunRow {
@@ -93,6 +95,7 @@ export function toPageRunRows(results: Record<"on" | "off", readonly LoadMetrics
           status429_count: r.status429,
           status5xx_count: r.status5xx,
           script_bytes: r.scriptBytes,
+          ...ctx.host,
         },
       });
     });

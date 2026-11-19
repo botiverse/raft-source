@@ -124,7 +124,7 @@ export function runtimeFormV2Choices(
     const options = (source?.optionsByValue?.[parent] ?? []).map((option) => labelled(field, option));
     const customAllowed = source?.customValueAllowedByValue?.[parent] === true;
     // Typed values only (a gateway: nothing listed) is a text box; listed
-    // options that also take a typed value (Built-in OpenRouter, task #10) is
+    // options that also take a typed value (a Built-in preset provider, task #10) is
     // the same combobox as `select.custom_value`.
     if (customAllowed && options.length === 0) return { kind: "free_text" };
     return { kind: "select", options, allowEmpty: false, allowCustom: customAllowed };

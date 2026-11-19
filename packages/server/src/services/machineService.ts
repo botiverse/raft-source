@@ -8,7 +8,7 @@ import { withServerLock, acquireServerLock } from "./planService";
 import { FencedAuthorizationDeniedError, lockActorMembershipRow } from "../lib/actorMembershipFence";
 import { actorRoleHasServerCapability } from "../lib/actorPermissions";
 import { lockLiveSessionFamily } from "./sessionService";
-import { PLAN_CONFIG, currentDate, getEffectiveLimits, type DeviceClass, type DaemonInstallKind, type HostProvider, type MachineId, type ServerPlan } from "@botiverse/raft-shared";
+import { PLAN_CONFIG, compareComputerVersions, currentDate, getEffectiveLimits, isComputerSemver, type DeviceClass, type DaemonInstallKind, type HostProvider, type MachineId, type ServerPlan } from "@botiverse/raft-shared";
 import { untracedDbQuery, type DbQueryTracer } from "../tracing/dbQueryTrace";
 import { agentFindableBy, type AgentFinder } from "./agentMemberListPolicy";
 
@@ -353,6 +353,34 @@ export async function recordMachineComputerVersion(
     ))
     .returning({ id: machines.id });
   return updated.length > 0;
+}
+
+/**
+ * Whether the Computer hosting `agentId` last reported a version at or above
+ * `minVersion` by SemVer precedence (1.0.54-rc.1 is above 1.0.53; 1.0.53-rc.1
+ * and the staging builds before the 1.0.53 release are not). No Computer, no
+ * reported version (a daemon from before Computers reported one) or a version
+ * that is not SemVer is false: a client whose CLI is the Computer's bundled
+ * one and that declares nothing itself counts as older.
+ */
+export async function agentComputerVersionAtLeast(
+  agentId: string,
+  minVersion: string,
+  executor: DatabaseExecutor = getDb(),
+): Promise<boolean> {
+  const version = await agentComputerVersion(agentId, executor) ?? "";
+  return isComputerSemver(version) && compareComputerVersions(version, minVersion) >= 0;
+}
+
+/** The version the Computer hosting `agentId` last reported, as reported (trimmed); null when none. */
+export async function agentComputerVersion(agentId: string, executor: DatabaseExecutor = getDb()): Promise<string | null> {
+  const [row] = await executor
+    .select({ computerVersion: machines.computerVersion })
+    .from(agents)
+    .innerJoin(machines, eq(machines.id, agents.machineId))
+    .where(eq(agents.id, agentId))
+    .limit(1);
+  return row?.computerVersion?.trim() || null;
 }
 
 export async function updateHeartbeat(machineId: string) {

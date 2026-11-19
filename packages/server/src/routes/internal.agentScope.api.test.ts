@@ -11,6 +11,8 @@ import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { createChannel, addAgent, addHuman } from "../services/channelService";
 import { registerMachine } from "../services/machineService";
 import { createServer } from "../services/serverService";
+import { refusalBody } from "../lib/refusal";
+import { AGENT_NOT_ON_THIS_COMPUTER_REFUSAL, MACHINE_AGENT_NOT_FOUND_REFUSAL } from "./agentRouteRefusals";
 
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true });
 
@@ -63,8 +65,9 @@ test("agent scope middleware checks machine ownership before scope grants", asyn
 
   assert.equal(crossServerRes.status, 404);
   assert.equal(missingRes.status, 404);
-  assert.deepEqual(await crossServerRes.json(), { error: "Agent not found" });
-  assert.deepEqual(await missingRes.json(), { error: "Agent not found" });
+  const crossServerBody = await crossServerRes.text();
+  assert.equal(crossServerBody, await missingRes.text());
+  assert.deepEqual(JSON.parse(crossServerBody), refusalBody(MACHINE_AGENT_NOT_FOUND_REFUSAL));
 });
 
 // An agent with no Computer (cloud agent, App Bot, assistant, unplaced) can't be
@@ -87,7 +90,8 @@ test("a machine key can't act for a same-server agent that has no Computer", asy
     body: JSON.stringify({ target: `#${channel.name}`, content: "probe" }),
   });
   assert.equal(sendRes.status, 403);
-  assert.deepEqual(await sendRes.json(), { error: "This agent is not assigned to your machine" });
+  const sendBody = await sendRes.json();
+  assert.deepEqual(sendBody, refusalBody(AGENT_NOT_ON_THIS_COMPUTER_REFUSAL));
 
   const profileRes = await fetch(`${app.baseUrl}/internal/agent/${unplaced.id}/profile`, {
     method: "POST",
@@ -95,5 +99,5 @@ test("a machine key can't act for a same-server agent that has no Computer", asy
     body: JSON.stringify({ description: "rewritten" }),
   });
   assert.equal(profileRes.status, 403);
-  assert.deepEqual(await profileRes.json(), { error: "This agent is not assigned to your machine" });
+  assert.deepEqual(await profileRes.json(), sendBody);
 });

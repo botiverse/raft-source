@@ -41,6 +41,18 @@ export const loadEmailVerificationPage = sharedModule(() => import("../component
 export const loadAccountIdentitySetupPage = sharedModule(() => import("../components/auth/AccountIdentitySetupPage"));
 export const loadInviteAcceptPage = sharedModule(() => import("../components/auth/InviteAcceptPage"));
 export const loadSocialAuthCallbackPage = sharedModule(() => import("../components/auth/SocialAuthCallbackPage"));
+// The sign-in page and the second step a sign-in may ask next: a signed-in
+// first screen draws neither, so both stay out of its download. The step is
+// taken from the sign-in page's module (its LoginPage imports the step, and
+// so do the callback pages: on its own it would be a shared chunk the build
+// check can't name, docs/frontend/boot-bundle.md). Once the sign-in page is
+// in, the step's loader is settled too, so a password sign-in's second step
+// opens without the loading line.
+export const loadPendingSecondFactorSignInStep = sharedModule(() => import("../components/auth/SignInPage").then((module) => ({ default: module.PendingSecondFactorSignInStep })));
+export const loadSignInPage = sharedModule(() => import("../components/auth/SignInPage").then((module) => {
+  void loadPendingSecondFactorSignInStep().catch(() => {});
+  return { default: module.SignInPage };
+}));
 export const loadSsoAuthCallbackPage = sharedModule(() => import("../components/auth/SsoAuthCallbackPage").then((module) => ({ default: module.SsoAuthCallbackPage })));
 
 const ROUTES: ReadonlyArray<readonly [string, () => Promise<unknown>]> = [
@@ -100,13 +112,56 @@ export function preloadLandingPageForLocation(location: Pick<Location, "pathname
   for (const load of landingPageLoadersFor(location)) void load().catch(() => {});
 }
 
+/** A server's address (`/s/<slug>`), which a signed-out visitor opens as its Public Server page (App.tsx). */
+export function isPublicServerPath(pathname: string): boolean {
+  return /^\/s\/[^/]+/.test(pathname);
+}
+
+/** The query parameters that open a landing page rather than sign-in (PARAMS, and an auth callback's): the boot script mirrors them. */
+export const LANDING_QUERY_PARAMS: readonly string[] = [...new Set([...PARAMS.map(([name]) => name), "auth_callback"])];
+
+/** The addresses whose page, signed out, is the sign-in page: the root (and `/login`). The boot script mirrors it. */
+export const SIGN_IN_PATHS: readonly string[] = ["/", "/login"];
+
+/**
+ * Whether this load starts the sign-in page's code before it renders: with no
+ * stored session (main.tsx at boot), or once the boot's `/auth/me` turned the
+ * stored one down (`hasStoredSession` false then); and only at an address
+ * whose page is sign-in (SIGN_IN_PATHS, with none of the landing pages' query
+ * parameters). An invite, a reset or verification link, sign-up, an Artifact
+ * link or a server's address (the Public Server page, whose Sign in buttons
+ * start the code on hover, focus or press: preloadSignInPage) draw something
+ * else first; anywhere else the page loads when it renders. A signed-in load
+ * never asks for it. Nothing waits for it: until it is in, the page draws its
+ * frame (SignInPageFrame.tsx).
+ */
+export function startsSignInPageEarly(location: Pick<Location, "pathname" | "search">, hasStoredSession: boolean): boolean {
+  if (hasStoredSession) return false;
+  const path = location.pathname.replace(/(.)\/+$/, "$1");
+  if (!SIGN_IN_PATHS.includes(path)) return false;
+  const params = new URLSearchParams(location.search);
+  return !LANDING_QUERY_PARAMS.some((name) => params.has(name));
+}
+
+/** Start the sign-in page's code (a failed start is retried when the page renders, where its recovery shows). */
+export function preloadSignInPage(): Promise<void> {
+  return loadSignInPage().then(() => {}, () => {});
+}
+
+/** main.tsx: at boot, and when `/auth/me` answers that the stored session is gone (authStore). */
+export function preloadSignInPageEarly(location: Pick<Location, "pathname" | "search">, hasStoredSession: boolean): void {
+  if (startsSignInPageEarly(location, hasStoredSession)) void preloadSignInPage();
+}
+
 /**
  * AppShell, once it knows no one is signed in: Create account and Forgot
  * password, which the sign-in, invite and Public Server pages open, start in
  * idle time, so opening one doesn't show the loading line first.
  */
-export function preloadSignedOutSteps(): void {
+export function preloadSignedOutSteps(location: Pick<Location, "pathname">): void {
   whenIdle(() => {
+    // Sign-in itself too (an invite opens it), but not on a Public Server page: its buttons start it.
+    if (!isPublicServerPath(location.pathname)) void preloadSignInPage();
     void loadRegisterPage().catch(() => {});
     void loadForgotPasswordPage().catch(() => {});
   });

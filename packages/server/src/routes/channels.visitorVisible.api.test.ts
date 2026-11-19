@@ -2,7 +2,7 @@ import { fillJointMembersFromChannelHumans } from "../test/jointMemberFill";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
-import { PUBLIC_SERVER_FEATURE_FLAG_KEY, SERVER_GUEST_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
+import { PUBLIC_SERVER_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
 import { createApiTest } from "../test/integration/apiTest";
 import { tokenForHuman } from "../test/integration/credentials";
 import { seedBoundGuest } from "../test/guestFixture";
@@ -28,8 +28,6 @@ async function setFlag(key: string, enabled: boolean) {
 
 async function seedPublicServer(prefix: string, opts: { publiclyVisible?: boolean } = {}) {
   await setFlag(PUBLIC_SERVER_FEATURE_FLAG_KEY, true);
-  // The old gate stays off throughout: it no longer matters.
-  await setFlag(SERVER_GUEST_FEATURE_FLAG_KEY, false);
   const owner = await seedUser(`${prefix}-owner@slock.test`, `${prefix}-owner`);
   const admin = await seedUser(`${prefix}-admin@slock.test`, `${prefix}-admin`);
   const member = await seedUser(`${prefix}-member@slock.test`, `${prefix}-member`);
@@ -85,7 +83,7 @@ const FORBIDDEN = {
   errorCode: "visitor_visibility_forbidden",
 };
 
-test("an owner makes a public channel visible to visitors with server_guest_v0 off; a signed-out visitor reads it until it is turned off; each change is audited", async ({ app }) => {
+test("an owner makes a public channel visible to visitors; a signed-out visitor reads it until it is turned off; each change is audited", async ({ app }) => {
   const f = await seedPublicServer("vv-owner");
   const posted = await createMessage(f.channel.id, "user", f.owner.id, "vv-owner hello");
   const msgsUrl = `${app.baseUrl}/api/public/servers/${f.slug}/channels/${f.channel.id}/messages`;

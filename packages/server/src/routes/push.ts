@@ -26,6 +26,7 @@ import {
 } from "../services/pushService";
 import * as serverService from "../services/serverService";
 import * as notificationSettings from "../services/notifications/settings";
+import { accountSettingsForClient, isFollowedThreadRepliesSwitchOn } from "../services/notifications/followedThreadRepliesSwitch";
 import { sendTestNotification } from "../services/notifications/testNotification";
 import { mapWithConcurrency } from "../lib/mapWithConcurrency";
 import { sendJsonServerError } from "./errorResponse";
@@ -488,7 +489,7 @@ pushRouter.post("/registrations", requireAuth, requireVerified, requireServer, a
     if (accountUpdate?.kind === "updated" && accountUpdate.changed) {
       notificationSettings.emitNotificationPrefsUpdated(req.app.get("io") as SocketServer | undefined, userId, {
         type: "account",
-        settings: accountUpdate.settings,
+        settings: accountSettingsForClient(accountUpdate.settings, await isFollowedThreadRepliesSwitchOn(userId)),
       });
     }
     res.json({

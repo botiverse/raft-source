@@ -8,7 +8,7 @@ import { createHash, randomUUID } from "node:crypto";
 import http from "node:http";
 import { Readable } from "node:stream";
 import { and, eq } from "drizzle-orm";
-import { artifactLinkId, asArtifactId, asServerId, decodeArtifactShortId, encodeArtifactShortId, type ServerId } from "@botiverse/raft-shared";
+import { artifactLinkId, asArtifactId, asServerId, decodeArtifactShortId, encodeArtifactShortId, parseArtifactId, type ServerId } from "@botiverse/raft-shared";
 import { getDb } from "../../db/index";
 import { agents } from "../../db/schema";
 import { createAgent } from "../../services/agentService";
@@ -18,7 +18,7 @@ import { WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY } from "../../services/featureFlag
 import { createMessage } from "../../services/messageService";
 import { createApiTest } from "../../test/integration/apiTest";
 import type { createSeed } from "../../test/integration/seed";
-import { ARTIFACTS_NOT_ENABLED, fileNotFound, notVisible, storageUnavailable, targetNotFound, versionNotFound } from "./apiCommon";
+import { ARTIFACTS_NOT_ENABLED, fileNotFound, notVisible, notVisibleTitle, storageUnavailable, targetNotFound, versionNotFound } from "./apiCommon";
 import { __setArtifactR2StoreForTests, r2KeyOf, type ArtifactR2Store } from "./blobStore";
 import { advanceReadPosition } from "./routes";
 import {
@@ -344,15 +344,16 @@ test("not visible, missing, deleted and revoked answer one identical 404", async
       [world.keys.in, revoked.title],
       [world.keys.peer, priv.id], // another server's agent, non-public home
     ];
-    const bodies = new Set<string>();
+    // One sentence for all; the step depends only on what was typed: a search for words that can
+    // only be a title (or an old name), else the list. Never on what exists or who may see it.
     for (const [key, ref] of cases) {
+      const expected = JSON.stringify((parseArtifactId(ref) === null ? notVisibleTitle(ref) : notVisible()).body);
       for (const suffix of ["", "/comments", "/files/index.html", "/files/index.html/content"]) {
         const res = await rawGet(app.baseUrl, `/internal/agent-api/artifacts/${encodeURIComponent(ref)}${suffix}`, key);
         assert.equal(res.status, 404, `${ref}${suffix}`);
-        bodies.add(res.body.toString("utf8"));
+        assert.equal(res.body.toString("utf8"), expected, `${ref}${suffix}`);
       }
     }
-    assert.deepEqual([...bodies], [JSON.stringify(notVisible().body)]);
     // A title or a name is looked up only in the caller's server: the peer agent can't name a public artifact.
     assert.equal((await getJson(app.baseUrl, `/artifacts/${world.items.public.name}`, world.keys.peer)).status, 404);
     assert.equal((await getJson(app.baseUrl, `/artifacts/${encodeURIComponent(world.items.public.title)}`, world.keys.peer)).status, 404);
@@ -550,7 +551,7 @@ test("read: the short id a link carries is the same Artifact as its pt_ id, on t
       assert.deepEqual((await getJson(app.baseUrl, `/artifacts/${id}`, key)).body.code, "NOT_VISIBLE");
     }
     // Not an id (22 characters of Base58 over 16 bytes): looked up as a title, and none has it.
-    assert.deepEqual((await getJson(app.baseUrl, "/artifacts/YcVfxkQb6JRzqk5kF2tNLw", world.keys.in)).body, wire(notVisible().body));
+    assert.deepEqual((await getJson(app.baseUrl, "/artifacts/YcVfxkQb6JRzqk5kF2tNLw", world.keys.in)).body, wire(notVisibleTitle("YcVfxkQb6JRzqk5kF2tNLw").body));
   } finally {
     resetStores();
   }

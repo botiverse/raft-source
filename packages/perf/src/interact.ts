@@ -15,14 +15,23 @@
  */
 import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
+import { availableParallelism } from "node:os";
 import process from "node:process";
 import { parseArgs } from "node:util";
 import { type Locator, type Page, type Request, chromium } from "playwright";
 import { cliArgs } from "./args";
 import { type FrameStats, frameStats, median } from "./frames";
+import { type HostSample, busyRuns, hostBenchmark, hostExtra, readPressure, stallShares, worseSample } from "./hostHealth";
 import { isProductionHost } from "./page";
 import type { PageRunRow } from "./pageRuns";
 import { type SwitchLongTask, type SwitchRequest, type SwitchTiming, isMessageRoute, routeOf, switchTiming } from "./switchTiming";
+import { TRACE_CATEGORIES, type TraceEvent, type WorkSplit, workSplit } from "./workSplit";
+
+/** With --trace: how long after the click main-thread work is counted. */
+const TRACE_WINDOW_MS = 3000;
+const NO_TRACE = "a trace could not be recorded or read: that switch has no work split";
+const NO_CLICK_IN_TRACE = "a trace held no click event: that switch has no work split";
+const SHORT_TRACE = `a trace stopped before ${TRACE_WINDOW_MS / 1000} s had passed since the click: that switch's work split misses the end (recordedMs)`;
 
 const HELP = `raft-perf interact — message-list scroll, channel switch and thread open on a deployed Raft web
 
@@ -35,6 +44,9 @@ Options:
                       message with replies is the thread that gets opened, if it has one
   --other <name>      a second channel to switch to and back (default all)
   --runs <n>          repetitions (default 3)
+  --keep-busy         keep runs taken while the host was busy in the medians (they are still reported)
+  --trace             record a Chrome trace of each switch and report what the main thread did in the
+                      ${TRACE_WINDOW_MS / 1000} s after the click: script, style, layout, large style passes (not with --jsonl)
   --out <file>        also write the JSON here
   --jsonl <file>      also write one row per run (ScopeDB perf.page_runs, metrics in extra); needs --project
   --project <name>    with --jsonl: the product this web belongs to (e.g. raft-web)
@@ -51,6 +63,9 @@ const fail = (message: string): never => {
   throw new InteractError(message);
 };
 
+/** One switch; with --trace also what the main thread did after its click (null: the trace could not be read). */
+export type TimedSwitch = SwitchTiming & { work?: WorkSplit | null };
+
 /** One repetition: a first visit and a thread open in a fresh tab; then a scroll up, a scroll down, a switch away and back. */
 export interface InteractRun {
   scrollUp: FrameStats | null;
@@ -62,12 +77,12 @@ export interface InteractRun {
   /** …and back to the busy channel. */
   switchBackMs: number | null;
   /** Where the time of those two switches went. */
-  switchAway: SwitchTiming | null;
-  switchBack: SwitchTiming | null;
+  switchAway: TimedSwitch | null;
+  switchBack: TimedSwitch | null;
   /** In a fresh tab opened on the other channel: the first click on the busy channel. */
-  firstVisit: SwitchTiming | null;
+  firstVisit: TimedSwitch | null;
   /** …then a click on the busy channel's last message with replies; null also when it has none. */
-  threadOpen: SwitchTiming | null;
+  threadOpen: TimedSwitch | null;
   domNodes: number;
 }
 
@@ -84,6 +99,8 @@ async function main(): Promise<number> {
       channel: { type: "string" },
       other: { type: "string", default: "all" },
       runs: { type: "string", default: "3" },
+      "keep-busy": { type: "boolean", default: false },
+      trace: { type: "boolean", default: false },
       out: { type: "string" },
       jsonl: { type: "string" },
       project: { type: "string" },
@@ -104,6 +121,8 @@ async function main(): Promise<number> {
   if (!args.server) fail("--server <slug> is required");
   if (!args.channel) fail("--channel <name> is required (a channel with a long history)");
   if (!Number.isInteger(runs) || runs < 1) fail("--runs must be an integer of at least 1");
+  // recording a trace can slow the page: its timings are for reading beside the split, not for the ledger
+  if (args.trace && args.jsonl) fail("--trace and --jsonl do not go together: rows are for untraced runs");
   if (args.jsonl && !args.project) fail("--jsonl needs --project (which product this web belongs to)");
   let production: boolean;
   try {
@@ -137,6 +156,8 @@ async function main(): Promise<number> {
   const results: InteractRun[] = [];
   let release: { commitSha?: string; deploymentEnvironment?: string } = {};
   const warnings: string[] = [];
+  /** Per run, what was seen of the host beside it: the worse of its two parts. */
+  const hostSamples: HostSample[] = [];
   let hasThread = false;
   try {
     /** A signed-in tab on one channel, settled, with long tasks recorded from the start. */
@@ -168,7 +189,7 @@ async function main(): Promise<number> {
      * target's messages are in the DOM. `target` is a channel id (a message that was not on screen before appears
      * under the new URL) or "thread" (the thread panel shows replies and no loading state).
      */
-    const timedClick = async (tab: Page, item: Locator, target: string): Promise<SwitchTiming | null> => {
+    const timedClick = async (tab: Page, item: Locator, target: string): Promise<TimedSwitch | null> => {
       // The target's own messages. A sidebar click loads a channel through its page and nothing else: other channels'
       // pages (inline reply previews) and message contexts (quoted permalinks) are someone else's. A thread's channel
       // id is not known from outside, so there any channel page or context counts.
@@ -178,6 +199,8 @@ async function main(): Promise<number> {
       };
       try {
         await item.waitFor({ state: "visible", timeout: 10_000 });
+        // one trace at a time per browser: switches are measured one after another. Started before the page's timer is armed.
+        const tracing = args.trace && (await browser.startTracing(tab, { categories: TRACE_CATEGORIES }).then(() => true, () => false));
         const done = tab.evaluate(
           ({ target, timeoutMs }) =>
             new Promise<{ start: number; handled: number; end: number } | null>((resolve) => {
@@ -217,15 +240,21 @@ async function main(): Promise<number> {
         const settled = (r: Request) => void out.delete(r);
         tab.on("request", sent).on("requestfinished", settled).on("requestfailed", settled);
         let window: { start: number; handled: number; end: number } | null;
+        let trace: Buffer | null = null;
         try {
           await item.click({ timeout: 10_000 });
+          // the click event is no later than this
+          const clickedBy = Date.now();
           window = await done;
           // a refresh behind a local paint is sent after it, and long tasks are delivered late: give both time,
           // then wait (up to 8 s more) for the message requests still out
           await tab.waitForTimeout(1200);
           for (let i = 0; i < 40 && out.size > 0; i++) await tab.waitForTimeout(200);
+          // the split covers a fixed time from the click: keep recording until it has passed
+          if (tracing) await tab.waitForTimeout(Math.max(0, TRACE_WINDOW_MS + 200 - (Date.now() - clickedBy)));
         } finally {
           tab.off("request", sent).off("requestfinished", settled).off("requestfailed", settled);
+          if (tracing) trace = await browser.stopTracing().catch(() => null);
         }
         if (!window) return null;
         const seen = await tab.evaluate(
@@ -240,7 +269,23 @@ async function main(): Promise<number> {
         );
         if (seen.bufferFull && !warnings.includes(BUFFER_FULL)) warnings.push(BUFFER_FULL);
         const requests: SwitchRequest[] = seen.requests.map(({ pathname, ...r }) => ({ path: routeOf(pathname), message: carriesMessages(pathname), ...r }));
-        return switchTiming(window.end - window.start, requests, seen.longTasks satisfies SwitchLongTask[], window.handled - window.start);
+        const timing = switchTiming(window.end - window.start, requests, seen.longTasks satisfies SwitchLongTask[], window.handled - window.start);
+        if (!args.trace) return timing;
+        const warn = (text: string) => void (warnings.includes(text) || warnings.push(text));
+        let events: TraceEvent[] | null = null;
+        try {
+          events = trace ? (JSON.parse(trace.toString()) as { traceEvents: TraceEvent[] }).traceEvents : null;
+        } catch {
+          events = null;
+        }
+        if (!Array.isArray(events)) {
+          warn(NO_TRACE);
+          return { ...timing, work: null };
+        }
+        const work = workSplit(events, TRACE_WINDOW_MS);
+        if (!work) warn(NO_CLICK_IN_TRACE);
+        else if (work.recordedMs < TRACE_WINDOW_MS) warn(SHORT_TRACE);
+        return { ...timing, work };
       } catch {
         return null;
       }
@@ -260,19 +305,32 @@ async function main(): Promise<number> {
 
     // Per run, what a tab that has never shown the busy channel does: the first visit, then a thread. Each in its own browser context.
     const fresh: Pick<InteractRun, "firstVisit" | "threadOpen">[] = [];
+    /** What was seen of the host beside each part of a run (src/hostHealth.ts): a benchmark and a pressure reading before, the same after. */
+    const beside = async <T>(part: () => Promise<T>): Promise<{ value: T; host: HostSample }> => {
+      const before = { benchMs: hostBenchmark(), pressure: readPressure(), at: Date.now() };
+      const value = await part();
+      return { value, host: { ...stallShares(before.pressure, readPressure(), Date.now() - before.at), benchMs: Math.max(before.benchMs, hostBenchmark()) } };
+    };
+    // the first run of the benchmark is slower while it is compiled: take it before any run is sampled (as measure does)
+    hostBenchmark();
+    const freshHost: HostSample[] = [];
     for (let i = 0; i < runs; i++) {
-      const tab = await openTab(other);
-      try {
-        const firstVisit = await timedClick(tab, inSidebar(tab, busy), busy.id);
-        await tab.waitForTimeout(1000);
-        // without the first visit the tab is not on the busy channel: its thread is not there to open
-        const replies = tab.locator("[data-testid=message-scroller] [data-message-affordance=inline-thread-replies]");
-        const threads = firstVisit ? await replies.count() : 0;
-        hasThread ||= threads > 0;
-        fresh.push({ firstVisit, threadOpen: threads > 0 ? await timedClick(tab, replies.last(), "thread") : null });
-      } finally {
-        await tab.context().close();
-      }
+      const { value, host } = await beside(async () => {
+        const tab = await openTab(other);
+        try {
+          const firstVisit = await timedClick(tab, inSidebar(tab, busy), busy.id);
+          await tab.waitForTimeout(1000);
+          // without the first visit the tab is not on the busy channel: its thread is not there to open
+          const replies = tab.locator("[data-testid=message-scroller] [data-message-affordance=inline-thread-replies]");
+          const threads = firstVisit ? await replies.count() : 0;
+          hasThread ||= threads > 0;
+          return { firstVisit, threadOpen: threads > 0 ? await timedClick(tab, replies.last(), "thread") : null };
+        } finally {
+          await tab.context().close();
+        }
+      });
+      fresh.push(value);
+      freshHost.push(host);
     }
 
     const scroll = async (direction: 1 | -1): Promise<{ stats: FrameStats | null; longtaskMs: number }> => {
@@ -319,47 +377,63 @@ async function main(): Promise<number> {
     };
 
     for (let i = 0; i < runs; i++) {
-      const up = await scroll(-1);
-      const down = await scroll(1);
-      const away = await timedClick(page, inSidebar(page, other), other.id);
-      await page.waitForTimeout(1000);
-      const back = await timedClick(page, inSidebar(page, busy), busy.id);
-      await page.waitForTimeout(1500);
+      const { value, host: mainHost } = await beside(async () => {
+        const up = await scroll(-1);
+        const down = await scroll(1);
+        const away = await timedClick(page, inSidebar(page, other), other.id);
+        await page.waitForTimeout(1000);
+        const back = await timedClick(page, inSidebar(page, busy), busy.id);
+        await page.waitForTimeout(1500);
+        return { up, down, away, back };
+      });
+      const { up, down, away, back } = value;
+      hostSamples.push(worseSample(freshHost[i]!, mainHost));
       results.push({ scrollUp: up.stats, scrollDown: down.stats, scrollLongtaskMs: up.longtaskMs + down.longtaskMs, switchAwayMs: away?.totalMs ?? null, switchBackMs: back?.totalMs ?? null, switchAway: away, switchBack: back, ...fresh[i]!, domNodes: await page.evaluate(() => document.querySelectorAll("*").length) });
     }
   } finally {
     await browser.close();
   }
 
-  const med = (pick: (r: InteractRun) => number | null | undefined) => {
-    const m = median(results.map(pick).filter((v): v is number => v != null));
+  // A run taken while something else had the machine says more about the machine than about the page: it stays in `runs`, out of the medians.
+  const hostSeen = busyRuns(hostSamples, args["keep-busy"]);
+  const kept = results.filter((_, i) => !hostSeen.leftOut.includes(i));
+  const medOf = (of: readonly InteractRun[]) => (pick: (r: InteractRun) => number | null | undefined) => {
+    const m = median(of.map(pick).filter((v): v is number => v != null));
     return m == null ? null : Math.round(m * 10) / 10;
   };
-  const switches = results.flatMap((r) => [r.firstVisit, r.threadOpen, r.switchAway, r.switchBack]).filter((t): t is SwitchTiming => t != null);
+  const switchesOf = (of: readonly InteractRun[]) => of.flatMap((r) => [r.firstVisit, r.threadOpen, r.switchAway, r.switchBack]).filter((t): t is SwitchTiming => t != null);
+  const switches = switchesOf(kept);
   const worst = (a: FrameStats | null, b: FrameStats | null, key: "slowPct" | "p95Ms" | "maxMs") => (a && b ? Math.max(a[key], b[key]) : (a ?? b)?.[key] ?? null);
-  /** The numbers watermarks are set on: medians over the runs; per run, the worse of the two scroll directions. */
-  const metrics = {
-    scroll_slow_frame_pct: med((r) => worst(r.scrollUp, r.scrollDown, "slowPct")),
-    scroll_frame_p95_ms: med((r) => worst(r.scrollUp, r.scrollDown, "p95Ms")),
-    scroll_frame_max_ms: med((r) => worst(r.scrollUp, r.scrollDown, "maxMs")),
-    scroll_longtask_ms: med((r) => r.scrollLongtaskMs),
-    channel_switch_ms: med((r) => (r.switchAwayMs != null && r.switchBackMs != null ? Math.max(r.switchAwayMs, r.switchBackMs) : null)),
-    channel_first_visit_ms: med((r) => r.firstVisit?.totalMs),
-    /** …and when the view was also current: the refresh behind a local paint had arrived. */
-    channel_first_visit_settled_ms: med((r) => r.firstVisit?.settledMs),
-    channel_switch_settled_ms: med((r) => (r.switchAway && r.switchBack ? Math.max(r.switchAway.settledMs, r.switchBack.settledMs) : null)),
-    thread_open_ms: med((r) => r.threadOpen?.totalMs),
-    /** Over every switch measured: the share of its time the main thread was busy, and how long after the click the messages were asked for. */
-    switch_main_thread_pct: (() => {
-      const m = median(switches.filter((t) => t.totalMs > 0).map((t) => (100 * t.mainThreadMs) / t.totalMs));
-      return m == null ? null : Math.round(m * 10) / 10;
-    })(),
-    switch_request_delay_ms: median(switches.map((t) => t.requestDelayMs).filter((v): v is number => v != null)),
-    /** …of which, over the same switches (those that asked): the browser was busy before the page handled the click (the runner's share), and the rest (the app's). */
-    switch_input_delay_ms: median(switches.filter((t) => t.requestDelayMs != null).map((t) => t.inputDelayMs)),
-    switch_app_request_delay_ms: median(switches.map((t) => t.appRequestDelayMs).filter((v): v is number => v != null)),
-    dom_node_count: med((r) => r.domNodes),
+  /** The numbers watermarks are set on: medians over the runs kept (all of them unless the host was busy for some); per run, the worse of the two scroll directions. */
+  const metricsOf = (of: readonly InteractRun[]) => {
+    const med = medOf(of);
+    const switches = switchesOf(of);
+    return {
+      scroll_slow_frame_pct: med((r) => worst(r.scrollUp, r.scrollDown, "slowPct")),
+      scroll_frame_p95_ms: med((r) => worst(r.scrollUp, r.scrollDown, "p95Ms")),
+      scroll_frame_max_ms: med((r) => worst(r.scrollUp, r.scrollDown, "maxMs")),
+      scroll_longtask_ms: med((r) => r.scrollLongtaskMs),
+      channel_switch_ms: med((r) => (r.switchAwayMs != null && r.switchBackMs != null ? Math.max(r.switchAwayMs, r.switchBackMs) : null)),
+      channel_first_visit_ms: med((r) => r.firstVisit?.totalMs),
+      /** …and when the view was also current: the refresh behind a local paint had arrived. */
+      channel_first_visit_settled_ms: med((r) => r.firstVisit?.settledMs),
+      channel_switch_settled_ms: med((r) => (r.switchAway && r.switchBack ? Math.max(r.switchAway.settledMs, r.switchBack.settledMs) : null)),
+      thread_open_ms: med((r) => r.threadOpen?.totalMs),
+      /** Over every switch measured: the share of its time the main thread was busy, and how long after the click the messages were asked for. */
+      switch_main_thread_pct: (() => {
+        const m = median(switches.filter((t) => t.totalMs > 0).map((t) => (100 * t.mainThreadMs) / t.totalMs));
+        return m == null ? null : Math.round(m * 10) / 10;
+      })(),
+      switch_request_delay_ms: median(switches.map((t) => t.requestDelayMs).filter((v): v is number => v != null)),
+      /** …of which, over the same switches (those that asked): the browser was busy before the page handled the click (the runner's share), and the rest (the app's). */
+      switch_input_delay_ms: median(switches.filter((t) => t.requestDelayMs != null).map((t) => t.inputDelayMs)),
+      switch_app_request_delay_ms: median(switches.map((t) => t.appRequestDelayMs).filter((v): v is number => v != null)),
+      dom_node_count: med((r) => r.domNodes),
+    };
   };
+  const metrics = metricsOf(kept);
+  /** The same medians over every run, when some were left out: a change that makes the page heavier can make its own runs read busy, and this shows what leaving them out moved. */
+  const metricsAllRuns = hostSeen.leftOut.length ? metricsOf(results) : null;
   /** One switch as row columns, each named with its unit; the cache state as two 0/1 counts (neither: a hit). All null when it was not measured. */
   const switchExtra = (name: string, t: SwitchTiming | null): Record<string, number | null> => ({
     [`${name}_settled_ms`]: t?.settledMs ?? null,
@@ -378,15 +452,27 @@ async function main(): Promise<number> {
     [`${name}_miss_count`]: t ? (t.cache === "miss" ? 1 : 0) : null,
     [`${name}_stale_count`]: t ? (t.cache === "stale" ? 1 : 0) : null,
   });
+  /** With --trace, per kind of switch over the runs kept: medians of what the main thread did in the window after the click. */
+  const workOf = (pick: (r: InteractRun) => TimedSwitch | null) => {
+    const splits = kept.map((r) => pick(r)?.work).filter((w): w is WorkSplit => w != null);
+    if (!splits.length) return null;
+    const med = (of: (w: WorkSplit) => number) => Math.round(median(splits.map(of))! * 10) / 10;
+    return { switches: splits.length, taskMs: med((w) => w.taskMs), scriptMs: med((w) => w.scriptMs), styleMs: med((w) => w.styleMs), layoutMs: med((w) => w.layoutMs), forcedMs: med((w) => w.forcedMs), stylePasses: med((w) => w.stylePasses), styleElements: med((w) => w.styleElements), layouts: med((w) => w.layouts), largeStylePasses: med((w) => w.largeStylePasses.length) };
+  };
+  const work = args.trace ? { windowMs: TRACE_WINDOW_MS, channel_first_visit: workOf((r) => r.firstVisit), thread_open: workOf((r) => r.threadOpen), channel_switch_away: workOf((r) => r.switchAway), channel_switch_back: workOf((r) => r.switchBack) } : null;
   const cacheCounts = { hit: 0, stale: 0, miss: 0 };
   for (const t of switches) cacheCounts[t.cache]++;
   if (results.some((r) => !r.scrollUp || !r.scrollDown)) warnings.push("a scroll produced too few frames to measure");
   if (results.some((r) => r.switchAwayMs == null || r.switchBackMs == null || r.firstVisit == null)) warnings.push("a channel switch did not finish in 15 s");
   if (hasThread && results.some((r) => r.threadOpen == null)) warnings.push("a thread did not open in 15 s");
   // only a first visit that worked could look for a thread
-  const notes = hasThread || results.every((r) => r.firstVisit == null) ? [] : [`#${busy.name} has no message with replies: thread_open_ms was not measured`];
+  const notes: string[] = hasThread || results.every((r) => r.firstVisit == null) ? [] : [`#${busy.name} has no message with replies: thread_open_ms was not measured`];
+  if (args.trace) notes.push("taken with --trace: recording can slow the page, so do not hold these timings against a watermark or put them beside an untraced run's");
+  const busyRunNumbers = hostSeen.busy.flatMap((b, i) => (b ? [i + 1] : []));
+  if (hostSeen.allBusy) warnings.push(`every run was taken on a busy host (by ${hostSeen.by}): the numbers say more about the machine than about the page`);
+  else if (busyRunNumbers.length) notes.push(`run(s) ${busyRunNumbers.join(", ")} ${args["keep-busy"] ? "taken on a busy host (kept: --keep-busy)" : `left out of the medians: the host was busy (by ${hostSeen.by})`}`);
   const measuredAt = new Date().toISOString();
-  const report = { tool: "raft-perf interact", measuredAt, origin, page: { server: server.slug, channel: busy.name, other: other.name }, commitSha: release.commitSha ?? null, requestedRuns: runs, metrics, switchCache: cacheCounts, warnings, notes, runs: results };
+  const report = { tool: "raft-perf interact", measuredAt, origin, page: { server: server.slug, channel: busy.name, other: other.name }, commitSha: release.commitSha ?? null, requestedRuns: runs, metrics, ...(metricsAllRuns ? { metricsAllRuns } : {}), ...(work ? { work } : {}), switchCache: cacheCounts, warnings, notes, host: { by: hostSeen.by, cpus: availableParallelism(), benchmarkMedianMs: hostSeen.benchmarkMedianMs, runs: hostSamples, busyRuns: busyRunNumbers, leftOut: hostSeen.leftOut.map((i) => i + 1) }, runs: results };
   const text = JSON.stringify(report, null, 2);
   process.stdout.write(`${text}\n`);
   if (args.out) writeFileSync(args.out, `${text}\n`);
@@ -429,6 +515,10 @@ async function main(): Promise<number> {
         ...switchExtra("channel_switch_away", r.switchAway),
         ...switchExtra("channel_switch_back", r.switchBack),
         dom_node_count: r.domNodes,
+        // 1 when this run was taken on a busy host; 1 when it was left out of the report's medians for it (readers of the rows skip those: claims.ts metricRuns)
+        host_busy: hostSeen.busy[i] ? 1 : 0,
+        host_left_out: hostSeen.leftOut.includes(i) ? 1 : 0,
+        ...hostExtra(availableParallelism(), hostSeen.benchmarkMedianMs),
       },
     }));
     writeFileSync(args.jsonl, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
@@ -436,6 +526,9 @@ async function main(): Promise<number> {
   process.stderr.write(
     `raft-perf interact ${busy.name}: slow frames ${metrics.scroll_slow_frame_pct}% (p95 ${metrics.scroll_frame_p95_ms} ms), channel switch ${metrics.channel_switch_ms} ms (first visit ${metrics.channel_first_visit_ms}, current after ${metrics.channel_first_visit_settled_ms}; thread ${metrics.thread_open_ms}; main thread ${metrics.switch_main_thread_pct}% of a switch, messages asked for ${metrics.switch_request_delay_ms} ms after the click (${metrics.switch_input_delay_ms} ms of it input delay); cache hit/stale/miss ${cacheCounts.hit}/${cacheCounts.stale}/${cacheCounts.miss})` + (warnings.length ? `; ${warnings.length} warning(s)` : "") + "\n",
   );
+  if (work)
+    for (const [name, w] of Object.entries(work))
+      if (w && typeof w === "object") process.stderr.write(`  ${name}, ${TRACE_WINDOW_MS / 1000} s after the click: tasks ${w.taskMs} ms, of it script ${w.scriptMs}, style ${w.styleMs}, layout ${w.layoutMs} (${w.forcedMs} of style and layout forced from script); ${w.largeStylePasses} large style pass(es), ${w.styleElements} elements restyled\n`);
   return warnings.length ? 2 : 0;
 }
 

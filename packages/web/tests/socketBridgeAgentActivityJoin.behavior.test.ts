@@ -179,6 +179,17 @@ test("agent:activity socket handler emits a bounded receipt and stores its opaqu
   for (const rawKey of ["agentId", "detail", "launchId", "probeId", "client_event_id"]) {
     assert.equal(rawKey in (receipt.attrs ?? {}), false, `${rawKey} must not leave the Web trace boundary`);
   }
+  // Q8 exception (webAgentActivityTrace.ts): the real handler hands client_seq through
+  // to both the receipt and the store decision; "launch-1" is not a UUID, so it
+  // stays boolean-only.
+  const decision = batches
+    .flatMap((batch) => batch.events ?? [])
+    .find((record) => record.name === "slock.agent_activity.store_decision");
+  for (const record of [receipt, decision]) {
+    assert.equal(record?.attrs?.client_seq, 7);
+    assert.equal(record?.attrs?.launch_id_present, true);
+    assert.equal("launch_id" in (record?.attrs ?? {}), false);
+  }
 });
 
 test("agent:activity socket handler falls back to opaque UUIDv4 from getRandomValues", () => {

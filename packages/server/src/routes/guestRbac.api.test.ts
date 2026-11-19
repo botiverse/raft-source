@@ -6,9 +6,9 @@ import { randomBytes, randomUUID } from "node:crypto";
 
 import { and, eq, sql } from "drizzle-orm";
 
-import { PUBLIC_SERVER_FEATURE_FLAG_KEY, SERVER_GUEST_FEATURE_FLAG_KEY, STORED_ACTION_CARD_ACTION_TYPES, actionCardTypeAuthority, asServerId } from "@botiverse/raft-shared";
+import { PUBLIC_SERVER_FEATURE_FLAG_KEY, STORED_ACTION_CARD_ACTION_TYPES, actionCardTypeAuthority, asServerId } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
-import { actionCards, agents, channelExternalInvites, channelHumans, channelServerConnectRequests, channels, featureFlagRules, featureFlags, messages, oauthClients, serverAgentMembers, serverMembers, serverMembershipDepartures, servers, users } from "../db/schema";
+import { actionCards, agents, channelExternalInvites, channelHumans, channelServerConnectRequests, channels, featureFlags, messages, oauthClients, serverAgentMembers, serverMembers, serverMembershipDepartures, servers, users } from "../db/schema";
 import { createAgent } from "../services/agentService";
 import { assertActionCardWritableByUser, prepareActionCard } from "../services/actionCardsService";
 import { addAgent, addHuman, archiveChannel, createChannel, findOrCreateDM, findOrCreateUserDM, getOrCreateThread, getSystemAllChannel, isChannelHuman, setLocalChannelArchivedByAgent, unarchiveChannel } from "../services/channelService";
@@ -51,17 +51,6 @@ function authHeaders(token: string, serverId: string) {
     "Content-Type": "application/json",
     "X-Server-Id": serverId,
   };
-}
-
-async function enableGuestFlag(serverId: string): Promise<void> {
-  await getDb().insert(featureFlagRules).values({
-    id: randomUUID(),
-    flagKey: SERVER_GUEST_FEATURE_FLAG_KEY,
-    stage: "server",
-    priority: 0,
-    decision: "allow",
-    values: [serverId],
-  });
 }
 
 /** Whether channels still has a guest_joinable column (retired, #wg-rbac:#47; dropped by channels_guest_joinable_drop). */
@@ -591,7 +580,6 @@ test("an agent cannot open a new DM with a Guest by name; existing Guest DMs and
   const earlyGuest = await seedUser(`agent-guest-dm-early-${suffix}@slock.test`, `agent-guest-dm-early-${suffix}`);
   const member = await seedUser(`agent-guest-dm-member-${suffix}@slock.test`, `agent-guest-dm-member-${suffix}`);
   const server = await createServer("Agent Guest DM", `agent-guest-dm-${suffix}`, owner.id);
-  await enableGuestFlag(server.id);
   await db.insert(serverMembers).values({ serverId: server.id, userId: member.id, role: "member" });
   await seedBoundGuest({ serverId: server.id, userId: guest.id });
   await seedBoundGuest({ serverId: server.id, userId: earlyGuest.id });
@@ -638,7 +626,6 @@ test("Guests cannot read server-wide App catalogues; members still can (B18)", a
   const server = await createServer("Guest integrations", `guest-integrations-${randomUUID()}`, owner.id);
   await getDb().insert(serverMembers).values({ serverId: server.id, userId: member.id, role: "member" });
   await seedBoundGuest({ serverId: server.id, userId: guest.id });
-  await enableGuestFlag(server.id);
   // An App installed here, so the per-App setup read has a real target for the member control.
   const created = await createOAuthClient({
     serverId: publisher.id,

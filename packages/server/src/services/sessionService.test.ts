@@ -92,6 +92,11 @@ function makeDb(options: {
               Promise.resolve(rows).then(resolve, reject),
           }) }) }) };
         },
+        update() {
+          // The family's scope, read by the statement that marks it active (familyScope).
+          const rows = [{ scope: "full", revokedAt: null, retiredAt: null }];
+          return { set: () => ({ where: () => ({ returning: async () => rows }) }) };
+        },
         delete(table: unknown) {
           const result = deleteResults.shift();
           if (!result) throw new Error("Unexpected delete");

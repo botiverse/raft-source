@@ -31,9 +31,18 @@
  * Overlay geometry (titlebar-area-* = the bar area clear of the controls, in CSS
  * px so it follows zoom; on macOS the right corner is 0); without it (e.g. the
  * desktop render smoke's plain window for Windows / Linux) fall back to
- * Windows' 3 × 46px caption buttons, 48px tall. */
+ * Windows' 3 × 46px caption buttons, 48px tall.
+ * The geometry is the WINDOW's, but 100vw is the page's: with DevTools docked
+ * beside the page (Raft Desktop, View › Developer Tools) the page is narrower
+ * than the window, the difference goes negative, and a negative end inset
+ * gave the bar's right region the leading region's room, so the history
+ * controls ended up under the search field. Docked on the right, the
+ * controls sit over DevTools, not the page: nothing to reserve, hence
+ * max(0px, …). Docked on the left is not handled: CSS cannot see where the
+ * page sits in the window, so the corners stay where the window's are
+ * (developer-only state; the bar is usable, the corners are off). */
 html[data-title-bar="overlay"]:not([data-fullscreen]) {
-  --raft-frame-inset-end: calc(100vw - env(titlebar-area-x, 0px) - env(titlebar-area-width, calc(100vw - 138px)));
+  --raft-frame-inset-end: max(0px, calc(100vw - env(titlebar-area-x, 0px) - env(titlebar-area-width, calc(100vw - 138px))));
   --raft-frame-inset-top: env(titlebar-area-height, 44px);
 }
 /* On macOS the traffic lights are drawn over the LEFT end as well

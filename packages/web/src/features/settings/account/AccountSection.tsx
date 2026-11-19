@@ -34,6 +34,7 @@ import { isSecondFactorStepUpCancelled, withSecondFactorStepUp } from "../../../
 import { AccountSignOutSection } from "./AccountSignOutSection";
 import { AppLoginsSection } from "./AppLoginsSection";
 import { DeleteAccountSection } from "./DeleteAccountSection";
+import { SignedInDevicesSection } from "./SignedInDevicesSection";
 import { UsageDataSettingsCard } from "../../../components/settings/UsageDataSettings";
 
 // Exported for the sub-batch-A i18n DOM smoke test: renders the Account section
@@ -631,6 +632,10 @@ export function AccountSection({
           the Account card and before Session, so Sign Out stays last. */}
       <PasskeysSection passwordConfigured={passwordConfigured} />
       <TwoStepVerificationSection passwordConfigured={passwordConfigured} />
+
+      {/* Signed-in devices: the person's own sign-ins, after the ways they
+          sign in and before the Apps, with Sign out for each other one. */}
+      <SignedInDevicesSection passwordConfigured={passwordConfigured} />
 
       {/* Apps signed in to with the Raft account (RFC 079 phase 3a, design
           §4.2): nothing renders while the list is empty. Revoking the last

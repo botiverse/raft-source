@@ -17,10 +17,12 @@ import { DeleteComputerDialog } from "./DeleteComputerDialog";
  * preselect another computer; Restart while it is online; Delete Computer, as on the Computer
  * page: DeleteComputerDialog). Absent when the viewer may do none of them.
  */
-export function RackRowMenu({ machine, agents, canManage, upgrade, restartState }: {
+export function RackRowMenu({ machine, agents, canManage, canControl, upgrade, restartState }: {
   machine: Machine;
   agents: readonly Agent[];
   canManage: boolean;
+  /** May restart it (canControlComputer): the server refuses a restart to the rest of canManage. */
+  canControl: boolean;
   upgrade: UpgradeCard;
   restartState: RestartState;
 }) {
@@ -37,7 +39,7 @@ export function RackRowMenu({ machine, agents, canManage, upgrade, restartState 
   }, []);
   const closeCreate = useCallback(() => setShowCreate(false), []);
   if (!canManage) return <div className="size-8 shrink-0" aria-hidden="true" />;
-  const canRestart = machine.isComputer === true && machine.status === "online" && cardState.kind !== "upgrading" && !progress;
+  const canRestart = canControl && machine.isComputer === true && machine.status === "online" && cardState.kind !== "upgrading" && !progress;
   const menuLabel = formatMessage({ id: "agent.detail.moreActions" });
   return (
     <>

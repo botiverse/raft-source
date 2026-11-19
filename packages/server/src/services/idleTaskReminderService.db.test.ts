@@ -10,16 +10,18 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
+
+import { TASK_V2_CONVERSATIONS_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
 
 import { getDb } from "../db/index";
-import { agents, agentTaskNudges, agentTaskNudgeSends, channelAgents, channels, messages, tasks, taskEvents } from "../db/schema";
+import { agents, agentTaskNudges, agentTaskNudgeSends, channelAgents, channels, featureFlagRules, messages, servers, tasks, taskEvents } from "../db/schema";
 import { dbTest as test } from "../test/integration/dbTest";
 import type { createSeed } from "../test/integration/seed";
 import { enableTaskV2ConversationsForServer } from "../test/integration/taskV2Flag";
 import { createAgent } from "./agentService";
 import { addAgent, getOrCreateThread } from "./channelService";
-import { computeIdleTaskReminder, IDLE_TASK_REMINDER_HOURLY_CAP, IDLE_TASK_REMINDER_MAX_UNASSIGNED_PER_NOTICE } from "./idleTaskReminderService";
+import { computeIdleTaskReminder, ensureTaskV2OnSince, IDLE_TASK_REMINDER_HOURLY_CAP, IDLE_TASK_REMINDER_MAX_UNASSIGNED_PER_NOTICE } from "./idleTaskReminderService";
 import { TASK_V2_RETIRED_IN_REVIEW_REASON } from "./taskV2Mode";
 import { createMessage } from "./messageService";
 import { ensureTaskConversation } from "./taskConversationService";
@@ -33,7 +35,13 @@ const ago = (ms: number) => new Date(NOW.getTime() - ms);
 
 type Actor = { type: "user" | "agent"; id: string };
 
-async function fixture(seed: ReturnType<typeof createSeed>, opts: { flag?: boolean } = {}) {
+/**
+ * `onSince`: when the server was first seen with task v2 on. By default long
+ * before every fact here (tasks are written with the wall clock's activity
+ * time, before NOW), so only the tests about it see it; `null` leaves it for
+ * the reminder to set.
+ */
+async function fixture(seed: ReturnType<typeof createSeed>, opts: { flag?: boolean; onSince?: Date | null } = {}) {
   const owner = await seed.human();
   const server = await seed.server({ owner });
   const channel = await seed.channel({ server, members: [owner] });
@@ -43,6 +51,8 @@ async function fixture(seed: ReturnType<typeof createSeed>, opts: { flag?: boole
   await addAgent(channel.id, peer.id);
   // The reminder shares the task v2 flag.
   if (opts.flag !== false) await enableTaskV2ConversationsForServer(server.id);
+  const onSince = opts.onSince === undefined ? ago(30 * 24 * HOUR) : opts.onSince;
+  if (onSince) await getDb().update(servers).set({ taskV2OnSince: onSince }).where(eq(servers.id, server.id));
   const ownerActor: Actor = { type: "user", id: owner.id };
   const agentActor: Actor = { type: "agent", id: agent.id };
   const peerActor: Actor = { type: "agent", id: peer.id };
@@ -372,13 +382,25 @@ test("no assignee: claimed by anyone, or assigned to a person, it leaves this pa
   assert.deepEqual(await remind(fx, { now: new Date(NOW.getTime() + 3 * 24 * HOUR) }), { send: false, reason: "no_open_tasks", items: [], backlog: [], text: "" });
 });
 
-test("no assignee: not on another server, nor a pre-v2 task", async ({ seed }) => {
-  const fx = await fixture(seed);
+test("no assignee: not on another server, nor a task from before task v2 went on with no activity since", async ({ seed }) => {
+  // "Pre-v2" is by time (the server's task_v2_on_since), not by
+  // own_conversation, so it still holds after the backfill.
+  const fx = await fixture(seed, { onSince: ago(24 * HOUR) });
   const otherServer = await seed.server({ owner: fx.owner });
   const otherChannel = await seed.channel({ server: otherServer, members: [fx.owner] });
   await unassignedTask(fx, { channelId: otherChannel.id, createdAt: ago(3 * 24 * HOUR) });
-  await unassignedTask(fx, { legacy: true, createdAt: ago(3 * 24 * HOUR) });
+  const legacy = await unassignedTask(fx, { legacy: true, createdAt: ago(3 * 24 * HOUR) });
+  await lastTouched(legacy.id, ago(3 * 24 * HOUR));
   assert.equal((await remind(fx)).reason, "no_open_tasks");
+});
+
+test("no assignee: an older task (own_conversation false) with activity since task v2 went on is chased, as one made since", async ({ seed }) => {
+  const fx = await fixture(seed, { onSince: ago(24 * HOUR) });
+  const legacy = await unassignedTask(fx, { legacy: true, createdAt: ago(3 * 24 * HOUR) });
+  await lastTouched(legacy.id, ago(9 * HOUR));
+  const result = await remind(fx);
+  assert.equal(result.send, true, JSON.stringify(result));
+  assert.deepEqual(result.items.map((item) => item.taskNumber), [legacy.taskNumber]);
 });
 
 test("no assignee: not where it has no exit: an archived channel, or one the agent has left", async ({ seed }) => {
@@ -541,11 +563,12 @@ test("listUnassignedTasksCreatedByAgent: per-status cutoff, most recently update
   await getDb().update(tasks).set({ claimedByType: "agent", claimedById: fx.peer.id }).where(eq(tasks.id, held.id));
   const createdByStatus = { todo: ago(8 * HOUR), in_progress: ago(2 * HOUR) };
 
-  const rows = await taskService.listUnassignedTasksCreatedByAgent([fx.channel.id], fx.agent.id, { createdByStatus, limit: 50 });
+  const activeSince = ago(30 * 24 * HOUR);
+  const rows = await taskService.listUnassignedTasksCreatedByAgent([fx.channel.id], fx.agent.id, { createdByStatus, activeSince, limit: 50 });
   assert.deepEqual(rows.map((row) => row.id), [newer.id, older.id]);
   assert.equal(rows[0]!.channelId, fx.channel.id);
   assert.equal(rows[0]!.createdAt, ago(3 * HOUR).toISOString());
-  const limited = await taskService.listUnassignedTasksCreatedByAgent([fx.channel.id], fx.agent.id, { createdByStatus, limit: 1 });
+  const limited = await taskService.listUnassignedTasksCreatedByAgent([fx.channel.id], fx.agent.id, { createdByStatus, activeSince, limit: 1 });
   assert.deepEqual(limited.map((row) => row.id), [newer.id]);
 });
 
@@ -586,4 +609,82 @@ test("backlog: a task moved out of backlog by someone else is news again", async
   assert.equal(result.send, true, JSON.stringify(result));
   assert.equal(result.items[0]?.reason, "others_acted");
   assert.equal(result.items[0]?.why, `@${fx.owner.name} changed its status`);
+});
+
+// ---------------------------------------------------------------------------
+// Only tasks with activity since the server turned task v2 on
+// (#wg-task-v2:#24): turning it on, or the backfill that makes every older
+// task a task v2 task, must not chase every open task at once.
+// ---------------------------------------------------------------------------
+
+/** The task's activity (and update) time, as if last touched at `at`. */
+async function lastTouched(taskId: string, at: Date) {
+  await getDb().update(tasks).set({ lastActivityAt: at, updatedAt: at }).where(eq(tasks.id, taskId));
+}
+
+test("on since: an open, assigned task with no activity since task v2 was turned on is not chased, before or after the backfill, even for a new session", async ({ seed }) => {
+  const fx = await fixture(seed, { onSince: ago(24 * HOUR) });
+  const legacy = await openTask(fx, { status: "in_progress", assignedBy: fx.ownerActor, assignedAt: ago(5 * 24 * HOUR) });
+  await getDb().update(tasks).set({ ownConversation: false }).where(eq(tasks.id, legacy.id));
+  await lastTouched(legacy.id, ago(5 * 24 * HOUR));
+  // As the backfill leaves it: a task v2 task by its column, nothing else changed.
+  const backfilled = await openTask(fx, { status: "todo", assignedBy: fx.ownerActor, assignedAt: ago(4 * 24 * HOUR) });
+  await lastTouched(backfilled.id, ago(4 * 24 * HOUR));
+
+  assert.equal((await remind(fx)).reason, "no_open_tasks");
+  assert.equal((await remind(fx, { freshSession: true })).reason, "no_open_tasks");
+  assert.deepEqual(await nudgeRows(fx.agent.id), []);
+});
+
+test("on since: an older task joins once someone picks it up again, and only that one", async ({ seed }) => {
+  const fx = await fixture(seed, { onSince: ago(24 * HOUR) });
+  const picked = await openTask(fx, { status: "in_progress", assignedBy: fx.ownerActor, assignedAt: ago(5 * 24 * HOUR) });
+  await lastTouched(picked.id, ago(5 * 24 * HOUR));
+  const left = await openTask(fx, { status: "in_progress", assignedBy: fx.ownerActor, assignedAt: ago(5 * 24 * HOUR) });
+  await lastTouched(left.id, ago(5 * 24 * HOUR));
+
+  await recordEvent(picked.id, "status_changed", fx.ownerActor, ago(HOUR), { from: "in_progress", to: "todo" });
+  await getDb().update(tasks).set({ status: "todo", lastActivityAt: ago(HOUR), updatedAt: ago(HOUR) }).where(eq(tasks.id, picked.id));
+  const result = await remind(fx);
+  assert.equal(result.send, true, JSON.stringify(result));
+  assert.deepEqual(result.items.map((item) => item.taskNumber), [picked.taskNumber]);
+});
+
+test("on since: a task created since is chased as before; a task with no assignee and no activity since is not", async ({ seed }) => {
+  const fx = await fixture(seed, { onSince: ago(24 * HOUR) });
+  const fresh = await openTask(fx, { title: "New since", assignedBy: fx.ownerActor, assignedAt: ago(10 * MIN) });
+  await lastTouched(fresh.id, ago(10 * MIN));
+  const old = await unassignedTask(fx, { createdAt: ago(3 * 24 * HOUR) });
+  await lastTouched(old.id, ago(3 * 24 * HOUR));
+  const result = await remind(fx);
+  assert.equal(result.send, true, JSON.stringify(result));
+  assert.deepEqual(result.items.map((item) => item.taskNumber), [fresh.taskNumber]);
+});
+
+test("on since: set once, when the reminder first finds task v2 on; off and on again keeps the first value", async ({ seed }) => {
+  const fx = await fixture(seed, { flag: false, onSince: null });
+  const readSince = async () => (await getDb().select({ since: servers.taskV2OnSince }).from(servers).where(eq(servers.id, fx.server.id)))[0]!.since;
+
+  assert.equal((await remind(fx)).reason, "disabled");
+  assert.equal(await readSince(), null, "not while the flag is off");
+
+  await enableTaskV2ConversationsForServer(fx.server.id);
+  const first = ago(3 * HOUR);
+  await remind(fx, { now: first });
+  assert.equal(new Date((await readSince())!).toISOString(), first.toISOString());
+
+  // Off for this server only: its allow rule goes.
+  await getDb().delete(featureFlagRules).where(and(
+    eq(featureFlagRules.flagKey, TASK_V2_CONVERSATIONS_FEATURE_FLAG_KEY),
+    sql`${featureFlagRules.values} @> ${JSON.stringify([fx.server.id])}::jsonb`,
+  ));
+  assert.equal((await remind(fx)).reason, "disabled");
+  await enableTaskV2ConversationsForServer(fx.server.id);
+  await remind(fx, { now: ago(HOUR) });
+  assert.equal(new Date((await readSince())!).toISOString(), first.toISOString(), "the first value stays");
+
+  // Concurrent first evaluations agree on one value.
+  const other = await fixture(seed, { onSince: null });
+  const [a, b] = await Promise.all([ensureTaskV2OnSince(other.server.id, ago(2 * HOUR)), ensureTaskV2OnSince(other.server.id, ago(HOUR))]);
+  assert.equal(a.toISOString(), b.toISOString());
 });

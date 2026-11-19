@@ -27,6 +27,10 @@
       "types": "./src/externalLinkSchemes.ts",
       "default": "./src/externalLinkSchemes.ts"
     },
+    "./src/linkRouter": {
+      "types": "./src/linkRouter.ts",
+      "default": "./src/linkRouter.ts"
+    },
     "./src/raftPermalinks": {
       "types": "./src/raftPermalinks.ts",
       "default": "./src/raftPermalinks.ts"
@@ -51,9 +55,17 @@
       "types": "./feature-flag-admin-privileges.ts",
       "default": "./feature-flag-admin-privileges.ts"
     },
+    "./feature-flag-default-policy": {
+      "types": "./feature-flag-default-policy.ts",
+      "default": "./feature-flag-default-policy.ts"
+    },
     "./feature-flag-client-rules": {
       "types": "./feature-flag-client-rules.ts",
       "default": "./feature-flag-client-rules.ts"
+    },
+    "./feature-flag-evaluation": {
+      "types": "./feature-flag-evaluation.ts",
+      "default": "./feature-flag-evaluation.ts"
     },
     "./feature-flag-taxonomy": {
       "types": "./feature-flag-taxonomy.ts",
@@ -242,9 +254,21 @@
       "types": "./announcement-audience.ts",
       "default": "./announcement-audience.ts"
     },
+    "./announcement-version-rules": {
+      "types": "./announcement-version-rules.ts",
+      "default": "./announcement-version-rules.ts"
+    },
     "./src/appLinkPreview": {
       "types": "./src/appLinkPreview.ts",
       "default": "./src/appLinkPreview.ts"
+    },
+    "./src/sealedInputs": {
+      "types": "./src/sealedInputs.ts",
+      "default": "./src/sealedInputs.ts"
+    },
+    "./src/sealedInputsVectors.testkit": {
+      "types": "./src/sealedInputsVectors.testkit.ts",
+      "default": "./src/sealedInputsVectors.testkit.ts"
     }
   },
   "scripts": {
@@ -258,6 +282,7 @@
     "check:openapi": "pnpm check:openapi-fresh && pnpm check:openapi-deterministic && pnpm lint:openapi && pnpm check:openapi-consumer && pnpm test:attachment-upload-contract && pnpm test:read-state-contract",
     "generate:runtime-provider-display-names": "node --import @oxc-node/core/register scripts/generate-runtime-provider-display-names.ts",
     "check:runtime-provider-display-names-fresh": "pnpm generate:runtime-provider-display-names && git diff --exit-code src/generated/runtimeProviderDisplayNames.ts",
+    "generate:sealed-inputs-vectors": "node --import @oxc-node/core/register scripts/generate-sealed-inputs-vectors.ts",
     "generate:agent-api-routes": "node --import @oxc-node/core/register scripts/generate-agent-api-routes.ts",
     "check:agent-api-routes-fresh": "pnpm generate:agent-api-routes && git diff --exit-code src/generated/agentApiRoutes.ts",
     "generate:agent-api-description": "node --import @oxc-node/core/register scripts/generate-agent-api-description.ts",
@@ -269,6 +294,7 @@
   },
   "dependencies": {
     "@botiverse/raft-sync-core": "workspace:*",
+    "jose": "^6.2.15",
     "mdast-util-from-markdown": "^2.0.3",
     "mdast-util-gfm": "^3.1.0",
     "mdast-util-math": "3.0.0",

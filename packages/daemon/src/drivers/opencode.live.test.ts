@@ -1,13 +1,17 @@
 /**
  * task #1258 — real-binary contract for the OpenCode 2.x launch path.
  *
+ * (The variables start with RAFT_TEST_ because the Vitest setup clears every
+ * other RAFT_* variable; under the old RAFT_OPENCODE_LIVE_* names the suite
+ * could never be enabled.)
+ *
  * Opt-in only: it runs a real `opencode` (2.x) against a free `opencode/*`
  * model, so it needs the network and the model service, neither of which may
  * decide an ordinary CI run. Enable with:
  *
- *   RAFT_OPENCODE_LIVE_TEST=1 \
- *   RAFT_OPENCODE_LIVE_BIN=/path/to/node_modules/.bin \   # dir holding a 2.x `opencode`; default: PATH
- *   RAFT_OPENCODE_LIVE_MODEL=opencode/mimo-v2.6-flash-free \   # default
+ *   RAFT_TEST_OPENCODE_LIVE=1 \
+ *   RAFT_TEST_OPENCODE_LIVE_BIN=/path/to/node_modules/.bin \   # dir holding a 2.x `opencode`; default: PATH
+ *   RAFT_TEST_OPENCODE_LIVE_MODEL=opencode/mimo-v2.6-flash-free \   # default
  *   pnpm --filter @botiverse/raft-daemon exec vitest run src/drivers/opencode.live.test.ts
  *
  * The cleanup oracle's negative control at the bottom needs neither and always
@@ -18,15 +22,16 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { ChildProcessRuntimeSession } from "./runtimeSession";
 import { OpenCodeDriver, isOpenCodeV2Launch, openCodeSessionRecordPath, readOpenCodeSessionRecord } from "./opencode";
 import type { ParsedEvent, SpawnContext } from "./types";
 
-const LIVE = process.env.RAFT_OPENCODE_LIVE_TEST === "1";
-const LIVE_BIN_DIR = process.env.RAFT_OPENCODE_LIVE_BIN;
-const LIVE_MODEL = process.env.RAFT_OPENCODE_LIVE_MODEL || "opencode/mimo-v2.6-flash-free";
+const LIVE = process.env.RAFT_TEST_OPENCODE_LIVE === "1";
+const LIVE_BIN_DIR = process.env.RAFT_TEST_OPENCODE_LIVE_BIN;
+const LIVE_MODEL = process.env.RAFT_TEST_OPENCODE_LIVE_MODEL || "opencode/mimo-v2.6-flash-free";
 const STEP_TIMEOUT_MS = 90_000;
 
 function liveVersion(): string | null {
@@ -216,6 +221,8 @@ async function runTurn(driver: OpenCodeDriver, ctx: SpawnContext, opts: { killAf
   clearInterval(treeWatcher);
   if (treeError) throw treeError;
   if (buffered.trim()) events.push(...driver.parseLine(buffered));
+  // As RuntimeSession does at the end of stdout.
+  events.push(...(driver.parseStdoutEnd?.() ?? []));
   return { events, exit, tree: [...tree], childPid: child.pid };
 }
 
@@ -272,8 +279,9 @@ liveTest("live 2.x: a turn streams session_init, text and turn_end, exits 0, and
     const kinds = run.events.map((event) => event.kind);
     assert.equal(kinds[0], "session_init");
     assert.ok(kinds.includes("text"), `no text event: ${JSON.stringify(run.events)}`);
+    // 2.x: the turn_end comes from parseStdoutEnd after a finished reply.
     // 2.0.27 prints no final `step_finish` for a plain reply (only after tool
-    // calls), so the driver may emit no turn_end; the daemon closes a per_turn
+    // calls), so there it may be missing; the daemon closes a per_turn
     // runtime's turn on process exit (runtimeSession.ts: turnBoundary
     // "process_exit"). A turn_end, when present, must still be last.
     if (kinds.includes("turn_end")) assert.equal(kinds[kinds.length - 1], "turn_end");
@@ -299,6 +307,41 @@ liveTest("live 2.x: a turn streams session_init, text and turn_end, exits 0, and
     env.restore();
   }
 }, STEP_TIMEOUT_MS * 3);
+
+liveTest("live 2.x (2.3+): through a RuntimeSession, a turn that starts a background sub-agent ends once, after the sub-agent's result and the final reply", async () => {
+  const env = enterLiveEnv();
+  try {
+    // A RuntimeSession, not runTurn: it takes the child over (runTurn's raw
+    // child is abandoned after 10 s) and emits the end-of-stdout turn_end.
+    const ctx = liveContext(
+      env,
+      "Use the subagent tool to start ONE general sub-agent with this instruction: run the bash command 'sleep 5; echo SUB-OK > sub.txt'. "
+        + "After the sub-agent has reported back, reply with exactly: RAFT-LIVE-FINAL",
+      null,
+    );
+    const session = new ChildProcessRuntimeSession(new OpenCodeDriver(), ctx);
+    const order: string[] = [];
+    const events: ParsedEvent[] = [];
+    session.on("runtime_event", (event) => { events.push(event); order.push(event.kind); });
+    const closed = new Promise<{ code: number | null }>((resolve) => session.on("close", (info) => { order.push("close"); resolve(info); }));
+    await session.start({ text: ctx.prompt });
+    const close = await Promise.race([closed, settle(STEP_TIMEOUT_MS).then(() => null)]);
+    assert.ok(close, `no close within ${STEP_TIMEOUT_MS} ms: ${JSON.stringify(events)}`);
+    assert.equal(close.code, 0, JSON.stringify(events));
+    assert.equal(order.filter((kind) => kind === "turn_end").length, 1, `one turn_end: ${JSON.stringify(order)}`);
+    assert.deepEqual(order.slice(-2), ["turn_end", "close"]);
+    const text = events.filter((event): event is Extract<ParsedEvent, { kind: "text" }> => event.kind === "text").map((event) => event.text).join("");
+    assert.match(text, /RAFT-LIVE-FINAL/);
+    // The sub-agent really ran in the background: its call precedes the final reply.
+    const subagentCall = events.findIndex((event) => event.kind === "tool_call" && event.name === "subagent");
+    const finalReply = events.findIndex((event) => event.kind === "text" && /RAFT-LIVE-FINAL/.test(event.text));
+    assert.ok(subagentCall >= 0 && subagentCall < finalReply, JSON.stringify(events));
+    // ...in the agent's workspace: 2.x takes its directory from $PWD (the test runner's otherwise).
+    assert.match(readFileSync(path.join(env.workdir, "sub.txt"), "utf8"), /SUB-OK/);
+  } finally {
+    env.restore();
+  }
+}, STEP_TIMEOUT_MS * 2);
 
 liveTest("live 2.x: a cancelled turn (SIGTERM) leaves no OpenCode process behind", async () => {
   const env = enterLiveEnv();

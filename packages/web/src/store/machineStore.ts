@@ -67,6 +67,12 @@ export interface Machine {
   // True when this Computer row was attached by the current user. Raw daemons
   // and older server responses leave this false/absent.
   computerAttachedByCurrentUser?: boolean;
+  // True when the current user is this machine's controller as the server's
+  // routes decide it (computerControllerUserId): the person the live Computer
+  // is attached by, else the one its most recently revoked Computer was, else
+  // the machine row's owner. Unlike computerAttachedByCurrentUser it survives
+  // a key revoke. Absent on older server responses.
+  controlledByCurrentUser?: boolean;
   // The machine row's owner (`machines.userId`, sent with every machine row:
   // machineReadModel.ts spreads it). It can differ from who attached the
   // Computer, for a legacy machine someone else adopted; the server's revoke
@@ -173,6 +179,17 @@ export interface MachineUpgradeRequest {
   drainingAgentIds?: string[];
   /** When the drain stops waiting (ISO). */
   drainDeadlineAt?: string;
+  /**
+   * A failed request whose failure was at a download step: `scheduled` while
+   * the server is about to send it once more by itself (`dueAt`), then
+   * `retried` or `skipped`. Absent: no automatic retry (and older servers).
+   */
+  autoRetry?:
+    | { state: "scheduled"; dueAt: string }
+    | { state: "retried" }
+    | { state: "skipped"; skipReason: string };
+  /** Set on a request the server sent by itself, retrying this failed request. */
+  autoRetryOfRequestId?: string;
 }
 
 export interface ComputerOperationProgress {

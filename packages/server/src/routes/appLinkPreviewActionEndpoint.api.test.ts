@@ -5,7 +5,7 @@ import { createApiTest } from "../test/integration/apiTest";
 import { tokenForHuman } from "../test/integration/credentials";
 import { decideActionEndpointReview, decidePublishReview } from "../test/marketplaceReviewFixture";
 import { createOAuthClient } from "../services/oauthService";
-import { integrationAuditEvents, oauthAppLinkPreviews, oauthClients } from "../db/schema";
+import { integrationAuditEvents, oauthAppLinkPreviews, oauthClients, officialAppRegistry } from "../db/schema";
 import { __setPreviewHttpForTests, nextActionEndpointState } from "../services/appLinkPreviewService";
 
 // RFC 076 §4: an action endpoint rides on the link-preview registration. For a
@@ -63,7 +63,8 @@ test("a published App's action endpoint waits for review; approval in App Admin 
   assert.equal(shown.status, 200, "the App's own Server admin reads it");
   assert.deepEqual({ ...(await shown.json()), requested_at: "x" }, {
     origin, action_endpoint: null, pending_action_endpoint: `${origin}/actions`, requested_at: "x", reject_reason: null,
-    own_server_actions: null, // a published App (RFC 076 §17 is for server_local ones)
+    own_server_actions: null, // a published App (the own-Server default is for server_local ones)
+    card_buttons: null, // not installed on its own Server: nothing acts here to switch or allow
   });
   assert.equal((await state(outsider)).status, 404, "a member who is not the App's admin");
   const reviewRoute = await fetch(`${app.baseUrl}/api/integrations/clients/${client.id}/action-endpoint/review`, {
@@ -144,6 +145,40 @@ test("an unpublished App's action endpoint applies at once and must stay on the 
   assert.equal((await put({ ...base, action_endpoint: "https://elsewhere.example.test/actions" })).status, 400);
   const read = await fetch(`${app.baseUrl}/api/oauth/link-preview`, { headers: { Authorization: "Basic " + Buffer.from(`${client.clientId}:${clientSecret}`).toString("base64") } });
   assert.equal((await read.json()).registration.actionEndpoint, `${origin}/actions`);
+});
+
+test("an unpublished App with an official registry entry, in any status, is reviewed like a published one (#proj-apps:#71)", async ({ app, db, seed }) => {
+  const owner = await seed.human();
+  const server = await seed.server({ owner });
+  const { client, clientSecret } = await createOAuthClient({ serverId: server.id, createdByUserId: owner.id, clientId: "cards-shared", name: "Cards shared" });
+  // Shared beyond its Server, not published: what the registry now accepts.
+  await db.update(oauthClients).set({ appType: "third_party_global", publishStatus: "private" }).where(eq(oauthClients.id, client.id));
+  __setPreviewHttpForTests(async () => ({ client_id: client.clientId }));
+  const put = (body: unknown) => fetch(`${app.baseUrl}/api/oauth/link-preview`, {
+    method: "PUT",
+    headers: { Authorization: "Basic " + Buffer.from(`${client.clientId}:${clientSecret}`).toString("base64"), "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const row = async () => (await db.select().from(oauthAppLinkPreviews).where(eq(oauthAppLinkPreviews.clientId, client.id)))[0]!;
+
+  // Before any entry: applies at once, as for every unpublished App.
+  assert.equal((await put({ ...base, action_endpoint: `${origin}/actions` })).status, 200);
+  assert.deepEqual([(await row()).actionEndpoint, (await row()).pendingActionEndpoint], [`${origin}/actions`, null]);
+
+  // Registered (pending review): the endpoint live now is the one the
+  // registry approver approves; a change waits for review.
+  await db.insert(officialAppRegistry).values({ oauthClientId: client.id, clientKey: client.clientId, publisherServerId: server.id, purpose: "Shared fixture." });
+  assert.equal((await put({ ...base, action_endpoint: `${origin}/actions-v2` })).status, 200);
+  assert.deepEqual([(await row()).actionEndpoint, (await row()).pendingActionEndpoint], [`${origin}/actions`, `${origin}/actions-v2`]);
+
+  // Disabled still reviews, so disable and re-enable cannot slip a change in.
+  await db.update(officialAppRegistry).set({ status: "disabled", revision: 2 }).where(eq(officialAppRegistry.oauthClientId, client.id));
+  assert.equal((await put({ ...base, action_endpoint: `${origin}/actions-v3` })).status, 200);
+  assert.deepEqual([(await row()).actionEndpoint, (await row()).pendingActionEndpoint], [`${origin}/actions`, `${origin}/actions-v3`]);
+
+  // Removing one still applies at once.
+  assert.equal((await put({ ...base })).status, 200);
+  assert.deepEqual([(await row()).actionEndpoint, (await row()).pendingActionEndpoint], [null, null]);
 });
 
 test("an endpoint set before publishing stops being in force at publish approval and waits for review", async ({ app, db, seed }) => {

@@ -62,6 +62,7 @@
 }
 
 .r-mermaid-source__code {
+  /* raft-ui: native-scroll the diagram source's <pre> (CodeBlock without a copy button) holds phrasing content only */
   overflow-x: auto;
   border: 0;
   background: transparent;

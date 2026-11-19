@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import "./helpers/domSetup";
+import { allModelsUsageAccount } from "@botiverse/raft-shared";
 import type { RuntimeAccountUsageSnapshot } from "@botiverse/raft-shared";
 
-import { allModelsUsageAccount, summarizeRuntimeUsage } from "../src/components/machine/bulkChangeModelPlan";
+import { summarizeRuntimeUsage } from "../src/components/machine/bulkChangeModelPlan";
 import { rackAgentModelGroups, rackRuntimeCell } from "../src/components/machine/rack/rackRuntimeColumns";
 import { rackRemaining } from "../src/features/computer/computersRackSort";
 import type { Machine } from "../src/store/machineStore";
+import { RuntimeAccountUsageClient } from "../src/utils/runtimeAccountUsageClient";
+import type { RuntimeAccountUsageReadResult } from "../src/utils/runtimeAccountUsageClient";
 
 // One basis for every usage summary (OAR window scope): the rack's cell and
 // first line, the rack's sort and the bulk dialog count all models, never
@@ -42,6 +45,44 @@ test("cell, sort and bulk agree: all models (60%), not Opus's limit nor the OAut
   assert.equal(cell.model?.usedUp, true);
   assert.deepEqual(summarizeRuntimeUsage(result.snapshot), { kind: "used", plan: "Max", percent: 60 });
   assert.ok(Math.abs(rackRemaining(result)! - 0.4) < 1e-9, "the sort reads what the cell's first line shows");
+});
+
+// Computers before window scope (1.22.0 and earlier) send no `scope`: the web
+// reads a Claude "Current week (<Model>)" window as that model's, at the read.
+async function readThroughClient(result: ReturnType<typeof read>, refresh = false) {
+  const client = new RuntimeAccountUsageClient(
+    async () => result,
+    async () => ({ accepted: true, state: "fresh", snapshot: result.snapshot }),
+  );
+  if (!refresh) return client.read("s1", "m1", result.snapshot.provider);
+  return { state: "fresh", snapshot: (await client.refresh("s1", "m1", result.snapshot.provider, "manual")).snapshot! } as RuntimeAccountUsageReadResult;
+}
+const allModels85: Window = { id: "w0_aaaaaaaaaaaa", label: "Current week (all models)", status: "ok", usedRatio: 0.85 };
+const fableUsedUp: Window = { id: "w4_eeeeeeeeeeee", label: "Current week (Fable)", status: "limit_reached", usedRatio: 1 };
+const sessionOpus: Window = { id: "w5_ffffffffffff", label: "Current session (Opus)", status: "ok", usedRatio: 0.1 };
+
+test("an older Computer's scope-less Claude windows: a model's label is its model's window, on the read and a refresh", async () => {
+  for (const refresh of [false, true]) {
+    const result = await readThroughClient(read([allModels85, { ...oauthApps }, fableUsedUp, sessionOpus], "rate_limited"), refresh);
+    assert.ok(result.snapshot);
+    assert.deepEqual(result.snapshot.accounts[0]!.windows.map((window) => window.scope), [undefined, undefined, { kind: "model", name: "Fable" }, { kind: "model", name: "Opus" }], "all models and the OAuth apps' window stay unscoped");
+    const cell = rackRuntimeCell(machine, "claude", { claude: result });
+    assert.equal(cell.kind, "value");
+    if (cell.kind !== "value") return;
+    assert.equal(cell.used, 85, "line 1: all models");
+    assert.equal(cell.usedUp, false);
+    assert.deepEqual(cell.model, { name: "Fable", used: 100, usedUp: true, resetsAt: null }, "line 2: Fable used up");
+    assert.ok(Math.abs(rackRemaining(result)! - 0.15) < 1e-9, "the sort reads all models");
+  }
+});
+
+test("the scope shim leaves explicitly scoped windows and other providers as given", async () => {
+  const scoped = read([allModels, oauthApps, { ...opusUsedUp, label: "Current week (Fable)", scope: { kind: "model", name: "Opus" } }], "rate_limited");
+  assert.deepEqual((await readThroughClient(scoped)).snapshot, scoped.snapshot);
+  const codex = read([{ id: "w0_aaaaaaaaaaaa", label: "Current week (Spark)", status: "limit_reached", usedRatio: 1 }, { ...allModels85 }], "rate_limited", "codex");
+  const codexRead = await readThroughClient(codex);
+  assert.deepEqual(codexRead.snapshot, codex.snapshot, "no label is read for a scope on another provider");
+  assert.equal(rackRemaining(codexRead), 0);
 });
 
 test("only model and OAuth apps' windows: one line counting the model, never the same model twice", () => {

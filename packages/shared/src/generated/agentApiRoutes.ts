@@ -1052,6 +1052,31 @@ export const AGENT_API_ROUTE_MANIFEST = [
     }
   },
   {
+    "key": "assistantOwnerArtifactPublishAsOwner",
+    "method": "POST",
+    "path": "/assistant/owner-artifact/as-owner",
+    "fullPath": "/internal/agent-api/assistant/owner-artifact/as-owner",
+    "client": {
+      "resource": "assistant",
+      "method": "publishArtifactAsOwner"
+    },
+    "capability": "send",
+    "description": "Personal assistants only, and only while your owner has \"send as me\" on: publish an Artifact AS your owner (they are its author) into a conversation they may post in now, named as they name it (home: #channel, dm:@peer, or an id); or a new version of one you published as them (artifact + base, the version you read; no home). The rules of sending as them apply: not your own DM with them (publish there as yourself with owner-artifact), a DM only while they let you read DMs, never a conversation bridged to an external chat. Any home you can't use answers the one TARGET_NOT_FOUND, whatever the reason; joint (shared) channels are not supported yet: a joint as home, or a new version of one homed in a joint, answers not-found too. Raft posts a receipt in your DM with your owner; you needn't tell them. If the answer is UNSEEN_CHANGES, read it with owner-artifact first and send the same publish with seen = the position it returned: the same publish without seen is held again.",
+    "sideEffect": "write",
+    "idempotency": "none",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
     "key": "assistantOwnerActivity",
     "method": "GET",
     "path": "/assistant/owner-activity",
@@ -2752,6 +2777,31 @@ export const AGENT_API_ROUTE_MANIFEST = [
     }
   },
   {
+    "key": "integrationAppCardButtons",
+    "method": "POST",
+    "path": "/integrations/app/card-buttons",
+    "fullPath": "/internal/agent-api/integrations/app/card-buttons",
+    "client": {
+      "resource": "integrations",
+      "method": "cardButtons"
+    },
+    "capability": "read",
+    "description": "Read or set whether an App's card buttons act on this Server (needs manageIntegrations here). An App Raft did not review acts on its own Server by default (withdraw switches that off, allow switches it on again); anywhere else only once allowed, for the exact action endpoint in force: show first, then allow with actionEndpoint exactly as shown. If the App changes its endpoint, it only opens links until allowed again.",
+    "sideEffect": "write",
+    "idempotency": "none",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
+      "query": false,
+      "body": true
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
     "key": "integrationAppStatus",
     "method": "GET",
     "path": "/integrations/app/status",
@@ -2818,6 +2868,31 @@ export const AGENT_API_ROUTE_MANIFEST = [
     "audience": "both",
     "request": {
       "params": true,
+      "query": false,
+      "body": false
+    },
+    "response": {
+      "kind": "json",
+      "body": true
+    }
+  },
+  {
+    "key": "actionOperations",
+    "method": "GET",
+    "path": "/prepare-action/operations",
+    "fullPath": "/internal/agent-api/prepare-action/operations",
+    "client": {
+      "resource": "actions",
+      "method": "operations"
+    },
+    "capability": "tasks",
+    "description": "List the operations the bound agent may prepare as a request card (request:prepare) on its server: each with its args, whom to ask and what the person sees. Empty while request cards are off for the server.",
+    "sideEffect": "read",
+    "idempotency": "natural",
+    "destructive": false,
+    "audience": "both",
+    "request": {
+      "params": false,
       "query": false,
       "body": false
     },
@@ -3679,4 +3754,4 @@ export const AGENT_API_ROUTE_MANIFEST = [
 ] as const;
 
 /** Content hash of AGENT_API_ROUTE_MANIFEST; see computeAgentApiManifestVersion. */
-export const AGENT_API_MANIFEST_VERSION = "a3e643c6f6e06751";
+export const AGENT_API_MANIFEST_VERSION = "27fac753c1d15016";

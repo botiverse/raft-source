@@ -10,6 +10,7 @@ import { Readable } from "node:stream";
 import type { ApiResponse } from "../../client";
 import type { AgentContext } from "../../auth/env";
 import { buildRaftProgram } from "../../program";
+import { RAFT_HINTS } from "@botiverse/raft-shared/src/agentCliSurface";
 
 const agentContext: AgentContext = {
   agentId: "agent-1",
@@ -29,9 +30,11 @@ const summary = {
 const noRequest = (): ApiResponse<unknown> => {
   throw new Error("no request expected");
 };
-const refusal = (status: number, code: string, details: Record<string, unknown>) => () => ({
-  ok: false, status, data: null, error: code, errorCode: code, errorBody: { error: code, code, details },
+/** A refusal as the Server words it: its sentence, its structured next step, its details. */
+const refusalSaying = (status: number, code: string, error: string, more: { next?: object; details?: Record<string, unknown> } = {}) => () => ({
+  ok: false, status, data: null, error, errorCode: code, errorBody: { error, code, ...more },
 }) as unknown as ApiResponse<unknown>;
+const NOT_VISIBLE_SENTENCE = "No artifact you can see has that id, link or title: it may not exist, may have been deleted, or may not be shared with you.";
 
 async function run(argv: string[], reply: (method: string, path: string, body?: unknown) => ApiResponse<unknown>) {
   const stdout: string[] = [];
@@ -91,20 +94,21 @@ test("move: --to anyone-with-link is a person's step and any other --to (public 
   assert.ok(missing.stderr.includes(`--to is required; it must be one of: ${homes}`) && missing.stderr.includes("raft artifact move pt_abc --to server"), missing.stderr);
 });
 
-test("move: the Server's refusals in the shared words, with their codes", async () => {
-  const forbidden = await run(["artifact", "move", "pt_abc", "--to", "server"], refusal(403, "FORBIDDEN", { title: "Workspace prototype", author: { type: "user", name: "xxchan" } }));
-  assert.ok(forbidden.stderr.includes(`You can't move "Workspace prototype": only its author (@xxchan), the person who manages an agent author, and the server's owners and admins can.`), forbidden.stderr);
-  assert.ok(forbidden.stderr.includes("Code: FORBIDDEN"), forbidden.stderr);
-  const unseen = await run(["artifact", "move", "pt_abc", "--to", "server"], refusal(403, "FORBIDDEN", { title: "Workspace prototype", author: { type: "agent", name: "Remy" }, reason: "manager_cannot_see", manager: { type: "user", name: "xxchan" }, target: "#secret" }));
-  assert.ok(unseen.stderr.includes(`You can't move "Workspace prototype" out of #secret: the person who manages you (@xxchan) can't see it there`), unseen.stderr);
-  assert.ok(unseen.stderr.includes(`Ask a server owner or admin who can see it in #secret to use "Make visible to the whole server" on the web, or tell whoever asked you that you can't move it.`) && unseen.stderr.includes("Code: FORBIDDEN"), unseen.stderr);
-  const wide = await run(["artifact", "move", "pt_abc", "--to", "server"], refusal(409, "HOME_NOT_WIDER", { title: "Workspace prototype", home: "server", to: "server" }));
-  assert.ok(wide.stderr.includes(`"Workspace prototype" is already visible to the whole server; nothing changed.`) && wide.stderr.includes("Code: HOME_NOT_WIDER"), wide.stderr);
-  const taken = await run(["artifact", "move", "pt_abc", "--to", "server"], refusal(409, "NAME_TAKEN", { name: "workspace-prototype" }));
-  assert.ok(taken.stderr.includes(`Another artifact visible to the whole server is already named "workspace-prototype", so this one can't move there.`), taken.stderr);
-  assert.ok(taken.stderr.includes("Ask the other one's author or a server admin whether it can be deleted, then run the move again: raft artifact move pt_abc --to server") && taken.stderr.includes("Code: NAME_TAKEN"), taken.stderr);
-  const hidden = await run(["artifact", "move", "pt_zzz", "--to", "server"], refusal(404, "NOT_VISIBLE", {}));
-  assert.ok(hidden.stderr.includes(`No artifact "pt_zzz" that you can see (by that id, link or exact title).`) && hidden.stderr.includes("Code: NOT_VISIBLE"), hidden.stderr);
+test("move: the Server's refusals in its own words, with their codes", async () => {
+  const mayNotMove = "Only the artifact's author, the person who manages an agent author, and the server's owners and admins (none of them guests) can move it: ask one of them to.";
+  const forbidden = await run(["artifact", "move", "pt_abc", "--to", "server"], refusalSaying(403, "FORBIDDEN", mayNotMove, { details: { title: "Workspace prototype", author: { type: "user", name: "xxchan" } } }));
+  assert.ok(forbidden.stderr.startsWith(`Error: ${mayNotMove}\nCode: FORBIDDEN\n`), forbidden.stderr);
+  const cannotSee = "The person who manages this agent can't see the artifact where it is, and moving it would show its pages and comments to the whole server: ask a server owner or admin who can see it to make it visible to the whole server on the web.";
+  const unseen = await run(["artifact", "move", "pt_abc", "--to", "server"], refusalSaying(403, "FORBIDDEN", cannotSee, { details: { title: "Workspace prototype", reason: "manager_cannot_see", manager: { type: "user", name: "xxchan" }, target: "#secret" } }));
+  assert.ok(unseen.stderr.startsWith(`Error: ${cannotSee}\nCode: FORBIDDEN\n`), unseen.stderr);
+  const already = "Nothing changed: the whole server can already see this artifact.";
+  const wide = await run(["artifact", "move", "pt_abc", "--to", "server"], refusalSaying(409, "HOME_NOT_WIDER", already, { next: RAFT_HINTS.artifactRead({ artifact: "pt_abc" }), details: { title: "Workspace prototype", home: "server", to: "server" } }));
+  assert.equal(wide.stderr, `Error: ${already}\nCode: HOME_NOT_WIDER\nNext action: raft artifact read pt_abc\n`);
+  const nameTaken = "Another artifact visible to the whole server already has this artifact's name, so it can't move there: ask the other one's author or a server admin whether it can be deleted, then move this one again.";
+  const taken = await run(["artifact", "move", "pt_abc", "--to", "server"], refusalSaying(409, "NAME_TAKEN", nameTaken, { details: { name: "workspace-prototype" } }));
+  assert.ok(taken.stderr.startsWith(`Error: ${nameTaken}\nCode: NAME_TAKEN\n`), taken.stderr);
+  const hidden = await run(["artifact", "move", "pt_zzz", "--to", "server"], refusalSaying(404, "NOT_VISIBLE", NOT_VISIBLE_SENTENCE, { next: RAFT_HINTS.artifactList({}) }));
+  assert.equal(hidden.stderr, `Error: ${NOT_VISIBLE_SENTENCE}\nCode: NOT_VISIBLE\nNext action: raft artifact list\n`);
 });
 
 test("delete: DELETE …/:artifact, then what went and that it can't be undone; a refusal keeps its code", async () => {
@@ -115,13 +119,14 @@ test("delete: DELETE …/:artifact, then what went and that it can't be undone; 
   assert.deepEqual(r.requests, [{ method: "DELETE", path: `${BASE}/pt_abc`, body: undefined }]);
   assert.equal(r.stdout, `Deleted "Workspace prototype" (pt_abc): no one can open it or any of its versions any more, and links to it say it can't be opened. This can't be undone.\n`);
 
-  const forbidden = await run(["artifact", "delete", "--artifact", "workspace-prototype"], refusal(403, "FORBIDDEN", { title: "Workspace prototype", author: { type: "agent", name: "Remy" } }));
+  const onlyAuthor = "Only the artifact's author, the person who manages an agent author, and the server's owners and admins can delete it: ask one of them to.";
+  const forbidden = await run(["artifact", "delete", "--artifact", "workspace-prototype"], refusalSaying(403, "FORBIDDEN", onlyAuthor, { details: { title: "Workspace prototype", author: { type: "agent", name: "Remy" } } }));
   assert.deepEqual(forbidden.requests.map((q) => `${q.method} ${q.path}`), [`DELETE ${BASE}/workspace-prototype`]);
-  assert.ok(forbidden.stderr.includes(`You can't delete "Workspace prototype": only its author (@Remy),`) && forbidden.stderr.includes("Code: FORBIDDEN"), forbidden.stderr);
+  assert.ok(forbidden.stderr.startsWith(`Error: ${onlyAuthor}\nCode: FORBIDDEN\n`), forbidden.stderr);
 
-  // Not found on a delete: it may have gone through already.
-  const gone = await run(["artifact", "delete", "pt_abc"], refusal(404, "NOT_VISIBLE", {}));
-  assert.ok(gone.stderr.includes(`No artifact "pt_abc" that you can see: it may already be deleted, or it lives where you can't see it.`) && gone.stderr.includes("Code: NOT_VISIBLE"), gone.stderr);
+  // Not found on a delete: the Server's sentence says it may have been deleted (a delete that went through, its answer lost).
+  const gone = await run(["artifact", "delete", "pt_abc"], refusalSaying(404, "NOT_VISIBLE", NOT_VISIBLE_SENTENCE, { next: RAFT_HINTS.artifactList({}) }));
+  assert.ok(gone.stderr.startsWith(`Error: ${NOT_VISIBLE_SENTENCE}\nCode: NOT_VISIBLE\n`), gone.stderr);
 
   const none = await run(["artifact", "delete"], noRequest);
   assert.equal(none.requests.length, 0);

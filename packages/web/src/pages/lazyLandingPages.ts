@@ -23,6 +23,7 @@ import {
   loadIntegrationInvitePage,
   loadInviteAcceptPage,
   loadMobileDownloadChooserPage,
+  loadPendingSecondFactorSignInStep,
   loadRegisterPage,
   loadResetPasswordPage,
   loadSecondFactorRecoveryLinkPage,
@@ -53,6 +54,9 @@ export const EmailVerificationPage = lazyPanel(loadEmailVerificationPage);
 export const InviteAcceptPage = lazyPanel(loadInviteAcceptPage);
 export const SocialAuthCallbackPage = lazyPanel(loadSocialAuthCallbackPage);
 export const SsoAuthCallbackPage = lazyPanel(loadSsoAuthCallbackPage);
+// Not lazyPanel: its own frame stands in while the code loads, with no Suspense reveal delay.
+export { DeferredSignInPage as SignInPage } from "../components/auth/SignInPageFrame";
+export const PendingSecondFactorSignInStep = lazyPanel(loadPendingSecondFactorSignInStep);
 export const AccountDeletionCancelLinkPage = lazyPanel(loadAccountDeletionCancelLinkPage);
 // Dev-only: a static import would still take its imports into the startup chunk.
 export const AccountBootstrapPreviewPage = lazyPanel(() => import("./AccountBootstrapPreviewPage"));

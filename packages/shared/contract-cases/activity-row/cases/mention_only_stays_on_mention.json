@@ -1,0 +1,42 @@
+{
+  "formatVersion": 1,
+  "id": "mention_only_stays_on_mention",
+  "rule": "position",
+  "title": "A mention that does not count, above a mention-only row, keeps it mention-only",
+  "why": "A mention that does not count (a muted conversation) lights the @ and keeps the row mention-only.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/shared/src/activityRowPosition.ts (reduceActivityRow; not wired yet, step 2)"
+    ],
+    "server": [
+      "packages/server/src/services/channelService.ts (latestActivitySeqSameSource; the row's latestActivitySeq)",
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (unread_count and latest_seq from one materialized row)"
+    ]
+  },
+  "given": {
+    "row": {
+      "unreadCount": 0,
+      "hasMention": true,
+      "position": "100",
+      "mentionOnly": true
+    }
+  },
+  "steps": [
+    {
+      "act": "liveMessage",
+      "seq": "101",
+      "counts": false,
+      "mentionsViewer": true
+    }
+  ],
+  "expect": {
+    "row": {
+      "unreadCount": 0,
+      "hasMention": true,
+      "position": "101",
+      "mentionOnly": true
+    },
+    "reread": false
+  }
+}

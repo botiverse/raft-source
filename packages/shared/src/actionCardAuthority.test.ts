@@ -13,7 +13,8 @@ test("only types that take no server permission are open to a Guest (the web's l
   assert.deepEqual(
     [...ACTION_CARD_TYPES_WITHOUT_AUTHORITY].sort(),
     // assistant:owner_action: only the assistant's owner decides (its form handler), on their own route's checks.
-    ["agent:approve_call", "assistant:owner_action", "feedback:submit", "question:ask"],
+    // request:prepare (RFC 085): only the person named decides (never a Guest: prepare refuses one), on their route's checks.
+    ["agent:approve_call", "assistant:owner_action", "feedback:submit", "question:ask", "request:prepare"],
   );
 });
 

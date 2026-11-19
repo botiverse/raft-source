@@ -295,7 +295,7 @@ test("strip matrix: not official / official without an approved endpoint / offic
   // Not an approved official App: navigate only, even read goes.
   for (const caps of [ALL, undoOnly]) assert.deepEqual(await view(caps), { ids: ["open", "root"], ticket: null, actions: [] });
   assert.deepEqual(await view(noButtons), { ids: ["root"], ticket: null, actions: [] });
-  // An action endpoint without the official registry is still navigate only.
+  // An action endpoint without the official registry is still navigate only for a client without unreviewed_app.v1 (RFC 076 §17).
   await db.update(oauthAppLinkPreviews).set({ actionEndpoint: `${origin}/card-actions` }).where(eq(oauthAppLinkPreviews.clientId, fx.client.id));
   assert.deepEqual(await view(ALL), { ids: ["open", "root"], ticket: null, actions: [] });
 
@@ -330,12 +330,12 @@ test("strip matrix: not official / official without an approved endpoint / offic
   assert.deepEqual((await read(app.baseUrl, fx)).items, []);
   assert.equal(calls.length, before);
   // Were a suspended registration's card shown, it would keep navigate and read only.
-  assert.equal(linkCardActionTier({ official: true, ownServer: false, actionEndpoint: `${origin}/card-actions`, suspended: true }), "read");
-  assert.equal(linkCardActionTier({ official: true, ownServer: false, actionEndpoint: null, suspended: false }), "read");
-  assert.equal(linkCardActionTier({ official: false, ownServer: false, actionEndpoint: `${origin}/card-actions`, suspended: false }), "navigate");
-  assert.equal(linkCardActionTier({ official: true, ownServer: false, actionEndpoint: `${origin}/card-actions`, suspended: false }), "execute");
-  // RFC 076 §17: an App that is not official acts only where its own-Server actions are in force.
-  assert.equal(linkCardActionTier({ official: false, ownServer: true, actionEndpoint: `${origin}/card-actions`, suspended: false }), "execute");
+  assert.equal(linkCardActionTier({ official: true, unreviewed: false, actionEndpoint: `${origin}/card-actions`, suspended: true }), "read");
+  assert.equal(linkCardActionTier({ official: true, unreviewed: false, actionEndpoint: null, suspended: false }), "read");
+  assert.equal(linkCardActionTier({ official: false, unreviewed: false, actionEndpoint: `${origin}/card-actions`, suspended: false }), "navigate");
+  assert.equal(linkCardActionTier({ official: true, unreviewed: false, actionEndpoint: `${origin}/card-actions`, suspended: false }), "execute");
+  // RFC 076 §17: an App that is not official acts only where its installation there lets it.
+  assert.equal(linkCardActionTier({ official: false, unreviewed: true, actionEndpoint: `${origin}/card-actions`, suspended: false }), "execute");
 });
 
 test("tokens: a ticket and one handle per enabled execute action, bound to this view; disabled actions stay visible without a handle", async ({ app, db, seed }) => {
@@ -388,39 +388,53 @@ test("tokens: a ticket and one handle per enabled execute action, bound to this 
     { version: 2, display: "connect_account", connect_url: `${origin}/s/team/auth/github` }, "capabilities don't strip connect_account");
 });
 
-test("RFC 076 §17: a server_local App's execute buttons only on its own Server, only while the endpoint in force is the one its admins confirmed; a withdrawal strips them from the next read", async ({ app, db, seed }) => {
+test("RFC 076 §17: a server_local App's execute buttons act on its own Server by default and follow its endpoint; switched off, the next read strips them; elsewhere only once allowed there", async ({ app, db, seed }) => {
   const origin = "https://own-server.example.test";
   const fx = await connected(db, seed, { key: "cards-own-server", origin, content: `Review ${origin}/pr/1`, actionEndpoint: true });
   stubApp(() => JSON.stringify(v2Answer({ approve, open: openButton(origin) })));
   // A client that declared unreviewed_app.v1 (shows Raft's not-reviewed confirmation before every acting button), unless `capable` is false.
-  const shown = async (capable = true) => {
-    const [item] = (await read(app.baseUrl, fx, readBody({ capabilities: capable ? [...ALL, "unreviewed_app.v1"] : ALL }))).items;
+  const shown = async (capable = true, viewer: Parameters<typeof read>[1] = fx) => {
+    const [item] = (await read(app.baseUrl, viewer, readBody({ capabilities: capable ? [...ALL, "unreviewed_app.v1"] : ALL }))).items;
     const reviewed = item!.app!.reviewed;
     return { elements: elementIds(item), actions: item!.actions!.map((action) => action.action_id), ticket: item!.ticket !== null, ...(reviewed === undefined ? {} : { reviewed }) };
   };
-  const ownServerActions = (method: "PUT" | "DELETE", actionEndpoint = `${origin}/card-actions`) => fetch(`${app.baseUrl}/api/integrations/clients/${fx.client.id}/action-endpoint/own-server-actions`, {
-    method, headers: fx.headers, ...(method === "PUT" ? { body: JSON.stringify({ action_endpoint: actionEndpoint }) } : {}),
+  const cardButtons = (method: "PUT" | "DELETE", headers = fx.headers, actionEndpoint = `${origin}/card-actions`) => fetch(`${app.baseUrl}/api/integrations/clients/${fx.client.id}/action-endpoint/own-server-actions`, {
+    method, headers, ...(method === "PUT" ? { body: JSON.stringify({ action_endpoint: actionEndpoint }) } : {}),
   });
+  const acting = { elements: ["approve", "open", "root"], actions: ["approve"], ticket: true, reviewed: false };
+  const navigateOnly = { elements: ["open", "root"], actions: [], ticket: false };
 
-  // Not official, not confirmed: navigate only, nothing signed.
-  assert.deepEqual(await shown(), { elements: ["open", "root"], actions: [], ticket: false });
-  // Confirmed by the App's own Server's owner: the execute button, its handle, and `reviewed: false`.
-  assert.equal((await ownServerActions("PUT")).status, 200);
-  assert.deepEqual(await shown(), { elements: ["approve", "open", "root"], actions: ["approve"], ticket: true, reviewed: false });
+  // Not official, nobody allowed anything: on its own Server the execute button, its handle, and `reviewed: false`.
+  assert.deepEqual(await shown(), acting);
   // A client that didn't declare unreviewed_app.v1 (it may skip the confirmation): navigate only, and no `reviewed` field.
-  assert.deepEqual(await shown(false), { elements: ["open", "root"], actions: [], ticket: false });
-  // The App moved its endpoint: the confirmation no longer applies.
+  assert.deepEqual(await shown(false), navigateOnly);
+  // The App moved its endpoint: still acting (the default follows it).
   await db.update(oauthAppLinkPreviews).set({ actionEndpoint: `${origin}/card-actions-v2` }).where(eq(oauthAppLinkPreviews.clientId, fx.client.id));
-  assert.deepEqual(await shown(), { elements: ["open", "root"], actions: [], ticket: false });
+  assert.deepEqual(await shown(), acting);
   await db.update(oauthAppLinkPreviews).set({ actionEndpoint: `${origin}/card-actions` }).where(eq(oauthAppLinkPreviews.clientId, fx.client.id));
-  assert.deepEqual((await shown()).actions, ["approve"]);
-  // Withdrawn: the next read of a card already shown is navigate only again.
-  assert.equal((await ownServerActions("DELETE")).status, 200);
-  assert.deepEqual(await shown(), { elements: ["open", "root"], actions: [], ticket: false });
-  // Published (no longer server_local): a confirmation it still carries does not apply.
-  assert.equal((await ownServerActions("PUT")).status, 200);
+  // Switched off by the Server's owner: the next read of a card already shown is navigate only.
+  assert.equal((await cardButtons("DELETE")).status, 200);
+  assert.deepEqual(await shown(), navigateOnly);
+  assert.equal((await cardButtons("PUT")).status, 200);
+  assert.deepEqual(await shown(), acting);
+
+  // Shared and installed on another Server: navigate only there until that Server's owner allows the endpoint.
   await db.update(oauthClients).set({ appType: "third_party_global" }).where(eq(oauthClients.id, fx.client.id));
-  assert.deepEqual(await shown(), { elements: ["open", "root"], actions: [], ticket: false });
+  assert.deepEqual(await shown(), navigateOnly, "shared: the own-Server default ends");
+  const other = await seed.server({ owner: fx.owner }); const channel = await seed.channel({ server: other, members: [fx.owner] });
+  const message = await seed.message({ channel, author: fx.owner, content: `Review ${origin}/pr/1` });
+  await db.insert(oauthClientInstalls).values({ clientId: fx.client.id, serverId: other.id, installedByUserId: fx.owner.id });
+  await db.insert(oauthUserConsents).values({ serverId: other.id, userId: fx.owner.id, clientId: fx.client.id, scopes: ["openid", "profile"] });
+  const elsewhere = { headers: { ...fx.headers, "X-Server-Id": other.id }, message };
+  assert.deepEqual(await shown(true, elsewhere), navigateOnly);
+  assert.equal((await cardButtons("PUT", elsewhere.headers)).status, 200);
+  assert.deepEqual(await shown(true, elsewhere), acting);
+  assert.deepEqual(await shown(false, elsewhere), navigateOnly);
+  // An endpoint change there: links only until allowed again.
+  await db.update(oauthAppLinkPreviews).set({ actionEndpoint: `${origin}/card-actions-v2` }).where(eq(oauthAppLinkPreviews.clientId, fx.client.id));
+  assert.deepEqual(await shown(true, elsewhere), navigateOnly);
+  await db.update(oauthAppLinkPreviews).set({ actionEndpoint: `${origin}/card-actions` }).where(eq(oauthAppLinkPreviews.clientId, fx.client.id));
+
   // An official App never gets `reviewed`, with or without the capability.
   await db.update(oauthClients).set({ appType: "server_local" }).where(eq(oauthClients.id, fx.client.id));
   await makeOfficial(db, fx);

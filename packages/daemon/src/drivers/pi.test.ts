@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
+import { classifySpawnFailure } from "../spawnFailureClassification";
 import { appendFileSync, chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { createConnection, type AddressInfo, type Socket } from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { BUILTIN_RUNTIME_HOST_PROVIDER_ENV_SCRUB_KEYS, eventsForSpan, PI_BUILTIN_PROVIDER_CONNECTION_PROBES, providerRequestId, RUNTIME_CONFIG_VERSION } from "@botiverse/raft-shared";
+import { BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS, BUILTIN_RUNTIME_HOST_PROVIDER_ENV_SCRUB_KEYS, eventsForSpan, PI_BUILTIN_PROVIDER_CONNECTION_PROBES, providerRequestId, RUNTIME_CONFIG_VERSION } from "@botiverse/raft-shared";
 import fc from "fast-check";
 import {
   BuiltInDriver,
@@ -193,7 +194,8 @@ test("Built-in driver is a separate preset runtime with static launchable models
       protocolVersion: 1,
       runtime: "builtin",
       runtimeVersion: driver.probe().version,
-      customModelProviderIds: ["openrouter"],
+      customModelProviderIds: [...BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS],
+      customModelConnectionProviderIds: [...BUILTIN_RUNTIME_CUSTOM_MODEL_PRESET_PROVIDER_IDS],
     });
     assert.equal(detected.value.models.some((model) => model.id === "deepseek/deepseek-v4-pro" && model.verified === "launchable"), true);
     // 0.86.0 renamed this entry: deepseek-v4-flash -> deepseek-flash ("DeepSeek V4.1 Flash").
@@ -337,6 +339,60 @@ test("a live Pi session counts in the memory event until it is disposed", async 
   }
   assert.equal(piSessionMemoryAttrs(Date.now()).pi_session_count ?? 0, before);
 });
+
+// #proj-raft-computer:1bfb0122 (Archer's review): a Pi runtime model missing
+// in a workspace with Pi code names the session's real agent dir; Built-in,
+// whose models come from Raft's presets, keeps the usual sentence.
+for (const runtime of ["pi", "builtin"] as const) {
+  test(`a missing model in a workspace with Pi extensions: ${runtime}`, async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "pi-missing-ws-"));
+    onTestFinished(() => rmSync(root, { recursive: true, force: true }));
+    const workingDirectory = path.join(root, "workspace");
+    const agentDir = path.join(root, "custom-agent-dir");
+    mkdirSync(path.join(workingDirectory, ".pi", "extensions"), { recursive: true });
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(path.join(workingDirectory, ".pi", "extensions", "noname.ts"), "export default () => {}");
+    const previous = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    try {
+      const error = await createPiAgentSessionForContext(
+        makeSpawnContext(
+          runtime === "pi"
+            ? { model: "wildwork/noname" }
+            : {
+              runtime: "builtin",
+              model: "definitely-missing-model",
+              runtimeConfig: {
+                version: RUNTIME_CONFIG_VERSION,
+                runtime: "builtin",
+                provider: { kind: "preset", providerId: "qwen-token-plan-cn", apiKey: "sk-missing-ws-test" },
+                hostUserState: "forbidden",
+                model: { kind: "preset", id: "definitely-missing-model" },
+                mode: { kind: "default" },
+                envVars: null,
+              },
+            },
+          { workingDirectory },
+        ),
+        `missing-ws-${runtime}`,
+        runtime === "builtin" ? { agentDir, sessionDir: path.join(root, "sessions"), isolateHostProviderEnv: true } : undefined,
+      ).then(() => null, (e: unknown) => e);
+      assert.ok(error instanceof Error);
+      const message = classifySpawnFailure(error).userMessage;
+      if (runtime === "pi") {
+        assert.match(message, /workspace has Pi code that Raft no longer loads/);
+        // The folder outside the home folder is named, not shown (displayHostDir).
+        // Outside because the suite points HOME/USERPROFILE at a temp dir beside it (scripts/vitest/clearAgentEnv.ts).
+        assert.ok(message.includes("install that extension or package on the Computer, in its Pi agent folder"), message);
+        assert.ok(!message.includes(agentDir), message);
+      } else {
+        assert.doesNotMatch(message, /workspace/);
+      }
+    } finally {
+      restoreEnv("PI_CODING_AGENT_DIR", previous);
+    }
+  });
+}
 
 test("createPiAgentSessionForContext persists an early startup failure without a native transcript", async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "pi-startup-failure-"));

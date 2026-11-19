@@ -107,6 +107,37 @@ test("the survey is asked after Cindy is created and before the handoff", async 
   assert.equal(screen.getByTestId("server-setup-survey").getAttribute("data-slot"), "dialog-surface");
 });
 
+test("the referral options are shown in the display language; the answer stays the id", async () => {
+  const updates: unknown[] = [];
+  useAuthStore.setState({
+    loading: false,
+    updateProfile: async (patch: unknown) => {
+      updates.push(patch);
+    },
+  } as never);
+
+  render(createElement(
+    TestIntlProvider,
+    { locale: "zh-cn" },
+    createElement(ServerSetupSurveyStep, { agentName: "Cindy", onDone: () => {} }),
+  ));
+
+  // Hard-coded English from the shared list was what a Chinese reader saw before.
+  assert.equal(screen.getByTestId("signup-source-friend_colleague").textContent, "朋友或同事");
+  assert.equal(screen.getByTestId("signup-source-other").textContent, "其他");
+  assert.ok(screen.queryByText("A friend or colleague") === null, "no English option label");
+
+  fireEvent.click(screen.getByTestId(`signup-role-${SIGNUP_ROLES[0].id}`));
+  fireEvent.click(screen.getByTestId("signup-source-friend_colleague"));
+  fireEvent.click(screen.getByTestId("server-setup-survey-continue"));
+  await waitFor(() => assert.equal(updates.length, 1));
+  assert.deepEqual(updates[0], {
+    signupRole: SIGNUP_ROLES[0].id,
+    referralSource: "friend_colleague",
+    referralSourceOther: undefined,
+  });
+});
+
 test("the handoff screen is answered by the server alone, with no session-local memory", async () => {
   const requests: string[] = [];
   let done = 0;

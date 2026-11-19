@@ -9,7 +9,10 @@ One component per file, named exports.
     `components/profile/ProfilePanel.tsx`. Its module records the
     `module-evaluated` profile-open e2e event when it loads.
   - `AgentProfileInfo.tsx`: the Profile tab (identity, runtime, role, external
-    setup, operations). `AgentChatTab.tsx`, `EnvVarsSection.tsx`,
+    setup, operations). `AgentRuntimeConfigEditor.tsx`: the Edit runtime
+    config dialog (draft, save, toasts), opened from the profile's Runtime
+    config pencil and from the Members page's Edit agent.
+    `AgentChatTab.tsx`, `EnvVarsSection.tsx`,
     `AgentDetailHeader.tsx`, `AgentStatusBadge.tsx`, `AgentRuntimeErrorNotice.tsx`
     (the runtime error banner, incl. the typed billing banner) and the small
     pieces next to them are the other parts of the panel.
@@ -21,8 +24,8 @@ One component per file, named exports.
 - Most agent code still lives in `components/agent/` (rows, dialogs,
   activity, tabs' content) and moves here by feature later. State:
   `store/agentStore.ts`.
-- `AgentDetailPanel`, `AgentProfileInfo` and `CreateAgentDialog` are each one
-  component over 800 lines (module-shape baseline); splitting them is its own
+- `AgentDetailPanel` and `CreateAgentDialog` are each one component over 800
+  lines (module-shape baseline); splitting them is its own
   task, not a move.
 - Tests live in `packages/web/tests/` (`agent*`, `createAgent*`, `runtime*`).
   Run named files with `pnpm --filter @botiverse/raft-web test:dom <files>`.

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
+import { INBOX_BACKEND_HEADER } from "@botiverse/raft-shared";
 import { tokenForHuman } from "../test/integration/credentials";
 import { createApiTest } from "../test/integration/apiTest";
 import { getDb } from "../db/index";
@@ -158,4 +159,24 @@ test("GET /channels/inbox?ids= rejects malformed lists and combinations", async 
   const ok = await readInbox(app.baseUrl, token, f.server.id, `ids=${fifty}`);
   assert.equal(ok.status, 200);
   assert.deepEqual(ok.body.items.map(inboxItemRowId), [f.room.id]);
+});
+
+// #244 step 2: the web's drift check says which source answered. Under test
+// the RisingWave reads are the reference stand-in (installRisingWaveReadReferences),
+// so a plain read says `risingwave`; a search is served by the canonical
+// Postgres read. Header only: the body has no `backend`.
+test("GET /channels/inbox says which source answered in X-Raft-Inbox-Backend, list and ids reads alike", async ({ app }) => {
+  const f = await seedFixture();
+  const token = await tokenForHuman(f.owner.email);
+  const read = async (query: string) => {
+    const res = await fetch(`${app.baseUrl}/api/channels/inbox?${query}`, { headers: headers(token, f.server.id) });
+    assert.equal(res.status, 200, query);
+    const body = await res.json() as Record<string, unknown>;
+    assert.equal("backend" in body, false, `${query}: not in the body`);
+    return res.headers.get(INBOX_BACKEND_HEADER);
+  };
+  assert.equal(await read("filter=all&limit=30"), "risingwave");
+  assert.equal(await read("filter=unread&limit=30"), "risingwave");
+  assert.equal(await read(`ids=${f.room.id},${f.thread.id}`), "risingwave");
+  assert.equal(await read("filter=all&limit=30&q=room"), "postgres");
 });

@@ -16,6 +16,8 @@
  *
  * CI gate (companion script):
  *   pnpm --filter @botiverse/raft-daemon check:pi-builtin-models-fresh
+ * It runs only in the full Test workflow (integration-contracts, on staging
+ * pushes), not on PRs: rerun the generator in the PR that bumps Pi.
  *
  * Do not edit `packages/shared/src/piBuiltinModels.generated.ts` directly —
  * edit `PI_SURFACED_PROVIDERS` below + rerun this script.
@@ -64,6 +66,13 @@ interface GeneratedProvider {
     baseUrl: string;
     headers: Record<string, string>;
   };
+  /**
+   * Every catalog model of the provider uses one api, base URL and static
+   * headers: a model id outside the catalog can run on that same transport.
+   */
+  uniformTransport: boolean;
+  /** Every catalog model of the provider reasons: a typed model id is registered with reasoning on. */
+  allModelsReason: boolean;
   models: GeneratedModel[];
 }
 
@@ -79,6 +88,7 @@ interface PiSdkModel {
   api: string;
   baseUrl: string;
   headers?: Record<string, string>;
+  reasoning?: boolean;
 }
 
 type PiSdkModelsByProvider = Record<string, Record<string, PiSdkModel>>;
@@ -246,6 +256,8 @@ async function buildProviders(): Promise<GeneratedProvider[]> {
     if (Object.keys(probeHeaders).some((key) => /authorization|api[-_]?key|token/iu.test(key))) {
       throw new Error(`Pi SDK default model ${providerId}/${defaultModelId} exposes credential-bearing static headers`);
     }
+    const transports = new Set(Object.values(modelsByProvider[providerId] ?? {}).map((model) =>
+      JSON.stringify([model.api, model.baseUrl, Object.entries(model.headers ?? {}).sort(([a], [b]) => a.localeCompare(b))])));
     providers.push({
       providerId,
       apiKeyEnvKey,
@@ -256,6 +268,8 @@ async function buildProviders(): Promise<GeneratedProvider[]> {
         baseUrl: defaultModel.baseUrl,
         headers: probeHeaders,
       },
+      uniformTransport: transports.size === 1,
+      allModelsReason: Object.values(modelsByProvider[providerId] ?? {}).every((model) => model.reasoning === true),
       models,
     });
   }
@@ -289,8 +303,12 @@ function buildSource(providers: readonly GeneratedProvider[], versions: PiSdkVer
     "// TODO: switch provider env metadata to codegen-read once Pi exports getApiKeyEnvVars.",
     "// Regenerate after any Pi SDK bump that affects exposed provider/model metadata.",
     "//",
-    "// CI gate keeps this in sync with the SDK by re-running the generator and",
-    "// failing on `git diff` drift.",
+    "// CI gate (check:pi-builtin-models-fresh) keeps this in sync with the SDK by",
+    "// re-running the generator and failing on `git diff` drift. It runs only in",
+    "// the full Test workflow, not on PRs: rerun the generator in the PR that bumps",
+    "// Pi. A provider leaving PI_BUILTIN_UNIFORM_TRANSPORT_PROVIDER_IDS_GENERATED",
+    "// stops taking typed model ids (stored ones would no longer parse); the floor",
+    "// test in shared runtimeConfig.test.ts fails then.",
     "",
     "export interface PiBuiltinModel {",
     "  id: string;",
@@ -316,6 +334,18 @@ function buildSource(providers: readonly GeneratedProvider[], versions: PiSdkVer
     "export const PI_BUILTIN_PROVIDER_MODELS_GENERATED: Record<string, ReadonlyArray<PiBuiltinModel>> = {",
     ...modelBlocks,
     "};",
+    "",
+    "// Providers whose catalog models all share one api, base URL and static",
+    "// headers: a typed model id outside the catalog runs on that transport.",
+    "export const PI_BUILTIN_UNIFORM_TRANSPORT_PROVIDER_IDS_GENERATED = [",
+    ...providers.filter((provider) => provider.uniformTransport).map((provider) => `  ${JSON.stringify(provider.providerId)},`),
+    "] as const;",
+    "",
+    "// Providers every catalog model of which reasons: a typed model id on one of",
+    "// them is registered with reasoning on (and takes a reasoning effort).",
+    "export const PI_BUILTIN_ALL_REASONING_PROVIDER_IDS_GENERATED = [",
+    ...providers.filter((provider) => provider.allModelsReason).map((provider) => `  ${JSON.stringify(provider.providerId)},`),
+    "] as const;",
     "",
   ].join("\n");
 }

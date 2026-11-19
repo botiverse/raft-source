@@ -15,10 +15,12 @@
  */
 import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
+import { availableParallelism } from "node:os";
 import process from "node:process";
 import { parseArgs } from "node:util";
-import { chromium } from "playwright";
 import { cliArgs } from "./args";
+import { BrowserError, openBrowser, planBrowser } from "./browser";
+import { hostBenchmarkMedian, hostExtra } from "./hostHealth";
 import type { PageRunRow } from "./pageRuns";
 import { type TimeLedger, timeLedger } from "./ledger";
 import { parseProjectConfig, selectRun } from "./project";
@@ -39,6 +41,8 @@ Options:
   --jsonl <file>      also write one row per load (ScopeDB perf.page_runs)
   --run-id <id>       with --jsonl: shared by every row of one collection (default: a new UUID)
   --chromium-arg <a>  extra Chromium switch (repeatable)
+  --browser <where>   local | browser-run (default local). browser-run: a Chromium on Cloudflare Browser Run, driven from
+                      here; needs RAFT_PERF_CF_ACCOUNT_ID and RAFT_PERF_CF_API_TOKEN. --jsonl is refused with it
 `;
 
 class LoadError extends Error {}
@@ -89,6 +93,7 @@ async function main(): Promise<number> {
       jsonl: { type: "string" },
       "run-id": { type: "string" },
       "chromium-arg": { type: "string", multiple: true, default: [] },
+      browser: { type: "string" },
       help: { type: "boolean", default: false },
     },
   });
@@ -96,6 +101,8 @@ async function main(): Promise<number> {
     process.stdout.write(HELP);
     return 0;
   }
+  const plan = planBrowser(args.browser, args["chromium-arg"], process.env);
+  if (plan.where !== "local" && args.jsonl) fail("--jsonl is refused with --browser browser-run: stored rows are one series per page, taken on one kind of machine");
   if (!args.project) fail("--project <file> is required");
   if (!args.env) fail("--env <name> is required");
   const state = args.state as "cold" | "repeat";
@@ -158,7 +165,8 @@ async function main(): Promise<number> {
     requestAnimationFrame(tick);
   };
 
-  const browser = await chromium.launch({ args: args["chromium-arg"] });
+  const opened = await openBrowser(plan);
+  const { browser, describe: browserSeen } = opened;
   const results: Record<string, LoadResult[]> = {};
   const warnings: string[] = [];
   try {
@@ -264,7 +272,9 @@ async function main(): Promise<number> {
       if (results[page.name].some((r) => r.readyMs == null)) warnings.push(`page "${page.name}": its ready element (${page.ready.selector}) never became visible in a load`);
     }
   } finally {
-    await browser.close();
+    // to stderr, not to the report's warnings: those decide the exit code and say something about the pages
+    const notEnded = await opened.close();
+    if (notEnded) process.stderr.write(`raft-perf load: ${notEnded}\n`);
   }
 
   const measuredAt = new Date().toISOString();
@@ -293,13 +303,15 @@ async function main(): Promise<number> {
   );
   // the command that reproduces this measurement, for advise's "verify" step
   const command = `pnpm --filter @botiverse/raft-perf load -- ${cliArgs().filter((x, i, all) => !["--out", "--jsonl", "--run-id"].includes(x) && !["--out", "--jsonl", "--run-id"].includes(all[i - 1] ?? "")).map((x) => (/^[\w@%+=:,./-]+$/.test(x) ? x : `'${x.replaceAll("'", "'\\''")}'`)).join(" ")}`;
-  const report = { tool: "raft-perf load", command, measuredAt, project: config.project, env: args.env, origin: env.origin, state, net, requestedRuns: runs, pages: summary, warnings, runs: results };
+  const report = { tool: "raft-perf load", command, measuredAt, project: config.project, env: args.env, origin: env.origin, state, net, browser: browserSeen, requestedRuns: runs, pages: summary, warnings, runs: results };
   const text = JSON.stringify(report, null, 2);
   process.stdout.write(`${text}\n`);
   if (args.out) writeFileSync(args.out, `${text}\n`);
   if (args.jsonl) {
     const toolVersion: string = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
     const runId = args["run-id"] ?? randomUUID();
+    // load takes no host sample beside each run, so the machine's idle level is timed here, after the loads
+    const host = hostExtra(availableParallelism(), hostBenchmarkMedian());
     const rows: PageRunRow[] = Object.entries(results).flatMap(([name, loads]) =>
       loads.map((r, i) => ({
         project: config.project,
@@ -321,7 +333,7 @@ async function main(): Promise<number> {
         ttfb_ms: r.ttfbMs,
         fcp_ms: r.fcpMs,
         verdict: r.readyMs == null ? "unknown" : "measured",
-        extra: { ready_ms: r.readyMs, js_bytes: r.jsBytes, css_bytes: r.cssBytes, total_bytes: r.totalBytes, request_count: r.requests, longtask_ms: r.longtaskMs, ledger_main_thread_ms: r.ledger?.mainThreadMs ?? null, ledger_download_ms: r.ledger?.downloadMs ?? null, ledger_network_wait_ms: r.ledger?.networkWaitMs ?? null, ledger_unexplained_ms: r.ledger?.unexplainedMs ?? null, load_total_bytes: r.loadTotalBytes, load_request_count: r.loadRequests },
+        extra: { ready_ms: r.readyMs, js_bytes: r.jsBytes, css_bytes: r.cssBytes, total_bytes: r.totalBytes, request_count: r.requests, longtask_ms: r.longtaskMs, ledger_main_thread_ms: r.ledger?.mainThreadMs ?? null, ledger_download_ms: r.ledger?.downloadMs ?? null, ledger_network_wait_ms: r.ledger?.networkWaitMs ?? null, ledger_unexplained_ms: r.ledger?.unexplainedMs ?? null, load_total_bytes: r.loadTotalBytes, load_request_count: r.loadRequests, ...host },
       })),
     );
     writeFileSync(args.jsonl, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
@@ -336,7 +348,7 @@ main().then(
     process.exitCode = code;
   },
   (error: unknown) => {
-    process.stderr.write(`raft-perf load: ${error instanceof LoadError ? error.message : `failed: ${(error as Error)?.stack ?? String(error)}`}\n`);
+    process.stderr.write(`raft-perf load: ${error instanceof LoadError || error instanceof BrowserError ? error.message : `failed: ${(error as Error)?.stack ?? String(error)}`}\n`);
     process.exitCode = 2;
   },
 );

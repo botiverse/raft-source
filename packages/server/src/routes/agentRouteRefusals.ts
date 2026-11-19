@@ -486,6 +486,21 @@ export const APP_RETURN_URL_REQUIRED_REFUSAL: RefusalInput = { code: "return_url
 export const APP_CLIENT_KEY_REQUIRED_REFUSAL: RefusalInput = { code: "client_key_required", error: "Say which app this is for: give its client id." };
 /** An app this agent can't see reads the same as one that doesn't exist (404 `app_not_found`, non-enumerating). */
 export const APP_NOT_FOUND_REFUSAL: RefusalInput = { code: "app_not_found", error: "No app you can see on this server has that client id: check the id, or list the apps you manage." };
+/** 400: `allow` sends the action endpoint exactly as `show` returned it; `show` and `withdraw` send none. */
+export const CARD_BUTTONS_ENDPOINT_REFUSAL: RefusalInput = {
+  code: "card_buttons_endpoint_invalid",
+  error: "Send actionEndpoint with allow only: the app's action endpoint exactly as show returned it.",
+};
+/** 409: why an allow changed nothing (RFC 076 §17): the same codes as the web's. */
+export function cardButtonsRefusal(kind: "not_found" | "no_action_endpoint" | "endpoint_changed" | "pending_review" | "official"): RefusalInput {
+  switch (kind) {
+    case "not_found": return APP_NOT_FOUND_REFUSAL;
+    case "no_action_endpoint": return { code: "OWN_SERVER_ACTIONS_NO_ENDPOINT", error: "This app has no action endpoint to allow yet." };
+    case "endpoint_changed": return { code: "OWN_SERVER_ACTIONS_ENDPOINT_CHANGED", error: "The app changed its action endpoint: show it again, check the new one, then allow it." };
+    case "pending_review": return { code: "OWN_SERVER_ACTIONS_PENDING_REVIEW", error: "That action endpoint is waiting for Raft's review: only the reviewed one in force (show) can be allowed." };
+    case "official": return { code: "OWN_SERVER_ACTIONS_OFFICIAL_APP", error: "This is an official app: Raft decides its card buttons on every server, so there is nothing to allow here." };
+  }
+}
 /** The same 404 for a status lookup by the card that registered the app. */
 export const APP_NOT_FOUND_BY_CARD_REFUSAL: RefusalInput = { code: "app_not_found", error: "No app you can see on this server was registered by that card: check the card, or list the apps you manage." };
 /** The one fixed message the Marketplace review request throws (oauthService requestOAuthClientPublish). */
@@ -646,5 +661,12 @@ export function taskAssignRefusal(reason: string, channel: string, taskNumber: n
 export const MACHINE_AUTH_REQUIRED_REFUSAL: RefusalInput = { code: "machine_auth_required", error: "This request needs a machine's own credential for this server: send it with the machine's key." };
 /** The authenticated machine is no longer on its server (404 `machine_not_found`). */
 export const MACHINE_NOT_FOUND_REFUSAL: RefusalInput = { code: "machine_not_found", error: "This machine is no longer registered on this server: connect it to the server again." };
+/**
+ * A machine acting for an agent that isn't on its server (404 `agent_not_found`):
+ * one that never existed and one on another server read the same.
+ */
+export const MACHINE_AGENT_NOT_FOUND_REFUSAL: RefusalInput = { code: "agent_not_found", error: "No agent on this server has that id: it may have been deleted, so stop acting for it." };
+/** A machine acting for an agent on another Computer, in the cloud, or on none (403 `agent_not_on_this_computer`). */
+export const AGENT_NOT_ON_THIS_COMPUTER_REFUSAL: RefusalInput = { code: "agent_not_on_this_computer", error: "This agent isn't on this Computer, so this Computer can't act for it." };
 /** The machine's server was deleted mid-request (404 `server_not_found`). */
 export const MACHINE_SERVER_GONE_REFUSAL: RefusalInput = { code: "server_not_found", error: "This machine's server no longer exists." };

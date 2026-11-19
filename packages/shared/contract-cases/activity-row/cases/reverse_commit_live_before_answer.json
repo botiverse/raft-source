@@ -1,0 +1,78 @@
+{
+  "formatVersion": 1,
+  "id": "reverse_commit_live_before_answer",
+  "rule": "position",
+  "title": "Live 101 then live 100 (an inversion), then an answer at 101 that misses 100: re-read the row once, nothing double counted",
+  "why": "An inversion means two messages committed out of seq order, so an answer may sit between the two commits; the applied seqs at or below it cannot be trusted.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/shared/src/activityRowPosition.ts (reduceActivityRow; not wired yet, step 2)"
+    ],
+    "server": [
+      "packages/server/src/services/channelService.ts (latestActivitySeqSameSource; the row's latestActivitySeq)",
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (unread_count and latest_seq from one materialized row)"
+    ]
+  },
+  "given": {
+    "row": {
+      "unreadCount": 0,
+      "hasMention": false,
+      "position": "99",
+      "mentionOnly": false
+    }
+  },
+  "steps": [
+    {
+      "act": "liveMessage",
+      "seq": "101",
+      "counts": true,
+      "mentionsViewer": false
+    },
+    {
+      "act": "liveMessage",
+      "seq": "100",
+      "counts": true,
+      "mentionsViewer": false
+    },
+    {
+      "act": "answer",
+      "row": {
+        "unreadCount": 1,
+        "hasMention": false,
+        "position": "101",
+        "mentionOnly": false
+      }
+    },
+    {
+      "act": "answer",
+      "row": {
+        "unreadCount": 2,
+        "hasMention": false,
+        "position": "101",
+        "mentionOnly": false
+      }
+    }
+  ],
+  "checkpoints": [
+    {
+      "afterStep": 2,
+      "row": {
+        "unreadCount": 2,
+        "position": "101"
+      },
+      "reread": false
+    },
+    {
+      "afterStep": 3,
+      "reread": true
+    }
+  ],
+  "expect": {
+    "row": {
+      "unreadCount": 2,
+      "position": "101"
+    },
+    "reread": true
+  }
+}

@@ -23,8 +23,10 @@
 // never in logs or funnel events; the card shows its `result` afterwards.
 //
 // Production form cards: feedback:submit (services/feedbackCardForm.ts),
-// agent:approve_call (services/agentApproveCallForm.ts) and question:ask
-// (services/questionAskForm.ts).
+// agent:approve_call (services/agentApproveCallForm.ts), question:ask
+// (services/questionAskForm.ts), assistant:owner_action
+// (services/assistantOwnerActionCards.ts) and request:prepare
+// (services/preparedRequestCards.ts).
 // Tests register others with setActionCardFormHandlerForTest.
 
 import type {
@@ -46,7 +48,9 @@ import { agentApproveCallFormHandler } from "./agentApproveCallForm";
 import { assistantOwnerActionFormHandler, type OwnerConfirmRequest } from "./assistantOwnerActionCards";
 import { feedbackCardFormHandler } from "./feedbackCardForm";
 import { questionAskFormHandler } from "./questionAskForm";
+import { preparedRequestFormHandler } from "./preparedRequestCards";
 import type { RequestClient } from "./productEventContext";
+import type { AgentOrchestrator } from "./agentOrchestrator";
 
 type ActionOf<T extends StoredActionCardActionType> = Extract<StoredActionCardAction, { type: T }>;
 
@@ -86,9 +90,12 @@ export interface ActionCardFormContext<T extends StoredActionCardActionType = St
   /**
    * The submitter's own request (the app and their Authorization header), for
    * a handler whose action runs one of their own routes: an assistant
-   * owner-action card's Confirm (assistantOwnerActionCards.ts). Absent outside a request.
+   * owner-action card's Confirm (assistantOwnerActionCards.ts), a
+   * request:prepare card's (preparedRequestCards.ts). Absent outside a request.
    */
   ownerRequest?: OwnerConfirmRequest;
+  /** The agent orchestrator, for a handler that replies to the card's agent itself (request:prepare); absent outside a request. */
+  orchestrator?: AgentOrchestrator | null;
 }
 
 export type ActionCardFormValidation<I> = { input: I } | { issues: ActionCardFormIssue[] };
@@ -151,6 +158,7 @@ const HANDLERS: Registry = {
   "agent:approve_call": agentApproveCallFormHandler,
   "assistant:owner_action": assistantOwnerActionFormHandler,
   "question:ask": questionAskFormHandler,
+  "request:prepare": preparedRequestFormHandler,
 };
 const handlersForTest: Registry = {};
 

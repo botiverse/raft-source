@@ -5,6 +5,10 @@ import { fileURLToPath } from "node:url";
 
 import pg from "pg";
 import {
+  parseFfaServerPlanEntitlementInputs,
+  resolveEffectiveServerBillingPlan,
+} from "@botiverse/raft-shared";
+import {
   FEATURE_FLAG_ADMIN_OPERATOR_ROLE,
   reconcileAndVerifyFeatureFlagAdminPrivileges,
   verifyFeatureFlagAdminPrivileges,
@@ -171,6 +175,8 @@ test("real PostgreSQL proves durable reconciliation, exact grants, and binding i
   await target.query(linkCardResolutionMigration.replaceAll("--> statement-breakpoint", ""));
   const rulesReachMigration = readFileSync(new URL("../../drizzle/0617_announcement_rules_reach.sql", import.meta.url), "utf8");
   await target.query(rulesReachMigration.replaceAll("--> statement-breakpoint", ""));
+  const planEntitlementMigration = readFileSync(new URL("../../drizzle/0716_ffa_server_plan_entitlement_inputs.sql", import.meta.url), "utf8");
+  await target.query(planEntitlementMigration.replaceAll("--> statement-breakpoint", ""));
   await assert.rejects(
     reconcileAndVerifyFeatureFlagAdminPrivileges((text, values) => target.query(text, values)),
     (error: unknown) => (error as { code?: string }).code === "42704",
@@ -213,6 +219,7 @@ test("real PostgreSQL proves durable reconciliation, exact grants, and binding i
   await target.query(`GRANT SELECT (operation_id, viewer_id, server_id, provider_kind, provider_key, installation_key, message_id, action_id, state, receipt_revision, last_status_at, resolved_by_user_id, resolution_reason, resolved_at, created_at, updated_at) ON TABLE public.link_card_operations TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
   await target.query(`GRANT UPDATE (state, resolved_by_user_id, resolution_reason, resolved_at, updated_at) ON TABLE public.link_card_operations TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
   await target.query(`GRANT EXECUTE ON FUNCTION public.announcement_rules_reach(jsonb, text, uuid[], uuid[], timestamptz) TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
+  await target.query(`GRANT EXECUTE ON FUNCTION public.ffa_server_plan_entitlement_inputs(uuid, timestamptz) TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
   await verifyFeatureFlagAdminPrivileges((text, values) => target.query(text, values));
   await assert.rejects(
     verifyFeatureFlagAdminPrivilegeReceipt((text, values) => target.query(text, values)),
@@ -312,6 +319,87 @@ test("real PostgreSQL proves durable reconciliation, exact grants, and binding i
       operator.query(forbiddenReachColumn),
       (error: unknown) => (error as { code?: string }).code === "42501",
       forbiddenReachColumn,
+    );
+  }
+  // Single-server plan entitlement inputs for preview (0716): the operator gets non-secret
+  // plan-resolution inputs through the function while AppSumo, prepaid, and Stripe columns stay unreadable.
+  await target.query(`
+    CREATE TABLE appsumo_licenses (
+      product_id text NOT NULL,
+      license_key uuid NOT NULL,
+      tier integer,
+      status text NOT NULL DEFAULT 'pending',
+      verified_at timestamptz,
+      PRIMARY KEY (product_id, license_key)
+    );
+    CREATE TABLE appsumo_license_bindings (
+      id uuid PRIMARY KEY,
+      server_id uuid UNIQUE REFERENCES servers(id) ON DELETE SET NULL,
+      product_id text NOT NULL,
+      original_license_key uuid NOT NULL,
+      current_license_key uuid NOT NULL
+    );
+    CREATE TABLE prepaid_pro_purchases (
+      id uuid PRIMARY KEY,
+      server_id uuid REFERENCES servers(id) ON DELETE SET NULL,
+      kind text NOT NULL,
+      seat_quantity integer NOT NULL,
+      starts_at timestamptz NOT NULL,
+      ends_at timestamptz NOT NULL,
+      status text NOT NULL,
+      stripe_checkout_session_id text NOT NULL,
+      amount_total integer NOT NULL
+    );
+  `);
+  await target.query(
+    "INSERT INTO servers (id, slug, name, plan, kind) VALUES ('00000000-0000-4000-8000-0000000000c1', 'plan-preview-srv', 'Plan Preview Server', 'free', 'normal')",
+  );
+  await target.query(
+    "INSERT INTO appsumo_licenses (product_id, license_key, tier, status, verified_at) VALUES ('raft_tier', '00000000-0000-4000-8000-0000000000c2', 2, 'active', now())",
+  );
+  await target.query(
+    "INSERT INTO appsumo_license_bindings (id, server_id, product_id, original_license_key, current_license_key) VALUES ('00000000-0000-4000-8000-0000000000c3', '00000000-0000-4000-8000-0000000000c1', 'raft_tier', '00000000-0000-4000-8000-0000000000c2', '00000000-0000-4000-8000-0000000000c2')",
+  );
+  await target.query(
+    "INSERT INTO prepaid_pro_purchases (id, server_id, kind, seat_quantity, starts_at, ends_at, status, stripe_checkout_session_id, amount_total) VALUES ('00000000-0000-4000-8000-0000000000c4', '00000000-0000-4000-8000-0000000000c1', 'period', 3, '2026-11-01T00:00:00Z', '2026-12-01T00:00:00Z', 'paid', 'cs_live_secret_123', 9900)",
+  );
+  const planInputs = await operator.query(
+    "SELECT public.ffa_server_plan_entitlement_inputs('00000000-0000-4000-8000-0000000000c1'::uuid, '2026-11-15T00:00:00Z'::timestamptz) AS inputs",
+  );
+  const parsedPlanInputs = parseFfaServerPlanEntitlementInputs(planInputs.rows[0].inputs);
+  assert.equal(parsedPlanInputs.found, true);
+  assert.equal(parsedPlanInputs.inputs.serverPlan, "free");
+  assert.equal(parsedPlanInputs.inputs.subscriptionPlan, null);
+  assert.equal(parsedPlanInputs.inputs.subscriptionStatus, null);
+  assert.equal(parsedPlanInputs.inputs.hasActiveAppSumo, true);
+  assert.equal(parsedPlanInputs.inputs.prepaidPurchases?.length, 1);
+  assert.equal(parsedPlanInputs.inputs.prepaidPurchases?.[0]?.kind, "period");
+  assert.equal(parsedPlanInputs.inputs.prepaidPurchases?.[0]?.seatQuantity, 3);
+  assert.equal(
+    Date.parse(String(parsedPlanInputs.inputs.prepaidPurchases?.[0]?.startsAt)),
+    Date.parse("2026-11-01T00:00:00Z"),
+  );
+  assert.equal(
+    Date.parse(String(parsedPlanInputs.inputs.prepaidPurchases?.[0]?.endsAt)),
+    Date.parse("2026-12-01T00:00:00Z"),
+  );
+  assert.equal(
+    resolveEffectiveServerBillingPlan(parsedPlanInputs.inputs, new Date("2026-11-15T00:00:00Z")),
+    "pro",
+  );
+  for (const forbiddenPlanQuery of [
+    "SELECT license_key FROM appsumo_licenses",
+    "SELECT tier FROM appsumo_licenses",
+    "SELECT current_license_key FROM appsumo_license_bindings",
+    "SELECT stripe_checkout_session_id FROM prepaid_pro_purchases",
+    "SELECT amount_total FROM prepaid_pro_purchases",
+    "SELECT kind FROM prepaid_pro_purchases",
+    "SELECT stripe_customer_id FROM subscriptions",
+  ]) {
+    await assert.rejects(
+      operator.query(forbiddenPlanQuery),
+      (error: unknown) => (error as { code?: string }).code === "42501",
+      forbiddenPlanQuery,
     );
   }
   // Stuck link card operations (0387): list them and resolve one manually; nothing else.

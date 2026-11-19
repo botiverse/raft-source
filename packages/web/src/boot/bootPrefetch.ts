@@ -8,6 +8,8 @@
  * so the app sends its own and its usual handling (refresh, sign-out) runs.
  */
 
+import { latestPagePath } from "../store/channelPageQuery";
+
 /** Where the boot script leaves its requests (window.__raftBootFetches). Here, not in bootInlineScript.ts, so the app's bundle doesn't carry the script's text. */
 export const BOOT_FETCHES_GLOBAL = "__raftBootFetches";
 
@@ -92,6 +94,71 @@ export function takeBootFetch(url: string, headers: Readonly<Record<string, unkn
   return entry;
 }
 
+/** How long a server read waits for the boot script to send its own (bootServerWait); the app is waiting for the same server list meanwhile. */
+export const BOOT_SERVER_WAIT_MS = 2_000;
+
+let serverWaitDone = false;
+
+/** The conversation the page's URL names (`/s/<slug>/channel|dm/<id>`), as the boot script reads it; null off a conversation. */
+function pageConversation(): string | null {
+  const match = /^\/s\/[^/]+\/(?:channel|dm)\/([0-9A-Za-z_-]+)\/?$/.exec(globalThis.location?.pathname ?? "");
+  return match ? match[1] : null;
+}
+
+/** Whether this URL is one of the server reads the boot script sends for conversation `o` (bootInlineScript.ts, S). */
+function isBootServerRead(url: string, o: string): boolean {
+  let path: string;
+  try {
+    const parsed = new URL(url);
+    path = parsed.pathname + parsed.search;
+  } catch {
+    return false;
+  }
+  const at = path.indexOf("/api/");
+  if (at < 0) return false;
+  path = path.slice(at + "/api".length);
+  return path === `/channels/${o}` || path === latestPagePath(o) || path === "/channels?archived=include" || path === "/channels/dm"
+    || /^\/servers\/[0-9a-f-]{36}\/(?:sidebar-order|members)$/i.test(path);
+}
+
+interface AbortLike { readonly aborted?: boolean; addEventListener?: (type: "abort", listener: () => void) => void; removeEventListener?: (type: "abort", listener: () => void) => void }
+
+/**
+ * On a device that doesn't remember the server's id, the boot script sends
+ * the server's reads (the conversation, its messages, the channel and DM
+ * lists, the sidebar order, the members) only once its own server list
+ * answers, and the app, given the same list, could ask first and send them
+ * again. For exactly those reads, while the script's wait (its list's `w`)
+ * is on, this is a promise of the boot script's request once that wait is
+ * over (at most BOOT_SERVER_WAIT_MS, or until the app's request is aborted:
+ * then null and the boot answer is left for the next ask). Anything else, or
+ * once one wait is over, null at once, so the request goes out inside the
+ * call as before (client.ts: a click's read leaves before React renders).
+ */
+export function bootServerWait(url: string, headers: Readonly<Record<string, unknown>>, signal?: AbortLike): Promise<BootFetch | null> | null {
+  if (serverWaitDone || signal?.aborted) return null;
+  const list = (globalThis as Record<string, unknown>)[BOOT_FETCHES_GLOBAL] as { w?: unknown } | undefined;
+  const wait = list?.w as Promise<unknown> | undefined;
+  if (!wait || typeof wait.then !== "function") return null;
+  if (!Object.keys(headers).some((name) => name.toLowerCase() === "x-server-id")) return null;
+  const o = pageConversation();
+  if (!o || !isBootServerRead(url, o)) return null;
+  return (async () => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    await Promise.race([
+      Promise.resolve(wait).catch(() => undefined),
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, BOOT_SERVER_WAIT_MS); }),
+      new Promise<void>((resolve) => { onAbort = resolve; signal?.addEventListener?.("abort", resolve); }),
+    ]);
+    if (timer !== undefined) clearTimeout(timer);
+    if (onAbort) signal?.removeEventListener?.("abort", onAbort);
+    if (signal?.aborted) return null;
+    serverWaitDone = true;
+    return takeBootFetch(url, headers);
+  })();
+}
+
 /** Its answer when it succeeded (2xx), as the browser gave it to the page; null for anything else. */
 export async function readBootFetch(entry: BootFetch): Promise<BootFetchAnswer | null> {
   try {
@@ -118,4 +185,5 @@ export function bootSentHistoryRead(): boolean {
 export function __resetBootFetchesForTest(): void {
   delete (globalThis as Record<string, unknown>)[BOOT_FETCHES_GLOBAL];
   sentHistoryRead = false;
+  serverWaitDone = false;
 }

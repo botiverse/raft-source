@@ -587,7 +587,7 @@ export function ChannelMembers({
   // The sidebar Agents "+" menu's second item, in the same order (artin,
   // #wg-mobile:8697bb4a). Same create-then-join path as the hosted item.
   const handleOpenCreateExternalAgent = useCallback(() => {
-    trackAgentCreateOpened("channel_members");
+    trackAgentCreateOpened("channel_members_external");
     setShowCreateExternalAgent(true);
   }, []);
 
@@ -626,9 +626,9 @@ export function ChannelMembers({
   // ONE row opens a menu with the Members page agent "+" menu's items, in its
   // order and with its icons (task #proj-raft-ui:#176): hosted, then external.
   // Both items share one gate (createAgents); a computer or the plan limit is
-  // the dialog's own business, which offers the way forward. So without the
-  // permission the whole row stays VISIBLE but disabled with the reason, since
-  // hiding it would recreate the dead end it removes.
+  // the dialog's own business, which offers the way forward. Without the
+  // permission the row is not drawn at all (cindyz, #wg-rbac:#76): a button the
+  // viewer can't use is noise; the external-member row still shows if allowed.
   const createAgentAutoJoinLine = formatMessage(
     { id: "channel.addMembers.createAgentAutoJoin" },
     { channel: `#${currentChannel?.name ?? ""}` },
@@ -680,18 +680,7 @@ export function ChannelMembers({
     {addExternalMemberRow}
     </>
   ) : (
-    <div className="px-2.5 py-2" data-testid="add-member-create-agent-entry-disabled">
-      <div className="flex items-center gap-2.5 text-foreground-disabled">
-        <span className="flex size-6 shrink-0 items-center justify-center rounded-sticker border-[1.5px] border-dashed border-foreground-disabled">
-          <Plus size={14} aria-hidden="true" />
-        </span>
-        <span className="text-callout font-semibold">{formatMessage({ id: "channel.addMembers.createAgent" })}</span>
-      </div>
-      <p className="mt-1.5 text-caption text-foreground-hint">
-        {formatMessage({ id: "channel.addMembers.createAgentNoPermission" })}
-      </p>
-      {addExternalMemberRow && <div className="-mx-2.5 mt-1.5">{addExternalMemberRow}</div>}
-    </div>
+    addExternalMemberRow
   );
 
   // The candidates: raft-ui's ChoiceList through MemberChoiceList (search at

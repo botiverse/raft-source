@@ -12,7 +12,7 @@ vi.mock("../src/analytics/track", () => ({
   trackEvent: (event: string, props: unknown, options: unknown) => { tracked.push({ event, props, options }); },
 }));
 
-const { resetActionCardShownForTest, useActionCardShown } = await import("../src/analytics/actionCards");
+const { requestCardNamesSomeoneElse, resetActionCardShownForTest, useActionCardShown } = await import("../src/analytics/actionCards");
 
 /** An observer the test drives: `show(ratio)` reports every observed card with that share on screen. */
 const observers: Array<{ callback: IntersectionObserverCallback; targets: Element[]; disconnected: boolean }> = [];
@@ -80,4 +80,13 @@ test("a card becomes reportable when this person can act on it", () => {
   view.rerender(createElement(Card, { messageId: "m3", actionable: true }));
   act(() => show());
   assert.deepEqual(tracked.map((entry) => entry.event), ["action_card_shown"]);
+});
+
+test("a request card counts as shown only for the person it names", () => {
+  type Action = Parameters<typeof requestCardNamesSomeoneElse>[0];
+  const request = { type: "request:prepare", addressee: { kind: "user", userId: "0B9C1E0A-0000-4000-8000-000000000001", handle: "Ada" } } as unknown as Action;
+  assert.equal(requestCardNamesSomeoneElse(request, "0b9c1e0a-0000-4000-8000-000000000001"), false, "the named person, whatever the id's case");
+  assert.equal(requestCardNamesSomeoneElse(request, "0b9c1e0a-0000-4000-8000-000000000002"), true);
+  assert.equal(requestCardNamesSomeoneElse(request, undefined), true, "signed out");
+  assert.equal(requestCardNamesSomeoneElse({ type: "channel:create" } as unknown as Action, "anyone"), false, "other card types are not narrowed");
 });

@@ -61,6 +61,7 @@ import * as channelService from "../channelService";
 import { CompatibilityReadMutationPendingError } from "../readMutationSequencer";
 import { isReceiverStatePushEnabled } from "../receiverStatePushService";
 import { emitThreadFollowersUpdated } from "../threadFollowerRealtimeService";
+import { followedThreadRepliesSwitchOnFor, type ClientNotificationAccountSettings } from "./followedThreadRepliesSwitch";
 
 export type { NotificationAccountSettings } from "@botiverse/raft-shared";
 
@@ -77,6 +78,8 @@ export interface NotificationPolicyPrefs {
   channelLevel: Map<string, NotificationLevel>;
   /** `${channelId}:${userId}` for activity-muted channels (inbox_target_mute_states): the mute's from-seq. */
   mutedFromSeq: Map<string, number | null>;
+  /** Receivers whose followed-thread switch flag is on; asked only for those who stored the switch off. */
+  followedThreadRepliesSwitch: Set<string>;
 }
 
 export interface NotificationPolicyPrefsQuery {
@@ -192,7 +195,12 @@ export async function loadNotificationPolicyPrefs(
     mutedFromSeq.set(`${row.channelId}:${row.userId}`, row.muteFromSeq);
   }
 
-  return { account, serverLevel, channelLevel, mutedFromSeq };
+  // The followed-thread switch counts only where its flag is on; a receiver who
+  // never turned it off reads as on either way, so is not asked.
+  const storedOff = [...account].filter(([, settings]) => settings.followedThreadReplies === false).map(([userId]) => userId);
+  const followedThreadRepliesSwitch = await followedThreadRepliesSwitchOnFor(storedOff, executor);
+
+  return { account, serverLevel, channelLevel, mutedFromSeq, followedThreadRepliesSwitch };
 }
 
 // ---------------------------------------------------------------------------
@@ -756,7 +764,8 @@ export function serverLevelPrefs(level: NotificationLevel) {
 }
 
 export type NotificationPrefsUpdatedPayload =
-  | { type: "account"; settings: NotificationAccountSettings }
+  /** `settings` as the person sees them (accountSettingsForClient): no followedThreadReplies while its flag is off. */
+  | { type: "account"; settings: ClientNotificationAccountSettings }
   | { type: "server"; serverId: string; scopeId: string; level: NotificationLevel; prefs: ReturnType<typeof serverLevelPrefs>; prefsVersion: number }
   | { type: "channel" | "thread"; serverId: string; scopeId: string; level: NotificationLevelSetting; prefsVersion: number };
 

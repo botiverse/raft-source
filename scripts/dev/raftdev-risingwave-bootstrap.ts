@@ -7,12 +7,13 @@
  * SQL selection here lets the fast raftdev suite prove the production-artifact
  * dependency order without starting Postgres or RisingWave.
  *
- * The bootstrap builds exactly the relations the server reads today (see
+ * The bootstrap builds the relations the server reads today (see
  * RISINGWAVE_SERVER_READ_RELATIONS, which mirrors UNIFIED_CHAIN_VIEWS /
  * CONVERSATION_UNREAD_VIEW in packages/server/src/db/risingwave.ts plus the
  * direct rw_* reads in packages/server/src/services) and their transitive
  * dependencies, taken statement-by-statement from the production artifacts in
- * infra/risingwave/sql. Superseded generations in those files are skipped.
+ * infra/risingwave/sql. It also builds the parallel 081 generation for staged
+ * comparison before the serving switch. Superseded older generations are skipped.
  */
 
 export const RISINGWAVE_LOCAL_SOURCE = "slockdev_pg_cdc";
@@ -34,6 +35,10 @@ export const RISINGWAVE_PUBLICATION_TABLES = [
   "server_members",
   "joint_channels",
   "joint_channel_servers",
+  "joint_channel_members",
+  "joint_channel_admissions",
+  "joint_membership_departures",
+  "joint_membership_removals",
   "inbox_suppression_states",
   "inbox_target_mute_states",
   "servers",
@@ -231,6 +236,12 @@ export const RISINGWAVE_CDC_TABLES: readonly RisingWaveCdcTable[] = [
  * projections above. The orchestrator waits for their count parity too.
  */
 export const RISINGWAVE_ARTIFACT_CDC_TABLES = [
+  { upstream: "joint_channel_members", name: "rw_joint_channel_members_v1" },
+  { upstream: "joint_channel_admissions", name: "rw_joint_channel_admissions_v1" },
+  { upstream: "joint_membership_departures", name: "rw_joint_membership_departures_v1" },
+  { upstream: "joint_membership_removals", name: "rw_joint_membership_removals_v1" },
+  { upstream: "server_members", name: "rw_joint_entry_server_members_v1" },
+  { upstream: "joint_channel_servers", name: "rw_joint_entry_projections_v1" },
   { upstream: "inbox_target_mute_states", name: "rw_inbox_target_mute_states_v2" },
   { upstream: "servers", name: "rw_servers" },
 ] as const satisfies readonly { upstream: (typeof RISINGWAVE_PUBLICATION_TABLES)[number]; name: string }[];
@@ -381,6 +392,33 @@ export const RISINGWAVE_BOOTSTRAP_ARTIFACTS: readonly RisingWaveBootstrapArtifac
     file: "infra/risingwave/sql/074-followed-threads-v5.sql",
     relations: ["rw_followed_threads_v5"],
   },
+  // Parallel 081 build only. The serving switch is a separate PR/release.
+  { file: "infra/risingwave/sql/081-computed-joint-members/01-rw_joint_channel_members_v1.sql", relations: ["rw_joint_channel_members_v1"] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/02-rw_joint_channel_admissions_v1.sql", relations: ["rw_joint_channel_admissions_v1"] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/03-rw_joint_membership_departures_v1.sql", relations: ["rw_joint_membership_departures_v1"] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/04-rw_joint_membership_removals_v1.sql", relations: ["rw_joint_membership_removals_v1"] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/05-rw_joint_entry_server_members_v1.sql", relations: ["rw_joint_entry_server_members_v1"] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/06-rw_joint_entry_projections_v1.sql", relations: ["rw_joint_entry_projections_v1"] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/07-rw_joint_human_entries_v1.sql", relations: ["rw_joint_human_entries_v1"] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/08-rw_human_channel_members_v1.sql", relations: ["rw_human_channel_members_v1"] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/09-rw_subs_jcm_v1.sql", relations: ["rw_subs_jcm_v1"] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/10-rw_muted_subs_jcm_v1.sql", relations: ["rw_muted_subs_jcm_v1"] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/11-rw_inbox_normal_jcm_v1.sql", relations: ["rw_inbox_normal_jcm_v1"] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/12-rw_inbox_muted_full_jcm_v1.sql", relations: ["rw_inbox_muted_full_jcm_v1"] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/13-rw_inbox_muted_prefix_jcm_v1.sql", relations: ["rw_inbox_muted_prefix_jcm_v1"] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/14-rw_task_conversation_unread_jcm_v1.sql", relations: ["rw_task_conversation_unread_jcm_v1"] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/15-rw_inbox_mention_jcm_v1.sql", relations: ["rw_inbox_mention_jcm_v1"] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/16-rw_activity_watermark_jcm_v1.sql", relations: ["rw_activity_watermark_jcm_v1"] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/17-rw_inbox_items_jcm_v1.sql", relations: ["rw_inbox_items_jcm_v1"] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/18-rw_inbox_preview_need_jcm_v1.sql", relations: ["rw_inbox_preview_need_jcm_v1"] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/19-rw_inbox_preview_seq_jcm_v1.sql", relations: ["rw_inbox_preview_seq_jcm_v1"] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/20-rw_inbox_serving_jcm_v1.sql", relations: ["rw_inbox_serving_jcm_v1"] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/21-idx_rw_inbox_serving_jcm_v1.sql", relations: [] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/22-rw_activity_totals_jcm_v1.sql", relations: ["rw_activity_totals_jcm_v1"] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/23-rw_agent_inbox_jcm_v1.sql", relations: ["rw_agent_inbox_jcm_v1"] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/24-idx_rw_agent_inbox_jcm_v1.sql", relations: [] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/25-rw_conversation_unread_jcm_v1.sql", relations: ["rw_conversation_unread_jcm_v1"] },
+  { file: "infra/risingwave/sql/081-computed-joint-members/26-idx_rw_conversation_unread_jcm_v1.sql", relations: [] },
 ] as const;
 
 /** Every table/view/MV the bootstrap creates, in creation order. */
@@ -566,7 +604,7 @@ export function referencedRelations(statement: string): string[] {
 }
 
 function isDdlSetting(body: string): boolean {
-  return /^SET\s+(?:BACKGROUND_DDL|STREAMING_PARALLELISM)\s*=/i.test(body);
+  return /^SET\s+(?:BACKGROUND_DDL|STREAMING_PARALLELISM|backfill_rate_limit)\s*=/i.test(body);
 }
 
 /**
@@ -576,7 +614,7 @@ function isDdlSetting(body: string): boolean {
  * Guards make a future artifact rewrite fail loudly instead of silently
  * applying a partial, unsafe, duplicate, or out-of-order graph:
  *   - an artifact may contain only CREATE TABLE / [MATERIALIZED] VIEW / INDEX and
- *     the two DDL settings (which are dropped: the prelude pins foreground DDL);
+ *     the DDL settings (which are dropped: the prelude pins foreground DDL);
  *   - every selected relation exists exactly once in its artifact;
  *   - leading comments are dropped (history notes may quote superseded settings);
  *   - the production CDC source name is rewritten to the local source, and no

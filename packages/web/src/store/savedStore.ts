@@ -28,6 +28,10 @@ export interface SavedEntry {
   parentMessageSenderType?: string | null;
   parentMessageSenderId?: string | null;
   replyCount?: number;
+  /** Task v2: set for a message in a task's own conversation (`channelType: "task"`), whose parent is the task. */
+  taskId?: string;
+  taskNumber?: number;
+  taskTitle?: string;
 }
 
 interface SavedState {

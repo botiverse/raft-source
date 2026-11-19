@@ -1,3 +1,4 @@
+import { markAgentProgress } from "./agentProgressMarks";
 import { randomBytes, randomUUID, createHash, timingSafeEqual } from "node:crypto";
 import sharp from "sharp";
 import { withImageDecodeSlot } from "../lib/imageDecodeLimit";
@@ -29,6 +30,9 @@ import {
   type AgentInstalledAppCatalogEntry,
   marketplaceInstallBucket,
   type MarketplaceInstallBadge,
+  APP_NAME_RESERVED_CODE,
+  appNameReservedMessage,
+  reservedAppNameBrand,
 } from "@botiverse/raft-shared";
 import { appNoticeKinds, firstPartyAppOfSystemApp } from "../apps/firstPartyApps";
 import { getDb, type DatabaseExecutor, type DatabaseTransaction } from "../db/index";
@@ -39,6 +43,7 @@ import {
   managedMcpServers,
   oauthClientInstalls,
   oauthClientShareLinks,
+  oauthClientUninstalls,
   oauthAppPermissionRevisions,
   oauthAccessRequests,
   oauthAccessTokens,
@@ -57,6 +62,7 @@ import {
   users,
 } from "../db/schema";
 import { actorHasServerCapabilityInServer } from "../lib/actorPermissions";
+import { RefusalError } from "../lib/refusal";
 import { getThumbnailUrl } from "../routes/attachments";
 import { serializeErrorForLog } from "../tracing/safeErrorLog";
 import {
@@ -76,6 +82,7 @@ import {
   resolveAgentFacingPromptText,
 } from "./appPromptTextService";
 import * as integrationAuditService from "./integrationAuditService";
+import { recordPersonOAuthClientUninstall } from "./oauthClientUninstalls";
 import { AppBotHandleConflictError, setInstallationBotGrant, withAppBotOffers, type AppBotOffer } from "./appBotIdentityService";
 import { filterReadableSystemAppEvents, partitionDeliverableSystemAppEvents } from "./systemAppDeliveryGuards";
 import {
@@ -83,6 +90,8 @@ import {
   oauthClientIsUserManagedPredicate,
 } from "./oauthClientManagementPolicy";
 import {
+  hasApprovedOfficialAppRegistryEntry,
+  isOfficialPublisherServer,
   projectOfficialAppDiscovery,
   projectOfficialAppDiscoveryMany,
   prepareExplicitUserInstallState,
@@ -359,6 +368,22 @@ export class OAuthInstallationSuspendedError extends Error {
     super("installation_suspended");
     this.name = "OAuthInstallationSuspendedError";
   }
+}
+
+/** Where a person approved a Login with Raft, when the approving client says so. */
+export const OAUTH_AUTHORIZATION_APPROVAL_SOURCES = ["desktop_browser"] as const;
+export type OAuthAuthorizationApprovalSource = (typeof OAUTH_AUTHORIZATION_APPROVAL_SOURCES)[number];
+
+/**
+ * The `source` an approving client sent with POST /oauth/authorize/human or
+ * /authorize/account: `desktop_browser` (Raft Desktop's sheet for a page of
+ * its built-in browser), else null (absent, or anything else: ignored, never
+ * an error, so no client breaks on it). A label on the authorization's audit
+ * event and nothing more: it is the signed-in client's own word, no check
+ * reads it, and every rule of the authorization holds with or without it.
+ */
+export function authorizationApprovalSource(value: unknown): OAuthAuthorizationApprovalSource | null {
+  return OAUTH_AUTHORIZATION_APPROVAL_SOURCES.find((source) => source === value) ?? null;
 }
 
 /**
@@ -1366,6 +1391,40 @@ function applyAppSetupUpdate(
   if (url !== before.setupUrl) updates.setupRevision = before.setupRevision + 1;
 }
 
+/**
+ * Refuses a name that reads as Raft (appNameReservation.ts) for an App whose
+ * own Server is not an official publisher. Checked only when the name changes
+ * (`previousName`), so an App that already had such a name before this rule
+ * still saves its other fields; renaming it must pick an allowed name.
+ */
+export function assertAppNameAllowed(input: { serverId: string; name: string; previousName?: string | null }): void {
+  const brand = reservedAppNameRefusal(input);
+  if (brand) throw new RefusalError(400, { code: APP_NAME_RESERVED_CODE, error: appNameReservedMessage(brand) });
+}
+
+function reservedAppNameRefusal(input: { serverId: string; name: string; previousName?: string | null }) {
+  if (input.previousName !== undefined && input.previousName === input.name) return null;
+  const brand = reservedAppNameBrand(input.name);
+  if (!brand || isOfficialPublisherServer(input.serverId)) return null;
+  return brand;
+}
+
+/**
+ * assertAppNameAllowed for a rename of an existing App: an App whose official
+ * registry entry is approved (Raft vouches for it) may also take such a name,
+ * wherever its Server is (Stamp is official without its Server being a
+ * publisher). A pending or disabled entry does not count. The registry is
+ * read only when the name would otherwise be refused.
+ */
+async function assertAppRenameAllowed(
+  input: { serverId: string; clientId: string; name: string; previousName: string | null },
+  tx: Parameters<typeof hasApprovedOfficialAppRegistryEntry>[1],
+): Promise<void> {
+  const brand = reservedAppNameRefusal(input);
+  if (!brand || await hasApprovedOfficialAppRegistryEntry(input.clientId, tx)) return;
+  throw new RefusalError(400, { code: APP_NAME_RESERVED_CODE, error: appNameReservedMessage(brand) });
+}
+
 export async function createOAuthClient(input: {
   serverId: string;
   createdByUserId: string;
@@ -1388,6 +1447,7 @@ export async function createOAuthClient(input: {
   if (!trimmedName) {
     throw new Error("name is required");
   }
+  assertAppNameAllowed({ serverId: input.serverId, name: trimmedName });
 
   const normalizedClientId = normalizeClientId(input.clientId, trimmedName);
   const rawSecret = generateOAuthClientSecret();
@@ -1906,6 +1966,7 @@ export async function updateOAuthClientForAgent(input: {
     if (input.name !== undefined) {
       const name = input.name.trim();
       if (!name) throw new Error("name is required");
+      await assertAppRenameAllowed({ serverId: before.serverId, clientId: before.id, name, previousName: before.name }, tx);
       updates.name = name;
     }
     if (input.description !== undefined) updates.description = input.description?.trim() || null;
@@ -2130,12 +2191,17 @@ export async function listMarketplaceOAuthClientEntries(serverId: string) {
     appNotificationPendingGroups: oauthAppPermissionRevisions.requestedGroups,
     appNotificationPendingEvents: oauthAppPermissionRevisions.requestedEvents,
     installConfirmedTextRevisionId: oauthClientInstalls.confirmedTextRevisionId,
+    uninstalledHereAt: oauthClientUninstalls.uninstalledAt,
   })
     .from(oauthClients)
     .innerJoin(servers, eq(servers.id, oauthClients.serverId))
     .leftJoin(oauthClientInstalls, and(
       eq(oauthClientInstalls.clientId, oauthClients.id),
       eq(oauthClientInstalls.serverId, serverId),
+    ))
+    .leftJoin(oauthClientUninstalls, and(
+      eq(oauthClientUninstalls.serverId, serverId),
+      eq(oauthClientUninstalls.clientId, oauthClients.id),
     ))
     .leftJoin(oauthAppPermissionRevisions, and(
       eq(oauthAppPermissionRevisions.id, oauthClients.outboundPendingRevisionId),
@@ -2177,7 +2243,7 @@ export async function listMarketplaceOAuthClientEntries(serverId: string) {
   // `bot` for this Server: an App not installed here reads "pending", so the
   // listing and the install dialog can name the bot before the install.
   const clientsWithBot = await withAppBotOffers(db, clients);
-  return clientsWithBot.map(({ effectiveInstallCount, publishedAt, installConfirmedTextRevisionId, ...client }) => ({
+  return clientsWithBot.map(({ effectiveInstallCount, publishedAt, installConfirmedTextRevisionId, uninstalledHereAt, ...client }) => ({
     client: {
       ...client,
       ...discovery.get(client.id)!,
@@ -2191,6 +2257,9 @@ export async function listMarketplaceOAuthClientEntries(serverId: string) {
       marketplaceInstallBadge: isPublicMarketplaceLifecycle(client.publishStatus) && client.humanMarketplaceVisible
         ? projectMarketplaceInstallBadge({ effectiveInstallCount, publishedAt, now })
         : { kind: "none" as const },
+      // When a person here last uninstalled this App (oauthClientUninstalls.ts),
+      // or null. Kept across a reinstall: compare with installationId.
+      uninstalledHereAt: uninstalledHereAt?.toISOString() ?? null,
     },
     publishedAt,
   }));
@@ -3411,7 +3480,8 @@ export type OAuthUninstallActor =
  * The uninstall itself, in the caller's transaction: the app's bot unbound
  * and its agent archived, the install row deleted, open requests denied,
  * queued deliveries suppressed, grants, server-scoped tokens and consents
- * revoked, link-preview declines deleted, and the audit event. Shared by the
+ * revoked, link-preview declines deleted, the audit event, and for a person
+ * the time this Server uninstalled the App (oauthClientUninstalls.ts). Shared by the
  * person's uninstall (uninstallMarketplaceOAuthClient) and the closed-server
  * purge's (uninstallOAuthClientInstallsOfClosedServer).
  */
@@ -3527,6 +3597,10 @@ async function uninstallOAuthClientInstallInTransaction(
       ...(input.actor.type === "system" ? { reason: input.actor.reason } : {}),
     },
   }, tx);
+  // The Marketplace's `uninstalledHereAt`: a person's choice only.
+  if (input.actor.type === "human") {
+    await recordPersonOAuthClientUninstall(tx, { serverId: input.serverId, clientId: client.id, actorUserId: input.actor.userId, uninstalledAt: revokedAt });
+  }
 
   return {
     clientId: client.id,
@@ -3708,6 +3782,7 @@ export async function updateOAuthClient(input: {
       if (!trimmedName) {
         throw new Error("name is required");
       }
+      await assertAppRenameAllowed({ serverId: before.serverId, clientId: before.id, name: trimmedName, previousName: before.name }, tx);
       updates.name = trimmedName;
     }
 
@@ -4493,6 +4568,8 @@ export async function issueHumanAuthorizationCode(input: {
    * the code is exchanged only while it is live (exchangeAccessRequest).
    */
   approverSessionFamilyId: string | null;
+  /** Where the person approved, as the approving client says (authorizationApprovalSource). On the audit event only. */
+  approvalSource?: OAuthAuthorizationApprovalSource | null;
 }) {
   const db = getDbForService();
   const now = currentDate();
@@ -4617,6 +4694,7 @@ export async function issueHumanAuthorizationCode(input: {
         result: "issued",
         grantType: "authorization_code",
         principalType: "human",
+        ...(input.approvalSource ? { source: input.approvalSource } : {}),
       },
     }, tx);
 
@@ -5398,6 +5476,8 @@ export async function consumeThirdPartyAgentEvents(
       or(eq(thirdPartyAgentEvents.status, "queued"), eq(thirdPartyAgentEvents.status, "delivering")),
     ))
     .returning({ id: thirdPartyAgentEvents.id });
+  // #proj-runtime:#62: consuming an app event is the agent moving forward.
+  if (updated.length > 0) markAgentProgress(options.agentId);
   return updated.map((row) => row.id);
 }
 
@@ -5797,6 +5877,35 @@ export async function listOAuthAgentDirectory(serverId: string) {
     ))
     .where(and(isNull(agents.deletedAt), listedServerAgent()))
     .orderBy(asc(agents.name), asc(agents.id));
+}
+
+/**
+ * What GET /api/oauth/apps lists, and callers must check the `app:read` scope:
+ * listAgentAvailableOAuthClients' third-party half, narrowed to Apps on the
+ * public Marketplace. This list leaves Raft for another App's backend, so an
+ * unpublished App's name stays out of it, and so does a server-local App.
+ */
+export async function listOAuthAppDirectory(serverId: string) {
+  return getDbForService().select({
+    clientId: oauthClients.clientId,
+    name: oauthClients.name,
+    logoUrl: oauthClients.logoUrl,
+    homepageUrl: oauthClients.homepageUrl,
+  }).from(oauthClients)
+    .leftJoin(oauthClientInstalls, and(
+      eq(oauthClientInstalls.clientId, oauthClients.id),
+      eq(oauthClientInstalls.serverId, serverId),
+    ))
+    .where(and(
+      oauthClientIsUserManagedPredicate(),
+      isInstalledThirdPartyAppPredicate(),
+      eq(oauthClients.humanMarketplaceVisible, true),
+      or(
+        eq(oauthClients.publishStatus, "published"),
+        eq(oauthClients.publishStatus, "unpublish_requested"),
+      ),
+    ))
+    .orderBy(asc(oauthClients.name), asc(oauthClients.id));
 }
 
 export async function getServerIntegrationsOverview(serverId: string): Promise<IntegrationOverviewItem[]> {

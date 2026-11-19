@@ -27,7 +27,7 @@ import { AgentRowSkeleton, MembersAgentGroup, MembersAgentUsageHeadings } from "
 import { MembersAgentUsageOne } from "./MembersAgentUsageOne";
 import { CELL, HEADING_LABEL } from "./membersAgentColumns";
 import type { AgentRowUsage } from "./MembersAgentList";
-import { firstUsageSort, sortUsageEntries } from "./membersAgentUsageModel";
+import { USAGE_NOTE, firstUsageSort, sortUsageEntries } from "./membersAgentUsageModel";
 import type { MembersAgentUsage, UsageSort, UsageSortKey } from "./membersAgentUsageModel";
 import type { MembersAgentUsageState } from "./useMembersAgentUsage";
 import type { MemberEntry, MemberGroup } from "./membersPageModel";
@@ -355,11 +355,11 @@ function UsageList({ usage, figures, groups, heading, openKey, onOpen }: {
             <span className={`${COL.trend} ${CELL}`}><Trend values={row.trend} mark={markIndex} partial={partialIndex} /></span>
           </>
         ),
-        // The server can't tell an agent that hasn't run since usage began
-        // from one whose Computer doesn't send it, nor can the page (no
-        // Computer version says it): "No usage yet", not "Update".
-        note: row.hasUsage ? null : (
-          <ListRowMeta data-testid="members-usage-no-usage">{formatMessage({ id: "members.usage.noUsageYet" })}</ListRowMeta>
+        // Why there are no figures, as the server tells it apart: the
+        // Computer is too old, the agent runs on none, or it hasn't run yet
+        // (also what an older server's "unknown" reads as here).
+        note: row.noUsage === null ? null : (
+          <ListRowMeta data-testid={USAGE_NOTE[row.noUsage].testId}>{formatMessage({ id: USAGE_NOTE[row.noUsage].labelId })}</ListRowMeta>
         ),
       });
     }

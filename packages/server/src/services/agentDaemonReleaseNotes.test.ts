@@ -284,18 +284,20 @@ test("agent-facing release notice: public Alpha 1.0.24 -> 1.0.25 carries the exa
   assert.doesNotMatch(allCopy, /stable promotion|production deployment/);
 });
 
-// Repository carrier tuple after Computer 1.22.0 went stable (2026-11-12): the
-// next carrier is 1.25.0, bumped right away so staging builds order above it.
-// Every Raft product shares one release number since 1.22.0 (tygg,
-// #proj-deploy:#7), and a Computer release takes the next free one: 1.23.0 is
-// the backend release already in production and 1.24.0 is taken by the next
-// backend release. (1.0.57 was skipped: npm @botiverse/raft 1.0.57 was
-// published on its own.) The CLI carries the Computer number (xxchan), so
-// all three are 1.25.0. The daemon is not released on its own
-// (docs/operations/computer-release-version.md). This does not describe the
-// CLI inside an already-published Computer artifact. Deliberate package bumps
-// must update this snapshot, so an unaccounted version change goes red here.
-test("Computer 1.25.0 closes the Computer, CLI, and daemon carrier tuple", () => {
+// Repository carrier tuple after Computer 1.25.3 went stable
+// (2026-11-15, tag computer-v1.25.3 on eb8f270e): the next carrier is
+// 1.25.4, bumped right away so staging builds (`<version>-staging.*`, which
+// SemVer orders below the released version) can publish to alpha again, and so
+// that the fixes merged after the rc land as the next patch: Hands keeps one
+// build per version name, so a later commit cannot become 1.25.3-rc.2
+// (docs/operations/computer-release-sop.md, step 4). Every Raft product shares
+// one release number since 1.22.0 (tygg, #proj-deploy:#7). The CLI carries the
+// Computer number (xxchan), so all three are 1.25.4. The daemon is not released
+// on its own (docs/operations/computer-release-version.md). This does not
+// describe the CLI inside an already-published Computer artifact. Deliberate
+// package bumps must update this snapshot, so an unaccounted version change
+// goes red here.
+test("Computer 1.25.4 closes the Computer, CLI, and daemon carrier tuple", () => {
   assert.deepEqual(
     {
       computer: readPackageVersion("computer"),
@@ -303,9 +305,9 @@ test("Computer 1.25.0 closes the Computer, CLI, and daemon carrier tuple", () =>
       daemon: readPackageVersion("daemon"),
     },
     {
-      computer: "1.25.0",
-      cli: "1.25.0",
-      daemon: "1.25.0",
+      computer: "1.25.4",
+      cli: "1.25.4",
+      daemon: "1.25.4",
     },
   );
 });

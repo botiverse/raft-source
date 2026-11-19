@@ -8,6 +8,7 @@ import type { ApiResponse } from "../../client";
 import type { AgentContext } from "../../auth/env";
 import type { CliIo } from "../../core/io";
 import { buildRaftProgram } from "../../program";
+import { RAFT_HINTS } from "@botiverse/raft-shared/src/agentCliSurface";
 
 const agentContext: AgentContext = {
   agentId: "agent-1",
@@ -50,8 +51,9 @@ async function run(argv: string[], reply: Reply) {
 }
 
 const ok = (data: unknown): ApiResponse<unknown> => ({ ok: true, status: 200, data, error: null });
-const refused = (status: number, code: string, details: Record<string, unknown>): ApiResponse<unknown> =>
-  ({ ok: false, status, data: null, error: code, errorCode: code, errorBody: { error: code, code, details } }) as ApiResponse<unknown>;
+/** A refusal as the Server words it: its sentence, its structured next step, its details. */
+const refusedSaying = (status: number, code: string, error: string, more: { next?: object; details?: Record<string, unknown> } = {}): ApiResponse<unknown> =>
+  ({ ok: false, status, data: null, error, errorCode: code, errorBody: { error, code, ...more } }) as ApiResponse<unknown>;
 
 test("resolve --note: the thread and the note reach the request; the answer says what was posted, who heard, and how to reopen", async () => {
   const r = await run(["artifact", "resolve", "pt_abc", "c_1", "--note", "Done in v13."], () => ok({
@@ -97,12 +99,15 @@ test("resolve: no comment is refused before any request; a reply and someone els
   assert.deepEqual(missing.requests, []);
   assert.ok(missing.stderr.includes("Name the thread to resolve") && missing.stderr.includes("raft artifact comments pt_abc --all"), missing.stderr);
 
-  const reply = await run(["artifact", "resolve", "pt_abc", "c_9"], () => refused(409, "COMMENT_IS_REPLY", { comment: "c_9", thread: "c_1" }));
-  assert.ok(reply.stderr.startsWith("Error: c_9 is a reply: only a whole thread is resolved, by its first comment (c_1).\nCode: COMMENT_IS_REPLY\nNext action: raft artifact resolve pt_abc c_1\n"), reply.stderr);
+  // The Server's own sentences and steps (#wg-ax:#13 P3).
+  const isReply = "That comment is a reply: only a whole thread is resolved, by its first comment (c_1).";
+  const reply = await run(["artifact", "resolve", "pt_abc", "c_9"], () => refusedSaying(409, "COMMENT_IS_REPLY", isReply, { next: RAFT_HINTS.artifactResolve({ artifact: "pt_abc", comment: "c_1" }), details: { comment: "c_9", thread: "c_1" } }));
+  assert.ok(reply.stderr.startsWith(`Error: ${isReply}\nCode: COMMENT_IS_REPLY\nNext action: raft artifact resolve pt_abc c_1\n`), reply.stderr);
 
-  const forbidden = await run(["artifact", "reopen", "pt_abc", "c_1"], () => refused(403, "FORBIDDEN", { reason: "not_resolver", title: "Proto", threadAuthor: kirby, author: { type: "user", name: "xxchan" } }));
-  assert.ok(forbidden.stderr.startsWith(`Error: You can't reopen thread c_1 on "Proto": only the thread's author @Kirby, the artifact's author @xxchan (or whoever manages it, when it's an agent), and the server's owners and admins can.\nCode: FORBIDDEN\n`), forbidden.stderr);
-  assert.ok(forbidden.stderr.includes("reply in it instead (that reopens it): raft artifact comment pt_abc --reply-to c_1"), forbidden.stderr);
+  const notResolver = "Only the thread's author, the artifact's author (or whoever manages it, when it's an agent), and the server's owners and admins can reopen a thread: to say it isn't done, reply in it instead (a reply reopens it).";
+  const forbidden = await run(["artifact", "reopen", "pt_abc", "c_1"], () => refusedSaying(403, "FORBIDDEN", notResolver, { next: RAFT_HINTS.artifactComment({ artifact: "pt_abc", replyTo: "c_1" }), details: { reason: "not_resolver", title: "Proto", threadAuthor: kirby, author: { type: "user", name: "xxchan" } } }));
+  assert.ok(forbidden.stderr.startsWith(`Error: ${notResolver}\nCode: FORBIDDEN\n`), forbidden.stderr);
+  assert.ok(forbidden.stderr.includes("Next action: raft artifact comment pt_abc --reply-to c_1"), forbidden.stderr);
 });
 
 test("comments --all: a resolved thread is marked status=resolved with who resolved it, and the open ones are listed with the resolve step", async () => {

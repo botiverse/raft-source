@@ -349,7 +349,17 @@ function PasskeyRow({ passkey, deleteDisabled, onRename, onDelete }: {
 // ── Adding: proof of identity first (design A6) ──
 
 /** Two-step verification off: the password again (POST /reauth/password), then the prompt. */
-function ReauthDialog({ onVerified, onClose }: { onVerified: () => Promise<void>; onClose: () => void }) {
+/**
+ * The password again, for a 403 `reauth_required` (design dlg-reauth-password):
+ * adding a passkey here, signing out a device (Signed-in devices). `description`
+ * says what it is for.
+ */
+export function ReauthDialog({ onVerified, onClose, description, testId = "passkeys-reauth-dialog" }: {
+  onVerified: () => Promise<void>;
+  onClose: () => void;
+  description?: string;
+  testId?: string;
+}) {
   const { formatMessage } = useIntl();
   const describeFailure = useFailureCopy();
   const answer = useAnswer();
@@ -380,7 +390,7 @@ function ReauthDialog({ onVerified, onClose }: { onVerified: () => Promise<void>
       busy={answer.busy}
       onClose={onClose}
       onSubmit={handleSubmit}
-      testId="passkeys-reauth-dialog"
+      testId={testId}
       footer={(
         <>
           <CancelButton busy={answer.busy} onClose={onClose} />
@@ -388,7 +398,7 @@ function ReauthDialog({ onVerified, onClose }: { onVerified: () => Promise<void>
         </>
       )}
     >
-      <DialogDescription>{formatMessage({ id: "settings.passkeys.reauthDescription" })}</DialogDescription>
+      <DialogDescription>{description ?? formatMessage({ id: "settings.passkeys.reauthDescription" })}</DialogDescription>
       <AnswerField
         kind="password"
         label={formatMessage({ id: "settings.twoStep.passwordLabel" })}
@@ -401,7 +411,12 @@ function ReauthDialog({ onVerified, onClose }: { onVerified: () => Promise<void>
   );
 }
 
-function NoPasswordDialog({ onClose }: { onClose: () => void }) {
+/** A `reauth_required` for an account without a password: only a fresh sign-in proves it. */
+export function NoPasswordDialog({ onClose, description, testId = "passkeys-reauth-dialog" }: {
+  onClose: () => void;
+  description?: string;
+  testId?: string;
+}) {
   const { formatMessage } = useIntl();
   return (
     <StepDialog
@@ -411,10 +426,10 @@ function NoPasswordDialog({ onClose }: { onClose: () => void }) {
       busy={false}
       onClose={onClose}
       onSubmit={onClose}
-      testId="passkeys-reauth-dialog"
+      testId={testId}
       footer={<DoneButton onClose={onClose} />}
     >
-      <DialogDescription>{formatMessage({ id: "settings.passkeys.reauthNoPassword" })}</DialogDescription>
+      <DialogDescription>{description ?? formatMessage({ id: "settings.passkeys.reauthNoPassword" })}</DialogDescription>
     </StepDialog>
   );
 }

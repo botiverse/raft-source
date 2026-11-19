@@ -3,9 +3,9 @@ import { eq } from "drizzle-orm";
 import { asServerId, validateAnnouncementAudience, type AnnouncementClient, type AnnouncementRulePlatform } from "@botiverse/raft-shared";
 import { dbTest as test } from "../test/integration/dbTest";
 import { closeTestDatabase } from "../test/integration/database";
-import { users, servers, serverMembers, announcements, channels } from "../db/schema";
+import { users, servers, serverMembers, announcements, channels, machines } from "../db/schema";
 import { seedBoundGuest } from "../test/guestFixture";
-import { listUndismissedForUser, dismiss } from "./announcementService";
+import { listUndismissedForUser, dismiss, resetAnnouncementComputerVersionsCacheForTest } from "./announcementService";
 afterEach(closeTestDatabase);
 test("targeting precedes FIFO; workspace membership and dismissal remain authoritative", async ({ db }) => {
   const [user, outsider] = await db.insert(users).values([
@@ -205,4 +205,44 @@ test("audience rules apply in queue order, follow live facts, and gate dismissal
   assert.equal(await dismiss(user.id, desktop.id, now, asServerId(server.id), null, "desktop"), true);
   const stacked = await listUndismissedForUser(user.id, undefined, new Date("2026-12-01T00:00:00Z"), undefined, asServerId(server.id), null, 1, "desktop");
   assert.equal(stacked[0].id, admins.id, "account age is measured at load time");
+});
+
+test("computer_version: the open Server's Computers in use (30 days) below the version, or unreported; cached per Server (task #39)", async ({ db }) => {
+  resetAnnouncementComputerVersionsCacheForTest();
+  const now = new Date("2026-11-14T00:00:00Z");
+  const day = 24 * 60 * 60_000;
+  const [user] = await db.insert(users).values({ email: "cv@test.invalid", name: "cv", displayName: "CV", passwordHash: "test" }).returning();
+  const [oldOne, upgraded, idle, unknown] = await db.insert(servers).values([
+    { name: "Old", slug: "cv-old", ownerId: user.id },
+    { name: "Upgraded", slug: "cv-up", ownerId: user.id },
+    { name: "Idle", slug: "cv-idle", ownerId: user.id },
+    { name: "Unknown", slug: "cv-unknown", ownerId: user.id },
+  ]).returning();
+  await db.insert(serverMembers).values([oldOne, upgraded, idle, unknown].map((server) => ({ serverId: server.id, userId: user.id, role: "owner" as const })));
+  const computer = (serverId: string, computerVersion: string | null, lastHeartbeat: Date | null, n: number) =>
+    ({ serverId, userId: user.id, name: `c${n}`, apiKeyHash: `h-${serverId}-${n}`, computerVersion, lastHeartbeat });
+  const [oldComputer] = await db.insert(machines).values([
+    computer(oldOne.id, "1.0.52", new Date(now.getTime() - 2 * day), 1),
+    computer(oldOne.id, "1.0.60", new Date(now.getTime() - 2 * day), 2),
+    computer(upgraded.id, "1.0.53", new Date(now.getTime() - day), 1),
+    computer(upgraded.id, "1.0.53-rc.2", new Date(now.getTime() - 40 * day), 2), // stale: not in use
+    computer(idle.id, null, null, 1), // never connected
+    computer(unknown.id, null, new Date(now.getTime() - 29 * day), 1),
+  ]).returning();
+  const rules = { match: "all", groups: [{ match: "all", conditions: [{ field: "computer_version", below: "1.0.53" }] }] };
+  const [nudge, global] = await db.insert(announcements).values([
+    { title: "Upgrade", pages: [{ body: "U" }], status: "published", startsAt: new Date("2026-01-01"), audience: validateAnnouncementAudience({ type: "all", rules }) },
+    { title: "Global", pages: [{ body: "G" }], status: "published", startsAt: new Date("2026-02-01") },
+  ]).returning();
+  const head = async (serverId: string | null, at = now) =>
+    (await listUndismissedForUser(user.id, undefined, at, undefined, serverId ? asServerId(serverId) : undefined, null, 1, "web"))[0]?.id;
+  assert.equal(await head(oldOne.id), nudge.id, "one Computer in use below the version is enough");
+  assert.equal(await head(unknown.id), nudge.id, "a Computer in use that never reported a version counts as older");
+  assert.equal(await head(upgraded.id), global.id, "a stale older Computer does not count");
+  assert.equal(await head(idle.id), global.id, "a never-connected Computer does not count");
+  assert.equal(await head(null), global.id, "with no Server open the condition does not match");
+  // An upgrade is seen once the per-Server cache (5 minutes) has expired.
+  await db.update(machines).set({ computerVersion: "1.0.53" }).where(eq(machines.id, oldComputer.id));
+  assert.equal(await head(oldOne.id, new Date(now.getTime() + 60_000)), nudge.id, "cached within 5 minutes");
+  assert.equal(await head(oldOne.id, new Date(now.getTime() + 6 * 60_000)), global.id, "re-read after the cache expires");
 });

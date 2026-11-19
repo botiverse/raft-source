@@ -1,4 +1,5 @@
 import {
+  ACTIVITY_UNCOUNTED_SYSTEM_SUBTYPES,
   formatInboxScopeCorruptionLine,
   makeInboxScopeReadFrontier,
   type InboxScopeCursorCorruption,
@@ -27,6 +28,13 @@ export type InboxPolicyMessage = {
   content?: string;
   senderType: InboxPolicyActorType;
   senderId: string;
+  /** Absent: a chat message. */
+  messageType?: "chat" | "system";
+  /** A system message's subtype; a noise subtype (shared ACTIVITY_UNCOUNTED_SYSTEM_SUBTYPES) never counts. */
+  systemSubtype?: string | null;
+  /** Who caused a system message: the receiver's own never counts for them. */
+  causalActorType?: string | null;
+  causalActorId?: string | null;
 };
 
 export type InboxPolicyMentionFact = {
@@ -642,13 +650,24 @@ function channelMessages(model: InboxPolicyModel, channelId: string): InboxPolic
     .sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
 }
 
-function unreadMessages(model: InboxPolicyModel, channelId: string): InboxPolicyMessage[] {
-  const cursor = lastReadSeq(model, channelId);
+/**
+ * Does a message past the cursor count as unread for the receiver? Not their
+ * own, not a system message they caused, not a noise subtype: the agreed
+ * Activity rule (shared activityUnreadPredicate.ts, contract cases
+ * predicate_*_own_caused_system / *_subtype; RisingWave `unread_count`).
+ */
+function countsForReceiver(model: InboxPolicyModel, message: InboxPolicyMessage): boolean {
   const currentReceiverType = receiverType(model);
   const currentReceiverId = receiverId(model);
-  return channelMessages(model, channelId).filter((message) =>
-    message.seq > cursor && !(message.senderType === currentReceiverType && message.senderId === currentReceiverId)
-  );
+  if (message.senderType === currentReceiverType && message.senderId === currentReceiverId) return false;
+  if (message.messageType !== "system") return true;
+  if (message.causalActorType === currentReceiverType && message.causalActorId === currentReceiverId) return false;
+  return message.systemSubtype == null || !ACTIVITY_UNCOUNTED_SYSTEM_SUBTYPES.includes(message.systemSubtype);
+}
+
+function unreadMessages(model: InboxPolicyModel, channelId: string): InboxPolicyMessage[] {
+  const cursor = lastReadSeq(model, channelId);
+  return channelMessages(model, channelId).filter((message) => message.seq > cursor && countsForReceiver(model, message));
 }
 
 function isVisibleMentionForReceiver(model: InboxPolicyModel, mention: InboxPolicyMentionFact): boolean {
@@ -706,12 +725,17 @@ function receiverActivityMessages(model: InboxPolicyModel, sourceChannelId: stri
   );
 }
 
+/**
+ * The unread of a channel or DM row: past the cursor, counted for the
+ * receiver, and before the mute. A mention past the mute lists the row and
+ * lights its @ (receiverActivityMessages, hasUnreadMention) but does not count
+ * (contract case predicate_muted_channel_mention; RisingWave muted prefix).
+ */
 function unreadReceiverActivityMessages(model: InboxPolicyModel, sourceChannelId: string): InboxPolicyMessage[] {
   const cursor = lastReadSeq(model, sourceChannelId);
-  const currentReceiverType = receiverType(model);
-  const currentReceiverId = receiverId(model);
-  return receiverActivityMessages(model, sourceChannelId).filter((message) =>
-    message.seq > cursor && !(message.senderType === currentReceiverType && message.senderId === currentReceiverId)
+  const muteStartSeq = receiverMuteStartSeq(model, sourceChannelId);
+  return channelMessages(model, sourceChannelId).filter((message) =>
+    message.seq > cursor && (muteStartSeq == null || message.seq < muteStartSeq) && countsForReceiver(model, message)
   );
 }
 

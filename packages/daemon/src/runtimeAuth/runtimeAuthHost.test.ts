@@ -444,7 +444,6 @@ test("a V1 server is sent exactly Claude Code and Codex; a V2 server every runti
     pi: { kind: "unavailable", reason: "not_installed" },
     grok: { kind: "unavailable", reason: "not_installed" },
     opencode: { kind: "unavailable", reason: "not_installed" },
-    codebuddy: { kind: "unavailable", reason: "not_installed" },
   });
   assert.deepEqual(v2.loads.sort(), ["kimi-status", "qoder"], "Kimi Code's status is read from its token files: neither OAR's kimi nor the SDK is loaded");
 
@@ -550,7 +549,7 @@ test("the runtimes a server reads follow its capabilities", () => {
   assert.deepEqual(runtimeAuthRuntimesReadBy([SERVER_CAPABILITY_RUNTIME_AUTH_V1]), ["claude", "codex"]);
   // A V2 server reads every runtime this daemon knows, Pi included (a server from before Pi drops the
   // key and keeps the rest); what the server may send back is the daemon's capabilities' say, not this.
-  assert.deepEqual(runtimeAuthRuntimesReadBy([SERVER_CAPABILITY_RUNTIME_AUTH_V1, SERVER_CAPABILITY_RUNTIME_AUTH_V2]), ["claude", "codex", "kimi", "qoder", "qwen", "antigravity", "pi", "grok", "opencode", "codebuddy"]);
+  assert.deepEqual(runtimeAuthRuntimesReadBy([SERVER_CAPABILITY_RUNTIME_AUTH_V1, SERVER_CAPABILITY_RUNTIME_AUTH_V2]), ["claude", "codex", "kimi", "qoder", "qwen", "antigravity", "pi", "grok", "opencode"]);
 });
 
 // ─── Antigravity: status and login (OAR 0.97), logout (OAR 0.98) ───
@@ -701,53 +700,6 @@ test("the status trace carries Antigravity's keys through the real contract", as
 
 /** OAR 0.99's `device_code` from `grok login --device-auth`: the code is the link's `user_code`. */
 const GROK_DEVICE_URL = "https://accounts.x.ai/oauth2/device?user_code=WXYZ-1234";
-
-// ─── CodeBuddy Code (OAR-only): status, link login, logout ───
-
-test("CodeBuddy's status, link login and logout run on OAR's codebuddy, with no browser on the Computer; never on Windows", async () => {
-  const CODEBUDDY_URL = "https://www.codebuddy.ai/login?state=s1";
-  let loginOptions: unknown;
-  const logoutOptions: unknown[] = [];
-  const changes: Array<[RuntimeAuthRuntime, RuntimeAuthCredentialsChange]> = [];
-  const { host, sent, events, loads, settle } = harness({
-    authStatus: async () => ({ kind: "logged_in", source: "codebuddy stream-json initialize.account" }),
-    login: async (_installation, interaction, options) => {
-      loginOptions = options;
-      interaction.onEvent({ kind: "auth_url", url: CODEBUDDY_URL, instructions: "Open this URL to sign in to CodeBuddy." });
-      return { kind: "logged_in" };
-    },
-    logout: async (_installation, options) => { logoutOptions.push(options); return { kind: "logged_out" }; },
-  }, { onCredentialsChanged: (runtime, reason) => changes.push([runtime, reason]) });
-
-  const report = await host.collectStatus(RUNTIME_AUTH_RUNTIMES, ["codebuddy"]);
-  assert.deepEqual(report.runtimes.codebuddy, { kind: "logged_in" }, "signed in, no account (OAR exposes none)");
-  assert.deepEqual(loads, ["codebuddy"], "detected as the Raft runtime codebuddy");
-
-  host.startLogin(loginId("codebuddy"), "codebuddy");
-  await settle();
-  assert.deepEqual(loginOptions, { openBrowser: false });
-  const event = sent.find((message) => message.type === "machine:runtime_auth:login:event") as { event: { kind: string; url?: string } } | undefined;
-  assert.equal(event?.event.kind, "auth_url");
-  assert.equal(event?.event.url, CODEBUDDY_URL);
-  const result = sent.find((message) => message.type === "machine:runtime_auth:login:result") as { result: unknown } | undefined;
-  assert.deepEqual(result?.result, { kind: "logged_in" });
-  assert.ok(!JSON.stringify(events).includes("codebuddy.ai"), "the link is in no trace");
-
-  await host.logout("req-codebuddy", "codebuddy");
-  const logout = sent.find((message) => message.type === "machine:runtime_auth:logout:result") as { result: unknown };
-  assert.deepEqual(logout.result, { kind: "logged_out" });
-  assert.deepEqual(logoutOptions, [{ timeoutMs: RUNTIME_AUTH_LOGOUT_TIMEOUT_MS }]);
-  assert.deepEqual(changes, [["codebuddy", "login"], ["codebuddy", "logout"]], "CodeBuddy agents on the Computer's sign-in are released");
-
-  // The OAR host, and so CodeBuddy, does not run on Windows.
-  const windows = harness({ authStatus: async () => ({ kind: "logged_in", source: "x" }), login: async () => ({ kind: "logged_in" }) }, { platform: "win32" });
-  assert.deepEqual((await windows.host.collectStatus(RUNTIME_AUTH_RUNTIMES, ["codebuddy"])).runtimes.codebuddy, { kind: "unavailable", reason: "unsupported_installation" });
-  windows.host.startLogin(loginId("codebuddywin"), "codebuddy");
-  await windows.settle();
-  const winResult = windows.sent.find((message) => message.type === "machine:runtime_auth:login:result") as { result: unknown };
-  assert.deepEqual(winResult.result, { kind: "unsupported", reason: "unsupported_installation" });
-  assert.ok(!windows.loads.includes("codebuddy"), "OAR's codebuddy was never loaded there");
-});
 
 test("Grok's status is grok's own (OAR authStatus, `grok models`): signed in names its method; signed out and unknown pass through", async () => {
   const seen: unknown[] = [];

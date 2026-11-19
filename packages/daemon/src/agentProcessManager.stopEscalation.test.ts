@@ -284,6 +284,15 @@ describe.skipIf(process.platform === "win32")("reconciler step 5: every stop pat
       }
       await waitFor(() => !tracked(ctx, agentId, runtime), "the release after the exit");
       assert.equal(ctx.events.some((event) => event.name === "daemon.agent.stop.kill_unconfirmed"), false);
+      if (stopCase.path === "explicit_stop" || stopCase.path === "silent_stop") {
+        // stopAgent's own record: the shutdown's (stopAll) or a person's, forced after the grace.
+        const stop = ctx.events.find((event) => event.name === "daemon.agent.stop" && event.attrs.agentId === agentId);
+        assert.ok(stop, "daemon.agent.stop");
+        assert.deepEqual([stop.attrs.host, stop.attrs.runtime, stop.attrs.reason, stop.attrs.had_process, stop.attrs.escalated, stop.attrs.exit_confirmed], [
+          "legacy", "claude", stopCase.path === "silent_stop" ? "shutdown" : "explicit", true, true, true,
+        ]);
+        assert.ok(Number(stop.attrs.wait_ms) >= GRACE_MS - 20, `wait_ms ${stop.attrs.wait_ms}`);
+      }
     }, stopCase.driver);
   });
 });

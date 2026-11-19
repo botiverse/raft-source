@@ -1,3 +1,4 @@
+import { DESKTOP_DOWNLOAD_FROM_APP, DESKTOP_DOWNLOAD_FROM_PARAM } from "@botiverse/raft-shared";
 import { RUNTIME_API_BASE } from "../runtimeEndpoints";
 
 /**
@@ -7,8 +8,13 @@ import { RUNTIME_API_BASE } from "../runtimeEndpoints";
  */
 export type DesktopTarget = "mac" | "mac-arm64" | "mac-x64" | "linux-appimage" | "linux-deb" | "windows";
 
+/**
+ * Every link the app makes says it came from the app (`from=app`), so the
+ * server leaves it out of `desktop_download_requested`: in-app clicks are
+ * `app_download_clicked`'s, which follows the person's usage-data choice.
+ */
 export function desktopDownloadUrl(target: DesktopTarget, apiBase: string = RUNTIME_API_BASE): string {
-  return `${apiBase.replace(/\/$/, "")}/desktop-download?target=${target}`;
+  return `${apiBase.replace(/\/$/, "")}/desktop-download?target=${target}&${DESKTOP_DOWNLOAD_FROM_PARAM}=${DESKTOP_DOWNLOAD_FROM_APP}`;
 }
 
 /** Which desktop OS this browser runs on, or null (a phone, a tablet, unknown). */
@@ -103,6 +109,25 @@ export const DEFAULT_DESKTOP_PLATFORMS: DesktopPlatforms = {
   linux: { status: "unknown" },
   windows: { status: "none" },
 };
+
+function isPlatformStatus(value: unknown): value is PlatformStatus {
+  const status = (value as { status?: unknown } | null)?.status;
+  return status === "available" || status === "none" || status === "unknown";
+}
+
+/**
+ * The platforms answer as the page may read it: each platform the server
+ * described, the default for any it did not (a malformed or partial answer
+ * must not take the pages that offer the app down with it).
+ */
+export function desktopPlatformsFrom(data: unknown): DesktopPlatforms {
+  const answer = (data && typeof data === "object" ? data : {}) as Partial<Record<keyof DesktopPlatforms, unknown>>;
+  return {
+    mac: isPlatformStatus(answer.mac) ? answer.mac : DEFAULT_DESKTOP_PLATFORMS.mac,
+    linux: isPlatformStatus(answer.linux) ? answer.linux : DEFAULT_DESKTOP_PLATFORMS.linux,
+    windows: isPlatformStatus(answer.windows) ? answer.windows : DEFAULT_DESKTOP_PLATFORMS.windows,
+  };
+}
 
 /** Whether to offer a platform: yes unless the release says it has none. */
 export function offered(platform: PlatformStatus | undefined): boolean {

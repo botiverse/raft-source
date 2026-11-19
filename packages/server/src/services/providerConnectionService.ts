@@ -1,4 +1,5 @@
 import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { and, asc, eq, sql } from "drizzle-orm";
 import {
   BUILTIN_RUNTIME_GATEWAY_PROVIDER_BASE_URL_ENV_KEYS,
@@ -6,9 +7,11 @@ import {
   BUILTIN_RUNTIME_PROVIDER_ENV_KEYS,
   clearClockTimeout,
   currentDate,
+  isBuiltInRuntimeCustomModelPresetProviderId,
   isBuiltInRuntimeGatewayProviderId,
   isBuiltInRuntimeProviderId,
   isProviderConnectionProviderId,
+  normalizeBuiltInPresetCustomModel,
   PI_BUILTIN_PROVIDER_CONNECTION_PROBES,
   PI_BUILTIN_PROVIDER_DEFAULT_MODELS,
   PI_BUILTIN_PROVIDER_MODELS,
@@ -724,6 +727,19 @@ export async function deleteProviderConnection(input: {
  *  malformed value is "unavailable", never a database error). */
 export const SAVED_CONNECTION_ID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/**
+ * The provider of a saved connection in this server, or null (unknown or
+ * malformed id). No availability gates: for checks that only need to know
+ * what a bound connection runs on (the migration target's catalog check).
+ */
+export async function providerConnectionProviderId(serverId: string, connectionId: string): Promise<string | null> {
+  if (!SAVED_CONNECTION_ID_SHAPE.test(connectionId)) return null;
+  const [row] = await getDb().select({ providerId: providerConnections.providerId }).from(providerConnections)
+    .where(and(eq(providerConnections.serverId, serverId), eq(providerConnections.id, connectionId)))
+    .limit(1);
+  return row?.providerId ?? null;
+}
+
 export async function resolveProviderConnectionSelection(serverId: string, connectionId: string) {
   if (!SAVED_CONNECTION_ID_SHAPE.test(connectionId)) {
     throw new ProviderConnectionError("Provider connection is unavailable", "provider_connection_unavailable");
@@ -749,13 +765,26 @@ export async function resolveProviderConnectionSelection(serverId: string, conne
   };
 }
 
+/**
+ * A saved preset connection takes what its provider takes directly: a listed
+ * model, or (task #10) on a provider that takes a typed id, a custom model
+ * stored as the direct path stores it (normalizeBuiltInPresetCustomModel; the
+ * v2 form builds it so). Whether the target Computer runs that typed id is
+ * the catalog check's (builtInCatalogSelection). A gateway connection takes a
+ * custom model only.
+ */
 export function assertProviderConnectionModelCompatible(
   providerId: ProviderConnectionProviderId,
   model: RuntimeModelConfig,
 ): void {
   if (isBuiltInRuntimeProviderId(providerId)) {
     const allowed = PI_BUILTIN_PROVIDER_MODELS[providerId] ?? [];
-    if (model.kind !== "preset" || !allowed.some((candidate) => candidate.id === model.id)) {
+    const compatible = model.kind === "preset"
+      ? allowed.some((candidate) => candidate.id === model.id)
+      : isBuiltInRuntimeCustomModelPresetProviderId(providerId)
+        && model.name.trim() !== ""
+        && isDeepStrictEqual(normalizeBuiltInPresetCustomModel(providerId, model), model);
+    if (!compatible) {
       throw new ProviderConnectionError(
         "Selected model is not compatible with the provider connection",
         "provider_connection_invalid",

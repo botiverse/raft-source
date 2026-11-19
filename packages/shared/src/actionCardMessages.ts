@@ -21,6 +21,9 @@
 
 import type { ActionCardSpecMsg, ActionCardSpecMsgParam } from "./actionCardSpec";
 import { DISPLAY_LOCALES, DISPLAY_LOCALE_INFO, type DisplayLocale } from "./displayLocales";
+import type { ActionCardMessageKey } from "./actionCardMessageKeys";
+
+export type { ActionCardMessageKey } from "./actionCardMessageKeys";
 
 export interface ActionCardMessageEntry {
   /** The web catalog id this copies; null for copy only cards have. */
@@ -495,6 +498,19 @@ export const ACTION_CARD_MESSAGES = {
       "ja": "推奨のコンピューター",
       "zh-cn": "建议的计算机",
       "zh-tw": "建議的電腦",
+    },
+  },
+  "actionCard.field.suggestedRuntime": {
+    source: "actionCard.field.suggestedRuntime",
+    text: {
+      "en": "Suggested runtime",
+      "es": "Runtime sugerido",
+      "pt-br": "Runtime sugerido",
+      "ru": "Рекомендуемая среда выполнения",
+      "ko": "추천 런타임",
+      "ja": "推奨のランタイム",
+      "zh-cn": "建议的运行时",
+      "zh-tw": "建議的執行環境",
     },
   },
   "actionCard.field.hosting": {
@@ -1854,6 +1870,153 @@ export const ACTION_CARD_MESSAGES = {
       "zh-tw": "預計抵達",
     },
   },
+  // Card-only copy for request:prepare (RFC 085 §4.4): the frame around a route's template. Its form and its
+  // declined and unknown lines reuse the owner-action copy above, which says the same thing.
+  "actionCard.preparedRequest.preparedFor": {
+    source: null,
+    text: {
+      "en": "{agent} prepared this for {person} to confirm.",
+      "es": "{agent} preparó esto para que {person} lo confirme.",
+      "pt-br": "{agent} preparou isto para {person} confirmar.",
+      "ru": "Подготовлено агентом {agent}. Подтвердить может {person}.",
+      "ko": "{agent}이(가) {person}의 확인을 받으려고 준비했어요.",
+      "ja": "{agent} が {person} の確認用に準備しました。",
+      "zh-cn": "{agent} 准备了这个请求，等待 {person} 确认。",
+      "zh-tw": "{agent} 準備了這個請求，等待 {person} 確認。",
+    },
+  },
+  "actionCard.preparedRequest.changed": {
+    source: null,
+    text: {
+      "en": "This changed since it was prepared. Check it again before you confirm.",
+      "es": "Esto cambió desde que se preparó. Revísalo de nuevo antes de confirmar.",
+      "pt-br": "Isto mudou desde que foi preparado. Confira de novo antes de confirmar.",
+      "ru": "С момента подготовки это изменилось. Проверьте ещё раз перед подтверждением.",
+      "ko": "준비된 뒤로 내용이 바뀌었어요. 확인하기 전에 다시 살펴보세요.",
+      "ja": "準備された後に内容が変わりました。確認する前にもう一度見直してください。",
+      "zh-cn": "准备之后内容有变化，确认前请再核对一遍。",
+      "zh-tw": "準備之後內容有變化，確認前請再核對一遍。",
+    },
+  },
+  "actionCard.preparedRequest.refused": {
+    source: null,
+    text: {
+      "en": "The last try didn't go through ({code}). You can try again.",
+      "es": "El último intento no se completó ({code}). Puedes volver a intentarlo.",
+      "pt-br": "A última tentativa não deu certo ({code}). Você pode tentar de novo.",
+      "ru": "Последняя попытка не удалась ({code}). Можно попробовать ещё раз.",
+      "ko": "마지막 시도가 처리되지 않았어요({code}). 다시 시도할 수 있어요.",
+      "ja": "前回の試行は完了しませんでした（{code}）。もう一度試せます。",
+      "zh-cn": "上一次尝试没有成功（{code}），可以再试一次。",
+      "zh-tw": "上一次嘗試沒有成功（{code}），可以再試一次。",
+    },
+  },
+  "actionCard.preparedRequest.changedUnavailable": {
+    source: null,
+    text: {
+      "en": "This changed since it was prepared and can't be confirmed any more. The agent was told.",
+      "es": "Esto cambió desde que se preparó y ya no se puede confirmar. Se avisó al agente.",
+      "pt-br": "Isto mudou desde que foi preparado e não pode mais ser confirmado. O agente foi avisado.",
+      "ru": "С момента подготовки это изменилось, и подтвердить это уже нельзя. Агент уведомлён.",
+      "ko": "준비된 뒤로 내용이 바뀌어 더 이상 확인할 수 없어요. 에이전트에게 알렸어요.",
+      "ja": "準備された後に内容が変わったため、もう確認できません。エージェントに伝えました。",
+      "zh-cn": "准备之后内容有变化，已无法确认。已告知 Agent。",
+      "zh-tw": "準備之後內容有變化，已無法確認。已告知 Agent。",
+    },
+  },
+  // The RFC 085 delegable list's summary templates (services/delegableSummaryTemplates.ts): each title takes its
+  // model's entries by name (EntityRefs the client names), each verb labels the confirm button.
+  "actionCard.preparedRequest.agentStart.title": {
+    source: null,
+    text: {
+      "en": "Start {agent}",
+      "es": "Iniciar {agent}",
+      "pt-br": "Iniciar {agent}",
+      "ru": "Запустить {agent}",
+      "ko": "{agent} 시작",
+      "ja": "{agent} を起動",
+      "zh-cn": "启动 {agent}",
+      "zh-tw": "啟動 {agent}",
+    },
+  },
+  "actionCard.preparedRequest.agentStart.verb": {
+    source: null,
+    text: {
+      "en": "Start agent",
+      "es": "Iniciar agente",
+      "pt-br": "Iniciar agente",
+      "ru": "Запустить агента",
+      "ko": "에이전트 시작",
+      "ja": "エージェントを起動",
+      "zh-cn": "启动 Agent",
+      "zh-tw": "啟動 Agent",
+    },
+  },
+  "actionCard.preparedRequest.agentStop.title": {
+    source: null,
+    text: {
+      "en": "Stop {agent}",
+      "es": "Detener {agent}",
+      "pt-br": "Parar {agent}",
+      "ru": "Остановить {agent}",
+      "ko": "{agent} 중지",
+      "ja": "{agent} を停止",
+      "zh-cn": "停止 {agent}",
+      "zh-tw": "停止 {agent}",
+    },
+  },
+  "actionCard.preparedRequest.agentStop.verb": {
+    source: null,
+    text: {
+      "en": "Stop agent",
+      "es": "Detener agente",
+      "pt-br": "Parar agente",
+      "ru": "Остановить агента",
+      "ko": "에이전트 중지",
+      "ja": "エージェントを停止",
+      "zh-cn": "停止 Agent",
+      "zh-tw": "停止 Agent",
+    },
+  },
+  "actionCard.preparedRequest.removeChannelAdmin.title": {
+    source: null,
+    text: {
+      "en": "Remove channel admin from {member} in {channel}",
+      "es": "Quitar a {member} el rol de admin del canal {channel}",
+      "pt-br": "Remover {member} da administração do canal {channel}",
+      "ru": "Снять с {member} роль администратора канала {channel}",
+      "ko": "{channel}에서 {member} 님의 채널 관리자 권한 해제",
+      "ja": "{channel} で {member} のチャンネル管理者権限を解除",
+      "zh-cn": "撤销 {member} 在 {channel} 的频道管理员",
+      "zh-tw": "移除 {member} 在 {channel} 的頻道管理員身分",
+    },
+  },
+  "actionCard.preparedRequest.removeChannelAdmin.verb": {
+    source: null,
+    text: {
+      "en": "Remove channel admin",
+      "es": "Quitar admin del canal",
+      "pt-br": "Remover admin do canal",
+      "ru": "Снять роль администратора",
+      "ko": "채널 관리자 해제",
+      "ja": "チャンネル管理者を解除",
+      "zh-cn": "撤销频道管理员",
+      "zh-tw": "移除頻道管理員",
+    },
+  },
+  "actionCard.preparedRequest.field.member": {
+    source: null,
+    text: {
+      "en": "Member",
+      "es": "Miembro",
+      "pt-br": "Membro",
+      "ru": "Участник",
+      "ko": "멤버",
+      "ja": "メンバー",
+      "zh-cn": "成员",
+      "zh-tw": "成員",
+    },
+  },
   "actionCard.result.approveCall.approved": {
     source: null,
     text: {
@@ -2554,9 +2717,7 @@ export const ACTION_CARD_MESSAGES = {
       "zh-tw": "收起",
     },
   },
-} as const satisfies Record<string, ActionCardMessageEntry>;
-
-export type ActionCardMessageKey = keyof typeof ACTION_CARD_MESSAGES;
+} as const satisfies Record<ActionCardMessageKey, ActionCardMessageEntry>;
 /** A key split out of a web plural: `actionCard.x` for `actionCard.x.one` / `actionCard.x.other`. */
 export type ActionCardPluralMessageKey = {
   [K in ActionCardMessageKey]: K extends `${infer Base}.other` ? (typeof ACTION_CARD_MESSAGES)[K] extends { branch: string } ? Base : never : never;

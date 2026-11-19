@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type Stripe from "stripe";
 import {
@@ -12,17 +13,26 @@ import {
   paidReceiptMarkerFromHtml,
 } from "./paidLifecycleContracts";
 
-test("offline assets match the reviewed welcome and unchanged check-in; migration uses the actual docs anchor", () => {
+// The offline renderer is repository tooling (scripts/ at the root), which the
+// source-available snapshot does not carry; skipped when an exported
+// snapshot's RELEASE_SOURCE marker is present.
+const inSourceSnapshot = existsSync(fileURLToPath(new URL("../../../../RELEASE_SOURCE", import.meta.url)));
+
+test("the documented offline Node entrypoint emits the same deployable assets", { skip: inSourceSnapshot }, () => {
   const rendered = JSON.parse(execFileSync(process.execPath, [
     fileURLToPath(new URL("../../../../scripts/render-paid-lifecycle-assets.mjs", import.meta.url)),
   ], { encoding: "utf8" }));
-  assert.deepEqual(rendered.templates, PAID_LIFECYCLE_TEMPLATES,
-    "the documented offline Node entrypoint must emit the same deployable assets");
+  assert.deepEqual(rendered.templates, PAID_LIFECYCLE_TEMPLATES);
+});
+
+test("offline assets match the reviewed welcome and unchanged check-in; migration uses the actual docs anchor", () => {
   const { welcome, checkin } = PAID_LIFECYCLE_TEMPLATES;
   assert.equal(welcome.subject, "Welcome to Raft Pro");
   assert.equal(createHash("sha256").update(welcome.html).digest("hex"),
-    "88e3ab4fdc7f08622f24fe3ac3b411a9e071ef4bdc915868519fe8080d96f862");
+    "00952b81b98be6bd15f6e2e71d485093fc11789255a8e297f73ab86b6ba6f479");
   assert.ok(welcome.html.includes("https://docs.raft.build/features/server/computers/#move-an-agent-to-another-computer"));
+  assert.ok(welcome.html.includes("https://docs.raft.build/features/messaging/external-channels/"));
+  assert.doesNotMatch(welcome.html, /joint/i);
   assert.equal(createHash("sha256").update(checkin.html).digest("hex"),
     "3a641c52225a0c7a4c79a2f98054978afb6661801ee6eba4025c18a28008f163");
 });

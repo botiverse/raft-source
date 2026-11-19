@@ -100,7 +100,7 @@ export function McpAppProfileSection({
           </div>
         </FormField>
         <div className="stack-y-3">
-          <FormField label={formatMessage({ id: "settings.connectedApps.appNameLabel" })} size="compact" required>
+          <FormField label={formatMessage({ id: "settings.connectedApps.appNameLabel" })} size="compact">
             <Input
               type="text"
               value={profile.name}

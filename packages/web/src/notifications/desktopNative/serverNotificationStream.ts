@@ -23,6 +23,7 @@ import type { DesktopNotificationRequest } from "@botiverse/raft-shared";
 import { localizeNotificationKey, localizeNotificationText } from "../localizeNotification";
 import type { NotificationKeyLocalizer } from "../localizeNotification";
 import { followSocket } from "./followSocket";
+import { messageCardFallbackText } from "../../utils/messageCardFallbackText";
 import type { EventSocketLike, SocketSource } from "./followSocket";
 
 // The server also drops events older than 10 minutes at claim time; this is
@@ -61,7 +62,7 @@ export function adaptServerNotification(
     kind: p.kind,
     title: text.title,
     ...(text.subtitle ? { subtitle: text.subtitle } : {}),
-    body: text.body,
+    body: messageCardFallbackText(text.body),
     ...(p.serverName ? { groupTitle: p.serverName } : {}),
     groupKey: p.groupKey,
     ...(p.replaceKey ? { replaceKey: p.replaceKey } : {}),

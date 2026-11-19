@@ -1,0 +1,49 @@
+{
+  "formatVersion": 1,
+  "id": "predicate_muted_channel_mention",
+  "rule": "predicate",
+  "title": "In a muted channel, a mention of the viewer lights the @ and does not count",
+  "why": "RisingWave counts only the pre-mute prefix and surfaces the mention through the mention arm. Decided (Tenny, #14988 review): follow the server (RisingWave). The canonical Postgres read in getInboxItems follows it too: its count stops at the mute boundary (inboxRowMessageCountsUnreadSql), and the mention still admits the row and lights the @ (activityPromotionAllowedByMuteSql, inboxPersonalMentionSql).",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/web/src/store/inboxInPlaceUnread.ts (liveActivityUnread, liveUnreadFields)",
+      "packages/web/src/store/inboxRowPosition.ts (rowPositionVerdict, with inbox_row_position_v1 on)"
+    ],
+    "server": [
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (unread_count FILTER)",
+      "packages/server/src/services/inboxUnreadEligibility.ts (isMessageUnreadEligibleForReceiver)",
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (rw_inbox_muted_prefix_v2)",
+      "packages/server/src/services/inboxUnreadEligibility.ts (inboxRowMessageCountsUnreadSql, inboxPersonalMentionSql, Postgres)"
+    ]
+  },
+  "given": {
+    "viewer": {
+      "type": "user",
+      "id": "viewer-1"
+    },
+    "scope": {
+      "rowKind": "channel",
+      "activityMuted": true
+    },
+    "message": {
+      "senderType": "user",
+      "senderId": "user-2",
+      "messageType": "chat",
+      "systemSubtype": null,
+      "mentions": [
+        {
+          "type": "user",
+          "id": "viewer-1"
+        }
+      ]
+    }
+  },
+  "steps": [],
+  "expect": {
+    "verdict": {
+      "counts": false,
+      "mention": true
+    }
+  }
+}

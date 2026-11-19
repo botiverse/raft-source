@@ -15,7 +15,7 @@ import { join } from "node:path";
 
 import { ComputerServiceError } from "./errors";
 import { start as startService } from "./start";
-import type { StartReadinessReport } from "../machineReadiness";
+import { SPAWNED_RUNNER_MIN_ALIVE_MS, type StartReadinessReport } from "../machineReadiness";
 import type { StartCommandNote } from "../remoteUpgradeTrace";
 import type { ComputerApiEvent } from "../lib/events";
 import {
@@ -28,6 +28,7 @@ import {
   serverRunnerVersionPath,
   serverManagedFlagPath,
   serverRunnerLockConflictPath,
+  serverRunnerSpawnedPath,
   servicePidPath,
   serviceLogPath,
   serviceVersionPath,
@@ -378,6 +379,9 @@ test("start service: daemon never ready throws START_DAEMON_TIMEOUT (single serv
         assert.ok(err instanceof ComputerServiceError);
         assert.equal((err as ComputerServiceError).code, "START_DAEMON_TIMEOUT");
         assert.match((err as ComputerServiceError).message, /Timed out waiting for \/alpha to start\./);
+        // The reason code leads the explanation, so a pasted error or the
+        // installer's diagnostic names the case (#77).
+        assert.match((err as ComputerServiceError).message, /to start\. Not ready: runner-absent \(no runner process is alive\)\. Run /);
         assert.match((err as ComputerServiceError).message, /Run `raft-computer status`/);
         assert.match((err as ComputerServiceError).message, /per-server runner logs/);
         assert.ok((err as ComputerServiceError).message.includes(serviceLogPath(home)));
@@ -540,6 +544,39 @@ test("start service: live old service version fails loud before daemon timeout",
   });
 });
 
+test("start service: timeout names a live runner of the wrong version", async () => {
+  await withHome(async (home) => {
+    await writeAttach(home, SERVER_A);
+    await mkdir(join(home, "computer", "run"), { recursive: true });
+    await writeFile(servicePidPath(home), String(process.pid));
+    await writeServiceVersion(home, COMPUTER_VERSION, process.pid);
+    await writeReadyRunner(home, SERVER_A);
+    await writeFile(
+      serverRunnerVersionPath(home, SERVER_A),
+      JSON.stringify({ version: "0.0.1", installRoot: "/old/raft-computer", pid: process.pid, writtenAt: "2026-07-22T00:00:00.000Z" }),
+      { mode: 0o600 },
+    );
+    await assert.rejects(
+      () =>
+        start(
+          { serverId: SERVER_A, serverLabel: "/alpha", slockHome: home },
+          { ensureTimeoutMs: 0, ensurePollIntervalMs: 1, sleep: async () => undefined },
+        ),
+      (err: unknown) => {
+        assert.ok(err instanceof ComputerServiceError);
+        assert.equal((err as ComputerServiceError).code, "START_DAEMON_TIMEOUT");
+        assert.ok(
+          (err as ComputerServiceError).message.includes(
+            `Not ready: runner-version-mismatch (pid ${process.pid} runs 0.0.1, expected ${COMPUTER_VERSION}).`,
+          ),
+          (err as ComputerServiceError).message,
+        );
+        return true;
+      },
+    );
+  });
+});
+
 test("start service: multi-runner timeout uses N server runner(s) form", async () => {
   await withHome(async (home) => {
     await writeAttach(home, SERVER_A);
@@ -562,6 +599,7 @@ test("start service: multi-runner timeout uses N server runner(s) form", async (
         assert.equal((err as ComputerServiceError).code, "START_DAEMON_TIMEOUT");
         // multi-server form: "N server runner(s): <ids>"
         assert.match((err as ComputerServiceError).message, /Timed out waiting for 2 server runner\(s\): /);
+        assert.ok((err as ComputerServiceError).message.includes(`Not ready: ${SERVER_A}: runner-absent (no runner process is alive); ${SERVER_B}: runner-absent`));
         assert.ok((err as ComputerServiceError).message.includes(serverRunnerLogPath(home, SERVER_A)));
         assert.ok((err as ComputerServiceError).message.includes(serverRunnerLogPath(home, SERVER_B)));
         assert.doesNotMatch((err as ComputerServiceError).message, /~\/.slock/);
@@ -1517,6 +1555,142 @@ test("start service: acceptPartialReady with no runner ready still fails", async
     await writeServiceVersion(home, COMPUTER_VERSION, process.pid);
     await writeDisconnectedRunner(home, SERVER_A);
     await assert.rejects(() => start({ slockHome: home }, PARTIAL_OPTIONS), (err: unknown) => (err as ComputerServiceError).code === "START_DAEMON_TIMEOUT");
+  });
+});
+
+// The service writes runner.pid only once a runner connects, so a runner it
+// spawned that never reached its server has only the spawn record and its own
+// version evidence. Production: `targets=3 ready=1 runner-absent:2` rolled a
+// working upgrade back.
+const DEAD_PID = 2_147_483_646;
+async function writeSpawnedUnconnectedRunner(
+  home: string,
+  serverId: string,
+  {
+    pid = process.pid,
+    servicePid = process.pid,
+    version = COMPUTER_VERSION,
+    // Alive long enough by default (SPAWNED_RUNNER_MIN_ALIVE_MS); real epoch ms.
+    spawnedAt = Date.now() - SPAWNED_RUNNER_MIN_ALIVE_MS - 5_000,
+  }: { pid?: number; servicePid?: number; version?: string; spawnedAt?: number } = {},
+): Promise<void> {
+  const recordPath = serverRunnerSpawnedPath(home, serverId);
+  await mkdir(join(recordPath, ".."), { recursive: true });
+  await rm(serverRunnerPidPath(home, serverId), { force: true });
+  await rm(serverConnectedMarkerPath(home, serverId), { force: true });
+  await writeFile(recordPath, JSON.stringify({ pid, servicePid, spawnedAt }));
+  await writeFile(serverRunnerVersionPath(home, serverId), JSON.stringify({ version, installRoot: "/current/raft-computer", pid, writtenAt: "2026-11-14T00:00:00.000Z" }));
+}
+
+async function withServiceRunning<T>(fn: (home: string) => Promise<T>): Promise<T> {
+  return withTwoServersOneReady(async (home) => {
+    await writeFile(servicePidPath(home), String(process.pid));
+    await writeServiceVersion(home, COMPUTER_VERSION, process.pid);
+    return fn(home);
+  });
+}
+
+test("start service (installer): a ready runner beside one spawned but never connected (no runner.pid) succeeds as partial_ready", async () => {
+  await withServiceRunning(async (home) => {
+    await writeSpawnedUnconnectedRunner(home, SERVER_B);
+    const events: ComputerApiEvent[] = [];
+    const reports: StartReadinessReport[] = [];
+    const result = await start({ slockHome: home }, {
+      ...PARTIAL_OPTIONS,
+      onEvent: (event: ComputerApiEvent) => { events.push(event); },
+      onReadiness: (report) => { reports.push(report); },
+    });
+    assert.equal(result.status, "already_running");
+    assert.deepEqual([...result.ready.keys()], [SERVER_A]);
+    const partial = events.find((event) => event.kind === "start.partial_ready");
+    assert.ok(partial && partial.kind === "start.partial_ready");
+    assert.deepEqual(partial.notReady, [SERVER_B]);
+    assert.deepEqual(reports.map((report) => [report.notReady, report.partial]), [[{ "runner-disconnected": 1 }, true]]);
+  });
+});
+
+test("start service: without acceptPartialReady a spawned, never connected runner still fails, named runner-disconnected", async () => {
+  await withServiceRunning(async (home) => {
+    await writeSpawnedUnconnectedRunner(home, SERVER_B);
+    await assert.rejects(
+      () => start({ slockHome: home }, { ensureTimeoutMs: 0, ensurePollIntervalMs: 1, sleep: async () => undefined }),
+      (err: unknown) => {
+        const error = err as ComputerServiceError;
+        assert.equal(error.code, "START_DAEMON_TIMEOUT");
+        assert.ok(error.message.includes(`Not ready: runner-disconnected (pid ${process.pid} is running this version but not connected to the server)`), error.message);
+        return true;
+      },
+    );
+  });
+});
+
+for (const [name, setUp, code] of [
+  ["its spawned pid is dead", (home: string) => writeSpawnedUnconnectedRunner(home, SERVER_B, { pid: DEAD_PID }), "runner-absent"],
+  ["it was spawned by an earlier service", (home: string) => writeSpawnedUnconnectedRunner(home, SERVER_B, { servicePid: DEAD_PID }), "runner-absent"],
+  ["it runs another version", (home: string) => writeSpawnedUnconnectedRunner(home, SERVER_B, { version: "0.0.1" }), "runner-version-mismatch"],
+  // Attested at the lock but not alive long enough: it may be about to crash on its handshake.
+  ["it was spawned a moment ago", (home: string) => writeSpawnedUnconnectedRunner(home, SERVER_B, { spawnedAt: Date.now() - 1_000 }), "runner-absent"],
+] as const) {
+  test(`start service (installer): a spawned, never connected runner still fails (${code}) when ${name}`, async () => {
+    await withServiceRunning(async (home) => {
+      await setUp(home);
+      const reports: StartReadinessReport[] = [];
+      await assert.rejects(
+        () => start({ slockHome: home }, { ...PARTIAL_OPTIONS, onReadiness: (report) => { reports.push(report); } }),
+        (err: unknown) => (err as ComputerServiceError).code === "START_DAEMON_TIMEOUT",
+      );
+      assert.deepEqual(reports.map((report) => [report.notReady, report.partial]), [[{ [code]: 1 }, false]]);
+    });
+  });
+}
+
+test("start service (installer): a runner in a crash loop before connecting (a new pid, freshly spawned, each read) still fails", async () => {
+  await withServiceRunning(async (home) => {
+    // Two live pids stand in for successive spawns; each attests at once and is respawned 2 s after the last crash.
+    const spawns = [process.pid, process.ppid];
+    let spawn = 0;
+    const respawn = () => writeSpawnedUnconnectedRunner(home, SERVER_B, { pid: spawns[spawn++ % 2]!, spawnedAt: Date.now() - 3_000 });
+    await respawn();
+    const reports: StartReadinessReport[] = [];
+    await assert.rejects(
+      () => start({ slockHome: home }, {
+        ...PARTIAL_OPTIONS,
+        ensureTimeoutMs: 40,
+        ensurePollIntervalMs: 5,
+        sleep: async (ms) => {
+          await respawn();
+          await new Promise((resolve) => setTimeout(resolve, ms));
+        },
+        onReadiness: (report) => { reports.push(report); },
+      }),
+      (err: unknown) => (err as ComputerServiceError).code === "START_DAEMON_TIMEOUT",
+    );
+    assert.ok(spawn >= 3, `the spawn record's pid changed between reads (${spawn} spawns)`);
+    assert.deepEqual(reports.map((report) => [report.notReady, report.partial]), [[{ "runner-absent": 1 }, false]]);
+  });
+});
+
+test("start service (installer): spawned, never connected runners and none ready still fail", async () => {
+  await withServiceRunning(async (home) => {
+    await writeSpawnedUnconnectedRunner(home, SERVER_A);
+    await writeSpawnedUnconnectedRunner(home, SERVER_B);
+    await assert.rejects(() => start({ slockHome: home }, PARTIAL_OPTIONS), (err: unknown) => (err as ComputerServiceError).code === "START_DAEMON_TIMEOUT");
+  });
+});
+
+test("a start with no service running forgets the spawn records an earlier service left", async () => {
+  await withTwoServersOneReady(async (home) => {
+    await writeSpawnedUnconnectedRunner(home, SERVER_B);
+    await start({ slockHome: home }, {
+      ...PARTIAL_OPTIONS,
+      spawnDetachedService: async () => {
+        assert.equal(existsSync(serverRunnerSpawnedPath(home, SERVER_B)), false);
+        await writeServiceVersion(home, COMPUTER_VERSION, process.pid);
+        await writeReadyRunner(home, SERVER_A);
+        await writeReadyRunner(home, SERVER_B);
+        return process.pid;
+      },
+    });
   });
 });
 

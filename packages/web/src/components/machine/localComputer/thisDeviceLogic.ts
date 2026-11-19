@@ -30,7 +30,7 @@ export type ThisDeviceStateKind =
   | "updating"
   | "stopped"
   | "running"
-  /** Installed, but its status cannot be read. */
+  /** Installed but its status cannot be read, or the host state itself could not be read. */
   | "unreadable"
   /** Another service on this machine holds the same machine key. */
   | "duplicate-key";
@@ -79,6 +79,8 @@ export interface ThisDeviceInput {
   diagnosticsFailed?: boolean;
   /** Its attachment names the current server (this account's), but the server does not list it yet. */
   awaitingListing?: boolean;
+  /** The shell has the host state, but reading it failed: unknown, never guessed from the service status. */
+  hostReadFailed?: boolean;
 }
 
 /** The states where Raft Desktop drives the Computer (lifecycle buttons). */
@@ -113,6 +115,8 @@ function primaryKind(input: ThisDeviceInput): ThisDeviceStateKind {
   if (input.lastErrorCode === "duplicate_key") return "duplicate-key";
   if (host?.migration.state === "running") return "migrating";
   if (host?.migration.state === "failed") return "migration-failed";
+  // The host state could not be read: unknown (Try again), never "stopped" on a guess.
+  if (!host && input.hostReadFailed) return "unreadable";
   // A shell without the host state: what its status says.
   if (!host) return input.status === null ? "not-installed" : input.running ? "running" : "stopped";
   if (!host.installed) return "not-installed";
@@ -147,4 +151,190 @@ export function startsWithMessageId(startsWith: DesktopComputerHostState["starts
 /** The machine is this device: the panel replaces every command with a button. */
 export function isThisDeviceMachine(host: { ready: boolean; self: { machineId: string | null } } | null, machineId: string): boolean {
   return host !== null && host.ready && host.self.machineId === machineId;
+}
+
+// ── Actions (no dead end) ───────────────────────────────────────────────────
+//
+// Every state offers a next step, and none that is known to fail. One pure
+// table, by state (a Record over ThisDeviceStateKind, so a new state does
+// not compile until it says what it offers); ThisDeviceSections renders the
+// status line and these buttons for both the embedded and the standalone page,
+// and the Computers row offers the first one.
+
+export type ThisDeviceActionId =
+  /** Install Raft Computer (updateComputer: installs it, starts it when it is attached somewhere). */
+  | "install"
+  /** The same install, for an embedded Computer that never moved (leftoverAttachments): it finishes the move. */
+  | "finish-move"
+  /** Add to this server (install, attach, start). */
+  | "add"
+  /** This computer cannot run it: install it on another computer. */
+  | "install-elsewhere"
+  | "start"
+  | "restart"
+  | "stop"
+  /** Below what this Raft Desktop uses (Updates section). */
+  | "update"
+  /** A newer Computer is published (Updates section). */
+  | "update-now"
+  /** Its status cannot be read: reinstall over it with the bundled installer (updateComputer). */
+  | "repair"
+  /** Read the host state and the status again. */
+  | "retry-read"
+  | "retry-migration"
+  | "run-diagnostics"
+  | "open-logs";
+
+export interface ThisDeviceAction {
+  id: ThisDeviceActionId;
+  /** The one thing to press first (at most one per plan). */
+  primary: boolean;
+  /**
+   * "status": beside the state (its notice, or the controls row); "updates":
+   * in the Updates section; "troubleshoot": in Troubleshoot, which a problem
+   * state opens, so it is not repeated in the notice above it.
+   */
+  place: "status" | "updates" | "troubleshoot";
+}
+
+/** What the page can do here (bridge members present, the host as read). */
+export interface ThisDeviceActionHost {
+  /** The host state as read; null: not read, or the read failed. */
+  hostState: DesktopComputerHostState | null;
+  /** Raft Desktop drives the install (host state known): lifecycle buttons. */
+  management: "host" | null;
+  running: boolean;
+  /** Add to this server can run here (a current server, and it can install or is installed). */
+  canAdd: boolean;
+  can: { updateComputer: boolean; retryMigration: boolean; runDiagnostics: boolean; openLogs: boolean; retryRead: boolean };
+  /** Still checking after CHECKING_STALL_MS: say it is unknown, with Try again. */
+  checkingStalled?: boolean;
+}
+
+export interface ThisDeviceActionPlan {
+  /** The status line's words when the state's phrase would guess (unknown, not "Stopped"). */
+  statusMessageId: MessageId | null;
+  actions: ThisDeviceAction[];
+}
+
+/** How long "Checking…" may last before the page says the status is unknown. */
+export const CHECKING_STALL_MS = 45_000;
+
+/**
+ * Run diagnostics would run: an installed Computer that reports doctor-json,
+ * or one whose capabilities are unknown on a Raft Desktop that then tries
+ * `doctor --json` anyway (it publishes readError; an older one refuses).
+ * Not installed: nothing to diagnose. The host state unknown: not offered
+ * (Try again reads it first).
+ */
+export function diagnosticsUsable(hostState: DesktopComputerHostState | null, capabilities: string[] | null): boolean {
+  // Unknown (the host state could not be read): what it reports is unknown too, and the shell may refuse.
+  if (!hostState) return false;
+  if (!hostState.installed) return false;
+  if (capabilities === null) return hostState.readError !== undefined;
+  return COMPUTER_FEATURE_NEEDS.diagnostics.every((need) => capabilities.includes(need));
+}
+
+const action = (id: ThisDeviceActionId, primary = false, place: ThisDeviceAction["place"] = "status"): ThisDeviceAction => ({ id, primary, place });
+
+interface PlanContext {
+  state: ThisDeviceState;
+  host: ThisDeviceActionHost;
+  variant: "embedded" | "standalone";
+  installSupported: boolean;
+  capabilities: string[] | null;
+  logs: ThisDeviceAction[];
+  diagnostics: ThisDeviceAction[];
+}
+
+function lifecycle({ state, host }: PlanContext, startIsFirst = true): ThisDeviceAction[] {
+  if (!state.controllable || host.management !== "host") return [];
+  return host.running ? [action("restart"), action("stop")] : [action("start", startIsFirst)];
+}
+
+function couldNotRead(ctx: PlanContext, repair: boolean): ThisDeviceActionPlan {
+  const { host, installSupported } = ctx;
+  return {
+    statusMessageId: "computerHost.thisDevice.state.couldNotRead",
+    actions: [
+      ...(host.can.retryRead ? [action("retry-read", true)] : []),
+      ...(repair && host.can.updateComputer && installSupported ? [action("repair", !host.can.retryRead)] : []),
+      ...ctx.logs,
+      ...(repair ? ctx.diagnostics : []),
+    ],
+  };
+}
+
+const plan = (actions: ThisDeviceAction[]): ThisDeviceActionPlan => ({ statusMessageId: null, actions });
+
+const PLANS: Record<ThisDeviceStateKind, (ctx: PlanContext) => ThisDeviceActionPlan> = {
+  "checking": (ctx) => (ctx.host.checkingStalled ? couldNotRead(ctx, false) : plan(ctx.logs)),
+  "not-installed": (ctx) => {
+    const { host, variant, installSupported } = ctx;
+    if (!installSupported) return plan([action("install-elsewhere"), ...ctx.logs]);
+    const install = host.can.updateComputer;
+    // An older Desktop's embedded Computer that never moved: finish the move first.
+    if (host.hostState?.leftoverAttachments === true && install) return plan([action("finish-move", true), ...ctx.logs]);
+    if (variant === "standalone" && host.canAdd) return plan([action("add", true)]);
+    if (install) return plan([action("install", true)]);
+    if (host.canAdd) return plan([action("add", true)]);
+    return plan([action("install-elsewhere"), ...ctx.logs]);
+  },
+  "setting-up": (ctx) => plan(ctx.logs),
+  "migrating": (ctx) => plan(ctx.logs),
+  "migration-failed": (ctx) => plan([
+    ...(ctx.host.can.retryMigration ? [action("retry-migration", true)] : []),
+    ...ctx.diagnostics,
+    ...ctx.logs,
+  ]),
+  "update-required": (ctx) => plan([
+    ...lifecycle(ctx, !ctx.host.can.updateComputer),
+    ...(ctx.host.can.updateComputer ? [action("update", true, "updates")] : []),
+  ]),
+  "updating": (ctx) => plan(ctx.logs),
+  "stopped": (ctx) => plan([
+    ...lifecycle(ctx),
+    ...(ctx.state.flags.updateAvailable && ctx.host.can.updateComputer && ctx.host.management === "host" ? [action("update-now", false, "updates")] : []),
+  ]),
+  "running": (ctx) => plan([
+    ...lifecycle(ctx),
+    ...(ctx.state.flags.updateAvailable && ctx.host.can.updateComputer && ctx.host.management === "host" ? [action("update-now", false, "updates")] : []),
+  ]),
+  "unreadable": (ctx) => couldNotRead(ctx, true),
+  "duplicate-key": (ctx) => plan([...ctx.diagnostics, ...ctx.logs]),
+};
+
+/**
+ * What This device offers in each state (every state offers at least one
+ * step; none known to fail). `installSupported` and `capabilities` are the
+ * host state's (unknown host: supported, capabilities null).
+ */
+export function thisDeviceActions(
+  state: ThisDeviceState,
+  host: ThisDeviceActionHost,
+  variant: "embedded" | "standalone",
+  installSupported: boolean,
+  capabilities: string[] | null,
+): ThisDeviceActionPlan {
+  const ctx: PlanContext = {
+    state,
+    host,
+    variant,
+    installSupported,
+    capabilities,
+    logs: host.can.openLogs ? [action("open-logs")] : [],
+    // A problem opens Troubleshoot, which has Run diagnostics: there, not twice.
+    diagnostics: host.can.runDiagnostics && diagnosticsUsable(host.hostState, capabilities)
+      ? [action("run-diagnostics", false, state.problem ? "troubleshoot" : "status")]
+      : [],
+  };
+  const result = PLANS[state.kind](ctx);
+  // A shell without the pieces a state's own steps need still offers its logs.
+  if (result.actions.length === 0 && ctx.logs.length > 0) return { ...result, actions: ctx.logs };
+  return result;
+}
+
+/** The plan's first step, for a surface with room for one (the Computers row). */
+export function primaryThisDeviceAction(plan: ThisDeviceActionPlan): ThisDeviceAction | null {
+  return plan.actions.find((candidate) => candidate.primary) ?? null;
 }

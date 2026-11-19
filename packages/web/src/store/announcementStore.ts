@@ -36,6 +36,12 @@ interface AnnouncementState {
    */
   writeFailedIds: string[];
   load: () => Promise<void>;
+  /**
+   * load(), unless this context's list is loading or loaded already (a server
+   * switch reads it at once; the layout's first screen then needn't again).
+   * Focus, visibility and reconnect keep calling load(), which always reads.
+   */
+  ensureLoaded: () => Promise<void>;
   markRead: (id: string) => Promise<void>;
   close: (id: string) => void;
   dismiss: (id: string) => Promise<void>;
@@ -51,6 +57,8 @@ interface AnnouncementState {
 let announcementLoadInFlight: Promise<void> | null = null;
 let announcementLoadGeneration = 0;
 let announcementAccountGeneration = 0;
+/** The load generation whose read last succeeded (ensureLoaded). */
+let announcementLoadedGeneration = -1;
 let contextKey: string | undefined;
 const failedByContext = new Map<string, string[]>();
 function currentContext() { return useServerStore.getState().current?.id ?? "account"; }
@@ -110,6 +118,7 @@ export const useAnnouncementStore = create<AnnouncementState>((set, get) => ({
           const pending = announcements.filter((announcement) => !hiddenIds.has(announcement.id));
           return { pending, stackTotal: pending.length, loaded: true };
         });
+        announcementLoadedGeneration = generation;
       } catch (err) {
         if (generation !== announcementLoadGeneration) return;
         console.error("Failed to load announcements:", err);
@@ -124,6 +133,13 @@ export const useAnnouncementStore = create<AnnouncementState>((set, get) => ({
 
   // Records explicit confirmation, closing, or CTA activation. Rendering
   // alone never records dismissal; already-open copies keep their local state.
+  ensureLoaded: () => {
+    syncContext();
+    if (announcementLoadInFlight) return announcementLoadInFlight;
+    if (announcementLoadedGeneration === announcementLoadGeneration) return Promise.resolve();
+    return get().load();
+  },
+
   markRead: async (id) => {
     if (get().markedReadIds.includes(id)) return;
     const writeContext = currentContext();

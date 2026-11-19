@@ -1,7 +1,8 @@
+import { isTypedCustomValue } from "./runtimeChoiceOptionId";
 import { Button, Card, CardDescription, CardHeader, CardLeading, CardTitle, Checkbox, Input } from "@botiverse/raft-ui";
 import { Pencil, RefreshCw } from "lucide-react";
 import { useCallback, useId, useMemo } from "react";
-import type { ChangeEvent, RefObject } from "react";
+import type { ChangeEvent } from "react";
 import {
   isRuntimeFormV2FieldRequired,
   runtimeFormV2Choices,
@@ -32,7 +33,6 @@ export function RuntimeFormV2FieldControl({
   onChange,
   error,
   editing,
-  portalContainer,
   onRetrySource,
   retryingSourceIds,
   connectionActive = false,
@@ -45,7 +45,6 @@ export function RuntimeFormV2FieldControl({
   onChange: (key: string, value: RuntimeFormV2Value) => void;
   error: string | undefined;
   editing: boolean;
-  portalContainer?: RefObject<HTMLElement | null>;
   onRetrySource?: (sourceId: string) => void;
   retryingSourceIds: readonly string[];
   /** `provider.saved_connection`: some field currently holds a saved-connection selection. */
@@ -222,8 +221,10 @@ export function RuntimeFormV2FieldControl({
         </Field>
       ) : null;
     case "boolean":
+      // The option card carries the field's hint as its description, so the
+      // field below repeats only a different note (a connection-owned one).
       return (
-        <Field {...common} label={undefined} adopt={false}>
+        <Field {...common} label={undefined} hint={hint === fieldHint ? undefined : hint} adopt={false}>
           <Card variant="option" render={<label />}>
             <CardHeader>
               <CardLeading>
@@ -269,8 +270,11 @@ export function RuntimeFormV2FieldControl({
               emptyOption={choices.allowEmpty ? emptyOption : undefined}
               unavailableOptions={unavailableOptions}
               allowCustom={choices.allowCustom}
+              // A value not in the list of a field that takes a typed one is
+              // the person's own model id: shown as custom, not as a saved
+              // value the list lost.
+              customValue={isTypedCustomValue(choices.allowCustom, text, listedOptions)}
               placeholder={field.placeholder ?? field.label}
-              portalContainer={portalContainer}
               testId={testId}
               belowControl={statusLine}
             />
@@ -283,7 +287,6 @@ export function RuntimeFormV2FieldControl({
               onValueChange={handleSelectChange}
               options={selectOptions}
               placeholder={field.placeholder ?? field.label}
-              portalContainer={portalContainer}
               testId={testId}
             />
           </Field>

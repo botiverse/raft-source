@@ -42,4 +42,10 @@ test("ids, slugs, names, queries and fragments never reach the template", () => 
   assert.equal(apiRouteTemplate("/channels/general#top"), "/api/channels/:id");
   assert.equal(apiRouteTemplate("/auth/me"), "/api/auth/me");
   assert.equal(apiRouteTemplate("/"), ":other");
+  assert.equal(
+    apiRouteTemplate("https://app.example.test/api/actions/3f1c2b7e-9a4d-4c1e-8b2a-0d9e8f7a6b5c/execute?x=1"),
+    "/api/actions/:id/execute",
+  );
+  assert.equal(apiRouteTemplate("/servers/42/seat-join-blocks?cursor=abc"), "/api/servers/:id/seat-join-blocks");
+  assert.equal(apiRouteTemplate("https://cdn.example.test/file/abc"), ":other");
 });

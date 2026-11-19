@@ -191,6 +191,8 @@ export function makeActivityState(
 }
 
 export function deriveActivityFromTrajectoryEntry(entry: TrajectoryEntry): AgentActivityState | null {
+  // A sub-agent's own row (its lineage) says nothing about the main turn; its frame carries that (#oar-raft:#18).
+  if (entry.kind !== "status" && "subagent" in entry && entry.subagent) return null;
   switch (entry.kind) {
     case "thinking":
       return makeActivityState("thinking", entry.text || "Thinking…", "none");

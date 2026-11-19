@@ -28,7 +28,8 @@ import { and, eq, sql } from "drizzle-orm";
 import pg from "pg";
 import { afterEach, beforeEach } from "vitest";
 import { getDb, type Database } from "../db/index";
-import { linkCardClientRequests, linkCardOperations, linkCardUpdateTokens, linkCardViews, messages, oauthLinkPreviewDeclines, oauthUserConsents } from "../db/schema";
+import { linkCardClientRequests, linkCardOperations, linkCardUpdateTokens, linkCardViews, messages, oauthClientInstalls, oauthClients, oauthLinkPreviewDeclines, oauthUserConsents, officialAppRegistry } from "../db/schema";
+import { UNREVIEWED_APP_CAPABILITY } from "@botiverse/raft-shared/src/appLinkPreview";
 import { declineLinkPreviews } from "../services/appLinkPreviewConsentService";
 import { __setPreviewHttpForTests, __settleAppLinkPreviewRechecksForTests } from "../services/appLinkPreviewService";
 import { addHuman, removeHuman } from "../services/channelService";
@@ -44,7 +45,7 @@ import { tokenForHuman } from "../test/integration/credentials";
 import { migrateRealPgTestDatabase } from "../test/integration/realPgMigrate";
 import { createSeed } from "../test/integration/seed";
 import {
-  appAnswer, appAuth, barrier, cardFixture, clientRequestId, executedOperation, handleFor, insertOperations, post, sendCardUpdate, statusOf, stubApp, type CardFixture,
+  ALL_CAPABILITIES, appAnswer, appAuth, barrier, cardFixture, clientRequestId, executedOperation, handleFor, insertOperations, post, sendCardUpdate, statusOf, stubApp, type CardFixture,
 } from "../test/linkCardActionFixture";
 
 const test = createApiTest();
@@ -286,6 +287,50 @@ test("real PG: the viewer's side is re-checked after a real lock wait: a revocat
       assert.equal((await operationsOf(db, viewer.id)).length, 0, `${why}: nothing written`);
     }
     assert.equal(actionCalls(calls, fx).length, 1, "only the control was sent");
+  });
+});
+
+test("real PG: an unofficial App's card buttons are decided at commit under the installation row: a switch-off or withdrawal committed while execute waits for that row is 410, nothing sent", REAL_PG_TEST, async () => {
+  await withRealPgApp(async ({ app, db, seed, holder }) => {
+    const fx = await cardFixture(db, seed);
+    await db.update(officialAppRegistry).set({ status: "disabled" }).where(eq(officialAppRegistry.oauthClientId, fx.client.id));
+    const calls = stubApp(() => appAnswer({ status: "accepted" }));
+    const handle = () => handleFor(fx, { binding: { capabilities: [...ALL_CAPABILITIES, UNREVIEWED_APP_CAPABILITY].sort() } }).handle;
+    const install = (values: Partial<typeof oauthClientInstalls.$inferInsert>) => db.update(oauthClientInstalls).set(values).where(eq(oauthClientInstalls.id, fx.install.id));
+    const cases: Array<[string, () => Promise<unknown>, string | null]> = [
+      // Own Server (server_local, on by default): switched off on the holder's connection.
+      ["own Server, nothing changed (control)", () => db.update(oauthClients).set({ appType: "server_local" }).where(eq(oauthClients.id, fx.client.id)), null],
+      ["own Server, switched off", async () => undefined, "UPDATE oauth_client_installs SET actions_off_at = clock_timestamp() WHERE id = $1"],
+      // Shared, allowed on this Server: the allow withdrawn on the holder's connection.
+      ["allowed, nothing changed (control)", async () => {
+        await db.update(oauthClients).set({ appType: "third_party_global" }).where(eq(oauthClients.id, fx.client.id));
+        await install({ actionsOffAt: null, allowedActionEndpoint: fx.actionEndpoint, actionsAllowedAt: new Date() });
+      }, null],
+      ["allowed, withdrawn", async () => undefined, "UPDATE oauth_client_installs SET allowed_action_endpoint = NULL, actions_allowed_at = NULL WHERE id = $1"],
+    ];
+    let sent = 0;
+    for (const [why, setup, write] of cases) {
+      await setup();
+      // The holder takes the installation row as a switch-off or withdrawal does
+      // (FOR UPDATE); execute passes its live check and waits for the row under
+      // its FOR SHARE; the holder's change commits (or it lets go).
+      await holder.query("BEGIN");
+      await holder.query("SELECT 1 FROM oauth_client_installs WHERE id = $1 FOR UPDATE", [fx.install.id]);
+      const pending = execute(app.baseUrl, fx, { client_request_id: clientRequestId(), handle: handle() });
+      await waitForLockWaiters(1);
+      if (write) await holder.query(write, [fx.install.id]);
+      await holder.query(write ? "COMMIT" : "ROLLBACK");
+      const res = await pending;
+      if (!write) {
+        assert.equal(res.status, 200, `${why}: ${JSON.stringify(res.body)}`);
+        sent++;
+        continue;
+      }
+      assert.equal(res.status, 410, `${why}: ${JSON.stringify(res.body)}`);
+      assert.equal(res.body.code, "PROVIDER_NOT_ELIGIBLE", why);
+    }
+    assert.equal(actionCalls(calls, fx).length, sent, "only the controls were sent");
+    assert.equal((await operationsOf(db, fx.owner.id)).length, sent, "nothing written for the refused ones");
   });
 });
 

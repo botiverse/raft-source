@@ -609,9 +609,10 @@ export function useAppNavigate() {
       taskId: string,
       routeKind: MessagePermalinkRouteKind = "channel",
       onNavigated?: () => void,
+      opts?: { replace?: boolean },
     ) => guardedNavigate(
       `${base}/${routeKind}/${parentChannelId}?${new URLSearchParams({ task: formatTaskConversationParam(parentChannelId, taskId) }).toString()}`,
-      undefined,
+      opts?.replace ? { replace: true } : undefined,
       onNavigated,
     ),
     toAgent: (agentId: string) => guardedNavigate(`${base}/agent/${agentId}`),

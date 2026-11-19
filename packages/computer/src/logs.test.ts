@@ -136,6 +136,46 @@ test("logs: SECRET REDLINE — sk_* in a log line is redacted in-place", async (
   });
 });
 
+test("logs: a secret spanning lines (YAML block, PEM key) is redacted across the tail", async () => {
+  await withHome(async (home) => {
+    await writeAttach(home, SERVER_A);
+    const pemBegin = "-----BEGIN " + "PRIVATE KEY-----";
+    await writeServerLog(
+      home,
+      SERVER_A,
+      `config dump:\n  private_key: |\n    YAML-LINE-ONE\n    YAML-LINE-TWO\n  user: bob\n${pemBegin}\nPEMBODYLINE0123\n-----END PRIVATE KEY-----\nafter\n`,
+    );
+    const cap = captureOut();
+    try {
+      await runLogs({});
+    } finally {
+      cap.restore();
+    }
+    const out = cap.text();
+    for (const secret of ["YAML-LINE-ONE", "YAML-LINE-TWO", "PEMBODYLINE0123"]) assert.ok(!out.includes(secret), `${secret} leaked: ${out}`);
+    assert.ok(out.includes("  private_key: |") && out.includes("  user: bob") && out.includes("after"));
+  });
+});
+
+test("logs --lines N: a stray PEM marker masks only its own line and every line is kept", async () => {
+  await withHome(async (home) => {
+    await writeAttach(home, SERVER_A);
+    const lines = Array.from({ length: 206 }, (_, i) => `2026-11-14 tick ${i}`);
+    lines[5] = "error: expected -----BEGIN " + "PRIVATE KEY----- in /etc/key.pem";
+    await writeServerLog(home, SERVER_A, `${lines.join("\n")}\n`);
+    const cap = captureOut();
+    try {
+      await runLogs({ lines: 206 });
+    } finally {
+      cap.restore();
+    }
+    const out = cap.text().trimEnd().split("\n");
+    assert.equal(out.length, 206);
+    assert.ok(out.includes("error: expected ***REDACTED***"));
+    assert.equal(out[205], "2026-11-14 tick 205");
+  });
+});
+
 test("logs: ≥2 attached without --server → AMBIGUOUS_SERVER", async () => {
   await withHome(async (home) => {
     await writeAttach(home, SERVER_A);

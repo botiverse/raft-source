@@ -19,6 +19,8 @@ import StatusDot from "../../components/ui/StatusDot";
 import { opensInNewTabAriaLabel } from "../../components/ui/LeavingRaftMark";
 import { useAppNavigate } from "../../hooks/useAppNavigate";
 import { useAgentStore } from "../../store/agentStore";
+import { trackExternalAgentSetupAction, trackExternalAgentSetupClosed, trackExternalAgentSetupProgress } from "../../analytics/externalAgentSetup";
+import type { ExternalAgentSetupAction } from "../../analytics/externalAgentSetup";
 import { existingAgentPrompt, PAGE_CREDENTIAL_NAME, RAFT_SDK_DOCS_URL, SDK_INSTALL_COMMAND, sdkStarterCode, STATUS_POLL_MS } from "./externalAgentSetup";
 import type { Created, ExternalSetupMethod } from "./externalAgentSetup";
 import { CopyBlock, CopyField } from "./ExternalSetupCopy";
@@ -40,6 +42,17 @@ export function CreateExternalAgentDialog({ onClose }: { onClose: () => void }) 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const discarded = useRef(false);
+  // The method on screen, for the status poll: switching must not restart it. Written by the two handlers that change it.
+  const methodRef = useRef<ExternalSetupMethod>("existing_agent");
+  // Analytics: one close per opening, and it says what became of the agent. Two races are left unreported
+  // rather than mislabelled: Cancel while Next is still running (the agent is still made: `created` follows, no
+  // close), and Done while a discard is still running (the discard reports itself if it succeeds).
+  const closeReported = useRef(false);
+  const reportClosed = useCallback((result: "cancelled" | "discarded" | "finish_later" | "done_connected") => {
+    if (closeReported.current) return;
+    closeReported.current = true;
+    trackExternalAgentSetupClosed(result, methodRef.current);
+  }, []);
 
   // Step 2 asks until the agent signs in (any of its credentials used: GET /agents/:id/external-status).
   useEffect(() => {
@@ -48,7 +61,12 @@ export function CreateExternalAgentDialog({ onClose }: { onClose: () => void }) 
     const tick = async () => {
       try {
         const status = await fetchExternalAgentStatus(created.id);
-        if (active && status.setupState === "connected") setConnected(true);
+        if (active && status.setupState === "connected") {
+          setConnected(true);
+          // Once: a second poll already in flight must not report it again.
+          active = false;
+          if (!closeReported.current) trackExternalAgentSetupProgress("connected_seen", "dialog", methodRef.current);
+        }
       } catch {
         // A missed poll is retried on the next tick.
       }
@@ -78,12 +96,14 @@ export function CreateExternalAgentDialog({ onClose }: { onClose: () => void }) 
       if (typeof data?.apiKey !== "string" || !data.apiKey.startsWith("sk_agent_")) throw new Error("Invalid credential response");
       setCreated(agent);
       setCredential(data.apiKey);
+      if (!closeReported.current) trackExternalAgentSetupProgress("created", "dialog", method);
     } catch (err) {
       // Nothing is left behind: an agent made before the failure is discarded (cindyz: Cancel leaves nothing).
       if (agent) await deleteAgent(agent.id).catch(() => undefined);
       if (!isSecondFactorStepUpCancelled(err)) {
         const body = (err as { response?: { data?: { error?: string } } }).response?.data;
         setError(body?.error ?? formatMessage({ id: "agent.createExternal.createFailed" }));
+        if (!closeReported.current) trackExternalAgentSetupProgress("create_failed", "dialog", method);
       }
     } finally {
       setBusy(false);
@@ -94,9 +114,18 @@ export function CreateExternalAgentDialog({ onClose }: { onClose: () => void }) 
     if (!created) return;
     const next: ExternalSetupMethod = method === "sdk" ? "existing_agent" : "sdk";
     setMethod(next);
+    methodRef.current = next;
     // The same credential works both ways: only the instructions and the remembered method change.
     void saveMethod(created.id, next).catch(() => undefined);
+    trackExternalAgentSetupAction("method_switched", "dialog", next);
   }, [created, method, saveMethod]);
+
+  const trackAction = useCallback((action: ExternalAgentSetupAction) => trackExternalAgentSetupAction(action, "dialog", method), [method]);
+  const handlePromptCopied = useCallback(() => trackAction("prompt_copied"), [trackAction]);
+  const handleCredentialCopied = useCallback(() => trackAction("credential_copied"), [trackAction]);
+  const handleInstallCopied = useCallback(() => trackAction("install_copied"), [trackAction]);
+  const handleCodeCopied = useCallback(() => trackAction("code_copied"), [trackAction]);
+  const handleSdkGuide = useCallback(() => trackAction("sdk_guide_opened"), [trackAction]);
 
   const finish = useCallback(() => {
     if (created) {
@@ -106,22 +135,37 @@ export function CreateExternalAgentDialog({ onClose }: { onClose: () => void }) 
         // stay where the person is
       }
     }
+    if (!discarded.current) reportClosed(connected ? "done_connected" : "finish_later");
     onClose();
-  }, [created, nav, onClose]);
+  }, [connected, created, nav, onClose, reportClosed]);
+
+  // Before Next: nothing was made, so closing just closes.
+  const handleCancelForm = useCallback(() => {
+    // While Next runs nothing closes the dialog (×, Escape, Cancel): closing then would leave an agent and a
+    // credential nobody saw (Nova's review of #15090).
+    if (busy) return;
+    reportClosed("cancelled");
+    onClose();
+  }, [busy, onClose, reportClosed]);
 
   const handleClose = useCallback(() => {
     // Once made, closing before it connects asks first; connected, closing is Done.
     if (created && !connected) setConfirmDiscard(true);
     else if (created) finish();
-    else onClose();
-  }, [connected, created, finish, onClose]);
+    else handleCancelForm();
+  }, [connected, created, finish, handleCancelForm]);
 
   const handleSubmit = useCallback((event: FormEvent) => void handleNext(event), [handleNext]);
   const handleName = useCallback((event: ChangeEvent<HTMLInputElement>) => setName(event.target.value), []);
   const handleDescription = useCallback((event: ChangeEvent<HTMLTextAreaElement>) => setDescription(event.target.value), []);
-  const handleMethod = useCallback((value: unknown) => setMethod(value as ExternalSetupMethod), []);
+  const handleMethod = useCallback((value: unknown) => {
+    setMethod(value as ExternalSetupMethod);
+    methodRef.current = value as ExternalSetupMethod;
+  }, []);
   const handleAskDiscard = useCallback(() => setConfirmDiscard(true), []);
   const handleKeep = useCallback(() => setConfirmDiscard(false), []);
+  // While the discard runs, Keep (×, Escape) waits: dismissing it then would leave a half-deleted agent.
+  const keepUnlessBusy = useCallback(() => { if (!busy) handleKeep(); }, [busy, handleKeep]);
 
   const handleDiscard = useCallback(async () => {
     if (!created || discarded.current) return;
@@ -129,6 +173,7 @@ export function CreateExternalAgentDialog({ onClose }: { onClose: () => void }) 
     setBusy(true);
     try {
       await deleteAgent(created.id);
+      reportClosed("discarded");
       onClose();
     } catch {
       discarded.current = false;
@@ -137,12 +182,12 @@ export function CreateExternalAgentDialog({ onClose }: { onClose: () => void }) 
     } finally {
       setBusy(false);
     }
-  }, [created, deleteAgent, formatMessage, onClose]);
+  }, [created, deleteAgent, formatMessage, onClose, reportClosed]);
   const handleDiscardClick = useCallback(() => void handleDiscard(), [handleDiscard]);
 
   if (!created) {
     return (
-      <DialogCard title={formatMessage({ id: "agent.createExternal.title" })} onClose={onClose} narrow="sheet" testId="create-external-agent-dialog">
+      <DialogCard title={formatMessage({ id: "agent.createExternal.title" })} onClose={handleCancelForm} narrow="sheet" testId="create-external-agent-dialog">
         <form onSubmit={handleSubmit} className="stack-y-4 md:pointer-fine:stack-y-3">
           {error ? <p className="text-callout text-danger" role="alert" data-testid="create-external-agent-error">{error}</p> : null}
           <FormField label={formatMessage({ id: "agent.createExternal.name" })} htmlFor={nameId}>
@@ -163,7 +208,7 @@ export function CreateExternalAgentDialog({ onClose }: { onClose: () => void }) 
             </div>
           </FormField>
           <DialogCardFooter>
-            <Button size="lg" variant="ghost" type="button" onClick={onClose}>{formatMessage({ id: "common.confirm.cancel" })}</Button>
+            <Button size="lg" variant="ghost" type="button" onClick={handleCancelForm} disabled={busy} data-testid="create-external-agent-form-cancel">{formatMessage({ id: "common.confirm.cancel" })}</Button>
             <DialogCommit>
               {(inHead) => (
                 <Button size={inHead ? "md" : "lg"} variant="primary" type="submit" disabled={!name.trim()} loading={busy} data-testid="create-external-agent-next">
@@ -179,11 +224,11 @@ export function CreateExternalAgentDialog({ onClose }: { onClose: () => void }) 
 
   if (confirmDiscard) {
     return (
-      <DialogCard title={formatMessage({ id: "agent.createExternal.discardTitle" }, { name: created.name })} onClose={handleKeep} testId="create-external-agent-discard">
+      <DialogCard title={formatMessage({ id: "agent.createExternal.discardTitle" }, { name: created.name })} onClose={keepUnlessBusy} testId="create-external-agent-discard">
         <div className="stack-y-4">
           <p className="text-callout text-foreground-muted">{formatMessage({ id: "agent.createExternal.discardBody" })}</p>
           <DialogCardFooter>
-          <Button size="lg" variant="ghost" type="button" onClick={handleKeep}>{formatMessage({ id: "agent.createExternal.keep" })}</Button>
+          <Button size="lg" variant="ghost" type="button" onClick={handleKeep} disabled={busy}>{formatMessage({ id: "agent.createExternal.keep" })}</Button>
           <Button size="lg" variant="danger" type="button" loading={busy} onClick={handleDiscardClick} data-testid="create-external-agent-discard-confirm">
             {formatMessage({ id: "agent.createExternal.discard" })}
           </Button>
@@ -218,12 +263,12 @@ export function CreateExternalAgentDialog({ onClose }: { onClose: () => void }) 
               <div className="stack-y-4" data-testid="create-external-agent-existing-steps">
                 <section className="stack-y-2">
                   <h3 className="text-body font-semibold">{formatMessage({ id: "agent.createExternal.step1Existing" })}</h3>
-                  <CopyBlock text={existingAgentPrompt(created, formatMessage)} label={formatMessage({ id: "agent.createExternal.copyPrompt" })} testId="create-external-agent-prompt" primary collapsed />
+                  <CopyBlock text={existingAgentPrompt(created, formatMessage)} label={formatMessage({ id: "agent.createExternal.copyPrompt" })} testId="create-external-agent-prompt" primary collapsed onCopied={handlePromptCopied} />
                 </section>
                 <section className="stack-y-2">
                   <h3 className="text-body font-semibold">{formatMessage({ id: "agent.createExternal.step2Existing" })}</h3>
                   <p className="text-callout text-foreground-muted">{formatMessage({ id: "agent.createExternal.credentialWarning" }, { name: created.name })}</p>
-                  <CopyField text={credential ?? ""} testId="create-external-agent-credential" />
+                  <CopyField text={credential ?? ""} testId="create-external-agent-credential" onCopied={handleCredentialCopied} />
                   <p className="text-footnote text-foreground-muted">{formatMessage({ id: "agent.createExternal.shownOnce" })}</p>
                 </section>
               </div>
@@ -232,16 +277,16 @@ export function CreateExternalAgentDialog({ onClose }: { onClose: () => void }) 
                 <section className="stack-y-2">
                   <h3 className="text-body font-semibold">{formatMessage({ id: "agent.createExternal.step1Sdk" })}</h3>
                   <p className="text-callout text-foreground-muted">{formatMessage({ id: "agent.createExternal.credentialWarning" }, { name: created.name })}</p>
-                  <CopyField text={credential ?? ""} testId="create-external-agent-credential" />
+                  <CopyField text={credential ?? ""} testId="create-external-agent-credential" onCopied={handleCredentialCopied} />
                   <p className="text-footnote text-foreground-muted">{formatMessage({ id: "agent.createExternal.envHint" })}</p>
                 </section>
                 <section className="stack-y-2">
                   <h3 className="text-body font-semibold">{formatMessage({ id: "agent.createExternal.step2Sdk" })}</h3>
-                  <CopyField text={SDK_INSTALL_COMMAND} testId="create-external-agent-install" />
-                  <CopyField text={sdkStarterCode()} testId="create-external-agent-code" />
+                  <CopyField text={SDK_INSTALL_COMMAND} testId="create-external-agent-install" onCopied={handleInstallCopied} />
+                  <CopyField text={sdkStarterCode()} testId="create-external-agent-code" onCopied={handleCodeCopied} />
                   <p className="text-callout text-foreground-muted">
                     {formatMessage({ id: "agent.createExternal.sdkConnectsHint" }, { name: created.name })}
-                    <TextLink variant="strong" className="ml-1" render={<a href={RAFT_SDK_DOCS_URL} target="_blank" rel="noopener noreferrer" aria-label={opensInNewTabAriaLabel(formatMessage, formatMessage({ id: "agent.createExternal.sdkGuide" }))} />}>
+                    <TextLink variant="strong" className="ml-1" render={<a href={RAFT_SDK_DOCS_URL} target="_blank" rel="noopener noreferrer" onClick={handleSdkGuide} aria-label={opensInNewTabAriaLabel(formatMessage, formatMessage({ id: "agent.createExternal.sdkGuide" }))} />}>
                       {formatMessage({ id: "agent.createExternal.sdkGuide" })}
                       <TextLinkExternalIcon />
                     </TextLink>

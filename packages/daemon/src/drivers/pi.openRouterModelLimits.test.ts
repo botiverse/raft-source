@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { RUNTIME_CONFIG_VERSION, type RuntimeConfig } from "@botiverse/raft-shared";
+import { eventsForSpan, RUNTIME_CONFIG_VERSION, type RuntimeConfig } from "@botiverse/raft-shared";
 import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import {
@@ -19,6 +19,7 @@ import {
 import type { SpawnContext } from "./types";
 import { installDaemonFetchMockForTests } from "../daemonFetch";
 import { resetGatewayModelLimitsCacheForTests } from "../gatewayModelLimits";
+import { makeDeterministicTracer } from "../testing/deterministicTracer";
 
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const OPENROUTER_MODELS = `${OPENROUTER_BASE}/models`;
@@ -80,6 +81,20 @@ test("OpenRouter's list is read from OpenRouter's catalog base URL; other preset
   assert.equal(builtInPresetModelListBaseUrl("openrouter"), OPENROUTER_BASE);
   assert.equal(builtInPresetModelListBaseUrl("deepseek"), null);
   assert.equal(builtInPresetModelListBaseUrl("anthropic"), null);
+  assert.equal(builtInPresetModelListBaseUrl("qwen-token-plan"), null);
+});
+
+test("a typed model on a provider whose list Raft does not read sends nothing anywhere and takes Raft's defaults", async () => {
+  const seen: Array<{ url: string; authorization: string | null }> = [];
+  const config = { ...openRouterConfig("qwen4-preview"), provider: { kind: "preset", providerId: "qwen-token-plan", apiKey: "sk-qwen-test" } } as RuntimeConfig;
+  const read = await readBuiltInPresetCustomModelLimits(config, fetchFrom(OPENROUTER_LIST, seen));
+  assert.deepEqual(read, { limits: null, outcome: "skipped", cached: false, baseUrl: null });
+  assert.deepEqual(seen, [], "the key goes nowhere but the model calls");
+  const { modelLimits } = configureBuiltInPresetCustomModel(await freshRegistry(), config, read.limits, read.baseUrl);
+  assert.deepEqual(modelLimits, {
+    contextWindow: { value: 200_000, source: "raft_default" },
+    maxTokens: { value: 8192, source: "raft_default" },
+  });
 });
 
 test("a typed OpenRouter id is matched exactly in OpenRouter's list, the output cap from top_provider", async () => {
@@ -154,8 +169,9 @@ test("limits read from another host than the registration's model calls go to ar
   });
 });
 
-function openRouterContext(workingDirectory: string, name: string): SpawnContext {
+function openRouterContext(workingDirectory: string, name: string, tracer?: SpawnContext["tracer"]): SpawnContext {
   return {
+    ...(tracer ? { tracer } : {}),
     agentId: "agent-1",
     standingPrompt: "standing instructions",
     prompt: "wake prompt",
@@ -180,11 +196,44 @@ function openRouterContext(workingDirectory: string, name: string): SpawnContext
   } as SpawnContext;
 }
 
+test("an opened session on a provider whose list Raft does not read makes no request and traces no list read", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "slock-builtin-qwen-limits-"));
+  const workingDirectory = path.join(root, "workspace");
+  mkdirSync(workingDirectory, { recursive: true });
+  const { sink, tracer, traceId } = makeDeterministicTracer();
+  const context = openRouterContext(workingDirectory, "qwen4-preview", tracer);
+  context.config.runtimeConfig = {
+    ...openRouterConfig("qwen4-preview"),
+    provider: { kind: "preset", providerId: "qwen-token-plan", apiKey: "sk-qwen-test" },
+    envVars: null,
+  } as RuntimeConfig;
+  try {
+    const handle = await openPiAgentSessionForContext(context, "session-qwen", {
+      agentDir: buildBuiltInAgentDir(workingDirectory),
+      sessionDir: buildBuiltInSessionDir(workingDirectory),
+      isolateHostProviderEnv: true,
+      exposeLaunchEnvToTools: false,
+    });
+    try {
+      assert.equal(handle.session.model?.provider, "qwen-token-plan");
+      assert.equal(handle.session.model?.id, "qwen4-preview");
+      assert.deepEqual(requests, []);
+      const events = eventsForSpan(sink, traceId, "daemon.pi.session.create");
+      assert.equal(events.some((event) => event.name === "daemon.pi.session.gateway_model_limits"), false);
+    } finally {
+      handle.session.dispose();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("an opened session registers OpenRouter's limits, only OpenRouter is asked, and a failing read never stops the start", async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "slock-builtin-openrouter-limits-"));
   const workingDirectory = path.join(root, "workspace");
   mkdirSync(workingDirectory, { recursive: true });
-  const open = async (name: string) => openPiAgentSessionForContext(openRouterContext(workingDirectory, name), `session-${name.replace(/[^A-Za-z0-9]+/g, "-")}`, {
+  const { sink, tracer, traceId } = makeDeterministicTracer();
+  const open = async (name: string) => openPiAgentSessionForContext(openRouterContext(workingDirectory, name, tracer), `session-${name.replace(/[^A-Za-z0-9]+/g, "-")}`, {
     agentDir: buildBuiltInAgentDir(workingDirectory),
     sessionDir: buildBuiltInSessionDir(workingDirectory),
     isolateHostProviderEnv: true,
@@ -201,6 +250,10 @@ test("an opened session registers OpenRouter's limits, only OpenRouter is asked,
       assert.equal(handle.session.model?.contextWindow, 262_144);
       assert.equal(handle.session.model?.maxTokens, 65_536);
       assert.deepEqual(requests, [{ url: OPENROUTER_MODELS, authorization: "Bearer sk-or-test" }]);
+      // Dashboards read this value: an OpenRouter read is traced as `openrouter`.
+      const read = eventsForSpan(sink, traceId, "daemon.pi.session.create").find((event) => event.name === "daemon.pi.session.gateway_model_limits");
+      assert.equal(read?.attrs?.provider_kind, "openrouter");
+      assert.equal(read?.attrs?.outcome, "ok");
     } finally {
       handle.session.dispose();
     }
@@ -215,6 +268,69 @@ test("an opened session registers OpenRouter's limits, only OpenRouter is asked,
       }, "the start goes on with the next source");
     } finally {
       failed.session.dispose();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// A saved preset connection runs a typed id exactly as its provider does: the
+// connection supplies only the key. The model is registered on the provider's
+// own transport, the agent's limits apply, OpenRouter's list is read with the
+// connection's key, and nothing goes anywhere else.
+test("an opened session runs a typed id through a saved preset connection on the provider's transport with the connection's key", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "slock-builtin-connection-typed-"));
+  const workingDirectory = path.join(root, "workspace");
+  mkdirSync(workingDirectory, { recursive: true });
+  const open = async (providerId: string, keyEnv: string, model: RuntimeConfig["model"], sessionId: string) => {
+    const context = openRouterContext(workingDirectory, (model as { name: string }).name);
+    context.config.runtimeConfig = {
+      ...openRouterConfig("unused"),
+      provider: { kind: "connection", connectionId: "conn-1" },
+      model,
+      envVars: null,
+    } as RuntimeConfig;
+    context.config.providerConnection = { providerId, endpointUrl: null, supportsImageInput: false } as NonNullable<SpawnContext["config"]["providerConnection"]>;
+    context.config.envVars = { [keyEnv]: "sk-connection-key" };
+    return openPiAgentSessionForContext(context, sessionId, {
+      agentDir: buildBuiltInAgentDir(workingDirectory),
+      sessionDir: buildBuiltInSessionDir(workingDirectory),
+      isolateHostProviderEnv: true,
+      exposeLaunchEnvToTools: false,
+    });
+  };
+  try {
+    serve((url) => (url === OPENROUTER_MODELS ? Response.json(OPENROUTER_LIST) : new Response("not found", { status: 404 })));
+    const openrouter = await open("openrouter", "OPENROUTER_API_KEY", { kind: "custom", name: "acme/brand-new-model", maxOutputTokens: 4_096 }, "session-or-conn");
+    try {
+      const template = (await freshRegistry()).getAll().find((model) => model.provider === "openrouter")!;
+      assert.equal(openrouter.session.model?.provider, "openrouter");
+      assert.equal(openrouter.session.model?.id, "acme/brand-new-model");
+      assert.equal(openrouter.session.model?.baseUrl, template.baseUrl, "the provider's own transport");
+      assert.deepEqual(openrouter.modelLimits, {
+        contextWindow: { value: 262_144, source: "gateway" },
+        maxTokens: { value: 4_096, source: "agent_config" },
+      });
+      assert.deepEqual(requests, [{ url: OPENROUTER_MODELS, authorization: "Bearer sk-connection-key" }], "the key goes only to the provider");
+    } finally {
+      openrouter.session.dispose();
+    }
+
+    requests = [];
+    const deepseek = await open("deepseek", "DEEPSEEK_API_KEY", { kind: "custom", name: "deepseek-v9", contextWindow: 128_000, maxOutputTokens: 16_000 }, "session-ds-conn");
+    try {
+      const template = (await freshRegistry()).getAll().find((model) => model.provider === "deepseek")!;
+      assert.equal(deepseek.session.model?.provider, "deepseek");
+      assert.equal(deepseek.session.model?.id, "deepseek-v9");
+      assert.equal(deepseek.session.model?.baseUrl, template.baseUrl);
+      assert.equal(deepseek.session.model?.api, template.api);
+      assert.deepEqual(deepseek.modelLimits, {
+        contextWindow: { value: 128_000, source: "agent_config" },
+        maxTokens: { value: 16_000, source: "agent_config" },
+      });
+      assert.deepEqual(requests, [], "DeepSeek has no list Raft reads");
+    } finally {
+      deepseek.session.dispose();
     }
   } finally {
     rmSync(root, { recursive: true, force: true });

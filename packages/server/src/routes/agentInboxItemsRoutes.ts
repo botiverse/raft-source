@@ -71,7 +71,7 @@ import * as channelService from "../services/channelService";
 import * as messageService from "../services/messageService";
 import * as oauthService from "../services/oauthService";
 import { emitScopeReadUpdated } from "../services/readReceiptService";
-import { recordTraceEvent } from "../tracing/semanticTrace";
+import { createTraceDbQueryTracer, recordTraceEvent } from "../tracing/semanticTrace";
 import { serializeErrorForLog } from "../tracing/safeErrorLog";
 import { getDb } from "../db/index";
 import { messages } from "../db/schema";
@@ -290,7 +290,9 @@ export async function handleInboxRead(req: Request, res: Response, deps: { serve
         const lastReadSeq = seqOf(history.last_read_seq);
         const readThroughSeq = seqOf(history.read_through_seq);
         const after = facts.pageLastSeq ?? readThroughSeq ?? lastReadSeq ?? 0;
-        const { remaining, capped } = await remainingConversationMessages({ storageChannelId: facts.storageChannelId, afterSeq: Number(after) || 0, historyCutoff: facts.historyCutoff, agentId });
+        // Timed like the history read's steps (#triage:#388).
+        const step = createTraceDbQueryTracer("agent.inbox.read");
+        const { remaining, capped } = await step("inbox.remaining", () => remainingConversationMessages({ storageChannelId: facts.storageChannelId, afterSeq: Number(after) || 0, historyCutoff: facts.historyCutoff, agentId }));
         // Validated against the inbox read schema on the way out (sendAgentApiResponse); the history types are hand-written.
         const reply: Record<string, unknown> = {
           target: typeof history.target === "string" ? history.target : target.target,
@@ -311,7 +313,7 @@ export async function handleInboxRead(req: Request, res: Response, deps: { serve
         };
         const send = deps.prepare(reply as AgentApiInboxReadResponse);
         if (!send) return;
-        await facts.consumePage();
+        await step("inbox.consume_page", () => facts.consumePage());
         send();
       },
     });

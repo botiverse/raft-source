@@ -23,6 +23,8 @@ import {
   boundSummaryAppName,
   listManagedAgentsWithPendingThirdPartyEvents,
   planReconnectRedelivery,
+  recordMachineDaemonInstance,
+  requeueDroppedThirdPartyAgentEvents,
   resolveOutageStart,
   redeliverPendingThirdPartyAgentEvents,
   type ThirdPartyEventRedeliverer,
@@ -60,11 +62,12 @@ async function fixture(seed: Seed) {
     status?: "queued" | "delivering" | "delivered" | "expired" | "rejected";
     deliveredAt?: Date | null;
     expiresInMs?: number;
-    systemApp?: "system.assistant" | "system.raftbench";
+    systemApp?: "system.assistant" | "system.raftbench" | "system.artifacts";
     /** An OAuth client other than the fixture's "Reminder service". */
     clientId?: string;
     summary?: string;
     payload?: Record<string, unknown>;
+    wakeCoalescedAt?: Date;
   }) => {
     const createdAt = new Date(now.getTime() - opts.createdAgoMs);
     const [row] = await db.insert(thirdPartyAgentEvents).values({
@@ -82,6 +85,7 @@ async function fixture(seed: Seed) {
       expiresAt: new Date(now.getTime() + (opts.expiresInMs ?? 7 * 24 * HOUR)),
       createdAt,
       updatedAt: new Date(now.getTime() - (opts.updatedAgoMs ?? opts.createdAgoMs)),
+      wakeCoalescedAt: opts.wakeCoalescedAt ?? null,
     }).returning();
     return row!;
   };
@@ -122,6 +126,8 @@ const pass = (
   opts: {
     trigger?: ThirdPartyEventRedeliveryTrigger;
     outageStartedAgoMs?: number;
+    /** Restart pass: when the new daemon instance connected (default 1 minute ago). */
+    daemonConnectedAgoMs?: number;
     agentIds?: string[];
     excludeEventIds?: string[];
     now?: Date;
@@ -137,7 +143,12 @@ const pass = (
     env: opts.env ?? {},
     tracer: opts.tracer,
   };
-  return (opts.trigger ?? "machine_ready") === "sweep"
+  const trigger = opts.trigger ?? "machine_ready";
+  if (trigger === "runtime_ready") return redeliverPendingThirdPartyAgentEvents({ ...common, trigger });
+  if (trigger === "daemon_instance_changed") {
+    return redeliverPendingThirdPartyAgentEvents({ ...common, trigger, daemonConnectedAt: new Date(f.now.getTime() - (opts.daemonConnectedAgoMs ?? MIN)) });
+  }
+  return trigger === "sweep"
     ? redeliverPendingThirdPartyAgentEvents({ ...common, trigger: "sweep" })
     : redeliverPendingThirdPartyAgentEvents({ ...common, trigger: "machine_ready", outageStartedAt: new Date(f.now.getTime() - (opts.outageStartedAgoMs ?? 4 * 24 * HOUR)) });
 };
@@ -577,4 +588,265 @@ test("resolveOutageStart: the heartbeat must be known and predate the connection
   assert.equal(at(resolveOutageStart({ lastHeartbeat: null, closedAt: ago(3 * 24 * 60), connectedAt })), "unknown", "no heartbeat: unknown, whatever the close time");
   assert.equal(at(resolveOutageStart({ lastHeartbeat: new Date(connectedAt + MIN), closedAt: ago(180), connectedAt })), "unknown", "a pong on the new connection overwrote it");
   assert.equal(at(resolveOutageStart({ lastHeartbeat: "read_failed", closedAt: ago(180), connectedAt })), "heartbeat_read_failed");
+});
+
+// Restart pass (trigger daemon_instance_changed): machine ca4239b1, 11-15.
+const RESTART_NOTE_START = THIRD_PARTY_EVENT_REDELIVERY_COPY.restartNote.slice(0, THIRD_PARTY_EVENT_REDELIVERY_COPY.restartNote.indexOf("{"));
+
+test("restart pass: a delivering event pushed (and acked) before the new daemon connected is sent again once, with the restart note; coalesced, system.assistant, expired, queued and newer-pushed rows are not", async ({ seed }) => {
+  const f = await fixture(seed);
+  // Pushed 5 minutes ago, during the upgrade drain: younger than any parked record.
+  const lost = await f.event({ createdAgoMs: 5 * MIN, summary: "Reminder: stand-up" });
+  const coalesced = await f.event({ createdAgoMs: 5 * MIN, wakeCoalescedAt: new Date(f.now.getTime() - 5 * MIN) });
+  const assistant = await f.event({ createdAgoMs: 5 * MIN, systemApp: "system.assistant" });
+  const pastTtl = await f.event({ createdAgoMs: 5 * MIN, expiresInMs: -MIN });
+  const queued = await f.event({ createdAgoMs: 5 * MIN, status: "queued" });
+  const pushedToNewDaemon = await f.event({ createdAgoMs: 5 * MIN, updatedAgoMs: 30_000 });
+  const stale = await f.event({ createdAgoMs: THIRD_PARTY_EVENT_REDELIVERY_MAX_AGE_MS + MIN });
+  const d = fakeDeliverer();
+  const { sink, tracer } = memoryTracer();
+
+  const result = await pass(f, d, { trigger: "daemon_instance_changed", daemonConnectedAgoMs: MIN, tracer });
+
+  assert.deepEqual(d.eventIds(), [lost.id]);
+  const message = d.calls[0]!.message;
+  const firstPush = buildThirdPartyAgentMessage({ event: lost, clientKey: f.client.clientId, clientName: "Reminder service" });
+  assert.equal(message.content, `Sent again after your computer restarted: this app notification was created at ${formatUtcTimestamp(lost.createdAt)}, and the restart may have lost it before it reached you. If you already handled it, ignore this copy; otherwise check that it still applies before you act on it.\n\n${firstPush.content}`);
+  assert.equal(message.message_id, lost.id, "same id as the first push (daemon / inbox dedupe)");
+  assert.equal(result.redelivered, 1);
+  assert.equal((await f.rowOf(lost.id)).updatedAt.getTime(), f.now.getTime(), "claimed");
+  for (const row of [coalesced, assistant, pastTtl, queued, pushedToNewDaemon, stale]) {
+    const after = await f.rowOf(row.id);
+    assert.equal(after.status, row.status, "untouched: nothing is expired");
+    assert.equal(after.updatedAt.getTime(), row.updatedAt.getTime(), "untouched: not claimed");
+  }
+  const span = sink.getAllSpans().find((s) => s.name === "server.third_party_event.redeliver")!;
+  assert.equal(span.attrs?.trigger, "daemon_instance_changed");
+  const sent = span.events.filter((e) => e.name === "server.third_party_event.redeliver.sent");
+  assert.equal(sent.length, 1);
+  assert.deepEqual(
+    { ...sent[0]!.attrs },
+    { third_party_event_id: lost.id, agent_id: f.agentId, trigger: "daemon_instance_changed", age_ms: 5 * MIN, outcome: "queued", reason: "replayable_inbox" },
+  );
+
+  // The same pass again (another `ready` of the same instance would not even
+  // run it): the claim moved the row past the connection time.
+  const again = fakeDeliverer();
+  await pass(f, again, { trigger: "daemon_instance_changed", daemonConnectedAgoMs: MIN, now: new Date(f.now.getTime() + MIN) });
+  assert.deepEqual(again.eventIds(), [], "sent again exactly once");
+});
+
+test("restart pass: past the newest 20 per agent the rest are left pending (deferred, never expired), and the first event sent says how many wait in the inbox", async ({ seed }) => {
+  const f = await fixture(seed);
+  const rows = [];
+  for (let i = 0; i < THIRD_PARTY_EVENT_REDELIVERY_PER_AGENT_CAP + 2; i += 1) rows.push(await f.event({ createdAgoMs: (60 - i) * MIN }));
+  const d = fakeDeliverer();
+
+  const result = await pass(f, d, { trigger: "daemon_instance_changed" });
+
+  assert.equal(d.calls.length, THIRD_PARTY_EVENT_REDELIVERY_PER_AGENT_CAP);
+  assert.deepEqual(d.eventIds(), rows.slice(2).map((row) => row.id), "the newest 20, oldest first");
+  const deferredLine = THIRD_PARTY_EVENT_REDELIVERY_COPY.restartDeferredMany.replace("{count}", "2");
+  assert.ok(d.calls[0]!.message.content.startsWith(`${deferredLine}\n\n${RESTART_NOTE_START}`), d.calls[0]!.message.content);
+  assert.ok(d.calls.slice(1).every((call) => call.message.content.startsWith(RESTART_NOTE_START)), "only on the first event");
+  assert.equal(result.summaryAttached, 1);
+  assert.equal(result.deferredOverCap, 2);
+  assert.equal(result.expiredOverCap, 0);
+  for (const row of rows.slice(0, 2)) assert.equal((await f.rowOf(row.id)).status, "delivering", "left in the inbox");
+});
+
+test("restart pass: one row past the cap is told in the singular; none past it, no line", async ({ seed }) => {
+  const f = await fixture(seed);
+  for (let i = 0; i < THIRD_PARTY_EVENT_REDELIVERY_PER_AGENT_CAP + 1; i += 1) await f.event({ createdAgoMs: (60 - i) * MIN });
+  const d = fakeDeliverer();
+  await pass(f, d, { trigger: "daemon_instance_changed" });
+  assert.ok(d.calls[0]!.message.content.startsWith(`${THIRD_PARTY_EVENT_REDELIVERY_COPY.restartDeferredOne}\n\n${RESTART_NOTE_START}`));
+
+  const g = await fixture(seed);
+  await g.event({ createdAgoMs: 5 * MIN });
+  const e = fakeDeliverer();
+  const result = await pass(g, e, { trigger: "daemon_instance_changed" });
+  assert.ok(e.calls[0]!.message.content.startsWith(RESTART_NOTE_START));
+  assert.equal(result.summaryAttached, 0);
+});
+
+test("restart pass: an event this replica still re-sends itself (ack-retry record, pending start) is skipped", async ({ seed }) => {
+  const f = await fixture(seed);
+  const tracked = await f.event({ createdAgoMs: 5 * MIN });
+  const other = await f.event({ createdAgoMs: 4 * MIN });
+  const d = fakeDeliverer();
+
+  await pass(f, d, { trigger: "daemon_instance_changed", excludeEventIds: [tracked.id] });
+
+  assert.deepEqual(d.eventIds(), [other.id]);
+});
+
+// PGlite runs the two "at once" calls one after the other: this proves the
+// second `ready` of a new instance sees `same`, not the row lock under real
+// concurrency.
+test("the machine's daemon instance marker: first, same, changed; two daemons taking turns count only their first flip; a second `ready` of a new instance sees same", async ({ seed }) => {
+  const owner = await seed.human();
+  const server = await seed.server({ owner });
+  const [machine] = await getDb().insert(machines).values({ serverId: server.id, userId: owner.id, name: `m-${randomUUID().slice(0, 8)}`, apiKeyHash: randomUUID() }).returning();
+  const machineId = machine!.id;
+
+  assert.equal(await recordMachineDaemonInstance({ machineId, daemonInstanceId: "a" }), "first");
+  assert.equal(await recordMachineDaemonInstance({ machineId, daemonInstanceId: "a" }), "same", "a socket reconnect");
+  assert.equal(await recordMachineDaemonInstance({ machineId, daemonInstanceId: "b" }), "changed", "a restart");
+  assert.equal(await recordMachineDaemonInstance({ machineId, daemonInstanceId: "b" }), "same", "the same new instance again");
+  // Two installs taking turns: A, B (counted above), A, B, A.
+  assert.equal(await recordMachineDaemonInstance({ machineId, daemonInstanceId: "a" }), "returned_to_previous");
+  assert.equal(await recordMachineDaemonInstance({ machineId, daemonInstanceId: "b" }), "returned_to_previous");
+  assert.equal(await recordMachineDaemonInstance({ machineId, daemonInstanceId: "a" }), "returned_to_previous");
+  const both = await Promise.all([
+    recordMachineDaemonInstance({ machineId, daemonInstanceId: "c" }),
+    recordMachineDaemonInstance({ machineId, daemonInstanceId: "c" }),
+  ]);
+  assert.deepEqual(both.sort(), ["changed", "same"]);
+  await assert.rejects(recordMachineDaemonInstance({ machineId: randomUUID(), daemonInstanceId: "a" }), "an unknown machine is refused (foreign key)");
+});
+
+// The next-start pass (`runtime_ready`): an abnormal end's daemon names the app
+// events it dropped (`agent:inbox:dropped_app_events`); they go back to
+// `queued`, and the agent's next runtime start sends its queued rows.
+const RUNTIME_NOTE_START = THIRD_PARTY_EVENT_REDELIVERY_COPY.runtimeRestartNote.slice(0, THIRD_PARTY_EVENT_REDELIVERY_COPY.runtimeRestartNote.indexOf("{"));
+
+test("dropped app events: only the agent's own delivering, unexpired rows go back to queued (coalesce mark kept); every other id is counted by reason", async ({ seed }) => {
+  const f = await fixture(seed);
+  const other = await f.newAgent();
+  const lost = await f.event({ createdAgoMs: 5 * MIN });
+  const coalesced = await f.event({ createdAgoMs: 5 * MIN, wakeCoalescedAt: new Date(f.now.getTime() - 4 * MIN) });
+  const othersRow = await f.event({ agentId: other, createdAgoMs: 5 * MIN });
+  const delivered = await f.event({ createdAgoMs: 5 * MIN, status: "delivered", deliveredAt: new Date(f.now.getTime() - MIN) });
+  const pastTtl = await f.event({ createdAgoMs: 5 * MIN, expiresInMs: -MIN });
+  const assistant = await f.event({ createdAgoMs: 5 * MIN, systemApp: "system.assistant" });
+
+  const result = await requeueDroppedThirdPartyAgentEvents({
+    agentId: f.agentId,
+    eventIds: [lost.id, coalesced.id, othersRow.id, delivered.id, pastTtl.id, assistant.id, randomUUID(), "not-a-uuid", 42, lost.id],
+    now: f.now,
+    env: {},
+  });
+
+  assert.deepEqual(new Set(result.requeued), new Set([lost.id, coalesced.id]));
+  assert.deepEqual(result.ignored, { over_cap: 0, invalid_id: 2, not_found: 1, other_agent: 1, not_delivering: 1, expired: 1, excluded_app: 1 });
+  assert.equal((await f.rowOf(lost.id)).status, "queued");
+  assert.equal((await f.rowOf(lost.id)).updatedAt.getTime(), f.now.getTime());
+  assert.ok((await f.rowOf(coalesced.id)).wakeCoalescedAt, "its coalesce mark is left as it is");
+  for (const row of [othersRow, delivered, pastTtl, assistant]) {
+    const after = await f.rowOf(row.id);
+    assert.equal(after.status, row.status, "untouched");
+    assert.equal(after.updatedAt.getTime(), row.updatedAt.getTime(), "untouched");
+  }
+});
+
+test("dropped app events: a frame acts on its first 100 ids and counts the rest; the kill switch moves nothing", async ({ seed }) => {
+  const f = await fixture(seed);
+  const rows = [];
+  for (let i = 0; i < 101; i += 1) rows.push(await f.event({ createdAgoMs: 5 * MIN }));
+
+  const off = await requeueDroppedThirdPartyAgentEvents({ agentId: f.agentId, eventIds: rows.map((row) => row.id), now: f.now, env: { THIRD_PARTY_EVENT_REDELIVERY_ENABLED: "false" } });
+  assert.equal(off.outcome, "disabled");
+  assert.deepEqual(off.requeued, []);
+
+  const result = await requeueDroppedThirdPartyAgentEvents({ agentId: f.agentId, eventIds: rows.map((row) => row.id), now: f.now, env: {} });
+  assert.equal(result.requeued.length, 100);
+  assert.equal(result.ignored.over_cap, 1);
+  assert.equal((await f.rowOf(rows[100]!.id)).status, "delivering", "the 101st is not touched");
+});
+
+test("next-start pass: the agent's queued rows go out once, oldest first, with the restart note; delivering (unread), coalesced, quiet and still-being-created rows do not", async ({ seed }) => {
+  const f = await fixture(seed);
+  // Requeued by a dropped-on-exit frame 1 minute ago.
+  const dropped = await f.event({ createdAgoMs: 10 * MIN, updatedAgoMs: MIN, status: "queued", summary: "Reminder: stand-up" });
+  // A push that failed (claim released) an hour ago.
+  const releasedLongAgo = await f.event({ createdAgoMs: 2 * HOUR, updatedAgoMs: HOUR, status: "queued" });
+  // Pushed and acked to an earlier run, left unread: the agent was told.
+  const toldEarlier = await f.event({ createdAgoMs: 3 * HOUR });
+  const coalesced = await f.event({ createdAgoMs: 10 * MIN, updatedAgoMs: MIN, status: "queued", wakeCoalescedAt: new Date(f.now.getTime() - 9 * MIN) });
+  // Just written: its own request is about to claim and push it.
+  const beingCreated = await f.event({ createdAgoMs: 10_000, status: "queued" });
+  // Queued on purpose and never pushed (an Artifact rename or channel
+  // announcement, Artifacts task #160): never touched since its insert.
+  const quiet = await f.event({ createdAgoMs: 2 * HOUR, status: "queued", systemApp: "system.artifacts" });
+  const stale = await f.event({ createdAgoMs: THIRD_PARTY_EVENT_REDELIVERY_MAX_AGE_MS + MIN, updatedAgoMs: MIN, status: "queued" });
+  const d = fakeDeliverer();
+  const { sink, tracer } = memoryTracer();
+
+  const result = await pass(f, d, { trigger: "runtime_ready", tracer });
+
+  assert.deepEqual(d.eventIds(), [releasedLongAgo.id, dropped.id], "oldest first");
+  const firstPush = buildThirdPartyAgentMessage({ event: dropped, clientKey: f.client.clientId, clientName: "Reminder service" });
+  assert.equal(d.calls[1]!.message.content, `Sent again after the agent restarted: this app notification was created at ${formatUtcTimestamp(dropped.createdAt)}, and it may not have reached you before your previous run ended. If you already handled it, ignore this copy; otherwise check that it still applies before you act on it.\n\n${firstPush.content}`);
+  assert.equal(d.calls[1]!.message.message_id, dropped.id, "same id as the first push (daemon / inbox dedupe)");
+  assert.equal(result.redelivered, 2);
+  assert.equal(result.summaryAttached, 0, "nothing past the cap");
+  for (const row of [dropped, releasedLongAgo]) {
+    const after = await f.rowOf(row.id);
+    assert.equal(after.status, "delivering", "claimed");
+    assert.equal(after.updatedAt.getTime(), f.now.getTime());
+  }
+  for (const row of [toldEarlier, coalesced, beingCreated, quiet, stale]) {
+    const after = await f.rowOf(row.id);
+    assert.equal(after.status, row.status, "untouched");
+    assert.equal(after.updatedAt.getTime(), row.updatedAt.getTime(), "untouched");
+  }
+  const span = sink.getAllSpans().find((s) => s.name === "server.third_party_event.redeliver")!;
+  assert.equal(span.attrs?.trigger, "runtime_ready");
+  const sent = span.events.filter((e) => e.name === "server.third_party_event.redeliver.sent");
+  assert.deepEqual(sent.map((e) => e.attrs?.trigger), ["runtime_ready", "runtime_ready"]);
+
+  // The agent's next start: nothing new.
+  const again = fakeDeliverer();
+  await pass(f, again, { trigger: "runtime_ready", now: new Date(f.now.getTime() + HOUR) });
+  assert.deepEqual(again.eventIds(), [], "sent once; an untouched queued row is never the pass's, however old");
+});
+
+test("dropped app events: a requeue always leaves updated_at after created_at (a lagging replica clock), so the next-start pass takes it", async ({ seed }) => {
+  const f = await fixture(seed);
+  const lost = await f.event({ createdAgoMs: 0, updatedAgoMs: 0 });
+  const result = await requeueDroppedThirdPartyAgentEvents({ agentId: f.agentId, eventIds: [lost.id], now: new Date(f.now.getTime() - 5_000), env: {} });
+  assert.deepEqual(result.requeued, [lost.id]);
+  const row = await f.rowOf(lost.id);
+  assert.ok(row.updatedAt.getTime() > row.createdAt.getTime(), "after its insert");
+  const d = fakeDeliverer();
+  await pass(f, d, { trigger: "runtime_ready", now: new Date(f.now.getTime() + 1_000) });
+  assert.deepEqual(d.eventIds(), [lost.id]);
+});
+
+test("next-start pass: past the newest 20 the rest stay queued for the next start, and the first event sent says how many wait in the inbox", async ({ seed }) => {
+  const f = await fixture(seed);
+  const rows = [];
+  for (let i = 0; i < THIRD_PARTY_EVENT_REDELIVERY_PER_AGENT_CAP + 2; i += 1) rows.push(await f.event({ createdAgoMs: (60 - i) * MIN, updatedAgoMs: MIN, status: "queued" }));
+  const d = fakeDeliverer();
+
+  const result = await pass(f, d, { trigger: "runtime_ready" });
+
+  assert.deepEqual(d.eventIds(), rows.slice(2).map((row) => row.id), "the newest 20, oldest first");
+  const deferredLine = THIRD_PARTY_EVENT_REDELIVERY_COPY.runtimeRestartDeferredMany.replace("{count}", "2");
+  assert.ok(d.calls[0]!.message.content.startsWith(`${deferredLine}\n\n${RUNTIME_NOTE_START}`), d.calls[0]!.message.content);
+  assert.ok(d.calls.slice(1).every((call) => call.message.content.startsWith(RUNTIME_NOTE_START)), "only on the first event");
+  assert.equal(result.deferredOverCap, 2);
+  assert.equal(result.expiredOverCap, 0);
+  for (const row of rows.slice(0, 2)) assert.equal((await f.rowOf(row.id)).status, "queued", "left queued");
+
+  const next = fakeDeliverer();
+  await pass(f, next, { trigger: "runtime_ready", now: new Date(f.now.getTime() + MIN) });
+  assert.deepEqual(next.eventIds(), rows.slice(0, 2).map((row) => row.id), "the next start sends them");
+});
+
+test("restart pass and next-start pass, one daemon restart and one agent start: each row is sent once, whichever runs first", async ({ seed }) => {
+  for (const order of [["daemon_instance_changed", "runtime_ready"], ["runtime_ready", "daemon_instance_changed"]] as const) {
+    const f = await fixture(seed);
+    // Lost with the old daemon (no frame reached the server): delivering.
+    const lostWithDaemon = await f.event({ createdAgoMs: 10 * MIN });
+    // Its frame reached the server before the shutdown: queued.
+    const reported = await f.event({ createdAgoMs: 10 * MIN, updatedAgoMs: 2 * MIN });
+    await requeueDroppedThirdPartyAgentEvents({ agentId: f.agentId, eventIds: [reported.id], now: new Date(f.now.getTime() - 2 * MIN), env: {} });
+    const d = fakeDeliverer();
+    for (const trigger of order) await pass(f, d, { trigger, daemonConnectedAgoMs: MIN });
+    // Both again (a second `ready` would not even run the restart pass).
+    for (const trigger of order) await pass(f, d, { trigger, daemonConnectedAgoMs: MIN, now: new Date(f.now.getTime() + MIN) });
+    assert.deepEqual(d.eventIds().sort(), [lostWithDaemon.id, reported.id].sort(), `once each (${order.join(", ")})`);
+  }
 });

@@ -176,8 +176,17 @@ export function bucketHttpStatus(status: number): HttpStatusBucket {
   return "other";
 }
 
-function httpOutcomeForStatus(statusCode: number): "success" | "error" {
-  return statusCode >= 500 ? "error" : "success";
+/**
+ * The request span's `outcome`: 5xx is `error`; 4xx is `refused` (the server
+ * answered and said no: not a failure, so it stays out of error rates and
+ * error alerts; read 401/403 or any single code from the exact `status_code`
+ * next to it); everything else is `success`. The span's own status is
+ * unchanged (`error` only for 5xx).
+ */
+export function httpOutcomeForStatus(statusCode: number): "success" | "refused" | "error" {
+  if (statusCode >= 500) return "error";
+  if (statusCode >= 400) return "refused";
+  return "success";
 }
 
 function httpReasonForStatusBucket(statusBucket: HttpStatusBucket): string {

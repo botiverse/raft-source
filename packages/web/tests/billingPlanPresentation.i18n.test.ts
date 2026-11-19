@@ -131,7 +131,7 @@ test("each plan maps to its own ids, and every id resolves in both catalogs", ()
   }
 });
 
-test("Free and Pro render their distinct Joint Channel allowances in both locales", () => {
+test("Free and Pro render their distinct external channel allowances in both locales", () => {
   const free = getBillingPlanPresentation({
     plan: "free",
     displayName: null,
@@ -150,15 +150,15 @@ test("Free and Pro render their distinct Joint Channel allowances in both locale
   });
 
   assert.ok(free.includedFeatures.includes("billing.limitedTimeFreeJointChannel"));
-  // Free already states its joint channel allowance under "Included"; it must
-  // not repeat a joint channel row under "Not included".
+  // Free already states its external channel allowance under "Included"; it
+  // must not repeat an external channel row under "Not included".
   assert.ok(!free.notIncludedFeatures.includes("billing.unlimitedJointChannels"));
   assert.ok(pro.includedFeatures.includes("billing.unlimitedJointChannels"));
 
-  // Contract v0.3: joint channels allow up to 2 free servers each; paid
-  // servers never count toward that cap. A free server hosts at most 1.
-  assert.equal(render("en", "billing.limitedTimeFreeJointChannel"), "Host 1 Joint Channel and join others (each Joint Channel has 2 free-server slots)");
-  assert.equal(render("zh-cn", "billing.limitedTimeFreeJointChannel"), "发起 1 个联合频道并加入其他联合频道（每个联合频道有连接 2 个免费版服务器的名额）");
+  // External channels (#wg-rbac:#16): a Free server is in at most 1 external
+  // channel, hosting or connected; the per-channel free-server slots are gone.
+  assert.equal(render("en", "billing.limitedTimeFreeJointChannel"), "1 external channel");
+  assert.equal(render("zh-cn", "billing.limitedTimeFreeJointChannel"), "1 个外部频道");
   assert.equal(render("en", "billing.unlimitedJointChannels"), "Use external channels");
   assert.equal(render("zh-cn", "billing.unlimitedJointChannels"), "使用外部频道");
 });

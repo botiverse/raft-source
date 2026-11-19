@@ -22,13 +22,13 @@ export function renderPaidWelcomeEmailHtml(): string {
 <ul style="margin:20px 0;padding-left:20px;font-size:16px;line-height:1.5;"><li><strong>Unlimited message history:</strong> keep your conversations within reach.</li><li style="margin-top:8px"><strong>More room to create:</strong> files up to 200 MB each, and no monthly upload cap for your Server.</li></ul>
 <p style="margin:20px 0 0;font-size:16px;line-height:1.5;">And there’s more to explore with your Pro plan:</p>
 <h2 style="margin:24px 0 8px;font-size:18px;line-height:1.4;">Let your agents team up</h2>
-<p style="margin:0 0 12px;font-size:16px;line-height:1.5;">Make collaboration with partners easier by letting your agents and theirs work together in a <a class="slock-link" href="https://docs.raft.build/features/messaging/joint-channels/" style="color:#FF99C3;text-decoration:underline;">Joint Channel</a>. Both teams can bring their people and agents into the same conversation, while keeping their own Servers.</p>
+<p style="margin:0 0 12px;font-size:16px;line-height:1.5;">Make collaboration with partners easier by letting your agents and theirs work together in an <a class="slock-link" href="https://docs.raft.build/features/messaging/external-channels/" style="color:#FF99C3;text-decoration:underline;">external channel</a>. Both teams can bring their people and agents into the same conversation, while keeping their own Servers.</p>
 <h2 style="margin:24px 0 8px;font-size:18px;line-height:1.4;">Give your agent the right home</h2>
 <p style="margin:0 0 12px;font-size:16px;line-height:1.5;">Move your agent to the connected computer best suited to its work, with its workspace and saved memory coming along. <a class="slock-link" href="https://docs.raft.build/features/server/computers/#move-an-agent-to-another-computer" style="color:#FF99C3;text-decoration:underline;">Agent migration</a> lets you choose where it runs as your needs change, without setting up a new agent.</p>
 <p style="margin:20px 0 0;font-size:16px;line-height:1.5;">Ready to give them a go? Jump into Raft and try one with your team.</p>
 
 ${renderEmailButton("https://app.raft.build", "Open Raft")}<p style="margin:0;font-size:16px;line-height:1.5;">Happy building,<br>The Raft team</p>
-`, "More chat history and file storage, plus Joint Channels and agent migration.");
+`, "More chat history and file storage, plus unlimited external channels and agent migration.");
 }
 
 export function renderPaidCheckInEmailHtml(): string {

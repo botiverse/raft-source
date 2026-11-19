@@ -21,7 +21,7 @@ export const reminderSnoozeCommand = defineCommand(
     name: "snooze",
     description: "Snooze a scheduled or fired reminder",
     options: [
-      { flags: "--id <id>", description: "Reminder id (full uuid or short prefix)" },
+      { flags: "--id <id>", description: "Reminder id (full uuid, short prefix, or reminder:<id> as raft inbox check prints it)" },
       { flags: "--by <duration>", description: "Snooze duration, e.g. 30m, 2h, 1d" },
     ],
   },

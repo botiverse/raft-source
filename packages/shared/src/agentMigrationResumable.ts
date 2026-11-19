@@ -25,6 +25,13 @@ export const AGENT_MIGRATION_CAPABILITY = "migration/v3" as const;
  */
 export const AGENT_MIGRATION_TARGET_IGNORE_SOURCES_CAPABILITY = "migration:target-ignore-sources-v1" as const;
 /**
+ * Advertised in `ready.migrationTransport.capabilities` by a Computer whose
+ * control-manifest schema accepts `excludedIgnoredPartial` in the transfer
+ * summary when it is a migration target. The Server sets the source lease's
+ * `targetAcceptsIgnoredPartial` only when the target advertises it.
+ */
+export const AGENT_MIGRATION_TARGET_IGNORED_PARTIAL_CAPABILITY = "migration:target-ignored-partial-v1" as const;
+/**
  * Advertised in `ready.migrationTransport.capabilities` by a Computer that, as a
  * migration source, writes the source lease's `userIgnoreAdditions` into the
  * agent's `.raftbackupignore.user` before it packs (./agentMigrationUserIgnore).

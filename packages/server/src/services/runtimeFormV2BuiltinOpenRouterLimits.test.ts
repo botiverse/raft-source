@@ -114,7 +114,7 @@ test("an older Computer: the limit fields are hidden for OpenRouter, and a liste
     () => assertBuiltInPresetSupportedByCatalog(config, {
       kind: "live",
       value: { models: [{ id: KIMI, label: "Kimi" }], catalog: { protocolVersion: 1, runtime: "builtin", runtimeVersion: "1.5.0" } },
-    }, { machineId: "m", daemonVersion: "1.0.67", computerVersion: "1.0.67" }),
+    }, { machineId: "m", daemonVersion: "1.0.67", computerVersion: "1.0.67" }, null),
     (error: unknown) => error instanceof BuiltInModelCatalogError && error.code === "builtin_custom_model_upgrade_required",
   );
 });

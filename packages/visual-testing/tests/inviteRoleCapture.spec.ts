@@ -33,8 +33,6 @@ for (const mode of ["light", "dark"] as const) {
     // link" across the shot.
     await page.route("**/join-links", (route) =>
       route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([{ id: "link-1", token: "join-token" }]) }));
-    await page.route("**/feature-flags/evaluate", (route) =>
-      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ values: { server_guest_v0: true }, resolved: true }) }));
 
     await page.goto(CASE("components.members.invite-human.per-row-role", mode));
 

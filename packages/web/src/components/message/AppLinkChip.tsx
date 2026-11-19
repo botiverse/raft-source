@@ -1,12 +1,8 @@
-import { useCallback, useEffect, useId, useMemo, useRef } from "react";
+import { lazy, Suspense, useCallback, useEffect, useId, useMemo, useRef } from "react";
 import type { KeyboardEvent, MouseEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
 import { FileX, Link as LinkIcon } from "lucide-react";
-import { defineCatalog } from "@json-render/core";
-import { ActionProvider, defineRegistry, Renderer, StateProvider, VisibilityProvider } from "@json-render/react";
-import { schema } from "@json-render/react/schema";
 import {
-  Badge,
   Button,
   MessageReferenceChip,
   MessageReferenceLabel,
@@ -30,7 +26,6 @@ import {
   PreviewCardFooter,
   useTruncated,
 } from "@botiverse/raft-ui/wip";
-import { previewBadgeProps, previewStackProps, previewTextProps } from "@botiverse/raft-shared/src/appLinkPreview";
 import { ArtifactLinkPreview, artifactKindIcon, artifactUrl, openArtifactOnPlainClick, useArtifactsAppName } from "../../apps/artifacts";
 import { appLinkDomain, appLinkOpenHref, appLinkShortAddress } from "../../utils/appLinkAddress";
 import { useAuthStore } from "../../store/authStore";
@@ -49,26 +44,12 @@ import { appLinkChipTitle } from "./useAppLinkPreviews";
 import type { AppLinkResult } from "./useAppLinkPreviews";
 import { useMessageLinkCard } from "./useMessageLinkCards";
 import type { ObjectLinkCard } from "./useMessageLinkCards";
+import { webLinkProps } from "../../features/webPreview/webLinkRouting";
 
-// The v1 card's read-only catalog, painted with raft-ui inside the hover card.
-// The App's state is a neutral soft Badge, in its own words (PreviewCard ›
-// Item card rules). v1 has no buttons; v2's go in PreviewCardActions
-// (LinkCardActions.tsx).
-const emptyState = Object.freeze({});
-const noActions = Object.freeze({});
-const catalog = defineCatalog(schema, {
-  components: {
-    Stack: { props: previewStackProps, slots: ["default"] },
-    Text: { props: previewTextProps },
-    Badge: { props: previewBadgeProps },
-  },
-  actions: {},
-});
-const { registry } = defineRegistry(catalog, { actions: {}, components: {
-  Stack: ({ children }) => <div className="flex min-w-0 flex-col gap-1.5">{children}</div>,
-  Text: ({ props }) => <Text.Sans size="small" variant={props.tone === "muted" ? "muted" : "default"} className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{props.text}</Text.Sans>,
-  Badge: ({ props }) => <Badge appearance="soft" className="max-w-full self-start whitespace-normal break-words">{props.text}</Badge>,
-} });
+// The v1 card's read-only body (json-render) loads with its first v1 card:
+// plain chips and v2 cards never need it, so it stays out of the startup
+// bundle (raft-perf graph, #proj-frontend:649d69de).
+const AppLinkCardV1Body = lazy(() => import("./AppLinkCardV1Body").then((module) => ({ default: module.AppLinkCardV1Body })));
 
 /** The plain text of a Markdown link's rendered children (a hast element). */
 export function markdownLinkText(node: unknown): string {
@@ -115,7 +96,7 @@ function MessageAppLinkDrawn({ href, text, children }: { href: string | undefine
   }
   if (card.kind === "app" && card.data.kind === "card" && card.data.drawn?.chip === false) return <>{children}</>;
   if (card.kind === "app") return <AppLinkChip result={card.data} />;
-  if (card.state === "deleted") return <DeletedObjectChip title={card.data.deleted.title} />;
+  if (card.state === "deleted") return <DeletedObjectChip title={card.data.deleted.title} url={href} />;
   if (card.state !== "ok") return <>{children}</>;
   return <ObjectLinkChip link={card} />;
 }
@@ -141,12 +122,13 @@ function ObjectLabelledLink({ link, children }: { link: Extract<ObjectLinkCard, 
  * message. raft-ui's unavailable chip has no `capped`: the same 24em cap as
  * the other chips, by class, since the title is the author's words; its
  * words are `foreground-muted`, not the chip's `foreground-hint`, so they
- * still read at 60%.
+ * still read at 60%. A share image draws the author's link (`url`) in its
+ * place: the title is this viewer's, not the author's words.
  */
-function DeletedObjectChip({ title }: { title: string }) {
+export function DeletedObjectChip({ title, url }: { title: string; url: string }) {
   const { formatMessage } = useIntl();
   return (
-    <MessageReferenceUnavailable className="max-w-[min(100%,24em)] text-foreground-muted opacity-dimmed" data-app-link-chip="deleted">
+    <MessageReferenceUnavailable className="max-w-[min(100%,24em)] text-foreground-muted opacity-dimmed" data-app-link-chip="deleted" data-select-screenshot-author-link={url}>
       <FileX aria-hidden />
       <MessageReferenceLabel>{title}</MessageReferenceLabel>
       <MessageReferenceSuffix className="text-foreground-muted">{formatMessage({ id: "artifacts.chip.deleted" })}</MessageReferenceSuffix>
@@ -154,9 +136,13 @@ function DeletedObjectChip({ title }: { title: string }) {
   );
 }
 
-/** The element a chip or button renders as to open `href` in a new tab; `label` mirrors its visible words. */
-function newTabLink(href: string, label: string) {
-  return <a href={href} target="_blank" rel="noopener noreferrer" aria-label={label} />;
+/**
+ * The element a chip or button renders as to open `href` in a new tab; `label` mirrors its visible words. A content
+ * link (webLinkProps: where it opens is the link router's decision, as a message's own link), unless `outside`: a
+ * step that must happen in the person's browser (connecting an account).
+ */
+function newTabLink(href: string, label: string, outside = false) {
+  return <a href={href} target="_blank" rel="noopener noreferrer" aria-label={label} {...(outside ? null : webLinkProps)} />;
 }
 
 /** A first-party chip's link: a page of Raft's, followed in this tab unless `onClick` opens it in place. */
@@ -274,7 +260,7 @@ function LinkCardFooter({ app, domain }: { app: string; domain?: string }) {
  * app's (`artifactKindIcon`, `ArtifactLinkPreview`; #proj-workspace:#34);
  * the chip, the hover card and its footer are this file's, as for an App.
  */
-function ObjectLinkChip({ link }: { link: Extract<ObjectLinkCard, { state: "ok" }> }) {
+export function ObjectLinkChip({ link }: { link: Extract<ObjectLinkCard, { state: "ok" }> }) {
   const owner = useId();
   const appName = useArtifactsAppName();
   const { target, summary } = link.data;
@@ -391,13 +377,13 @@ function AppLinkCardBody({ result, owner }: { result: Extract<AppLinkResult, { k
         <ItemCardTitle title={result.title} />
         {result.cardV2 ? (
           <LinkCardBoundary key={JSON.stringify(result.cardV2)}>
-            <LinkCardElements card={result.cardV2} />
+            <LinkCardElements card={result.cardV2} surface="popover" />
           </LinkCardBoundary>
         ) : result.card ? (
           <LinkCardBoundary key={JSON.stringify(result.card)}>
-            <StateProvider initialState={emptyState}><VisibilityProvider><ActionProvider handlers={noActions}>
-              <Renderer spec={result.card} registry={registry} />
-            </ActionProvider></VisibilityProvider></StateProvider>
+            <Suspense fallback={null}>
+              <AppLinkCardV1Body spec={result.card} />
+            </Suspense>
           </LinkCardBoundary>
         ) : null}
       </PreviewCardBody>
@@ -439,7 +425,7 @@ function AppLinkConnectBody({ result }: { result: Extract<AppLinkResult, { kind:
       </PreviewCardBody>
       {connectHref ? (
         <PreviewCardActions>
-          <Button variant="outline" nativeButton={false} role="link" render={newTabLink(connectHref, formatMessage({ id: "message.appLink.connect.action" }))}>
+          <Button variant="outline" nativeButton={false} role="link" render={newTabLink(connectHref, formatMessage({ id: "message.appLink.connect.action" }), true)}>
             {formatMessage({ id: "message.appLink.connect.action" })}
           </Button>
         </PreviewCardActions>

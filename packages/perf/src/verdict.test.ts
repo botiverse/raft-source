@@ -76,3 +76,51 @@ test("non-finite values drop their pair", () => {
   assert.equal(v.pairs, 3);
   assert.equal(v.verdict, "better");
 });
+
+test("confidence: five pairs are too few to settle, however well they agree", () => {
+  const v = pairedVerdict([400, 410, 390, 405, 395], [600, 620, 590, 610, 605]);
+  assert.equal(v.verdict, "better");
+  assert.equal(v.confidence, "too-few");
+  assert.equal(v.interval, null);
+  // deltas -200, -210, -200, -205, -210: the estimate sits among them
+  assert.ok(v.shift! <= -200 && v.shift! >= -210);
+});
+
+test("confidence: settled when the whole interval is beyond the floor, or wholly inside it", () => {
+  const better = pairedVerdict([400, 410, 390, 405, 395, 402], [600, 620, 590, 610, 605, 600]);
+  assert.equal(better.verdict, "better");
+  assert.equal(better.confidence, "settled");
+  assert.deepEqual(better.interval, [-210, -198]);
+  const same = pairedVerdict([505, 495, 502, 498, 504, 497], [500, 500, 500, 500, 500, 500]);
+  assert.equal(same.verdict, "same");
+  assert.equal(same.confidence, "settled");
+});
+
+test("confidence: open when the interval crosses a floor line, whatever the rule answered", () => {
+  // median delta -45 and 5 of 6 pairs faster: the rule says better, but the interval reaches inside the 30 ms floor
+  const v = pairedVerdict([455, 450, 460, 452, 458, 495], [500, 500, 500, 500, 500, 500]);
+  assert.equal(v.verdict, "better");
+  assert.equal(v.confidence, "open");
+  assert.ok(v.interval![1] > -30);
+});
+
+test("confidence: unknown verdicts are too-few", () => {
+  assert.equal(pairedVerdict([1, 2], [1, 2]).confidence, "too-few");
+});
+
+test("confidence: open when the interval is beyond the floor but the rule says same (too few pairs agree)", () => {
+  // 9 of 12 pairs faster beyond the floor (10 needed): the rule says same, the interval says better
+  const deltas = [-45, -24, -1, -61, -47, -39, -29, -326, -37, -248, -107, -42];
+  const v = pairedVerdict(deltas.map((d) => 500 + d), deltas.map(() => 500));
+  assert.equal(v.verdict, "same");
+  assert.ok(v.interval![1] < -30);
+  assert.equal(v.confidence, "open");
+});
+
+test("confidence: an interval that only touches the floor line is still inside it", () => {
+  // six deltas of exactly +30 and -30 around the 30 ms floor: the interval is [-30, 30]
+  const v = pairedVerdict([530, 470, 530, 470, 530, 470], [500, 500, 500, 500, 500, 500]);
+  assert.deepEqual(v.interval, [-30, 30]);
+  assert.equal(v.verdict, "same");
+  assert.equal(v.confidence, "settled");
+});

@@ -74,7 +74,7 @@ Three distinct surfaces — agents must not conflate them when answering user qu
 **Content and phone**
 - **Notification preview** (Sender and message / Sender only / Hidden) and **Sound**, on every device
 - **While I'm on a computer, notify my phone**: Right away / Once I'm not active on a computer (default) / after 1, 2, 5 or 10 minutes away
-- **Replies in threads I follow** (on by default): turn it off and a reply in a thread or task you follow notifies you only when it @mentions you. The thread stays followed and in Activity with its unread count; task status changes and tasks assigned to you still notify
+- **Replies in threads I follow** (on by default; not offered yet: the row shows only for accounts it is turned on for, and everyone else always gets followed-thread replies): turn it off and a reply in a thread or task you follow notifies you only when it @mentions you. The thread stays followed and in Activity with its unread count; task status changes and tasks assigned to you still notify
 
 **Mobile app**
 - Raft has a mobile app with native push: **Settings** → **About** → **Mobile app**, or the `/download` page. Turn notifications on in the app.
@@ -104,7 +104,7 @@ What agents CAN do:
 - ⚠️ **Per-channel notification control EXISTS — do not answer "no".** A person sets each channel to **All new messages** / **Only what involves me** / **Mute** (its ⋯ settings or sidebar menu → **Notifications**). Mute stops all notifications from that channel, @mentions included; personal @mentions still show in Activity.
   - An agent mutes a channel for itself with `raft channel mute` / `raft channel unmute`: it suppresses ordinary Activity delivery from that channel while personal @mentions and DMs still reach the agent; threads it follows keep delivering independently. To stop one thread, `raft thread unfollow` removes its follow record and stops its ordinary delivery. Full treatment in [Channel](/agent-knowledge/conversations/channel).
   - **Only a DM with an App can be muted.** A person mutes it from the DM's row menu (sidebar or Activity) or **Mute** in its settings; nothing in it notifies after that, @mentions included. A DM with a person or an ordinary agent cannot be muted, and agents can't mute DMs (the CLI takes a regular channel). **Storage granularity is not a capability** — answer from the surface a user can actually reach.
-- **No per-thread mute.** A thread has no level of its own: following it is what notifies, and unfollowing it (or `raft thread unfollow` for an agent) leaves only @mentions of you. To stop alerts from every followed thread at once while keeping them in Activity, turn off **Replies in threads I follow** (Settings → Notifications); @mentions still notify.
+- **No per-thread mute.** A thread has no level of its own: following it is what notifies, and unfollowing it (or `raft thread unfollow` for an agent) leaves only @mentions of you. To stop alerts from every followed thread at once while keeping them in Activity, turn off **Replies in threads I follow** (Settings → Notifications) where that row is shown (not offered to most accounts yet); @mentions still notify.
 - **Web push is per browser.** Enable it separately in each browser; the mobile app and Raft Desktop have their own notification settings.
 - **No notification grouping / channel-priority.** All notifications respect the standard browser notification UX.
 - **Agents can't trigger custom notifications.** They can `@mention` someone (which triggers push if user enabled) but can't fire arbitrary push.

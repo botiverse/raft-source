@@ -98,8 +98,9 @@ test("Built-in Pi form lists Qwen Token Plan global and CN as first-class preset
   if (!modelSource || modelSource.kind !== "dependent_select") return;
   assert.equal(modelSource.defaultValueByValue["qwen-token-plan"], "qwen-token-plan/qwen3.8-max");
   assert.equal(modelSource.defaultValueByValue["qwen-token-plan-cn"], "qwen-token-plan-cn/qwen3.8-max");
-  assert.equal(modelSource.customValueAllowedByValue["qwen-token-plan"], false);
-  assert.equal(modelSource.customValueAllowedByValue["qwen-token-plan-cn"], false);
+  // Both take a typed id too (task #10): their catalogs are one transport each.
+  assert.equal(modelSource.customValueAllowedByValue["qwen-token-plan"], true);
+  assert.equal(modelSource.customValueAllowedByValue["qwen-token-plan-cn"], true);
   assert.ok(modelSource.optionsByValue["qwen-token-plan"]?.some(
     (option) => option.value === "qwen-token-plan/qwen3.8-max",
   ));
@@ -149,7 +150,7 @@ test("projection mutation teeth fail on provider, kind, model, default, and mode
   const presetPolicySource = presetPolicyDrift.optionSources.model;
   if (presetPolicySource.kind === "dependent_select") {
     const presetId = Object.keys(presetPolicySource.defaultValueByValue)[0]!;
-    presetPolicySource.customValueAllowedByValue[presetId] = true;
+    presetPolicySource.customValueAllowedByValue[presetId] = !presetPolicySource.customValueAllowedByValue[presetId];
   }
   assert.ok(validateBuiltInPiDefinitionProjection(presetPolicyDrift).some(
     (issue) => issue.code === "definition_preset_custom_model_drift",
@@ -305,10 +306,8 @@ test("protocol v2 form values point at the offending field", () => {
   };
   assert.deepEqual(issue("builtin", { providerId: "nope" }), { code: "select_valid_provider", pointer: "/formValues/providerId" });
   assert.deepEqual(issue("builtin", { providerId: "deepseek", model: "deepseek/deepseek-v4-pro" }), { code: "api_key_required", pointer: "/formValues/apiKey" });
-  assert.deepEqual(
-    issue("builtin", { providerId: "deepseek", apiKey: "k", model: "not-a-deepseek-model" }),
-    { code: "select_valid_provider_model", pointer: "/formValues/model" },
-  );
+  // A typed id on a preset provider is a custom model (task #10), not an issue.
+  assert.equal(issue("builtin", { providerId: "deepseek", apiKey: "k", model: "not-a-deepseek-model" }), null);
   assert.deepEqual(issue("builtin", { providerId: "deepseek", apiKey: "k", model: "m", envVars: { A: 1 } }), { code: "invalid_string_map", pointer: "/formValues/envVars" });
   assert.deepEqual(issue("kimi-sdk", {}), { code: "model_required", pointer: "/formValues/model" });
   assert.deepEqual(issue("codex", {}), { code: "model_required", pointer: "/formValues/model" });

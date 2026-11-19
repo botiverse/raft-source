@@ -607,6 +607,8 @@ export function createAgentApiSurfaceClient(client: CliAgentApiHttpClient, optio
         requestMultipartContractAgentApiRoute(client, "integrationAppLogoUpdate", form),
       listApps: () =>
         requestClientAsApiResponse(agentApi.integrations.listApps()),
+      cardButtons: (body: AgentApiRequestBodyByRoute["integrationAppCardButtons"]) =>
+        requestClientAsApiResponse(agentApi.integrations.cardButtons(body)),
       getAppStatus: (query: AgentApiRequestQueryByRoute["integrationAppStatus"]) =>
         requestClientAsApiResponse(agentApi.integrations.getAppStatus(query)),
     },

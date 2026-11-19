@@ -1,5 +1,5 @@
-import { useCallback } from "react";
-import type { ReactNode, RefObject } from "react";
+import { useCallback, useRef } from "react";
+import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
 import { Dialog, DialogSurface } from "@botiverse/raft-ui";
 import { NarrowDialogContent } from "../../components/ui/NarrowDialog";
@@ -9,29 +9,27 @@ import { NarrowDialogContent } from "../../components/ui/NarrowDialog";
  * "page") it is the bare surface the gate places. Opened on its own ("modal":
  * from the members panel, or a hosted Cindy's DM banner) it is a raft-ui
  * Dialog: Base UI's Esc, focus trap and focus return, no scrim press (as the
- * old Modal), and focus starting on the dialog itself rather than its ×. The
- * frame is the runtime selects' portal target either way, so in the dialog
- * they open inside its focus trap.
+ * old Modal), and focus starting on the dialog itself rather than its ×. Its
+ * runtime lists portal into the dialog's own portal, so they open inside its
+ * focus trap and above it.
  */
 export function CreateCindyFrame({
   modal,
   onClose,
-  portalRef,
   className,
   children,
 }: {
   modal: boolean;
   onClose: () => void;
-  portalRef: RefObject<HTMLElement | null>;
   className: string;
   children: ReactNode;
 }) {
   const { formatMessage } = useIntl();
-  const setPopup = useCallback((node: HTMLDivElement | null) => { portalRef.current = node; }, [portalRef]);
+  const popupRef = useRef<HTMLDivElement | null>(null);
   const handleOpenChange = useCallback((open: boolean) => { if (!open) onClose(); }, [onClose]);
   if (!modal) {
     return (
-      <DialogSurface render={<section ref={portalRef} />} className={className} data-testid="create-cindy-screen-c">
+      <DialogSurface render={<section />} className={className} data-testid="create-cindy-screen-c">
         {children}
       </DialogSurface>
     );
@@ -40,9 +38,9 @@ export function CreateCindyFrame({
   return (
     <Dialog open disablePointerDismissal onOpenChange={handleOpenChange}>
       <NarrowDialogContent
-        ref={setPopup}
+        ref={popupRef}
         narrow="centered"
-        initialFocus={portalRef}
+        initialFocus={popupRef}
         className={className}
         aria-label={title}
         data-testid="create-cindy-screen-c"

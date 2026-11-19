@@ -52,28 +52,14 @@ test("managed MCP: Qwen takes it as a session MCP server; Qoder never does (OAR 
   assert.equal(qwen.options.resume, "qwen-session-1", "given again on resume");
   assert.equal(JSON.stringify(qwen.options.env).includes("qwen-token"), false);
   assert.equal("mcpServers" in oarOnlyLaunch("qwen", ctx(), {}, installation, {}).options, false, "none without managed MCP");
-  assert.deepEqual(OAR_ONLY_MANAGED_MCP, { qwen: true, qoder: false, codebuddy: false });
-  assert.throws(() => oarOnlyLaunch("codebuddy", ctx({ runtime: "codebuddy" }), {}, installation, {}, managedMcp), /takes no managed MCP/);
+  assert.deepEqual(OAR_ONLY_MANAGED_MCP, { qwen: true, qoder: false });
   assert.throws(() => oarOnlyLaunch("qoder", ctx({ runtime: "qoder" }), {}, installation, {}, managedMcp), /takes no managed MCP/);
   assert.equal("mcpServers" in oarOnlyLaunch("qoder", ctx({ runtime: "qoder" }), {}, installation, {}).options, false);
 });
 
-test("busy deliveries: Qoder steers natively, Qwen's and CodeBuddy's wait for the turn end", () => {
+test("busy deliveries: Qoder steers natively, Qwen's wait for the turn end", () => {
   assert.equal(oarOnlyLaunch("qoder", ctx({ runtime: "qoder" }), {}, installation, {}).busyDelivery, "now");
   assert.equal(oarOnlyLaunch("qwen", ctx(), {}, installation, {}).busyDelivery, "after_turn");
-  assert.equal(oarOnlyLaunch("codebuddy", ctx({ runtime: "codebuddy" }), {}, installation, {}).busyDelivery, "after_turn");
-});
-
-test("a CodeBuddy launch: the standing prompt as its system prompt, the chosen model and its thought level, resume", () => {
-  const launch = oarOnlyLaunch("codebuddy", ctx({ runtime: "codebuddy", model: "cb-model", reasoningEffort: "medium", sessionId: "cb-session-1" }), {}, installation, {});
-  assert.deepEqual(launch.options, {
-    cwd: "/work/agent-1",
-    env: {},
-    systemPrompt: "standing instructions",
-    model: "cb-model",
-    effort: "medium",
-    resume: "cb-session-1",
-  });
 });
 
 test("prepareOarOnlyLaunch: the executable OAR's lookup finds, the agent token out of the runtime's environment", async () => {

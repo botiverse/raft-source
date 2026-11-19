@@ -92,7 +92,6 @@ import {
   getModelLabel,
   PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY,
   RUNTIME_ERROR_CODE_SENTENCES,
-  SERVER_GUEST_FEATURE_FLAG_KEY,
 } from "@botiverse/raft-shared";
 import { useModelLabelCatalogStore } from "../src/store/modelLabelCatalogStore";
 import { setServerFeatureFlagForTests } from "../src/store/serverFeatureFlags";
@@ -891,6 +890,9 @@ function requestedCaseId(): string {
 // The capture's mode (`?theme=dark`, light otherwise), applied at the app root
 // (main.tsx) so a single ThemeProvider owns the mode class — no nested provider
 // whose syncDom effect could race the root's.
+/** A Copy link that always reaches the clipboard (SelectModeToolbar's onCopyLinks). */
+const copiedLinks = () => Promise.resolve(true);
+
 export function requestedMode(): "light" | "dark" {
   const params = new URLSearchParams(window.location.search);
   return params.get("theme") === "dark" ? "dark" : "light";
@@ -2413,25 +2415,20 @@ function primeSettingsVisualStores(caseConfig: SettingsVisualCase) {
 
 type InviteHumanVisualCase = {
   id: string;
-  /** Guest is offered only when the server flag is on AND the caller may invite. */
-  guestEnabled: boolean;
 };
 
 const INVITE_HUMAN_CASES: Record<string, InviteHumanVisualCase> = {
   "components.members.invite-human.per-row-role": {
     id: "components.members.invite-human.per-row-role",
-    guestEnabled: true,
   },
   "components.members.invite-human.gate-off": {
     id: "components.members.invite-human.gate-off",
-    guestEnabled: false,
   },
 };
 
 function InviteHumanVisualCaseView({ caseConfig }: { caseConfig: InviteHumanVisualCase }) {
   useMemo(() => {
-    // Owner, so `capabilities.inviteMembers` is true: the Guest control needs
-    // both halves, and seeding only the flag would render nothing.
+    // Owner, so `capabilities.inviteMembers` is true.
     useServerStore.setState({
       current: {
         id: fxServer.id,
@@ -2447,10 +2444,7 @@ function InviteHumanVisualCaseView({ caseConfig }: { caseConfig: InviteHumanVisu
       billing: null,
       loadBilling: async () => {},
     } as never);
-    // Read from the flag STORE rather than the evaluate endpoint, so route
-    // mocking cannot switch it on — it has to be seeded.
-    setServerFeatureFlagForTests(fxServer.id, SERVER_GUEST_FEATURE_FLAG_KEY, caseConfig.guestEnabled);
-  }, [caseConfig.guestEnabled]);
+  }, []);
 
   return (
     <main className="min-h-screen bg-layer-canvas p-0 font-display text-foreground">
@@ -3612,8 +3606,8 @@ function DirectVisualCaseView({ caseConfig }: { caseConfig: DirectVisualCase }) 
           }}
         >
           <div className="flex flex-col gap-3">
-            <FormField label="Email" required htmlFor="visual-email">
-              <Input id="visual-email" value="cindy@slock.ai" readOnly />
+            <FormField label="Email" htmlFor="visual-email">
+              <Input id="visual-email" value="cindy@slock.ai" readOnly required />
             </FormField>
             <FormField label="Description" optional hint="Shown in channel discovery.">
               <Input value="Visual parity fixture" readOnly />
@@ -4297,7 +4291,7 @@ function ThreadMessageShareSelectionVisualCaseView({ caseConfig }: { caseConfig:
           onSavePic={noop}
           onCopyMd={noop}
           onForward={noop}
-          onCopyLinks={noop}
+          onCopyLinks={copiedLinks}
         />
       </div>
     </main>

@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { verifyStandardWebhook } from "../lib/standardWebhooks";
 import { and, eq, sql } from "drizzle-orm";
 import { getDb } from "../db/index";
 import type { DatabaseExecutor } from "../db/index";
@@ -340,46 +340,9 @@ export async function syncNewsletterSignup(user: NewsletterUser, options: Signup
   }
 }
 
-function decodeSvixSecret(secret: string): Buffer {
-  const encoded = secret.startsWith("whsec_") ? secret.slice("whsec_".length) : secret;
-  return Buffer.from(encoded, "base64");
-}
-
-function safeEqual(a: Buffer, b: Buffer) {
-  return a.length === b.length && timingSafeEqual(a, b);
-}
-
+/** Resend signs with Svix, which is Standard Webhooks. */
 export function verifyResendWebhookSignature(payload: Buffer, headers: ResendWebhookHeaders, secret: string): void {
-  const id = getSingleHeader(headers.id);
-  const timestamp = getSingleHeader(headers.timestamp);
-  const signature = getSingleHeader(headers.signature);
-  if (!id || !timestamp || !signature) {
-    throw new Error("Missing Resend webhook signature headers");
-  }
-
-  const timestampSeconds = Number(timestamp);
-  if (!Number.isFinite(timestampSeconds)) {
-    throw new Error("Invalid Resend webhook timestamp");
-  }
-  const maxSkewSeconds = 5 * 60;
-  if (Math.abs(Date.now() / 1000 - timestampSeconds) > maxSkewSeconds) {
-    throw new Error("Stale Resend webhook timestamp");
-  }
-
-  const expected = createHmac("sha256", decodeSvixSecret(secret)).update(`${id}.${timestamp}.`).update(payload).digest();
-  const valid = signature
-    .split(" ")
-    .some((part) => {
-      const [version, encoded] = part.split(",", 2);
-      if (version !== "v1" || !encoded) return false;
-      try {
-        return safeEqual(expected, Buffer.from(encoded, "base64"));
-      } catch {
-        return false;
-      }
-    });
-
-  if (!valid) {
+  if (!verifyStandardWebhook(payload, headers, secret)) {
     throw new Error("Invalid Resend webhook signature");
   }
 }

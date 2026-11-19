@@ -217,6 +217,18 @@ export const RAFT_HINT_SAMPLES: Record<RaftHintBuilderName, RaftHintSample[]> = 
     { hint: RAFT_HINTS.actionWithdraw(MSG), cli: `raft action withdraw --message ${MSG}`, tool: `actions_withdraw({ messageId: "${MSG}" })` },
   ],
   actionPrepareName: [{ hint: RAFT_HINTS.actionPrepareName(), cli: "raft action prepare", tool: "actions_prepare({ target: …, action: … })" }],
+  actionPrepareCard: [
+    {
+      hint: RAFT_HINTS.actionPrepareCard({ target: "dm:@<person>", action: { type: "request:prepare", to: "@<person>", operation: "agent:stop", args: { agent: "@builder" } } }),
+      cli: `raft action prepare --target "dm:@<person>" <<'RAFTACTION'\n{"type":"request:prepare","to":"@<person>","operation":"agent:stop","args":{"agent":"@builder"}}\nRAFTACTION`,
+      tool: `actions_prepare({ target: "dm:@<person>", action: … })`,
+    },
+    {
+      hint: RAFT_HINTS.actionPrepareCard({ target: "#ops", action: { type: "request:prepare", note: "it's stuck" } }),
+      cli: `raft action prepare --target "#ops" <<'RAFTACTION'\n{"type":"request:prepare","note":"it's stuck"}\nRAFTACTION`,
+      tool: `actions_prepare({ target: "#ops", action: … })`,
+    },
+  ],
   manualGet: [
     { hint: RAFT_HINTS.manualGet("tasks", { intent: "Track my work with tasks", reason: "Deciding how to claim one" }), cli: `raft manual get tasks --intent "Track my work with tasks" --reason "Deciding how to claim one"`, tool: `manual_get({ topic: "tasks", intent: "Track my work with tasks", reason: "Deciding how to claim one" })` },
     { hint: RAFT_HINTS.manualGet("artifact", { intent: `Ship "v2" for $5`, reason: "It's needed now" }), cli: `raft manual get artifact --intent 'Ship "v2" for $5' --reason "It's needed now"`, tool: `manual_get({ topic: "artifact", intent: "Ship \\"v2\\" for $5", reason: "It's needed now" })` },

@@ -4,6 +4,8 @@
  * firstScreen.ts.
  */
 import { createHash } from "node:crypto";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { brotliCompressSync, constants } from "node:zlib";
 import { type FirstScreenFile, type FirstScreenSnapshot, parseIndexHtml, stableName, staticImports, totals } from "./firstScreen";
 
@@ -11,22 +13,71 @@ const br = (b: Buffer) => brotliCompressSync(b, { params: { [constants.BROTLI_PA
 
 const sha256 = (b: Buffer) => createHash("sha256").update(b).digest("hex");
 
-type Got = { status: number; body: Buffer; cacheControl: string | null };
+type Got = { status: number; body: Buffer; cacheControl: string | null; contentType: string | null };
 
-async function get(url: string): Promise<Got> {
-  const r = await fetch(url, { headers: { "accept-encoding": "identity", "user-agent": "raft-perf-snapshot" }, redirect: "follow" });
-  return { status: r.status, body: Buffer.from(await r.arrayBuffer()), cacheControl: r.headers.get("cache-control") };
+const USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 raft-perf-snapshot";
+
+/**
+ * Each request carries what a browser sends for that kind of resource. Node's
+ * `fetch` cannot be used: it always sends `Sec-Fetch-Mode: cors`, and a server
+ * that answers by that header hands it another document than a browser gets
+ * (Stamp's gateway serves its agent/htmx site to it, so the snapshot listed
+ * the wrong files). The navigation headers go on the document only: a server
+ * that serves its app shell to any navigation would answer 200 with HTML for
+ * a script path that does not exist, and a regex false positive would be
+ * counted as a file.
+ */
+export const REQUEST_HEADERS = {
+  document: { accept: "text/html,application/xhtml+xml,*/*;q=0.8", "accept-encoding": "identity", "sec-fetch-dest": "document", "sec-fetch-mode": "navigate", "sec-fetch-site": "none", "user-agent": USER_AGENT },
+  js: { accept: "*/*", "accept-encoding": "identity", "sec-fetch-dest": "script", "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin", "user-agent": USER_AGENT },
+  css: { accept: "text/css,*/*;q=0.1", "accept-encoding": "identity", "sec-fetch-dest": "style", "sec-fetch-mode": "no-cors", "sec-fetch-site": "same-origin", "user-agent": USER_AGENT },
+} as const;
+
+type RequestKind = keyof typeof REQUEST_HEADERS;
+
+const MAX_REDIRECTS = 5;
+
+function get(url: string, kind: RequestKind, redirectsLeft = MAX_REDIRECTS): Promise<Got> {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const send = target.protocol === "http:" ? httpRequest : httpsRequest;
+    const req = send(target, { method: "GET", headers: REQUEST_HEADERS[kind] }, (res) => {
+      const status = res.statusCode ?? 0;
+      const location = res.headers.location;
+      if (status >= 300 && status < 400 && location) {
+        res.resume();
+        if (redirectsLeft <= 0) reject(new Error(`${url}: more than ${MAX_REDIRECTS} redirects`));
+        else resolve(get(new URL(location, target).href, kind, redirectsLeft - 1));
+        return;
+      }
+      const chunks: Buffer[] = [];
+      res.on("data", (chunk: Buffer) => chunks.push(chunk));
+      res.on("end", () => {
+        const cacheControl = res.headers["cache-control"];
+        const contentType = res.headers["content-type"];
+        resolve({ status, body: Buffer.concat(chunks), cacheControl: typeof cacheControl === "string" ? cacheControl : null, contentType: typeof contentType === "string" ? contentType : null });
+      });
+      res.on("error", reject);
+    });
+    req.setTimeout(60_000, () => req.destroy(new Error(`${url}: no answer in 60 s`)));
+    req.on("error", reject);
+    req.end();
+  });
 }
 
-async function getOk(url: string): Promise<Got> {
-  const r = await get(url);
+/** An HTML answer to a script or stylesheet request is the server's fallback page, not that file. */
+const isHtml = (got: Got) => /^text\/html\b/i.test(got.contentType ?? "");
+
+async function getOk(url: string, kind: RequestKind): Promise<Got> {
+  const r = await get(url, kind);
+  if (kind !== "document" && r.status >= 200 && r.status < 300 && isHtml(r)) throw new Error(`GET ${url} -> ${r.status} with an HTML body where a ${kind} file was expected`);
   if (r.status < 200 || r.status >= 300) throw new Error(`GET ${url} -> ${r.status}`);
   return r;
 }
 
 export async function takeSnapshot(originArg: string): Promise<FirstScreenSnapshot> {
   const origin = new URL(originArg).origin;
-  const htmlGot = await getOk(origin + "/");
+  const htmlGot = await getOk(origin + "/", "document");
   const htmlBuf = htmlGot.body;
   const { release, assets } = parseIndexHtml(htmlBuf.toString("utf8"), origin);
   // A server-rendered page may start its module from preloads or inline code; only a page with no script or stylesheet at all is refused.
@@ -40,16 +91,16 @@ export async function takeSnapshot(originArg: string): Promise<FirstScreenSnapsh
     const f = found.get(url)!;
     if (f.got) continue;
     if (f.via === "static-import") {
-      // found by regex: a 404 is a false positive, not a broken page
-      const r = await get(origin + url);
-      if (r.status === 404) {
+      // found by regex: a 404, or the server's HTML fallback page, is a false positive, not a broken page
+      const r = await get(origin + url, "js");
+      if (r.status === 404 || (r.status >= 200 && r.status < 300 && isHtml(r))) {
         found.delete(url);
         skipped.push(url);
         continue;
       }
       if (r.status < 200 || r.status >= 300) throw new Error(`GET ${origin + url} -> ${r.status}`);
       f.got = r;
-    } else f.got = await getOk(origin + url);
+    } else f.got = await getOk(origin + url, "js");
     for (const rel of staticImports(f.got.body.toString("utf8"))) {
       const u = new URL(rel, origin + url);
       const path = u.pathname + u.search;
@@ -61,7 +112,7 @@ export async function takeSnapshot(originArg: string): Promise<FirstScreenSnapsh
   }
   const files: FirstScreenFile[] = [];
   for (const f of found.values()) {
-    const got = f.got ?? (await getOk(origin + f.url));
+    const got = f.got ?? (await getOk(origin + f.url, f.kind === "css" ? "css" : "js"));
     files.push({ url: f.url, name: stableName(f.url), kind: f.kind, via: f.via, bytes: got.body.length, brBytes: br(got.body), sha256: sha256(got.body), cacheControl: got.cacheControl });
   }
   return {

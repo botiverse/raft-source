@@ -4,11 +4,19 @@ These definitions and validation queries support the Inbox materialized views.
 They are executable infrastructure inputs, not PostgreSQL/Drizzle migrations.
 The numeric prefixes retain links to the design history in `rfcs/`.
 
+`081-computed-joint-members/` builds a parallel generation for computed joint
+human membership, including shared parent visibility checks. Numbered files
+are single-object build steps; `parity.sql` and `membership-diagnostics.sql`
+are read-only validation inputs. Server serving references remain on 078 until
+a separately reviewed switch. The build contract and rollout gates are in
+[the 081 procedure](../../../docs/operations/rw-computed-joint-members-081.md).
+
 The local bootstrap in `packages/server/scripts/bootstrap-risingwave-local.ts`
 (`./raftdev start`, which runs it by default, and the `risingwave-real` CI job) selects, statement by
-statement, exactly the relations the server reads and their dependencies from
+statement, the relations the server reads, their dependencies, and the staged
+081 generation from
 024 (CDC-table indexes only), 061, 063-unified-inbox-chain, 063-chain-v5,
-066 (`rw_inbox_muted_full_v1` only), 075, 078, 071 (indexes only), and 074, in
+066 (`rw_inbox_muted_full_v1` only), 075, 078, 071 (indexes only), and 074, followed by the parallel 081 generation, in
 that order (078's conversation unread reads 066's `rw_inbox_muted_full_v1`
 instead of 075's `rw_inbox_muted_full_v2`, which is therefore not built; 066's
 `rw_conversation_unread_v1` and 068's consumers are superseded by 068/076; 076's

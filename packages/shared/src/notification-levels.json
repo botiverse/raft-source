@@ -1,0 +1,140 @@
+{
+  "description": "resolveEffectiveLevel cases (packages/shared/src/notifications.ts). Every client that shows an effective level, and the server policy, must agree with each case. thread/channel null means default (inherit).",
+  "cases": [
+    {
+      "name": "server all, nothing explicit",
+      "server": "all",
+      "channel": null,
+      "thread": null,
+      "muted": false,
+      "effective": "all"
+    },
+    {
+      "name": "server mentions, nothing explicit",
+      "server": "mentions",
+      "channel": null,
+      "thread": null,
+      "muted": false,
+      "effective": "mentions"
+    },
+    {
+      "name": "server none, nothing explicit",
+      "server": "none",
+      "channel": null,
+      "thread": null,
+      "muted": false,
+      "effective": "none"
+    },
+    {
+      "name": "server none + a legacy or automatic follow (thread level NULL = default): no notification",
+      "server": "none",
+      "channel": null,
+      "thread": null,
+      "muted": false,
+      "effective": "none"
+    },
+    {
+      "name": "server none + a thread explicitly set to all (Follow after this contract)",
+      "server": "none",
+      "channel": null,
+      "thread": "all",
+      "muted": false,
+      "effective": "all"
+    },
+    {
+      "name": "server none, channel all wins (most specific)",
+      "server": "none",
+      "channel": "all",
+      "thread": null,
+      "muted": false,
+      "effective": "all"
+    },
+    {
+      "name": "server all, channel mentions",
+      "server": "all",
+      "channel": "mentions",
+      "thread": null,
+      "muted": false,
+      "effective": "mentions"
+    },
+    {
+      "name": "channel mentions, thread none",
+      "server": "all",
+      "channel": "mentions",
+      "thread": "none",
+      "muted": false,
+      "effective": "none"
+    },
+    {
+      "name": "server none, thread all wins",
+      "server": "none",
+      "channel": null,
+      "thread": "all",
+      "muted": false,
+      "effective": "all"
+    },
+    {
+      "name": "channel default is the same as null",
+      "server": "mentions",
+      "channel": "default",
+      "thread": "default",
+      "muted": false,
+      "effective": "mentions"
+    },
+    {
+      "name": "muted channel caps all at mentions",
+      "server": "all",
+      "channel": "all",
+      "thread": null,
+      "muted": true,
+      "effective": "mentions"
+    },
+    {
+      "name": "muted channel keeps none",
+      "server": "none",
+      "channel": null,
+      "thread": null,
+      "muted": true,
+      "effective": "none"
+    },
+    {
+      "name": "muted channel keeps mentions",
+      "server": "mentions",
+      "channel": null,
+      "thread": null,
+      "muted": true,
+      "effective": "mentions"
+    },
+    {
+      "name": "muted channel caps an explicit thread all",
+      "server": "all",
+      "channel": null,
+      "thread": "all",
+      "muted": true,
+      "effective": "mentions"
+    }
+  ],
+  "categoryDecisions": {
+    "description": "Whether a category notifies at an effective level (before quiet hours / pause). personal = dm, mention, task_assigned, agent_attention, reminder, personal task_status, system_notice.",
+    "personal": {
+      "all": true,
+      "mentions": true,
+      "none": false
+    },
+    "thread": {
+      "all": true,
+      "mentions": true,
+      "none": false
+    },
+    "follower_task_status": {
+      "all": true,
+      "mentions": true,
+      "none": false
+    },
+    "channel": {
+      "all": true,
+      "mentions": false,
+      "none": false
+    }
+  }
+}

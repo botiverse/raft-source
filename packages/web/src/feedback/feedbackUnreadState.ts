@@ -1,7 +1,15 @@
-import type { ProductFeedbackUnreadEvent } from "@botiverse/raft-shared";
+import type { ProductFeedbackAppSource, ProductFeedbackAppUnreadEvent, ProductFeedbackUnreadEvent } from "@botiverse/raft-shared";
 import api from "../api/client";
-import { FEEDBACK_LIST_DEGRADED_OK, degradedRetryAfterMs, isDegradedFeedbackPage } from "./productFeedbackListContract";
-import type { ApiDegradedTicketPage } from "./productFeedbackListContract";
+import {
+  FEEDBACK_LIST_ALL_SOURCES,
+  FEEDBACK_LIST_DEGRADED_OK,
+  degradedRetryAfterMs,
+  feedbackListUnread,
+  feedbackUnreadCount,
+  isDegradedFeedbackPage,
+  isProductFeedbackAppSource,
+} from "./productFeedbackListContract";
+import type { ApiDegradedTicketPage, FeedbackListUnread, FeedbackUnreadBySource } from "./productFeedbackListContract";
 
 // Shared by desktop/mobile notification hosts. Do not import the feedback SDK:
 // the workspace and its CSS must stay behind the existing lazy boundary.
@@ -19,11 +27,14 @@ let stopListening: (() => void) | null = null;
 let owedOnShow = false;
 // When the count was last known fresh: a list read, a push, a ticket read.
 let freshAt = 0;
+// Each Hands app's total, once a list read has carried `unread_by_source`;
+// the dot is their sum. Null until then (see "Every client's tickets" below).
+let bySource: FeedbackUnreadBySource | null = null;
 
 // The count is pushed: the server sends `product_feedback:unread` (shared
 // productFeedbackUnread.ts, the total, never a delta) to the user's own
 // connections when a Hands reply lands or the count changes elsewhere. The
-// list (`GET /product-feedback/tickets?limit=1`, for `unread_total`) is read
+// list (`GET /product-feedback/tickets?limit=1&sources=all`, for its totals) is read
 // only when a pushed value may have been missed: once when retained (start,
 // another account), on the socket's first connect and after each reconnect
 // (socketBridge.ts; pushes are not replayed), and the feedback panel's own
@@ -34,6 +45,19 @@ let freshAt = 0;
 // socket that looks connected but is not), so a page that shows or gets
 // focus reads once if nothing has refreshed the count for SAFETY_READ_MS.
 const SAFETY_READ_MS = 30 * 60_000;
+//
+// Every client's tickets: the Feedback list merges every Hands app's
+// (`?sources=all`, productFeedbackListContract.ts), so the dot counts every
+// app's unread replies. A list read's first page carries `unread_by_source`,
+// each app's total; they are kept per app, an app missing from it keeps its
+// last value, and the dot is the sum. Then `product_feedback:unread` replaces
+// the web's, `product_feedback:app_unread` that app's, and a ticket read the
+// total of the ticket's app.
+//
+// FALLBACK, while the server sends no `unread_by_source` (it lands in a
+// follow-up server PR; remove this then): the dot is as before, the web's
+// total: a list read's `unread_total` (null: keep the count), web pushes and
+// web ticket reads replace it, another app's push or ticket read is ignored.
 //
 // The list read needs Hands (route binding, then the list). When Hands was
 // down every open tab's read failed with it, hundreds of 5xx in a few
@@ -106,12 +130,46 @@ function setFresh(count: number) {
   emit();
 }
 
-/** Detail GET advances Hands' read-through cursor. Invalidate older list reads. */
-export function acceptFeedbackUnread(userId: string | null, count: number) {
+function sum(counts: FeedbackUnreadBySource) {
+  return Object.values(counts).reduce((total, count) => total + count, 0);
+}
+
+/**
+ * One app's total is known: the dot is the new sum. Fallback (no
+ * `unread_by_source` yet): only the web's counts, as the whole dot.
+ */
+function setSourceFresh(source: ProductFeedbackAppSource, count: number) {
+  if (bySource) {
+    bySource = { ...bySource, [source]: count };
+    setFresh(sum(bySource));
+  } else if (source === "web") {
+    setFresh(count);
+  }
+}
+
+/** A real first list page's totals. */
+function setListFresh(page: FeedbackListUnread) {
+  if (page.bySource) {
+    bySource = { ...bySource, ...page.bySource };
+    setFresh(sum(bySource));
+    return;
+  }
+  // Fallback: a server without `unread_by_source`; the page's total is the dot.
+  bySource = null;
+  if (page.total !== null) setFresh(page.total);
+}
+
+/**
+ * Detail GET advances Hands' read-through cursor. Invalidate older list
+ * reads. `count` is the total of `source`, the ticket's app.
+ */
+export function acceptFeedbackUnread(userId: string | null, count: number, source: ProductFeedbackAppSource = "web") {
   if (!userId || userId !== owner || !isCurrentUser(userId) || !validCount(count)) return;
+  // Fallback: another app's ticket read says nothing the dot shows.
+  if (!bySource && source !== "web") return;
   // A ticket read answered: Hands is back, reads need not wait.
   resetBackoff();
-  setFresh(count);
+  setSourceFresh(source, count);
 }
 
 /**
@@ -127,7 +185,22 @@ export function acceptFeedbackUnreadPush(payload: Partial<ProductFeedbackUnreadE
   if (!owner || payload?.userId !== owner || !isCurrentUser(owner)
     || typeof count !== "number" || !validCount(count)) return;
   cancelRetry();
-  setFresh(count);
+  setSourceFresh("web", count);
+}
+
+/**
+ * The server's `product_feedback:app_unread` push: a mobile App's total. It
+ * names no user (the room does), so it applies while a retained owner is the
+ * signed-in user. Only counted once a list read carried `unread_by_source`.
+ */
+export function acceptFeedbackAppUnreadPush(payload: Partial<ProductFeedbackAppUnreadEvent> | undefined) {
+  // Untrusted wire value: the web's own total never comes on this event.
+  const source: unknown = payload?.source;
+  const count = feedbackUnreadCount(payload?.unreadTotal);
+  if (!owner || !isCurrentUser(owner) || !bySource || source === "web"
+    || !isProductFeedbackAppSource(source) || count === null) return;
+  cancelRetry();
+  setSourceFresh(source, count);
 }
 
 /**
@@ -157,8 +230,8 @@ async function refresh() {
   const controller = new AbortController();
   pending = controller;
   try {
-    const { data } = await api.get<{ unread_total: number } | ApiDegradedTicketPage>("/product-feedback/tickets", {
-      params: { limit: 1, ...FEEDBACK_LIST_DEGRADED_OK },
+    const { data } = await api.get<{ unread_total?: number | null; unread_by_source?: FeedbackUnreadBySource } | ApiDegradedTicketPage>("/product-feedback/tickets", {
+      params: { limit: 1, ...FEEDBACK_LIST_ALL_SOURCES, ...FEEDBACK_LIST_DEGRADED_OK },
       signal: controller.signal,
     });
     if (controller.signal.aborted) return;
@@ -169,9 +242,7 @@ async function refresh() {
       return;
     }
     resetBackoff();
-    if (version === revision && owner === userId && isCurrentUser(userId) && validCount(data.unread_total)) {
-      setFresh(data.unread_total);
-    }
+    if (version === revision && owner === userId && isCurrentUser(userId)) setListFresh(feedbackListUnread(data));
   } catch (error) {
     // A transient outage is not evidence that the user has read their replies:
     // keep the last count, and wait before asking again.
@@ -203,6 +274,7 @@ function endSession() {
   pending = null;
   generation += 1;
   unread = 0;
+  bySource = null;
   revision += 1;
   resetBackoff();
 }
@@ -242,25 +314,26 @@ export const feedbackUnreadSnapshot = (userId: string | null) => userId && owner
 export function captureFeedbackUnreadUpdate() {
   const userId = owner;
   const session = generation;
-  return (count: number) => {
-    if (session === generation) acceptFeedbackUnread(userId, count);
+  return (count: number, source: ProductFeedbackAppSource) => {
+    if (session === generation) acceptFeedbackUnread(userId, count, source);
   };
 }
 
 /**
  * The feedback panel's own list read (the transport's listTickets), captured
- * when it is sent: its `unread_total` is the read the panel's opening owes, so
- * no second request is made. Like a list read here, it loses to anything newer
- * (a push, a ticket read, another list read) that landed while it was in flight.
+ * when it is sent: its first page's totals are the read the panel's opening
+ * owes, so no second request is made. Like a list read here, it loses to
+ * anything newer (a push, a ticket read, another list read) that landed while
+ * it was in flight. A page that knows no total (a cursor page) changes nothing.
  */
 export function captureFeedbackUnreadListRead() {
   const userId = owner;
   const session = generation;
   const version = revision;
-  return (count: number) => {
+  return (page: FeedbackListUnread) => {
     if (session !== generation || version !== revision || !userId || userId !== owner
-      || !isCurrentUser(userId) || !validCount(count)) return;
+      || !isCurrentUser(userId) || (page.bySource === null && page.total === null)) return;
     resetBackoff();
-    setFresh(count);
+    setListFresh(page);
   };
 }

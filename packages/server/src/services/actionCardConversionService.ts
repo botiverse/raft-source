@@ -235,6 +235,7 @@ async function actionCardScopeRows(tx: DatabaseExecutor, sourceChannelId: string
       card.action_type::text AS "actionType",
       card.freeze_state::text AS "freezeState",
       card.state::text AS "state",
+      card.payload AS "payload",
       message.action_metadata AS "actionMetadata"
     FROM action_cards card
     JOIN messages message ON message.id = card.message_id
@@ -254,8 +255,28 @@ async function actionCardScopeRows(tx: DatabaseExecutor, sourceChannelId: string
     actionType: string;
     freezeState: string;
     state: string;
+    payload: unknown;
     actionMetadata: unknown;
   }>;
+}
+
+/**
+ * A request card (RFC 085, request:prepare) waiting to be confirmed again
+ * because its summary changed (`changePending`, preparedRequestCards.ts): it is
+ * open, so a conversion holds it like any open card. The freeze binds it and
+ * drops `changePending` from it (row and message alike), so from then on it is
+ * the conversion's to have confirmed again, by the conversion's own path; its
+ * `changedAt` stays, and its confirm still re-checks the preparing agent.
+ */
+function isRequestCardChangePending(row: { actionType: string; freezeState: string; payload: unknown }): boolean {
+  return row.actionType === "request:prepare" && row.freezeState === "reconfirm_required"
+    && typeof row.payload === "object" && row.payload !== null && (row.payload as { changePending?: unknown }).changePending === true;
+}
+
+function withoutChangePending(value: unknown): unknown {
+  if (typeof value !== "object" || value === null) return value;
+  const { changePending: _pending, ...rest } = value as Record<string, unknown>;
+  return rest;
 }
 
 /** Freeze all prepared executable cards before the first conversion phase. */
@@ -267,16 +288,21 @@ export async function freezeActionCardsForConversion(
   await betweenActionCardFreezeReadAndWriteForTest?.();
   let changed = 0;
   for (const row of rows) {
-    if (row.freezeState !== "ready" && row.freezeState !== "frozen") continue;
+    const changePending = isRequestCardChangePending(row);
+    if (row.freezeState !== "ready" && row.freezeState !== "frozen" && !changePending) continue;
     await tx.update(actionCards).set({
       conversionJobId: job.id,
       conversionSourceChannelId: job.sourceChannelId,
       conversionEpoch: job.conversionEpoch,
       freezeState: "frozen",
+      ...(changePending ? { payload: withoutChangePending(row.payload) } : {}),
       updatedAt: currentDate(),
     }).where(and(eq(actionCards.id, row.cardId), eq(actionCards.state, "prepared")));
+    const metadata = changePending && typeof row.actionMetadata === "object" && row.actionMetadata !== null
+      ? { ...(row.actionMetadata as Record<string, unknown>), action: withoutChangePending((row.actionMetadata as { action?: unknown }).action) }
+      : row.actionMetadata;
     await tx.update(messages).set({
-      actionMetadata: cardMetadataWithState(row.actionMetadata, "frozen", {
+      actionMetadata: cardMetadataWithState(metadata, "frozen", {
         conversionJobId: job.id,
         conversionEpoch: job.conversionEpoch,
       }),
@@ -327,6 +353,9 @@ export async function unfreezeActionCardsAfterCancellation(
   const rows = await tx.select({
     id: actionCards.id,
     messageId: actionCards.messageId,
+    actionType: actionCards.actionType,
+    payload: actionCards.payload,
+    reconfirmedAt: actionCards.reconfirmedAt,
     actionMetadata: messages.actionMetadata,
   }).from(actionCards).innerJoin(messages, eq(messages.id, actionCards.messageId)).where(and(
     eq(actionCards.conversionJobId, job.id),
@@ -335,19 +364,44 @@ export async function unfreezeActionCardsAfterCancellation(
     eq(actionCards.freezeState, "frozen"),
   ));
   for (const row of rows) {
+    // A request card the freeze took while it waited to be confirmed again goes back to waiting (Tenny 296b02bc):
+    // the freeze dropped its `changePending` so the conversion could own it, and handing it back `ready` would let
+    // a plain Confirm run a change nobody confirmed again.
+    const pending = requestCardChangeNeverReconfirmed(row);
     await tx.update(actionCards).set({
       conversionJobId: null,
       conversionSourceChannelId: null,
       conversionEpoch: null,
-      freezeState: "ready",
+      freezeState: pending ? "reconfirm_required" : "ready",
+      ...(pending ? { payload: withChangePending(row.payload) } : {}),
       updatedAt: currentDate(),
     }).where(eq(actionCards.id, row.id));
+    const metadata = pending && typeof row.actionMetadata === "object" && row.actionMetadata !== null
+      ? { ...(row.actionMetadata as Record<string, unknown>), action: withChangePending((row.actionMetadata as { action?: unknown }).action) }
+      : row.actionMetadata;
     await tx.update(messages).set({
-      actionMetadata: cardMetadataWithState(row.actionMetadata, "prepared"),
+      actionMetadata: cardMetadataWithState(metadata, pending ? "reconfirm_required" : "prepared"),
       updatedAt: currentDate(),
     }).where(eq(messages.id, row.messageId));
   }
   return rows.length;
+}
+
+/**
+ * A request card whose summary changed (`changedAt`) and that nobody has confirmed again since (no
+ * `reconfirmed_at`, or one older than the change): what `changePending` said before the freeze dropped it.
+ */
+function requestCardChangeNeverReconfirmed(row: { actionType: string; payload: unknown; reconfirmedAt: Date | null }): boolean {
+  if (row.actionType !== "request:prepare" || typeof row.payload !== "object" || row.payload === null) return false;
+  const changedAt = (row.payload as { changedAt?: unknown }).changedAt;
+  if (typeof changedAt !== "string") return false;
+  const changed = Date.parse(changedAt);
+  return Number.isFinite(changed) && (row.reconfirmedAt === null || row.reconfirmedAt.getTime() < changed);
+}
+
+function withChangePending(value: unknown): unknown {
+  if (typeof value !== "object" || value === null) return value;
+  return { ...(value as Record<string, unknown>), changePending: true };
 }
 
 /** Resolve the source channel for a card before conversion starts. */

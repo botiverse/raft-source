@@ -69,7 +69,7 @@ export function SystemChannelsSection() {
       />
       {confirmHideAll ? (
         <ConfirmDialog
-          title={formatMessage({ id: "channel.edit.hideAll" })}
+          title={formatMessage({ id: "channel.edit.hideAllTitle" })}
           message={formatMessage({ id: "channel.edit.confirmHideAll" })}
           confirmLabel={formatMessage({ id: "channel.edit.confirmHideAllAction" })}
           loadingLabel={formatMessage({ id: "channel.edit.updating" })}

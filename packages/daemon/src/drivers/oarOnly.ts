@@ -1,5 +1,5 @@
-// Runtimes that run only on the OAR host (RFC 060): Qwen Code, Qoder and
-// CodeBuddy Code have no legacy driver, only OAR's runtime. The daemon still asks a driver for the
+// Runtimes that run only on the OAR host (RFC 060): Qwen Code and Qoder have
+// no legacy driver, only OAR's runtime. The daemon still asks a driver for the
 // runtime's detection probe, its model listing and its standing prompt (the
 // OAR host builds the first input from it, agentHost/oarAgentHost.ts), so each
 // gets this driver shell. It never spawns: `oarOnly` tells the router
@@ -39,7 +39,7 @@ interface OarOnlyRuntimeSpec {
    * input (standingPromptRefresh.ts).
    */
   standingPromptRefreshesOnResume: boolean;
-  /** Keep OAR's effort menu: only where Raft's form offers an effort for the runtime (CodeBuddy). */
+  /** Keep OAR's effort menu (off for now: Raft's forms offer no effort for them). */
   keepReasoningEfforts: boolean;
 }
 
@@ -57,18 +57,6 @@ export const OAR_ONLY_RUNTIMES: Record<OarOnlyRuntimeId, OarOnlyRuntimeSpec> = {
     binary: "qodercli",
     standingPromptRefreshesOnResume: true,
     keepReasoningEfforts: false,
-  },
-  codebuddy: {
-    id: "codebuddy",
-    displayName: "CodeBuddy Code",
-    binary: "codebuddy",
-    // OAR gives the prompt as a --system-prompt-file on every open, resume
-    // included, but whether CodeBuddy applies a new one to a loaded session
-    // is not verified: a changed prompt is re-delivered in the first input.
-    standingPromptRefreshesOnResume: false,
-    // OAR lists the thought levels of CodeBuddy's current model (its ACP
-    // `thought_level` option) and applies the session's `effort` through it.
-    keepReasoningEfforts: true,
   },
 };
 

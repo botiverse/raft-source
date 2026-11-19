@@ -486,6 +486,7 @@ export default function ServerSetupProjectionGate({
   const trackUseThisComputer = useCallback(() => {
     trackServerSetupAction(serverId, "computer_runtime", "use_this_computer");
   }, [serverId]);
+  const trackConnectWay = useCallback((way: "download_app" | "install_myself") => trackServerSetupAction(serverId, "computer_runtime", way), [serverId]);
   const copyRuntimeInstallCommand = useCallback((runtimeId: string, command: string) => {
     trackServerSetupAction(serverId, "computer_runtime", "copy_runtime_install_command");
     copyInstallCommand(runtimeId, command);
@@ -785,6 +786,7 @@ export default function ServerSetupProjectionGate({
         onNext={handleComputerRuntimeNext}
         onCopyCommand={trackCopiedCommand}
         onUseThisComputer={trackUseThisComputer}
+        onChooseConnectWay={trackConnectWay}
         onLeaveSetup={trackLeaveSetup}
       />
   );

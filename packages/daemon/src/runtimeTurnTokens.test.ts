@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
 import type { ParsedEvent } from "./drivers/index";
-import { activityTurnTokensFrom, createTurnTokenAccumulator, noteTurnTokenUsage, turnTokenTraceAttrs } from "./runtimeTurnTokens";
+import { RUNTIMES, RUNTIMES_REPORTING_TURN_TOKENS_FROM_TELEMETRY } from "@botiverse/raft-shared";
+import { activityTurnTokensFrom, createTurnTokenAccumulator, noteTurnTokenUsage, TURN_TOKEN_USAGE_SOURCE_RUNTIMES, turnTokenTraceAttrs } from "./runtimeTurnTokens";
 
 type TelemetryEvent = Extract<ParsedEvent, { kind: "telemetry" }>;
 const usage = (source: string, attrs: TelemetryEvent["attrs"]): TelemetryEvent => ({ kind: "telemetry", name: "token_usage", source, attrs });
@@ -90,4 +91,26 @@ test("activityTurnTokensFrom: the turn's counts, its last request's context and 
   noteTurnTokenUsage(acc, usage("claude_result_usage", { inputTokens: 12, outputTokens: 900, cachedInputTokens: 80_000, lastRequestContextTokens: 81_000 }));
   assert.deepEqual(activityTurnTokensFrom(acc, "claude-opus"), { input: 12, cacheRead: 80_000, output: 900, contextUsed: 81_000, model: "claude-opus" });
   assert.deepEqual(activityTurnTokensFrom(createTurnTokenAccumulator(), undefined), {});
+});
+
+test("the runtimes whose token_usage is folded are exactly shared's RUNTIMES_REPORTING_TURN_TOKENS_FROM_TELEMETRY (the usage panel reads it)", () => {
+  // Every listed source is really folded: a sample report in every attr spelling the branches read leaves counts.
+  const sample = {
+    inputTokens: 10, cachedInputTokens: 2, outputTokens: 3, lastInputTokens: 4, lastCachedInputTokens: 1, lastOutputTokens: 1,
+    input_tokens: 10, output_tokens: 3,
+  };
+  for (const source of Object.keys(TURN_TOKEN_USAGE_SOURCE_RUNTIMES)) {
+    const acc = createTurnTokenAccumulator();
+    noteTurnTokenUsage(acc, usage(source, sample));
+    assert.notDeepEqual(turnTokenTraceAttrs(acc), {}, `${source} is listed but not folded`);
+  }
+  // A source not listed is not folded (the switch is exhaustive over the list, so a new branch must add an entry).
+  const other = createTurnTokenAccumulator();
+  noteTurnTokenUsage(other, usage("gemini_result_stats", sample));
+  assert.deepEqual(turnTokenTraceAttrs(other), {});
+
+  const folded = new Set<string>(Object.values(TURN_TOKEN_USAGE_SOURCE_RUNTIMES).flat());
+  const known = new Set(RUNTIMES.map((runtime) => runtime.id));
+  for (const id of folded) assert.ok(known.has(id), `${id} is not a runtime id in shared's RUNTIMES`);
+  assert.deepEqual([...folded].sort(), [...RUNTIMES_REPORTING_TURN_TOKENS_FROM_TELEMETRY].sort());
 });

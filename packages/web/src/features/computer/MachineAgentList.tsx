@@ -1,10 +1,25 @@
-import { Button, ListRowGroup, useLocated } from "@botiverse/raft-ui";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Button, Checkbox, DropdownMenu, DropdownMenuContent, DropdownMenuTrigger, ListRowGroup, useLocated } from "@botiverse/raft-ui";
+import {
+  SelectionToolbar,
+  SelectionToolbarAction,
+  SelectionToolbarActions,
+  SelectionToolbarClose,
+  SelectionToolbarCount,
+  SelectionToolbarCountValue,
+  SelectionToolbarDock,
+  SelectionToolbarHint,
+  SelectionToolbarItem,
+  SelectionToolbarMore,
+  SelectionToolbarMoreItems,
+} from "@botiverse/raft-ui/wip";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useIntl } from "react-intl";
-import { Check, Play, Plus, X, Square, RotateCcw, ArrowLeftRight } from "lucide-react";
+import { Check, Play, Plus, Square, RotateCcw, ArrowLeftRight } from "lucide-react";
 import DialogCard from "../../components/ui/DialogCard";
 import { DialogCardFooter } from "../../components/ui/NarrowDialog";
 import Banner from "../../components/ui/Banner";
+import { showToast } from "../../components/toastBridge";
 import { clearClockTimeout, currentTimeMs, setClockTimeout } from "@botiverse/raft-shared";
 import { useBulkChangeModelReceiptStore } from "../../store/bulkChangeModelReceiptStore";
 import type { BulkChangeReceipt, BulkUnfinishedAgent } from "../../store/bulkChangeModelReceiptStore";
@@ -19,10 +34,7 @@ import { useAppNavigate } from "../../hooks/useAppNavigate";
 import ConfirmDialog from "../../components/ConfirmDialog";
 import { trackAgentCreateOpened } from "../../analytics/journey";
 import { CreateAgentDialog } from "../../components/agent/DeferredCreateAgentDialog";
-import Tooltip from "../../components/ui/Tooltip";
-import SectionEyebrow from "../../components/ui/SectionEyebrow";
 import SectionHeader from "../../components/ui/SectionHeader";
-import SurfaceListItem from "../../components/ui/SurfaceListItem";
 import { BulkResetOptionCard } from "../../components/machine/BulkResetOptionCard";
 import { MachineAgentRow } from "../../components/machine/MachineAgentRow";
 import { DETAIL_EMPTY_NOTE_CLASS_NAME } from "./machineDetailClassNames";
@@ -30,7 +42,15 @@ import type { BulkAgentAction, BulkResetMode, BulkResetOption } from "./machineD
 
 // Isolated component — subscribes to current display-state projections only for agents on this machine,
 // preventing activity changes from re-rendering the entire MachineDetailPanel.
-export function MachineAgentList({ machine, canManageMachines, canViewRuntimeAccountUsage }: { machine: Machine; canManageMachines: boolean; canViewRuntimeAccountUsage: boolean }) {
+export function MachineAgentList({ machine, canManageMachines, canViewRuntimeAccountUsage, selectionDock, onSelectingChange }: {
+  machine: Machine;
+  canManageMachines: boolean;
+  canViewRuntimeAccountUsage: boolean;
+  /** Where the toolbar for selected agents floats: an element at the bottom of the page's column, outside its scroller (MachineDetailPanel). */
+  selectionDock: HTMLElement | null;
+  /** Told when selecting starts and ends, so the page keeps its last content clear of the floating toolbar. */
+  onSelectingChange: (selecting: boolean) => void;
+}) {
   const { formatMessage } = useIntl();
   const allAgents = useAgentStore((s) => s.agents);
   const startAgent = useAgentStore((s) => s.startAgent);
@@ -41,7 +61,6 @@ export function MachineAgentList({ machine, canManageMachines, canViewRuntimeAcc
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedAgentIds, setSelectedAgentIds] = useState<Set<string>>(() => new Set());
   const [bulkAction, setBulkAction] = useState<BulkAgentAction | null>(null);
-  const [bulkError, setBulkError] = useState("");
   const [showResetOptions, setShowResetOptions] = useState(false);
   const [showStopConfirm, setShowStopConfirm] = useState(false);
   const [bulkResetMode, setBulkResetMode] = useState<BulkResetMode>("restart");
@@ -162,18 +181,23 @@ export function MachineAgentList({ machine, canManageMachines, canViewRuntimeAcc
     });
   }, []);
 
+  // Only the toolbar's select-all box calls this, so selecting is already on.
   const selectAllAgents = useCallback(() => {
-    setSelectionMode(true);
     setSelectedAgentIds(new Set(machineAgents.map((a) => a.id)));
   }, [machineAgents]);
 
   const clearAllAgents = useCallback(() => setSelectedAgentIds(new Set()), []);
 
+  // Every way selecting ends (×, Escape, an action that worked) gives focus back to Select, where it
+  // started (raft-design accessibility.md, "Moving focus"): the toolbar that held it is gone.
+  const selectButtonRef = useRef<HTMLButtonElement>(null);
+  const returnFocusRef = useRef(false);
   const clearSelection = useCallback(() => {
+    returnFocusRef.current = true;
     setSelectionMode(false);
     setSelectedAgentIds(new Set());
-    setBulkError("");
-  }, []);
+    onSelectingChange(false);
+  }, [onSelectingChange]);
 
   const runBulkAction = useCallback(async (action: BulkAgentAction) => {
     const targets =
@@ -185,7 +209,6 @@ export function MachineAgentList({ machine, canManageMachines, canViewRuntimeAcc
     if (targets.length === 0) return;
 
     setBulkAction(action);
-    setBulkError("");
     try {
       const results = await Promise.allSettled(
         targets.map((agent) => {
@@ -196,7 +219,8 @@ export function MachineAgentList({ machine, canManageMachines, canViewRuntimeAcc
       );
       const failed = results.filter((result) => result.status === "rejected").length;
       if (failed > 0) {
-        setBulkError(formatMessage({ id: "machine.detail.bulkActionFailed" }, { failed, total: targets.length }));
+        // Where the toolbar's other surfaces say it (Tasks): a toast, in view wherever the list is scrolled. What failed stays selected.
+        showToast({ title: formatMessage({ id: "machine.detail.bulkActionFailed" }, { failed, total: targets.length }), type: "error" });
       } else {
         clearSelection();
         setShowResetOptions(false);
@@ -218,7 +242,38 @@ export function MachineAgentList({ machine, canManageMachines, canViewRuntimeAcc
   const stopSelectedAgents = useCallback(() => runBulkAction("stop"), [runBulkAction]);
   const resetSelectedAgents = useCallback(() => runBulkAction(bulkResetMode), [bulkResetMode, runBulkAction]);
   const openAgent = useCallback((agentId: string) => nav.toAgent(agentId), [nav]);
-  const enterSelectionMode = useCallback(() => setSelectionMode(true), []);
+  const enterSelectionMode = useCallback(() => {
+    setSelectionMode(true);
+    onSelectingChange(true);
+  }, [onSelectingChange]);
+  useEffect(() => {
+    if (selectionMode || !returnFocusRef.current) return;
+    returnFocusRef.current = false;
+    selectButtonRef.current?.focus();
+  }, [selectionMode]);
+  // Escape ends selecting from anywhere on the page, not only from the toolbar: after Select, focus is
+  // on a row or nowhere. It runs before the side panel's own Escape (which closes the Computer), and
+  // leaves alone an Escape that a field, an input method, or a menu or dialog over the page takes.
+  const rootRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!selectionMode) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented || event.isComposing) return;
+      const root = rootRef.current;
+      const target = event.target;
+      if (!root) return;
+      if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) return;
+      for (const layer of document.querySelectorAll("[role='menu'], [role='listbox'], [role='dialog'], [role='alertdialog']")) {
+        if (!layer.contains(root)) return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      clearSelection();
+    };
+    // keydown-global-exempt: the Computer page's Esc ends selecting agents, in the capture phase, before the side panel's own Esc closes the Computer
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [clearSelection, selectionMode]);
   const openCreateAgent = useCallback(() => {
     trackAgentCreateOpened("computer_detail");
     setShowCreateAgent(true);
@@ -253,6 +308,8 @@ export function MachineAgentList({ machine, canManageMachines, canViewRuntimeAcc
     [bulkModelDialog, machineAgents],
   );
   const showBulkSuccess = bulkReceipt?.kind === "success" && bulkReceipt.bannerUntil > bulkClock;
+  const busy = bulkAction !== null;
+  const moreLabel = formatMessage({ id: "task.page.batch.more" });
   const bulkTargetLabel = bulkReceipt
     ? formatBulkModelLabel(bulkReceipt.target.runtime, bulkReceipt.target.model, true)
     : "";
@@ -260,7 +317,7 @@ export function MachineAgentList({ machine, canManageMachines, canViewRuntimeAcc
 
   return (
     <>
-      <div>
+      <div ref={rootRef}>
         <SectionHeader
           className="mb-3 flex-wrap gap-y-2"
           label={formatMessage({ id: "machine.detail.agentsOnComputer" })}
@@ -268,31 +325,12 @@ export function MachineAgentList({ machine, canManageMachines, canViewRuntimeAcc
           action={
             <div className="flex items-center gap-1.5">
               {canManageMachines && machineAgents.length > 0 && (
-                selectionMode ? (
-                  <>
-                    <Button size="md"
-                      variant="outline"
-                      type="button"
-                      onClick={allSelected ? clearAllAgents : selectAllAgents}
-                    >
-                      <Check size={16} />
-                      {allSelected
-                        ? formatMessage({ id: "machine.detail.clearAll" })
-                        : formatMessage({ id: "machine.detail.selectAll" })}
-                    </Button>
-                    <Button size="md"
-                      variant="default"
-                      type="button"
-                      onClick={clearSelection}
-                    >
-                      <X size={16} />
-                      {formatMessage({ id: "common.confirm.cancel" })}
-                    </Button>
-                  </>
-                ) : (
+                // While selecting, the toolbar at the bottom has select all and × (end selecting).
+                selectionMode ? null : (
                   <Button size="md"
                     variant="outline"
                     type="button"
+                    ref={selectButtonRef}
                     onClick={enterSelectionMode}
                   >
                     <Check size={16} />
@@ -363,77 +401,6 @@ export function MachineAgentList({ machine, canManageMachines, canViewRuntimeAcc
                 </span>
               </Banner>
             )}
-            {canManageMachines && selectedCount > 0 && (
-              // The bulk toolbar is about the selected rows: the selection's
-              // cyan-soft wash (SurfaceListItem selected).
-              <SurfaceListItem selected interactive={false} className="px-3 py-2">
-                <div className="flex flex-wrap items-center gap-2">
-                  <SectionEyebrow tone="ink" className="mr-auto">
-                    {formatMessage({ id: "machine.detail.selectedCount" }, { count: selectedCount })}
-                  </SectionEyebrow>
-                  <Tooltip content={
-                      !canStartLike
-                        ? formatMessage({ id: "machine.detail.mustBeOnlineToStartAgents" })
-                        : formatMessage({ id: "machine.detail.startSelectedOfflineAgents" })
-                    }>
-                  <Button size="md"
-                    variant="success"
-                    type="button"
-                    onClick={startSelectedAgents}
-                    disabled={bulkAction !== null || selectedOfflineAgents.length === 0 || !canStartLike}
-                  >
-                    <Play size={16} />
-                    {bulkAction === "start"
-                      ? formatMessage({ id: "machine.detail.starting" })
-                      : formatMessage({ id: "machine.detail.start" })}
-                  </Button>
-                  </Tooltip>
-                  <Tooltip content={formatMessage({ id: "machine.detail.stopSelectedOnlineAgents" })}>
-                  <Button size="md"
-                    variant="outline"
-                    type="button"
-                    onClick={openStopConfirm}
-                    disabled={bulkAction !== null || selectedOnlineAgents.length === 0}
-                  >
-                    <Square size={16} />
-                    {formatMessage({ id: "machine.detail.stop" })}
-                  </Button>
-                  </Tooltip>
-                  <Tooltip content={
-                      !canStartLike
-                        ? formatMessage({ id: "machine.detail.mustBeOnlineToRestartAgents" })
-                        : formatMessage({ id: "machine.detail.restartOrResetSelectedAgents" })
-                    }>
-                  <Button size="md"
-                    variant="outline"
-                    type="button"
-                    onClick={openResetOptions}
-                    disabled={bulkAction !== null || !canStartLike}
-                  >
-                    <RotateCcw size={16} />
-                    {formatMessage({ id: "machine.detail.restartReset" })}
-                  </Button>
-                  </Tooltip>
-                  <Tooltip content={formatMessage({ id: "machine.detail.bulkModel.tooltip" })}>
-                  <Button size="md"
-                    variant="outline"
-                    type="button"
-                    onClick={openBulkModel}
-                    disabled={bulkAction !== null || selectedCount === 0}
-                    data-testid="bulk-change-model-button"
-                  >
-                    <ArrowLeftRight size={16} />
-                    {formatMessage({ id: "machine.detail.bulkModel.button" })}
-                  </Button>
-                  </Tooltip>
-                </div>
-                {bulkError && (
-                  <Banner intent="warning" density="sm" className="mt-2">
-                    {bulkError}
-                  </Banner>
-                )}
-              </SurfaceListItem>
-            )}
             {/* DS ListRow › `rf-list--inset`: the agents are one card with
                 hairlines between rows (AvatarListRow is a raft-ui ListRow). */}
             <ListRowGroup>
@@ -454,6 +421,92 @@ export function MachineAgentList({ machine, canManageMachines, canViewRuntimeAcc
           </div>
         )}
       </div>
+
+      {canManageMachines && selectionMode && machineAgents.length > 0 && selectionDock
+        ? createPortal(
+          // The toolbar for selected items, as Tasks and messages have it (raft-design components/overview.md,
+          // "Toolbar for selected items"): it floats at the bottom of the page's column, so the actions stay in
+          // reach however long the list is. Select all leads, as in a thread; × ends selecting. No button is
+          // coloured: no action outranks the others while several agents are selected.
+          <SelectionToolbarDock>
+            <SelectionToolbar aria-label={formatMessage({ id: "machine.detail.selectionToolbar.aria" })} data-testid="machine-agents-selection-bar">
+              <SelectionToolbarItem>
+                <Checkbox
+                  checked={allSelected}
+                  indeterminate={selectedCount > 0 && !allSelected}
+                  disabled={busy}
+                  onCheckedChange={selectedCount > 0 ? clearAllAgents : selectAllAgents}
+                  aria-label={formatMessage({ id: "machine.detail.selectAll" })}
+                  data-testid="machine-agents-select-all"
+                />
+              </SelectionToolbarItem>
+              <SelectionToolbarCount data-testid="selection-toolbar-count">
+                {/* With every agent selected the count says so ("All 9 selected"), the words for the checked box beside it
+                    (raft-design components/overview.md, "Toolbar for selected items"). A lone agent stays "1 selected". */}
+                {formatMessage(
+                  { id: allSelected && selectedCount > 1 ? "ui.selectionToolbar.allCount" : "ui.selectionToolbar.count" },
+                  { number: <SelectionToolbarCountValue key="n">{selectedCount}</SelectionToolbarCountValue> },
+                )}
+              </SelectionToolbarCount>
+              {/* Why Start and Restart are off: the row can't wrap a tooltip around a disabled button. */}
+              {canStartLike ? null : <SelectionToolbarHint>{formatMessage({ id: "machine.attention.offline" })}</SelectionToolbarHint>}
+              <SelectionToolbarActions>
+                <SelectionToolbarAction
+                  icon={<Play aria-hidden />}
+                  onClick={startSelectedAgents}
+                  disabled={busy || selectedOfflineAgents.length === 0 || !canStartLike}
+                  data-testid="bulk-start-agents-button"
+                >
+                  {bulkAction === "start"
+                    ? formatMessage({ id: "machine.detail.starting" })
+                    : formatMessage({ id: "machine.detail.start" })}
+                </SelectionToolbarAction>
+                <SelectionToolbarAction
+                  icon={<Square aria-hidden />}
+                  onClick={openStopConfirm}
+                  disabled={busy || selectedOnlineAgents.length === 0}
+                  data-testid="bulk-stop-agents-button"
+                >
+                  {formatMessage({ id: "machine.detail.stop" })}
+                </SelectionToolbarAction>
+                <SelectionToolbarAction
+                  icon={<RotateCcw aria-hidden />}
+                  onClick={openResetOptions}
+                  disabled={busy || selectedCount === 0 || !canStartLike}
+                  data-testid="bulk-restart-agents-button"
+                >
+                  {formatMessage({ id: "machine.detail.restartReset" })}
+                </SelectionToolbarAction>
+                <SelectionToolbarAction
+                  secondary
+                  icon={<ArrowLeftRight aria-hidden />}
+                  onClick={openBulkModel}
+                  disabled={busy || selectedCount === 0}
+                  data-testid="bulk-change-model-button"
+                >
+                  {formatMessage({ id: "machine.detail.bulkModel.button" })}
+                </SelectionToolbarAction>
+                <DropdownMenu>
+                  <DropdownMenuTrigger
+                    disabled={busy}
+                    render={<SelectionToolbarMore aria-label={moreLabel} title={moreLabel} disabled={busy} data-testid="machine-agents-selection-more" />}
+                  />
+                  <DropdownMenuContent side="top" align="end" sideOffset={8} aria-label={moreLabel}>
+                    <SelectionToolbarMoreItems />
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </SelectionToolbarActions>
+              <SelectionToolbarClose
+                aria-label={formatMessage({ id: "machine.detail.clearAll" })}
+                title={formatMessage({ id: "machine.detail.clearAll" })}
+                onClick={clearSelection}
+                data-testid="selection-toolbar-clear"
+              />
+            </SelectionToolbar>
+          </SelectionToolbarDock>,
+          selectionDock,
+        )
+        : null}
 
       {canManageMachines && showCreateAgent && (
         <CreateAgentDialog

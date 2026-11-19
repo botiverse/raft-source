@@ -377,10 +377,19 @@ What differs from v2 (contract docs carry the details):
   visibility HIDEs while the provider matches `^connection:`; one with
   visibility (a gateway URL) is simply not listed for connections. A required
   owned field moves to `allOf[{ if: provider matches ^connection:, else:
-  { required } }]`. Fields a gateway shows that a connection does not own
-  (the model limits) list the gateway connections' values in their SHOW
-  condition; the connection set is folded into `revision`. The server still
-  refuses any owned-field value on a connection submit
+  { required } }]`. Fields a provider shows that a connection does not own
+  (the model limits) list the values of the connections whose provider is in
+  their SHOW condition: a gateway's, and a preset's where the target Computer
+  runs that provider's typed model id through a saved connection (Built-in
+  catalog `customModelConnectionProviderIds`; none on Computers released
+  before it, which run one only directly). The connection set is folded into
+  `revision`. Such a saved preset connection takes a typed model id and the
+  limits on the same terms as its provider chosen directly. A v2 client
+  shows a connection's fields by its `underlyingProviderId`, so on a
+  Computer that runs a typed id only directly it still shows them for a
+  preset connection, and the save is refused
+  (`builtin_custom_model_upgrade_required`). The server still refuses any
+  owned-field value on a connection submit
   (`savedConnection.connectionOwnedFields`).
 - Reasoning effort (Codex, Grok, Claude, Copilot, Kimi Code, Pi): no
   `x-optionsFrom`. The field is an `x-optionSource` dependent_select on the

@@ -1,4 +1,7 @@
-import { parseLinkCardReadAnswer } from "@botiverse/raft-shared/src/appLinkPreview";
+import { z } from "zod";
+import { MESSAGE_CARD_EXECUTE_CAPABILITY, MESSAGE_CARD_FORM_CAPABILITY, MESSAGE_CARD_LIMITS, MESSAGE_CARD_SECRET_INPUT_CAPABILITY } from "@botiverse/raft-shared";
+import type { MessageCardCapability, MessageCardReadAnswer } from "@botiverse/raft-shared";
+import { appCardEncryptionKeySchema, LINK_CARD_ACTION_ID, parseLinkCardReadAnswer, publicPreviewUrl } from "@botiverse/raft-shared/src/appLinkPreview";
 import type { LinkCardCapability, LinkCardReadAnswerItem, LinkCardReadAnswerTicket } from "@botiverse/raft-shared/src/appLinkPreview";
 import api from "../../api/client";
 
@@ -17,13 +20,34 @@ import api from "../../api/client";
  * `block.v1` changes nothing Raft sends this client; it is declared because
  * the web draws block cards, so an App that checks it before asking for one
  * gets it (raft-design Navigation › What an app's answer lists).
+ * `unreviewed_app.v1` (RFC 076 §17): before every acting button of an item
+ * whose `app.reviewed` is `false` (an App made on this Server, acting here
+ * under its admins' confirmation), Raft's confirm dialog says who runs it and
+ * that Raft hasn't reviewed it, undo-window buttons included
+ * (linkCardExecute.tsx, LinkCardConfirmDialog).
+ * `badge.color.v1` (RFC 076 §15): the block card and the hover card draw a
+ * card Badge in the App's `color` (CardBadge's `fill`).
+ * `execute.toast.v1` (RFC 076 §6.3): an operation that ends at execute's
+ * answer shows the App's toast from it, as one that ends at a status does
+ * (linkCardExecute.tsx).
+ * `card.execute.v1` (RFC 086 §4.4): the web draws a card message's acting
+ * buttons (MessageCardActingButtons.tsx), so Raft answers `message_card` with a
+ * handle for each one this viewer may press. Declared only with that drawing.
+ * `card.form.v1` (RFC 086 §5.1): Raft's dialog draws a button's form and
+ * execute sends its TextInput values (LinkCardFormFields.tsx).
+ * `card.form.secret.v1` (RFC 086 §5.3): a SecretInput's value is sealed on
+ * this device to the App's key from this read (linkCardSeal.ts) and sent
+ * only in execute's `sealed_inputs`.
  *
  * Every device declares the same list, a touch-only one too (RFC 076 §13,
  * AppFather): a block card's buttons work by keyboard and touch, on desktop
  * and phone. Only the hover card stays read-only on touch, where it doesn't
  * open (LinkCardActions); the handles it isn't used for are harmless.
  */
-export const LINK_CARD_READ_CAPABILITIES: readonly LinkCardCapability[] = ["card.v2", "inline.v1", "inline.tone.v2", "button.v1", "confirm.v1", "undo.v1", "block.v1", "preview.v3"];
+export const LINK_CARD_READ_CAPABILITIES: readonly (LinkCardCapability | MessageCardCapability)[] = [
+  "card.v2", "inline.v1", "inline.tone.v2", "button.v1", "confirm.v1", "undo.v1", "block.v1", "preview.v3", "unreviewed_app.v1", "badge.color.v1", "execute.toast.v1",
+  MESSAGE_CARD_EXECUTE_CAPABILITY, MESSAGE_CARD_FORM_CAPABILITY, MESSAGE_CARD_SECRET_INPUT_CAPABILITY,
+];
 
 /**
  * A touch-only device: it can tap (`any-pointer: coarse`, the query the chip
@@ -34,7 +58,7 @@ export const LINK_CARD_READ_CAPABILITIES: readonly LinkCardCapability[] = ["card
 export const LINK_CARD_COARSE_POINTER_QUERY = "(any-pointer: coarse)";
 export const LINK_CARD_HOVER_QUERY = "(any-hover: hover)";
 
-export function linkCardReadCapabilities(): readonly LinkCardCapability[] {
+export function linkCardReadCapabilities(): typeof LINK_CARD_READ_CAPABILITIES {
   return LINK_CARD_READ_CAPABILITIES;
 }
 
@@ -60,14 +84,62 @@ export function bumpLinkCardViewSeq(view: LinkCardView) {
 }
 
 export type MessageLinksRead =
-  | { batched: true; items: LinkCardReadAnswerItem[]; data: unknown }
+  | { batched: true; items: LinkCardReadAnswerItem[]; data: unknown; messageCard: MessageCardRead | null }
   | { batched: false; data: unknown };
+
+// What a SecretInput is sealed to (RFC 086 §5.3): one that doesn't read is no key, so only its buttons are unavailable.
+const messageCardAppSchema = z.object({
+  id: z.string().min(1).max(200), name: z.string().min(1).max(300), icon: z.string().max(2000).nullable(), reviewed: z.literal(false).optional(),
+  encryption_key: appCardEncryptionKeySchema.optional().catch(undefined), client_key: z.string().min(1).max(200).optional().catch(undefined),
+});
+const messageCardAnswerSchema = z.object({
+  card_revision: z.string().min(1).max(64),
+  app: messageCardAppSchema.optional(),
+  actions: z.array(z.object({
+    element_id: z.string().min(1).max(64),
+    action_id: z.string().regex(LINK_CARD_ACTION_ID),
+    url: z.string().max(2000).refine((value) => !!publicPreviewUrl(value)),
+    ticket: z.string().min(1).max(4096).brand<"LinkCardReadTicket">(),
+    handle: z.string().min(1).max(4096).brand<"LinkCardHandle">(),
+    handle_exp: z.number().int().positive().optional().catch(undefined),
+  })).max(MESSAGE_CARD_LIMITS.maxButtons),
+  waiting_for: z.object({ id: z.string().min(1).max(200), name: z.string().max(300) }).optional(),
+  consent: z.enum(["needed", "declined"]).optional(),
+});
+
+type MessageCardReadAction = Omit<MessageCardReadAnswer["actions"][number], "ticket" | "handle"> & z.infer<typeof messageCardAnswerSchema>["actions"][number];
+/** The shared MessageCardReadAnswer as this client reads it: its tickets and handles the branded strings a link card's are. */
+export type MessageCardRead = Omit<MessageCardReadAnswer, "actions"> & { actions: MessageCardReadAction[] };
+
+/**
+ * A batched read's `message_card` (RFC 086 §4.2; the shared
+ * MessageCardReadAnswer): what a card message's acting buttons are for this
+ * viewer. Null when the answer has none (not a card message, a Server older
+ * than RFC 086) or one this client can't read: the card then draws its
+ * buttons as unavailable, never with a handle it didn't check.
+ */
+export function parseMessageCardReadAnswer(data: unknown): MessageCardRead | null {
+  const parsed = messageCardAnswerSchema.safeParse((data as { message_card?: unknown } | null)?.message_card);
+  if (!parsed.success) return null;
+  const { app, waiting_for: waitingFor, consent, ...rest } = parsed.data;
+  return {
+    ...rest,
+    ...(app ? {
+      app: {
+        id: app.id, name: app.name, icon: app.icon, ...(app.reviewed === false ? { reviewed: false as const } : {}),
+        ...(app.encryption_key && app.client_key ? { encryption_key: app.encryption_key, client_key: app.client_key } : {}),
+      },
+    } : {}),
+    ...(waitingFor ? { waiting_for: waitingFor } : {}),
+    ...(consent ? { consent } : {}),
+  };
+}
 
 /**
  * One read of a message's App links. With a view (the flag is on): the batched
  * read, with this client's capabilities, the UI's language, the view's tickets
  * and, to read some links again, `urls`. Tickets in the answer replace the
- * view's. An answer to a request that is no longer the view's latest is null.
+ * view's. A card message's answer brings `message_card` instead of items. An answer to a request that is no longer the view's latest is null.
  * Without a view: the GET (a re-read of some links has no GET form, and is
  * null). A 404 is the message not being previewable, and fails like any error.
  */
@@ -96,5 +168,8 @@ export async function readMessageLinks({ messageId, view, locale, urls, signal }
     if (item.ticket) view.tickets.set(item.url, item.ticket);
     else view.tickets.delete(item.url);
   }
-  return { batched: true, items, data };
+  // A card message's handles come with the ticket of each fallback page's view, kept like a link's.
+  const messageCard = parseMessageCardReadAnswer(data);
+  for (const action of messageCard?.actions ?? []) view.tickets.set(action.url, action.ticket);
+  return { batched: true, items, data, messageCard };
 }

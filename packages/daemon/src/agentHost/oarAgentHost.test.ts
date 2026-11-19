@@ -1269,7 +1269,10 @@ test("supports(): Grok runs here only as Grok Build itself at a checked version;
   assert.equal(isVerifiedGrokCli("grok 1.0.77"), true);
   assert.equal(isVerifiedGrokCli("grok 1.0.70 [stable]"), true);
   assert.equal(isVerifiedGrokCli("grok 1.1.0"), true);
-  for (const other of [undefined, "", "grok 1.0.62", "grok 0.9.0 (raft-acp-bridge 0.3.0)", "raft-devin-adapter 0.2.0", "aiderdesk 0.1.0", "grok"]) {
+  // What Grok Build 1.0.77 prints on xxwork (#oar-raft:82d5fa91): the build hash before the channel.
+  assert.equal(isVerifiedGrokCli("grok 1.0.77 (50ca579fa996) [stable]"), true);
+  assert.equal(isVerifiedGrokCli("grok 1.0.77 (50ca579fa996)"), true);
+  for (const other of [undefined, "", "grok 1.0.62", "grok 1.0.62 (50ca579fa996) [stable]", "grok 0.9.0 (raft-acp-bridge 0.3.0)", "grok 1.0.77 (raft-acp-bridge)", "raft-devin-adapter 0.2.0", "aiderdesk 0.1.0", "grok"]) {
     assert.equal(isVerifiedGrokCli(other), false, String(other));
   }
   for (const version of ["raft-devin-adapter 0.2.0", "grok 1.0.62", undefined]) {
@@ -1280,6 +1283,12 @@ test("supports(): Grok runs here only as Grok Build itself at a checked version;
     } finally {
       await h.cleanup();
     }
+  }
+  const verified = await harness({ deps: { detectedRuntimeCliVersion: () => "grok 1.0.77 (50ca579fa996) [stable]" } });
+  try {
+    assert.deepEqual(verified.host.supports(request()), { ok: true }, "Grok Build with a build hash runs on the OAR host");
+  } finally {
+    await verified.cleanup();
   }
 });
 
@@ -1575,6 +1584,51 @@ test("a steer the runtime refused is held and tried again at the next tool start
     assert.equal(h.inputs.length, 1, "it went into the running turn, once");
   } finally {
     toolGate.resolve();
+    endGate.resolve();
+    await h.cleanup();
+  }
+});
+
+// OAR 0.105+: a steer with no turn to join while the status still shows that
+// turn running lands in OAR's own queue (`landed: "queued"`). The host takes it
+// back (withdraw) and holds it, as it held `no_active_turn` before; it is then
+// delivered by the host, once, never by OAR's queue.
+test("a steer OAR queued instead of steering is withdrawn and held by the host, then delivered once", async () => {
+  const endGate = deferred();
+  const withdrawn: string[] = [];
+  let queuedOnce = true;
+  const h = await harness({
+    turn: async (turn) => {
+      if (turn.input.includes("m-queued")) { turn.say("own turn"); return; }
+      await endGate.promise;
+      turn.say("done");
+    },
+    wrapSession: (session) => new Proxy(session, {
+      get: (target, prop, receiver) => {
+        if (prop === "deliver") {
+          return async (...args: Parameters<Session["deliver"]>) => {
+            if (queuedOnce) { queuedOnce = false; return { landed: "queued", inputId: args[1]?.inputId ?? "", result: {} }; }
+            return target.deliver(...args);
+          };
+        }
+        if (prop === "withdraw") {
+          return async (inputId: string) => { withdrawn.push(inputId); return { kind: "accepted", seq: 0, requestId: "w-1" }; };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    }),
+    deps: { prepareLaunch: STEER_LAUNCH },
+  });
+  try {
+    await h.host.start(request());
+    await until(() => h.inputs.length === 1, "first turn running");
+    assert.equal(await h.host.deliverMessage("agent-1", message("m-queued"), { deliveryId: "d-q" }), true);
+    await until(() => withdrawn.length === 1, "the queued input taken back");
+    await until(() => h.events.some((event) => event.name === "daemon.agent.oar.delivery" && event.attrs.code === "no_active_turn"), "held as no_active_turn");
+    endGate.resolve();
+    await until(() => h.inputs.some((input) => input.includes("m-queued")), "delivered by the host after the turn end");
+    assert.equal(h.inputs.filter((input) => input.includes("m-queued")).length, 1, "once");
+  } finally {
     endGate.resolve();
     await h.cleanup();
   }
@@ -2368,6 +2422,14 @@ test("reconciler step 5: an OAR dispose that never finishes is traced as escalat
     assert.equal(escalated?.attrs.grace_ms, 30);
     const unconfirmed = h.events.find((event) => event.name === "daemon.agent.stop.kill_unconfirmed");
     assert.equal(unconfirmed?.attrs.path, "oar_explicit_stop");
+    // The per-agent stop record says it was forced and never confirmed, and how long it waited.
+    const stop = h.events.find((event) => event.name === "daemon.agent.stop");
+    assert.equal(typeof stop?.attrs.runtime, "string");
+    assert.deepEqual(stop && { ...stop.attrs, runtime: undefined, launchId: undefined, wait_ms: undefined }, {
+      agentId: "agent-1", runtime: undefined, launchId: undefined, host: "oar", reason: "explicit", had_process: true,
+      wait_ms: undefined, escalated: true, exit_confirmed: false,
+    });
+    assert.ok(Number(stop?.attrs.wait_ms) >= 30 + 60 - 5, `wait_ms ${stop?.attrs.wait_ms}`);
     await until(() => !h.host.isUnwinding("agent-1"), "released: a later start does not wait forever", 500);
   } finally {
     await h.cleanup();
@@ -2381,6 +2443,23 @@ test("reconciler step 5: a dispose that finishes within the grace records no esc
     await until(() => h.framesOf("agent:turn:ended").length > 0, "turn ended");
     await h.host.stopAgent("agent-1", { wait: true });
     assert.equal(h.events.some((event) => event.name === "daemon.agent.stop.escalated" || event.name === "daemon.agent.stop.kill_unconfirmed"), false);
+    const stop = h.events.find((event) => event.name === "daemon.agent.stop");
+    assert.deepEqual(stop && [stop.attrs.host, stop.attrs.reason, stop.attrs.had_process, stop.attrs.escalated, stop.attrs.exit_confirmed], ["oar", "explicit", true, false, true]);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("daemon.agent.stop: the daemon's stopAll records each agent's stop as `shutdown`", async () => {
+  const h = await harness({ deps: { stopKill: { graceMs: 2_000, confirmMs: 60 } } });
+  try {
+    assert.deepEqual(await h.host.start(request({ wakeMessage: message("m-1") })), { kind: "started" });
+    await until(() => h.framesOf("agent:turn:ended").length > 0, "turn ended");
+    await h.host.stopAll();
+    const stops = h.events.filter((event) => event.name === "daemon.agent.stop");
+    assert.equal(stops.length, 1);
+    assert.deepEqual([stops[0]!.attrs.agentId, stops[0]!.attrs.host, stops[0]!.attrs.reason, stops[0]!.attrs.had_process, stops[0]!.attrs.escalated], ["agent-1", "oar", "shutdown", true, false]);
+    assert.equal(typeof stops[0]!.attrs.wait_ms, "number");
   } finally {
     await h.cleanup();
   }

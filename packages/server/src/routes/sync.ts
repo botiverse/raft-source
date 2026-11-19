@@ -12,7 +12,9 @@
 //   sidebar_order  GET /api/servers/:id/sidebar-order (loadSidebarOrderResponse);
 //   server_order   GET /api/servers/order (getServerSwitcherOrder);
 //   message        GET /api/messages/channel/:id's row for one message
-//                  (readVisibleMessageRow: that list's access and read).
+//                  (readVisibleMessageRow: that list's access and read);
+//   task           GET /api/tasks/channel/:id's row for one task, in the
+//                  change's channel (listChannelTaskRows).
 // Not in the list for this viewer (deleted, archived, no longer visible):
 // the change goes out as a delete.
 import { Router, type Router as RouterType } from "express";
@@ -51,6 +53,7 @@ import { buildChannelMembersView } from "./channels";
 import { buildAgentListItems } from "./agents";
 import { buildMachineList, loadSidebarOrderResponse } from "./servers";
 import { readVisibleMessageRow } from "./messages";
+import { listChannelTaskRows, resolveReadableTaskSurface } from "./tasks";
 
 export const syncRouter: RouterType = Router();
 
@@ -159,6 +162,33 @@ async function buildMessageRows(viewer: Viewer, ids: string[]): Promise<RowsById
   return rows;
 }
 
+/** Channels whose changed tasks are rebuilt at once (each reads its own list). */
+const TASK_CHANNEL_CONCURRENCY = 4;
+
+/** The key of a task row: a task is in one channel's list (`<channelId>:<taskId>`). */
+const taskRowKey = (channelId: string, taskId: string) => `${channelId}:${taskId}`;
+
+/**
+ * Task rows (#wg-task-v2:7b87bf4a) by taskRowKey, each the task's row in
+ * GET /api/tasks/channel/:id of the change's channel for this viewer: one
+ * narrowed list read per channel. A channel the viewer cannot read, or a task
+ * no longer in its list, is left out, so its change goes out as a delete.
+ */
+async function buildTaskRows(viewer: Viewer, changes: readonly PendingRowChange[]): Promise<RowsById> {
+  const rows: RowsById = new Map();
+  const byChannel = new Map<string, string[]>();
+  for (const change of changes) {
+    if (!change.channelId) continue;
+    byChannel.set(change.channelId, [...(byChannel.get(change.channelId) ?? []), change.id]);
+  }
+  await mapWithConcurrency([...byChannel], TASK_CHANNEL_CONCURRENCY, async ([channelId, taskIds]) => {
+    const surface = await resolveReadableTaskSurface(viewer, channelId);
+    if (!surface) return;
+    for (const task of await listChannelTaskRows(viewer, surface, { taskIds })) rows.set(taskRowKey(channelId, task.id), task);
+  });
+  return rows;
+}
+
 type RowDeps = { agentOrchestrator: AgentOrchestrator; app: { get(name: string): unknown } };
 
 /**
@@ -197,9 +227,9 @@ const NO_ROWS: RowsById = new Map();
 
 async function buildChanges(viewer: Viewer, pending: readonly PendingSyncChange[], deps: RowDeps, refusals: Refusals): Promise<SyncChange[]> {
   const refused = refusals.entities;
-  const upserts = (entity: PendingRowChange["entity"]) => refused.has(entity) ? [] : pending
-    .filter((change): change is PendingRowChange => change.entity === entity && change.op === "upsert")
-    .map((change) => change.id);
+  const upsertChanges = (entity: PendingRowChange["entity"]) => refused.has(entity) ? [] : pending
+    .filter((change): change is PendingRowChange => change.entity === entity && change.op === "upsert");
+  const upserts = (entity: PendingRowChange["entity"]) => upsertChanges(entity).map((change) => change.id);
   const build = (ids: string[], work: (ids: string[]) => Promise<RowsById>) => ids.length > 0 ? work(ids) : Promise.resolve(NO_ROWS);
   const channelIds = upserts("channel");
   // Member changes of a channel the viewer cannot access are dropped (one
@@ -208,7 +238,8 @@ async function buildChanges(viewer: Viewer, pending: readonly PendingSyncChange[
   const accessibleMemberChannels = memberChannelIds.length > 0
     ? await channelService.filterUserAccessibleChannelIds(memberChannelIds, viewer.userId, viewer.serverId)
     : new Set<string>();
-  const [channel, channelMember, serverMember, agent, machine, sidebarOrder, serverOrder, message] = await Promise.all([
+  const taskUpserts = upsertChanges("task");
+  const [channel, channelMember, serverMember, agent, machine, sidebarOrder, serverOrder, message, task] = await Promise.all([
     build(channelIds, (ids) => buildChannelRows(viewer, ids)),
     build(upserts("channel_member"), (ids) => buildChannelMemberRows(viewer, ids, accessibleMemberChannels, deps.agentOrchestrator)),
     build(upserts("server_member"), (ids) => buildServerMemberRows(viewer, ids)),
@@ -217,6 +248,7 @@ async function buildChanges(viewer: Viewer, pending: readonly PendingSyncChange[
     build(upserts("sidebar_order"), (ids) => buildOrderRows(viewer, "sidebar_order", ids)),
     build(upserts("server_order"), (ids) => buildOrderRows(viewer, "server_order", ids)),
     build(upserts("message"), (ids) => buildMessageRows(viewer, ids)),
+    taskUpserts.length > 0 ? buildTaskRows(viewer, taskUpserts) : Promise.resolve(NO_ROWS),
   ]);
   const channelDeleteIds = pending
     .filter((change) => change.entity === "channel" && change.op === "delete")
@@ -237,6 +269,7 @@ async function buildChanges(viewer: Viewer, pending: readonly PendingSyncChange[
     sidebar_order: sidebarOrder,
     server_order: serverOrder,
     message,
+    task,
   };
 
   const changes: SyncChange[] = [];
@@ -250,6 +283,17 @@ async function buildChanges(viewer: Viewer, pending: readonly PendingSyncChange[
       continue;
     }
     if (refused.has(change.entity)) continue;
+    if (change.entity === "task") {
+      if (change.op === "resnapshot") {
+        changes.push(change);
+        continue;
+      }
+      const channelId = change.channelId!;
+      const row = change.op === "upsert" ? task.get(taskRowKey(channelId, change.id)) : undefined;
+      if (row) changes.push({ seq: change.seq, entity: "task", id: change.id, op: "upsert", row });
+      else changes.push({ seq: change.seq, entity: "task", id: change.id, op: "delete", channelId });
+      continue;
+    }
     if (change.entity === "channel" && skippedChannels.has(change.id)) continue;
     if (change.entity === "channel_member" && !accessibleMemberChannels.has(change.id.split(":")[0]!)) continue;
     if (change.op === "delete") {

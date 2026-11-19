@@ -22,6 +22,7 @@ import { useServerStore } from "../../store/serverStore";
 import { useThreadStore } from "../../store/threadStore";
 import { useAppNavigate, useMobileBack, buildMessagePermalink } from "../../hooks/useAppNavigate";
 import { resolveMessageSenderMemberFromList } from "../../utils/messageSenderMember";
+import { openMessagePlace, savedTaskMessagePlace } from "../../utils/messagePlace";
 import { formatRelativeTime } from "../../utils/relativeTime";
 import AvatarSlot from "../ui/AvatarSlot";
 import PanelHeader from "../ui/PanelHeader";
@@ -32,6 +33,7 @@ import { ContentLoading } from "../ui/ContentLoading";
 import { PagePullToRefreshIndicator } from "../ui/PagePullToRefreshIndicator";
 import { usePagePullToRefresh } from "../../hooks/usePagePullToRefresh";
 import { showToast } from "../toastBridge";
+import { messageCardFallbackText } from "../../utils/messageCardFallbackText";
 import { HistoryWindowBanner } from "../message/HistoryWindowNotices";
 
 const FREE_HISTORY_DAYS = PLAN_CONFIG.free.limits.messageHistoryDays;
@@ -66,10 +68,12 @@ const SavedItem = memo(function SavedItem({ entry, onOpenEntry, onRemoveMessage,
   const currentUser = useAuthStore((s) => s.user);
 
   const isThread = entry.channelType === "thread";
-  const isDm = isThread
+  // A task's own conversation is named for its channel too, not its internal `task-…` name.
+  const inParent = isThread || (entry.channelType === "task" && !!entry.parentChannelName);
+  const isDm = inParent
     ? entry.parentChannelType === "dm"
     : entry.channelType === "dm";
-  const sourceChannelName = isThread
+  const sourceChannelName = inParent
     ? entry.parentChannelName
     : entry.channelName;
   const channelLabel = isDm
@@ -96,7 +100,7 @@ const SavedItem = memo(function SavedItem({ entry, onOpenEntry, onRemoveMessage,
   }, [serverSlug, isDm, isThread, entry.parentChannelId, entry.parentMessageId, entry.channelId, entry.messageId]);
 
   const handleCopyMarkdown = useCallback(() => {
-    navigator.clipboard.writeText(entry.content);
+    navigator.clipboard.writeText(messageCardFallbackText(entry.content));
   }, [entry.content]);
 
   const handleRemove = useCallback(() => {
@@ -165,7 +169,7 @@ const SavedItem = memo(function SavedItem({ entry, onOpenEntry, onRemoveMessage,
             </span>
           </div>
           <p className={SAVED_ROW_BODY_CLASS}>
-            {entry.content}
+            {messageCardFallbackText(entry.content)}
           </p>
         </div>
         <div className={SAVED_ROW_TOGGLE_SLOT_CLASS}>
@@ -276,7 +280,10 @@ export default function SavedPanel({ embedded = false }: {
   const loadMoreSentinelRef = useRef<HTMLDivElement | null>(null);
 
   const openSavedEntry = useCallback((entry: SavedEntry) => {
-    if (entry.channelType === "thread" && entry.parentChannelId && entry.parentMessageId) {
+    const taskPlace = savedTaskMessagePlace(entry);
+    if (taskPlace) {
+      openMessagePlace(taskPlace, nav);
+    } else if (entry.channelType === "thread" && entry.parentChannelId && entry.parentMessageId) {
       nav.toMessage(entry.parentChannelId, entry.parentMessageId);
       // Stryker disable all: typed thread payload shape is covered by openThread payload/source contracts.
       void openThread({

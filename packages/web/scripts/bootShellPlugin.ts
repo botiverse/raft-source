@@ -3,7 +3,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import postcss from "postcss";
 import type { Plugin, ResolvedConfig } from "vite";
-import { BOOT_LOCALE_CATALOGS_ID, BOOT_LOCALE_RULES, BOOT_PREFETCH_CONFIG_ID, buildBootInlineScript } from "../src/boot/bootInlineScript";
+import { BOOT_LOCALE_CATALOGS_ID, BOOT_LOCALE_RULES, BOOT_PREFETCH_CONFIG_ID, BOOT_SIGN_IN_FILES_ID, buildBootInlineScript } from "../src/boot/bootInlineScript";
 import { deriveRuntimeEndpoints } from "../src/runtimeEndpoints";
 import { resolveWebAppVersion } from "../src/utils/webAppVersion";
 import { COLUMN_BOUNDS } from "../src/lib/panelBounds";
@@ -305,18 +305,56 @@ export function localeCatalogMap(parts: Record<string, unknown>): Record<string,
 }
 
 /**
- * The catalog map, before the first script in <head>: before the inline boot
- * script that reads it, and after <meta charset> (which must stay in the
- * page's first 1024 bytes, pageMetaCsp.ts). Not run by the browser (no CSP hash).
+ * A JSON value the boot script reads, as `<script type="application/json" id>`
+ * before the first script in <head>: before the inline boot script, and after
+ * <meta charset> (which must stay in the page's first 1024 bytes,
+ * pageMetaCsp.ts). Not run by the browser (no CSP hash).
  */
-export function injectLocaleCatalogMap(html: string, map: Record<string, string>): string {
+function injectHeadJson(html: string, id: string, value: unknown): string {
   const head = /<head>[\s\S]*?<\/head>/.exec(html);
   if (!head) throw new Error("boot shell: index.html has no <head>");
   const script = head[0].search(/<script\b/);
   if (script < 0) throw new Error("boot shell: index.html's <head> has no boot script");
   const at = head.index + script;
-  const json = JSON.stringify(map).replace(/</g, "\\u003c");
-  return `${html.slice(0, at)}<script type="application/json" id="${BOOT_LOCALE_CATALOGS_ID}">${json}</script>\n    ${html.slice(at)}`;
+  const json = JSON.stringify(value).replace(/</g, "\\u003c");
+  return `${html.slice(0, at)}<script type="application/json" id="${id}">${json}</script>\n    ${html.slice(at)}`;
+}
+
+/** The catalog map (localeCatalogMap), for the boot script and the app. */
+export function injectLocaleCatalogMap(html: string, map: Record<string, string>): string {
+  return injectHeadJson(html, BOOT_LOCALE_CATALOGS_ID, map);
+}
+
+type ManifestChunk = { file: string; isEntry?: boolean; imports?: string[] };
+const SIGN_IN_PAGE_SOURCE = "src/components/auth/SignInPage.tsx";
+
+/**
+ * The sign-in page's JS files outside the first download (its chunk and the
+ * chunks it imports statically, from the build's manifest), which the boot
+ * script modulepreloads for a load with no stored session
+ * (BOOT_SIGN_IN_PRELOAD_STATEMENT). A build without the page fails.
+ */
+export function signInPreloadFiles(manifest: Record<string, ManifestChunk>): string[] {
+  const closure = (roots: string[]) => {
+    const seen = new Set<string>();
+    const pending = [...roots];
+    while (pending.length > 0) {
+      const key = pending.pop()!;
+      if (seen.has(key) || !manifest[key]) continue;
+      seen.add(key);
+      pending.push(...(manifest[key].imports ?? []));
+    }
+    return seen;
+  };
+  if (!manifest[SIGN_IN_PAGE_SOURCE]) throw new Error(`boot shell: ${SIGN_IN_PAGE_SOURCE} has no chunk of its own in the manifest`);
+  const first = closure(Object.keys(manifest).filter((key) => manifest[key]!.isEntry));
+  const files = [...closure([SIGN_IN_PAGE_SOURCE])].filter((key) => !first.has(key)).map((key) => `/${manifest[key]!.file}`);
+  return files.filter((file) => file.endsWith(".js"));
+}
+
+/** The sign-in page's files (signInPreloadFiles), for the boot script. */
+export function injectSignInFiles(html: string, files: readonly string[]): string {
+  return injectHeadJson(html, BOOT_SIGN_IN_FILES_ID, files);
 }
 
 /**
@@ -334,7 +372,8 @@ export async function renderBootShellPage(root: string, configFile: string | fal
   const markup = await renderBootShellMarkup(root, configFile);
   const shell = `<div data-boot-shell="" class="contents">${markup}</div>`;
   const parts = JSON.parse(await readFile(join(outDir, CATALOG_PARTS_FILE), "utf8")) as Record<string, unknown>;
-  const withCatalogs = injectLocaleCatalogMap(html, localeCatalogMap(parts));
+  const manifest = JSON.parse(await readFile(join(outDir, ".vite", "manifest.json"), "utf8")) as Record<string, ManifestChunk>;
+  const withCatalogs = injectSignInFiles(injectLocaleCatalogMap(html, localeCatalogMap(parts)), signInPreloadFiles(manifest));
   const page = injectMetaCsp(injectBootShell(withCatalogs, markup, criticalCss(appCss, shell) + BOOT_SHELL_CSS));
   assertMetaCsp(page);
   await writeFile(indexPath, page);

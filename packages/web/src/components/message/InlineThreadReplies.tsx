@@ -42,6 +42,7 @@ import type { ServerMember } from "../../store/serverStore";
 import type { ThreadReplyPreview } from "../../store/threadRepliesReadModel";
 import { resolveMessageSenderMember } from "../../utils/messageSenderMember";
 import { useTimeFormatter } from "../../hooks/useTimeFormatter";
+import { messageCardFallbackText } from "../../utils/messageCardFallbackText";
 
 const MAX_INLINE_PREVIEWS = 3;
 
@@ -223,7 +224,7 @@ export const InlineThreadReplies = memo(function InlineThreadReplies({
               {reply.senderDisplayName || reply.senderName}
             </MessageRepliesItemSender>
             <MessageRepliesItemContent className={previewSizeClass}>
-              {reply.preview}
+              {messageCardFallbackText(reply.preview)}
             </MessageRepliesItemContent>
             <MessageRepliesItemTime
               dateTime={reply.createdAt}

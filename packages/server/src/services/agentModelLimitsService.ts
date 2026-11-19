@@ -157,8 +157,9 @@ function storedReportOf(row: typeof agentModelLimitsReports.$inferSelect): Store
  * provider is a gateway one and that has an endpoint (`connection`). The
  * daemon reports limits for exactly these (`resolveBuiltInGatewayLaunch`,
  * `configureBuiltInGatewayCustomModel`), and for a typed model on a preset
- * provider that takes one (task #10: OpenRouter,
- * `configureBuiltInPresetCustomModel`).
+ * provider that takes one (task #10: OpenRouter, Qwen Token Plan, ...;
+ * `configureBuiltInPresetCustomModel`), chosen directly or through a saved
+ * connection to it.
  */
 export function isBuiltInGatewayCustomModelConfig(
   runtimeConfig: RuntimeConfig | null | undefined,
@@ -172,8 +173,8 @@ export function isBuiltInGatewayCustomModelConfig(
   }
   return runtimeConfig.provider.kind === "connection"
     && connection !== null
-    && isBuiltInRuntimeGatewayProviderId(connection.providerId)
-    && Boolean(connection.endpointUrl);
+    && ((isBuiltInRuntimeGatewayProviderId(connection.providerId) && Boolean(connection.endpointUrl))
+      || isBuiltInRuntimeCustomModelPresetProviderId(connection.providerId));
 }
 
 /** The signal the agent detail, the directory and the PATCH answer carry. */

@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runInTestSlot } from "../../../scripts/vitest/testSlot";
+import { splitRunnerArgs } from "./splitRunnerArgs";
 import { defaultTestIncludes } from "./testLocations";
 
 const scriptPath = fileURLToPath(import.meta.url);
@@ -48,40 +49,7 @@ function normalizeTestArg(arg) {
   return arg;
 }
 
-const valueTakingFlags = new Set([
-  "-t",
-  "--testNamePattern",
-  "--testTimeout",
-  "--hookTimeout",
-  "--maxWorkers",
-  "--pool",
-  "--reporter",
-  "--outputFile",
-  "--shard",
-]);
-
-const userArgs = process.argv.slice(2);
-const testArgs = [];
-const vitestArgs = [];
-let dom = false;
-
-for (let index = 0; index < userArgs.length; index += 1) {
-  const arg = userArgs[index];
-  if (arg === "--") continue;
-  if (arg === "--dom") {
-    dom = true;
-    continue;
-  }
-  if (arg.startsWith("-")) {
-    vitestArgs.push(arg);
-    if (valueTakingFlags.has(arg) && index + 1 < userArgs.length) {
-      vitestArgs.push(userArgs[index + 1]);
-      index += 1;
-    }
-    continue;
-  }
-  testArgs.push(normalizeTestArg(arg));
-}
+const { testArgs, vitestArgs, dom } = splitRunnerArgs(process.argv.slice(2), normalizeTestArg);
 
 // No paths: every unit (or DOM) test, in tests/ and src/features/<feature>/tests/.
 const includes = testArgs.length > 0 ? testArgs : defaultTestIncludes(dom);
@@ -121,7 +89,8 @@ if (namedFiles.length > 0 && process.env.RAFT_WEB_TEST_SKIP_LINT !== "1") {
 
 // One of the host's test slots (scripts/vitest/testSlot.ts): at most two
 // local runs at once across every agent, the rest wait in turn; cancelling
-// this runner kills the whole run, so no orphan keeps the slot.
+// this runner kills the whole run, so no orphan keeps the slot. The run's wait
+// and duration go to the host's test-run log (scripts/vitest/testRunLog.ts).
 const result = await runInTestSlot(
   process.execPath,
   [vitestCli, "run", "--config", resolve(webRoot, "vitest.config.ts"), ...vitestArgs],
@@ -133,6 +102,8 @@ const result = await runInTestSlot(
       RAFT_WEB_TEST_INCLUDE: JSON.stringify(includes),
     },
     stdio: "inherit",
+    // The host's test-run log: the files given ([] = the default set).
+    runLog: { package: "web", files: testArgs },
   },
 );
 

@@ -1850,7 +1850,7 @@ const stubCatalogWithoutCustomModels = (app: { app: { get: (k: string) => unknow
   const counter = { calls: 0 };
   Object.assign(app.app.get("agentOrchestrator") as object, {
     hasMachineLocally: () => true,
-    validateBuiltInPresetForMachine: async (machineId: string, config: Parameters<typeof assertBuiltInPresetSupportedByCatalog>[0]) => {
+    validateBuiltInPresetForMachine: async (machineId: string, config: Parameters<typeof assertBuiltInPresetSupportedByCatalog>[0], connectionProviderId: string | null) => {
       counter.calls += 1;
       const validation = assertBuiltInPresetSupportedByCatalog(
         config,
@@ -1862,6 +1862,7 @@ const stubCatalogWithoutCustomModels = (app: { app: { get: (k: string) => unknow
           },
         },
         { machineId, daemonVersion: "1.0.67", computerVersion: "1.0.67" },
+        connectionProviderId,
       );
       return validation ? { ...validation, authority: { connectionEpochId: "e", replicaGeneration: "g" } } : null;
     },

@@ -151,6 +151,50 @@ test("protected request terminal verdict carries auth refresh attempt join id", 
   }
 });
 
+test("a 401 and a 403 share statusBucket auth_401_403 but keep their exact status apart", async () => {
+  __resetAuthTraceForTest({ traceUrl: "https://trace.example.test" });
+  setAuthTraceServerIdGetter(() => "server-abc");
+  const ls = stubLocalStorage({ slock_access_token: "tok" });
+  const tracePosts: Array<{ events?: Array<{ name?: string; attrs?: Record<string, unknown> }> }> = [];
+
+  try {
+    setAuthTraceFetchForTest((input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("/scope-attestation")) {
+        return Promise.resolve(jsonResponse({ attestation: `att-${tracePosts.length}` }));
+      }
+      if (url.includes("/api/web-traces")) {
+        tracePosts.push(JSON.parse(String(init?.body)));
+        return Promise.resolve(jsonResponse({ ok: true }));
+      }
+      return Promise.resolve(jsonResponse({ ok: true }));
+    });
+
+    for (const status of [401, 403]) {
+      assert.equal(
+        getProtectedRequestAuthFailureAction({
+          status,
+          hasRefreshToken: true,
+          hasAccessToken: true,
+          initialized: true,
+          restoreState: "authenticated",
+        }),
+        "logout",
+      );
+    }
+
+    await waitFor(() => tracePosts.length >= 2);
+    const verdicts = tracePosts.flatMap((post) => post.events ?? []).filter((event) => event.name === "slock.auth.verdict");
+    assert.deepEqual(verdicts.map((event) => event.attrs?.statusBucket), ["auth_401_403", "auth_401_403"]);
+    assert.deepEqual(verdicts.map((event) => event.attrs?.status).sort(), [401, 403]);
+  } finally {
+    ls.restore();
+    setAuthTraceFetchForTest(null);
+    setAuthTraceServerIdGetter(() => undefined);
+    __resetAuthTraceForTest();
+  }
+});
+
 test("missing refresh token still logs out once restore is settled — a session existed", () => {
   // task #632 split this case in two. Here the access token is present, so a
   // session DID exist and could not be refreshed: ending it is correct.

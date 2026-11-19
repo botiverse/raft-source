@@ -24,17 +24,23 @@ import {
   PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY as SHARED_PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY,
   PUBLIC_SERVER_FEATURE_FLAG_KEY as SHARED_PUBLIC_SERVER_FEATURE_FLAG_KEY,
   SERVER_LABS_UI_FEATURE_FLAG_KEY as SHARED_SERVER_LABS_UI_FEATURE_FLAG_KEY,
-  SERVER_GUEST_FEATURE_FLAG_KEY as SHARED_SERVER_GUEST_FEATURE_FLAG_KEY,
-  canUseProBillingFeatures,
-  clientRuleConstraintsSatisfied,
   clientRuleShapeError,
   currentDate,
+  featureFlagDefaultPolicyFromEnv,
   findClientRuleBypassConflicts,
+  type FeatureFlagDefaultPolicy,
   type FeatureFlagClientFacts,
   type FeatureFlagClientRuleBypassConflict,
   type FeatureFlagRuleForConflictCheck,
   type FeatureFlagRuleShapeInput,
 } from "@botiverse/raft-shared";
+import {
+  FEATURE_FLAG_RULE_STAGE_ORDER,
+  computeFeatureFlagBucket,
+  evaluateFeatureFlagRow,
+  evaluatePreAuthFeatureFlagRow,
+  type FeatureFlagRuleRowInput,
+} from "@botiverse/raft-shared/feature-flag-evaluation";
 
 export const FEATURE_FLAG_CONFIG_SCOPE_GLOBAL = "global";
 /** Task #4 (#proj-apps): see APP_PROMPT_TEXT_CONSENT_FEATURE_FLAG_KEY in packages/shared. */
@@ -82,7 +88,6 @@ export const AGENT_INBOX_ITEMS_FEATURE_FLAG_KEY = SHARED_AGENT_INBOX_ITEMS_FEATU
 export const PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY = SHARED_PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY;
 export const PUBLIC_SERVER_FEATURE_FLAG_KEY = SHARED_PUBLIC_SERVER_FEATURE_FLAG_KEY;
 export const SERVER_LABS_UI_FEATURE_FLAG_KEY = SHARED_SERVER_LABS_UI_FEATURE_FLAG_KEY;
-export const SERVER_GUEST_FEATURE_FLAG_KEY = SHARED_SERVER_GUEST_FEATURE_FLAG_KEY;
 /**
  * Sub-agent delegation prompt: named agents whose runtime can start sub-agents
  * are told to stay on Raft (think, reply fast, coordinate) and hand hands-on
@@ -162,7 +167,7 @@ export const WAKE_RECYCLE_WARM_FEATURE_FLAG_KEY = "wake_recycle_warm";
 
 /**
  * RFC 060 OAR host, one flag per runtime that also has a legacy driver
- * (antigravity, grok), so each runtime rolls out on its own. Codex no longer
+ * (antigravity, grok, cursor, opencode), so each runtime rolls out on its own. Codex no longer
  * has one (retired, #raft-architecture:#32): it runs on the OAR host wherever
  * the Computer advertises `runtime-host:oar:codex`. Server-scoped,
  * default OFF: a missing flag or any evaluation failure leaves it off.
@@ -181,6 +186,9 @@ export const AGENT_RUNTIME_OAR_FEATURE_FLAG_KEYS = {
   // it off until OAR runs Cursor in a per-session child process that takes
   // the launch environment (daemon/src/agentHost/README.md, "Cursor").
   cursor: "agent_runtime_oar_cursor",
+  // OpenCode (`opencode acp`), only from a Computer that advertises
+  // `runtime-host:oar:opencode` (Linux and macOS, OpenCode 1.18.30+ / 2.0.27+).
+  opencode: "agent_runtime_oar_opencode",
   // A flag on a DEPRECATED runtime (antigravity) also reopens creating and
   // switching to it where it is on (runtimeAdmissionService.ts
   // FLAG_REVIVED_RUNTIME_IDS, tygg #oar-raft:e9798673). Adding a flag for
@@ -203,6 +211,31 @@ export function agentRuntimeOarFeatureFlagKey(runtime: string | null | undefined
 export function agentRuntimeOarDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = env[AGENT_RUNTIME_OAR_DISABLED_ENV]?.trim().toLowerCase();
   return raw !== undefined && raw !== "" && raw !== "0" && raw !== "false" && raw !== "off";
+}
+
+/**
+ * Task #255: staging default-on. Only where `DEPLOYMENT_ENV` is exactly
+ * "staging": `FEATURE_FLAGS_DEFAULT_ON` ("true"/"1") turns
+ * the final `default_enabled` fallback ON, and a key with no row ON, unless
+ * the key is in FEATURE_FLAG_DEFAULT_ON_EXCEPTIONS
+ * (packages/shared/src/featureFlagDefaultPolicy.ts). Kill switch,
+ * enabled=false and every matching rule still win. The pre-auth evaluator
+ * flips only the default of marked rows: a missing row cannot be marked
+ * pre_auth_evaluable, so it stays off there.
+ * Read per evaluation batch so tests can inject an env.
+ */
+export function featureFlagDefaultPolicy(env: NodeJS.ProcessEnv = process.env): FeatureFlagDefaultPolicy {
+  const policy = featureFlagDefaultPolicyFromEnv(env);
+  // Staging only: anywhere else (production, unset) the variable changes nothing, so one var set in the wrong
+  // config can't turn every flag on.
+  return env.DEPLOYMENT_ENV === "staging" ? policy : { ...policy, defaultOn: false };
+}
+
+/** The startup line (server.ts) when default-on is active, so it shows in staging's logs; null when it is off. */
+export function featureFlagDefaultPolicyStartupLine(env: NodeJS.ProcessEnv = process.env): string | null {
+  const policy = featureFlagDefaultPolicy(env);
+  if (!policy.defaultOn) return null;
+  return "[Slock] Feature flags default ON (staging, task #255)";
 }
 
 /**
@@ -271,6 +304,16 @@ export const ANTIPROTON_MODEL_PICKER_FEATURE_FLAG_KEY = "antiproton_model_picker
 export const RUNNER_CREDENTIAL_RECONCILE_FEATURE_FLAG_KEY = "runner_credential_reconcile";
 
 /**
+ * #proj-runtime:#62 repeated-wake guard (agentRepeatedWakeGuard.ts): with it
+ * on, an agent woken REPEATED_WAKE_THRESHOLD turns in a row by the same
+ * message with no progress has its process stopped (the agent stays on), that
+ * message is left out of its next starts' catch-up until a person starts it,
+ * and its owner is told once. Server-scoped, default OFF: off (or failing to
+ * read) only records `server.agent.repeated_wake` with `enforced: false`.
+ */
+export const AGENT_REPEATED_WAKE_GUARD_FEATURE_FLAG_KEY = "agent_repeated_wake_guard";
+
+/**
  * Account-mode Login with Raft (RFC 079 phase 3a, decision Q12): the kill
  * switch, the only rollback once an App has switched (an App never leaves
  * account mode, D16). An account-mode token has no Server, so the flag is
@@ -323,7 +366,7 @@ export const READY_WAKE_LOST_DELIVERIES_FEATURE_FLAG_KEY = "ready_wake_lost_deli
 const FEATURE_FLAG_LOCK_NAMESPACE = 0x46464c47; // "FFLG"
 const FEATURE_FLAG_CONFIG_VERSION_LOCK_NAMESPACE = 0x46464356; // "FFCV"
 const FEATURE_FLAG_CONFIG_VERSION_LOCK_KEY = 0;
-const RULE_STAGE_ORDER = ["user", "platform", "client", "server", "audience", "lab", "plan", "percentage"] as const;
+const RULE_STAGE_ORDER = FEATURE_FLAG_RULE_STAGE_ORDER;
 const LAB_KEY_RE = /^[a-z0-9][a-z0-9_.-]{0,127}$/;
 const AUDIENCE_KEY_RE = /^[a-z0-9][a-z0-9_.-]{0,127}$/;
 
@@ -487,17 +530,7 @@ export async function bumpFeatureFlagConfigVersion(
   return row.version;
 }
 
-export function computeFeatureFlagBucket(args: {
-  key: string;
-  salt: string;
-  unit: FeatureFlagRandomizationUnit;
-  unitId: string;
-}): number {
-  const digest = createHash("sha256")
-    .update(`${args.salt}:${args.key}:${args.unit}:${args.unitId}`)
-    .digest();
-  return digest.readUInt32BE(0) % 10_000;
-}
+export { computeFeatureFlagBucket };
 
 function asStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
@@ -621,203 +654,70 @@ async function assertEnabledAudienceKeys(
   }
 }
 
-function rulesForStage(rules: FeatureFlagRuleRow[], stage: FeatureFlagRuleStage): FeatureFlagRuleRow[] {
-  return rules
-    .filter((rule) => rule.stage === stage)
-    .sort((a, b) => a.priority - b.priority || a.createdAt.getTime() - b.createdAt.getTime());
-}
+const EMPTY_STRING_SET: ReadonlySet<string> = new Set<string>();
 
-function fromRule(key: string, rule: FeatureFlagRuleRow, reason: FeatureFlagReason): FeatureFlagEvaluation {
-  const enabled = rule.decision === "allow";
+function toEvaluatableRuleRow(row: FeatureFlagRuleRow): FeatureFlagRuleRowInput {
   return {
-    key,
-    enabled,
-    reason,
-    ...(enabled && rule.variant ? { variant: rule.variant } : {}),
+    id: row.id,
+    stage: row.stage,
+    priority: row.priority,
+    decision: row.decision,
+    values: asStringArray(row.values),
+    percentageBasisPoints: row.percentageBasisPoints,
+    variant: row.variant,
+    clientOs: row.clientOs == null ? null : asStringArray(row.clientOs),
+    minClientBuild: row.minClientBuild,
+    clientBuildTypes: row.clientBuildTypes == null ? null : asStringArray(row.clientBuildTypes),
+    createdAt: row.createdAt,
   };
 }
 
-function matchExplicitRule(
-  flag: FeatureFlagRow,
-  rules: FeatureFlagRuleRow[],
-  stage: "user" | "platform" | "server" | "plan",
-  value: string | null | undefined,
-): FeatureFlagEvaluation | null {
-  if (!value) return null;
-  for (const rule of rulesForStage(rules, stage)) {
-    if (asStringArray(rule.values).includes(value)) {
-      return fromRule(flag.key, rule, `${stage}_rule` as FeatureFlagReason);
-    }
-  }
-  return null;
-}
-
-function matchClientRule(
-  flag: FeatureFlagRow,
-  rules: FeatureFlagRuleRow[],
-  input: Pick<EvaluateFeatureFlagInput, "serverId" | "client">,
-): FeatureFlagEvaluation | null {
-  if (!input.serverId) return null;
-  for (const rule of rulesForStage(rules, "client")) {
-    if (!asStringArray(rule.values).includes(input.serverId)) continue;
-    const constraints = {
-      clientOs: rule.clientOs == null ? null : asStringArray(rule.clientOs),
-      minClientBuild: rule.minClientBuild,
-      clientBuildTypes: rule.clientBuildTypes == null ? null : asStringArray(rule.clientBuildTypes),
-    };
-    if (clientRuleConstraintsSatisfied(constraints, input.client)) {
-      return fromRule(flag.key, rule, "client_rule");
-    }
-  }
-  return null;
-}
-
-function matchPlanRule(
-  flag: FeatureFlagRow,
-  rules: FeatureFlagRuleRow[],
-  entitlement: ServerBillingEntitlement,
-  now: Date,
-): FeatureFlagEvaluation | null {
-  for (const rule of rulesForStage(rules, "plan")) {
-    const values = asStringArray(rule.values);
-    const exactMatch = values.includes(entitlement.plan);
-    const proCohortAllowMatch = rule.decision === "allow"
-      && entitlement.plan !== "pro"
-      && values.includes("pro")
-      && canUseProBillingFeatures(entitlement.plan, now);
-    if (exactMatch || proCohortAllowMatch) {
-      return fromRule(flag.key, rule, "plan_rule");
-    }
-  }
-  return null;
-}
-
-function matchLabRule(
-  flag: FeatureFlagRow,
-  rules: FeatureFlagRuleRow[],
-  effectiveLabKeys: ReadonlySet<string> | undefined,
-): FeatureFlagEvaluation | null {
-  if (!effectiveLabKeys || effectiveLabKeys.size === 0) return null;
-  for (const rule of rulesForStage(rules, "lab")) {
-    if (asStringArray(rule.values).some((labKey) => effectiveLabKeys.has(labKey))) {
-      return fromRule(flag.key, rule, "lab_rule");
-    }
-  }
-  return null;
-}
-
-function matchAudienceRule(
-  flag: FeatureFlagRow,
-  rules: FeatureFlagRuleRow[],
+function matchingAudienceKeysForInput(
   input: Pick<EvaluateFeatureFlagInput, "userId" | "serverId">,
   matchingAudienceKeysByIdentity: ReadonlyMap<string, ReadonlySet<string>>,
-): FeatureFlagEvaluation | null {
-  const matchingAudienceKeys = new Set<string>();
-  if (input.userId) {
-    for (const key of matchingAudienceKeysByIdentity.get(`user:${input.userId}`) ?? []) matchingAudienceKeys.add(key);
-  }
-  if (input.serverId) {
-    for (const key of matchingAudienceKeysByIdentity.get(`server:${input.serverId}`) ?? []) matchingAudienceKeys.add(key);
-  }
-  if (matchingAudienceKeys.size === 0) return null;
-  for (const rule of rulesForStage(rules, "audience")) {
-    if (asStringArray(rule.values).some((key) => matchingAudienceKeys.has(key))) {
-      return fromRule(flag.key, rule, "audience_rule");
-    }
-  }
-  return null;
-}
-
-function matchPercentageRule(
-  flag: FeatureFlagRow,
-  rules: FeatureFlagRuleRow[],
-  input: Pick<EvaluateFeatureFlagInput, "userId" | "serverId">,
-): FeatureFlagEvaluation | null {
-  const unitId = flag.randomizationUnit === "server" ? input.serverId : input.userId;
-  if (!unitId) return null;
-  const bucket = computeFeatureFlagBucket({
-    key: flag.key,
-    salt: flag.salt,
-    unit: flag.randomizationUnit,
-    unitId,
-  });
-
-  for (const rule of rulesForStage(rules, "percentage")) {
-    const threshold = rule.percentageBasisPoints;
-    if (threshold !== null && bucket < threshold) {
-      return fromRule(flag.key, rule, "percentage_rule");
-    }
-  }
-  return null;
-}
-
-function missingRandomizationUnitReason(
-  flag: FeatureFlagRow,
-  input: Pick<EvaluateFeatureFlagInput, "userId" | "serverId">,
-): Extract<FeatureFlagReason, "missing_user_unit" | "missing_server_unit"> | null {
-  if (flag.randomizationUnit === "user" && !input.userId) return "missing_user_unit";
-  if (flag.randomizationUnit === "server" && !input.serverId) return "missing_server_unit";
-  return null;
+): ReadonlySet<string> {
+  const userMatches = input.userId ? matchingAudienceKeysByIdentity.get(`user:${input.userId}`) : undefined;
+  const serverMatches = input.serverId ? matchingAudienceKeysByIdentity.get(`server:${input.serverId}`) : undefined;
+  if (!userMatches && !serverMatches) return EMPTY_STRING_SET;
+  if (userMatches && !serverMatches) return userMatches;
+  if (!userMatches && serverMatches) return serverMatches;
+  const combined = new Set<string>(userMatches);
+  for (const key of serverMatches!) combined.add(key);
+  return combined;
 }
 
 function evaluateFlagRow(
   flag: FeatureFlagRow | null,
-  rules: FeatureFlagRuleRow[],
+  rules: readonly FeatureFlagRuleRowInput[],
   input: EvaluateFeatureFlagInput,
   preload: FeatureFlagEvaluationPreload,
+  defaultPolicy: FeatureFlagDefaultPolicy,
 ): FeatureFlagEvaluation {
-  const key = input.key;
-  if (!flag) {
-    return { key, enabled: false, reason: "missing_flag" };
-  }
-  if (flag.killSwitch) {
-    return { key, enabled: false, reason: "kill_switch" };
-  }
-  if (!flag.enabled) {
-    return { key, enabled: false, reason: "flag_disabled" };
-  }
-
-  const userRule = matchExplicitRule(flag, rules, "user", input.userId);
-  if (userRule) return userRule;
-
-  const platformRule = matchExplicitRule(flag, rules, "platform", input.platform);
-  if (platformRule) return platformRule;
-
-  const clientRule = matchClientRule(flag, rules, input);
-  if (clientRule) return clientRule;
-
-  const serverRule = matchExplicitRule(flag, rules, "server", input.serverId);
-  if (serverRule) return serverRule;
-
-  const audienceRule = matchAudienceRule(flag, rules, input, preload.matchingAudienceKeysByIdentity);
-  if (audienceRule) return audienceRule;
-
-  if (input.serverId) {
-    const labRule = matchLabRule(flag, rules, preload.effectiveLabKeysByServer.get(input.serverId));
-    if (labRule) return labRule;
-  }
-
-  if (input.serverId && rulesForStage(rules, "plan").length > 0) {
-    const entitlement = preload.billingEntitlementByServer.get(input.serverId);
-    if (entitlement) {
-      const planRule = matchPlanRule(flag, rules, entitlement, preload.now);
-      if (planRule) return planRule;
-    }
-  }
-
-  const missingUnitReason = missingRandomizationUnitReason(flag, input);
-  if (missingUnitReason) {
-    return { key, enabled: false, reason: missingUnitReason };
-  }
-
-  const percentageRule = matchPercentageRule(flag, rules, input);
-  if (percentageRule) return percentageRule;
-
+  const evaluated = evaluateFeatureFlagRow({
+    flag,
+    rules,
+    input,
+    cohorts: {
+      matchingAudienceKeys: matchingAudienceKeysForInput(input, preload.matchingAudienceKeysByIdentity),
+      lab: {
+        status: "ready",
+        effectiveLabKeys: (input.serverId ? preload.effectiveLabKeysByServer.get(input.serverId) : undefined)
+          ?? EMPTY_STRING_SET,
+      },
+      plan: {
+        status: "ready",
+        entitlementPlan: (input.serverId ? preload.billingEntitlementByServer.get(input.serverId)?.plan : undefined)
+          ?? null,
+        now: preload.now,
+      },
+    },
+    defaultPolicy,
+  });
   return {
-    key,
-    enabled: flag.defaultEnabled,
-    reason: "default",
-    ...(flag.defaultEnabled && flag.defaultVariant ? { variant: flag.defaultVariant } : {}),
+    key: evaluated.key,
+    enabled: evaluated.enabled,
+    reason: evaluated.reason,
+    ...(evaluated.variant ? { variant: evaluated.variant } : {}),
   };
 }
 
@@ -940,6 +840,7 @@ async function preloadMatchingAudienceKeysByIdentity(
 export async function evaluateFeatureFlags(
   inputs: EvaluateFeatureFlagInput[],
   executor: DatabaseExecutor = getDb(),
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<FeatureFlagEvaluation[]> {
   // Keys the deployment answers itself (deploymentAnsweredFlags.ts): never read from Feature Flag Admin.
   const answered = inputs.map((input) => deploymentAnswerOf(input.key));
@@ -969,12 +870,12 @@ export async function evaluateFeatureFlags(
         .select()
         .from(featureFlagRules)
         .where(inArray(featureFlagRules.flagKey, flagRows.map((flag) => flag.key)))
-        .orderBy(asc(featureFlagRules.priority), asc(featureFlagRules.createdAt))
+        .orderBy(asc(featureFlagRules.priority), asc(featureFlagRules.createdAt), asc(featureFlagRules.id))
     : [];
-  const rulesByKey = new Map<string, FeatureFlagRuleRow[]>();
+  const rulesByKey = new Map<string, FeatureFlagRuleRowInput[]>();
   for (const rule of ruleRows) {
     const list = rulesByKey.get(rule.flagKey) ?? [];
-    list.push(rule);
+    list.push(toEvaluatableRuleRow(rule));
     rulesByKey.set(rule.flagKey, list);
   }
 
@@ -1010,6 +911,7 @@ export async function evaluateFeatureFlags(
     billingEntitlementByServer,
     now,
   };
+  const defaultPolicy = featureFlagDefaultPolicy(env);
 
   return inputs.map((input) => {
     const key = input.key;
@@ -1018,6 +920,7 @@ export async function evaluateFeatureFlags(
       rulesByKey.get(key) ?? [],
       input,
       preload,
+      defaultPolicy,
     );
     return evaluation;
   });
@@ -1026,8 +929,9 @@ export async function evaluateFeatureFlags(
 export async function evaluateFeatureFlag(
   input: EvaluateFeatureFlagInput,
   executor: DatabaseExecutor = getDb(),
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<FeatureFlagEvaluation> {
-  const [evaluation] = await evaluateFeatureFlags([input], executor);
+  const [evaluation] = await evaluateFeatureFlags([input], executor, env);
   return evaluation ?? { key: input.key, enabled: false, reason: "missing_flag" };
 }
 
@@ -1037,11 +941,13 @@ export async function evaluateFeatureFlag(
  * Only flags marked `pre_auth_evaluable` are read, and only their `platform` rules are loaded, so the
  * query itself never touches a user, server, audience, lab or plan rule. Every other key (unmarked,
  * missing, disabled) answers false, and the caller cannot tell which.
+ * Task #255: the default step follows FEATURE_FLAGS_DEFAULT_ON too.
  */
 export async function evaluatePreAuthFeatureFlags(
   keys: string[],
   platform: FeatureFlagPlatform | null,
   executor: DatabaseExecutor = getDb(),
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<Record<string, boolean>> {
   const uniqueKeys = [...new Set(keys)];
   const result: Record<string, boolean> = Object.fromEntries(uniqueKeys.map((key) => [key, false]));
@@ -1059,13 +965,25 @@ export async function evaluatePreAuthFeatureFlags(
           inArray(featureFlagRules.flagKey, flagRows.map((flag) => flag.key)),
           eq(featureFlagRules.stage, "platform"),
         ))
+        .orderBy(asc(featureFlagRules.priority), asc(featureFlagRules.createdAt), asc(featureFlagRules.id))
     : [];
 
+  const platformRulesByKey = new Map<string, FeatureFlagRuleRowInput[]>();
+  for (const rule of platformRules) {
+    const list = platformRulesByKey.get(rule.flagKey) ?? [];
+    list.push(toEvaluatableRuleRow(rule));
+    platformRulesByKey.set(rule.flagKey, list);
+  }
+
+  const defaultPolicy = featureFlagDefaultPolicy(env);
   for (const flag of flagRows) {
-    if (flag.killSwitch || !flag.enabled) continue;
-    const rules = platformRules.filter((rule) => rule.flagKey === flag.key);
-    const platformRule = matchExplicitRule(flag, rules, "platform", platform);
-    result[flag.key] = platformRule ? platformRule.enabled : flag.defaultEnabled;
+    result[flag.key] = evaluatePreAuthFeatureFlagRow({
+      key: flag.key,
+      flag,
+      platformRules: platformRulesByKey.get(flag.key) ?? [],
+      platform,
+      defaultPolicy,
+    }).enabled;
   }
   return result;
 }
@@ -1141,7 +1059,12 @@ export async function listFeatureFlagRules(flagKey: string, executor: DatabaseEx
     .select()
     .from(featureFlagRules)
     .where(eq(featureFlagRules.flagKey, flagKey))
-    .orderBy(asc(featureFlagRules.stage), asc(featureFlagRules.priority), asc(featureFlagRules.createdAt));
+    .orderBy(
+      asc(featureFlagRules.stage),
+      asc(featureFlagRules.priority),
+      asc(featureFlagRules.createdAt),
+      asc(featureFlagRules.id),
+    );
 }
 
 export async function createFirstServerAllowFeatureFlagRule(input: {
@@ -1182,7 +1105,12 @@ export async function createFirstServerAllowFeatureFlagRule(input: {
       .select()
       .from(featureFlagRules)
       .where(eq(featureFlagRules.flagKey, input.flagKey))
-      .orderBy(asc(featureFlagRules.stage), asc(featureFlagRules.priority), asc(featureFlagRules.createdAt))
+      .orderBy(
+        asc(featureFlagRules.stage),
+        asc(featureFlagRules.priority),
+        asc(featureFlagRules.createdAt),
+        asc(featureFlagRules.id),
+      )
       .for("update");
     if (existingRules.some((rule) => rule.stage === "server")) {
       throw new FeatureFlagServerRuleAlreadyExistsError(

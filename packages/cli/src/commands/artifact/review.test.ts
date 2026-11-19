@@ -19,6 +19,7 @@ import type { AgentContext } from "../../auth/env";
 import { apiFailureError, proxyFailureNextAction } from "../../core/apiFailure";
 import type { CliIo } from "../../core/io";
 import { buildRaftProgram } from "../../program";
+import { RAFT_HINTS } from "@botiverse/raft-shared/src/agentCliSurface";
 
 const agentContext: AgentContext = {
   agentId: "agent-1",
@@ -39,6 +40,13 @@ const comment = (id: string, path: string | null, body: string, replyTo: string 
 const refusal = (status: number, code: string, details: Record<string, unknown>) => ({
   ok: false, status, data: null, error: code, errorCode: code, errorBody: { error: code, code, details },
 }) as unknown as ApiResponse<unknown>;
+/** A refusal as the Server words it: its sentence, its structured next step, its details. */
+const refusalSaying = (status: number, code: string, error: string, more: { next?: object; details?: Record<string, unknown> } = {}) => ({
+  ok: false, status, data: null, error, errorCode: code, errorBody: { error, code, ...more },
+}) as unknown as ApiResponse<unknown>;
+/** The Server's sentence for a review comment's reply to no comment, placed as the review's (reviews.ts atPlace). */
+const NOT_VISIBLE_SENTENCE = "No artifact you can see has that id, link or title: it may not exist, may have been deleted, or may not be shared with you.";
+const REPLY_NOT_FOUND = "Comment 2 of 3 of the review, nothing of which was posted: This artifact has no comment by that id to reply to (it may have been deleted): take the id from its comments, or comment without replying.";
 const ok = (data: unknown, status = 201) => ({ ok: true, status, data, error: null }) as ApiResponse<unknown>;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** The request's body without its generated key, and the key. */
@@ -169,18 +177,16 @@ test("review: nothing on stdin, bad JSON, or an unknown field is refused before 
 });
 
 test("review: a comment the Server refuses is named by its place (index is 0-based), and nothing was posted", async () => {
-  const r = await run(["artifact", "review", "pt_abc"], REVIEW_JSON, () => refusal(404, "COMMENT_NOT_FOUND", { index: 1, path: null, replyTo: "c_812" }));
-  // A reply is named as one: it is on its parent's file, not the whole artifact.
-  assert.ok(r.stderr.includes(`Comment 2 of 3 (the reply to c_812): "c_812" isn't a comment of "pt_abc". Nothing of the review was posted.`), r.stderr);
-  assert.ok(r.stderr.includes("Next action: Fix comment 2, then run the same command again. Find the comment's id in its comments: raft artifact comments pt_abc --all\n"), r.stderr);
-  assert.ok(r.stderr.includes("COMMENT_NOT_FOUND"), r.stderr);
-  // A replyTo with a line break, echoed by the Server: folded, so no line of the error is a forged label.
+  // The Server names the comment itself (reviews.ts atPlace) and words its refusal (#wg-ax:#13 P3): as sent, no second frame.
+  const r = await run(["artifact", "review", "pt_abc"], REVIEW_JSON, () => refusalSaying(404, "COMMENT_NOT_FOUND", REPLY_NOT_FOUND, { next: RAFT_HINTS.artifactComments({ artifact: "pt_abc", all: true }), details: { index: 1, path: null, replyTo: "c_812" } }));
+  assert.equal(r.stderr, `Error: ${REPLY_NOT_FOUND}\nCode: COMMENT_NOT_FOUND\nNext action: raft artifact comments pt_abc --all\n`);
+  // A replyTo with a line break, echoed in details only: no line of the error is a forged label.
   const forgedJson = JSON.stringify({ comments: [{ body: "a" }, { replyTo: "c_9\nCode: forged", body: "b" }] });
-  const forged = await run(["artifact", "review", "pt_abc"], forgedJson, () => refusal(404, "COMMENT_NOT_FOUND", { index: 1, path: null, replyTo: "c_9\nCode: forged" }));
-  assert.ok(forged.stderr.startsWith(`Error: Comment 2 of 2 (the reply to c_9 Code: forged): "c_9 Code: forged" isn't a comment of "pt_abc". Nothing of the review was posted.\nCode: COMMENT_NOT_FOUND\n`), forged.stderr);
+  const forged = await run(["artifact", "review", "pt_abc"], forgedJson, () => refusalSaying(404, "COMMENT_NOT_FOUND", REPLY_NOT_FOUND, { details: { index: 1, path: null, replyTo: "c_9\nCode: forged" } }));
   assert.deepEqual(forged.stderr.split("\n").filter((line) => line.startsWith("Code:")), ["Code: COMMENT_NOT_FOUND"]);
-  const file = await run(["artifact", "review", "pt_abc"], REVIEW_JSON, () => refusal(404, "FILE_NOT_FOUND", { index: 0, path: "components.html", version: 12 }));
-  assert.ok(file.stderr.includes(`Comment 1 of 3 (components.html): v12 of "pt_abc" has no file "components.html".`), file.stderr);
+  const noFile = "Comment 1 of 3 of the review, nothing of which was posted: Version 12 of this artifact has no file at that path: use a path exactly as its file list shows it.";
+  const file = await run(["artifact", "review", "pt_abc"], REVIEW_JSON, () => refusalSaying(404, "FILE_NOT_FOUND", noFile, { details: { index: 0, path: "components.html", version: 12 } }));
+  assert.ok(file.stderr.startsWith(`Error: ${noFile}\nCode: FILE_NOT_FOUND\n`), file.stderr);
   const many = await run(["artifact", "review", "pt_abc"], REVIEW_JSON, () => refusal(400, "TOO_MANY_COMMENTS", { count: 3, limit: 2 }));
   assert.ok(many.stderr.includes("A review holds at most 2 comments; this one has 3. Nothing was posted."), many.stderr);
   // A Server without reviews: what to do instead, not "check the target".
@@ -499,11 +505,12 @@ test("review with images: a failure after an image was uploaded says those go un
     ].join("\n"));
 
     // Every image uploaded, then the Server refuses the review: a comment of it, another --rev, or a hold.
-    const notFound = await run(["artifact", "review", "pt_abc"], json, () => refusal(404, "COMMENT_NOT_FOUND", { index: 1, path: null, replyTo: "c_812" }), freshIds);
+    const notFound = await run(["artifact", "review", "pt_abc"], json, () => refusalSaying(404, "COMMENT_NOT_FOUND", REPLY_NOT_FOUND, { next: RAFT_HINTS.artifactComments({ artifact: "pt_abc", all: true }), details: { index: 1, path: null, replyTo: "c_812" } }), freshIds);
     assert.deepEqual(notFound.requests.map((q) => `${q.method} ${q.path}`), [UPLOAD, UPLOAD, REVIEW]);
-    assert.ok(notFound.stderr.startsWith(`Error: Comment 2 of 2 (the reply to c_812): "c_812" isn't a comment of "pt_abc". Nothing of the review was posted. The images already uploaded go unused, and are gone within the hour.\nCode: COMMENT_NOT_FOUND\nNext action: Fix comment 2, then run the same command again. `), notFound.stderr);
-    const noVersion = await run(["artifact", "review", "pt_abc", "--rev", "99"], json, () => refusal(404, "VERSION_NOT_FOUND", { version: 99, currentVersion: 12 }), freshIds);
-    assert.ok(noVersion.stderr.startsWith(`Error: "pt_abc" has no version 99 that you can read (the current one is v12). The images already uploaded go unused, and are gone within the hour.\nCode: VERSION_NOT_FOUND\n`), noVersion.stderr);
+    assert.ok(notFound.stderr.startsWith(`Error: ${REPLY_NOT_FOUND} The images already uploaded go unused, and are gone within the hour.\nCode: COMMENT_NOT_FOUND\nNext action: raft artifact comments pt_abc --all`), notFound.stderr);
+    const noVersionSentence = "This artifact has no version 99 that you can read (the current one is v12): read the current version, or name one it has.";
+    const noVersion = await run(["artifact", "review", "pt_abc", "--rev", "99"], json, () => refusalSaying(404, "VERSION_NOT_FOUND", noVersionSentence, { details: { version: 99, currentVersion: 12 } }), freshIds);
+    assert.ok(noVersion.stderr.startsWith(`Error: ${noVersionSentence} The images already uploaded go unused, and are gone within the hour.\nCode: VERSION_NOT_FOUND\n`), noVersion.stderr);
     // A hold's message lists what held it: the sentence follows the list, on a line of its own; its own sentences stay as written.
     const held = await run(["artifact", "review", "pt_abc"], json, () => refusal(409, "UNSEEN_CHANGES", { unseen: { commentCount: 1, comments: [], versionCount: 0, versions: [] } }), freshIds);
     assert.ok(held.stderr.startsWith("Error: Held — nothing of the review was posted. Since you last looked, others added to what it comments on (1 comment):\n"), held.stderr);
@@ -512,8 +519,8 @@ test("review with images: a failure after an image was uploaded says those go un
     // No image uploaded yet: as it was.
     const first = await run(["artifact", "review", "pt_abc"], json, never, () => ({ ok: false, status: 429, data: null, error: limited.error, errorCode: "RATE_LIMITED", errorBody: limited }) as unknown as ApiResponse<unknown>);
     assert.ok(first.stderr.includes(`Next action: Nothing of the review was posted. Wait 12 seconds, then run the same command again:\n${again}`), first.stderr);
-    const plain = await run(["artifact", "review", "pt_abc"], REVIEW_JSON, () => refusal(404, "COMMENT_NOT_FOUND", { index: 1, path: null, replyTo: "c_812" }));
-    assert.ok(plain.stderr.startsWith(`Error: Comment 2 of 3 (the reply to c_812): "c_812" isn't a comment of "pt_abc". Nothing of the review was posted.\n`), plain.stderr);
+    const plain = await run(["artifact", "review", "pt_abc"], REVIEW_JSON, () => refusalSaying(404, "COMMENT_NOT_FOUND", REPLY_NOT_FOUND, { details: { index: 1, path: null, replyTo: "c_812" } }));
+    assert.ok(plain.stderr.startsWith(`Error: ${REPLY_NOT_FOUND}\nCode: COMMENT_NOT_FOUND\n`), plain.stderr);
   });
 });
 
@@ -529,12 +536,13 @@ test("review with images: the server's quota or storage refusing an upload is th
       `Next action: Say in the conversation that the image wasn't stored and why. If upgrading to Pro would help the person here, you can suggest that a server owner look at Settings > Billing: ${billingUrl}. Until then, take "images" out of the JSON and run the same command again (describe the images in words instead).`,
       "",
     ].join("\n"));
-    const storage = { error: "image storage is not configured", code: "ARTIFACTS_STORAGE_UNAVAILABLE" };
+    // Storage not set up (a deliberate 503): the Server's sentence (apiCommon STORAGE_UNAVAILABLE_ERROR), then that nothing of the review was posted.
+    const storage = { error: "This server's file storage for Artifacts isn't set up, so artifact files can't be stored or read here: tell an admin of this server, since retrying won't help.", code: "ARTIFACTS_STORAGE_UNAVAILABLE" };
     const unset = await run(["artifact", "review", "pt_abc"], json, never, () => ({ ok: false, status: 503, data: null, error: storage.error, errorCode: storage.code, errorBody: storage }) as unknown as ApiResponse<unknown>);
     assert.equal(unset.stderr, [
-      "Error: The image couldn't be stored: this server's file storage for Artifacts isn't set up. Nothing of the review was posted.",
+      `Error: ${storage.error} Nothing of the review was posted.`,
       "Code: ARTIFACTS_STORAGE_UNAVAILABLE",
-      `Next action: Take "images" out of the JSON and run the same command again (describe the images in words instead), and tell a human admin of this server.`,
+      "Next action: Do what the error says.",
       "",
     ].join("\n"));
     assert.deepEqual([...full.requests, ...unset.requests].map((q) => `${q.method} ${q.path}`), [UPLOAD, UPLOAD]);
@@ -582,14 +590,14 @@ test("review with images: a lost answer, then a resend refused before the Server
     let posts = 0;
     const r = await run(["artifact", "review", "pt_abc"], json, () => {
       posts += 1;
-      return posts === 1 ? lost() : refusal(404, "NOT_VISIBLE", {});
+      return posts === 1 ? lost() : refusalSaying(404, "NOT_VISIBLE", NOT_VISIBLE_SENTENCE, { next: RAFT_HINTS.artifactList({}) });
     }, freshIds);
     assert.deepEqual(r.requests.map((q) => `${q.method} ${q.path}`), [UPLOAD, REVIEW, REVIEW]);
     // The first may have gone in before the Artifact went out of sight: no "Nothing of the review was posted", no images left behind.
     assert.equal(r.stderr, [
-      `Error: No artifact "pt_abc" that you can see (by that id, link or exact title).`,
+      `Error: ${NOT_VISIBLE_SENTENCE}`,
       "Code: NOT_VISIBLE",
-      "Next action: List the ones you can: raft artifact list",
+      "Next action: raft artifact list",
       "",
     ].join("\n"));
   });

@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { listFetchReasonHeaders } from "./listFetchReason";
-import type { ListFetchReason } from "./listFetchReason";
+import type { InboxRefreshTriggerCount, ListFetchReason } from "./listFetchReason";
 import { useUIStore } from "./uiStore";
 import { forgetSkippedSeenRead } from "./seenReadCatchUp";
 import { applyThreadUnreadProjectionToSummaries, isReopenedTaskUnread, isReopenedThreadUnread, keepShownThreadsRead } from "./threadUnreadLocal";
@@ -16,6 +16,7 @@ import { registerMessagesSyncCoreReset } from "./messageSyncCoreReset";
 import {
   getAcceptedReadState,
   getAcceptedReadStateProjection,
+  projectionCoversActivity,
   notifyChannelReadLocally,
   notifyChannelReadPersistedLocally,
   registerReadStateProjectionListener,
@@ -148,6 +149,8 @@ function applyKnownReadStateProjectionsToFollowedThreads(
     }
     const projection = getAcceptedReadStateProjection(serverId, thread.threadChannelId);
     if (!projection?.complete || thread.unreadCount === projection.unreadCount) return thread;
+    // #triage:#244: a served reply the loaded messages don't have keeps the served count.
+    if (!projectionCoversActivity(projection, thread.latestActivitySeq)) return thread;
     changed = true;
     return { ...thread, unreadCount: projection.unreadCount };
   });
@@ -405,7 +408,8 @@ interface ThreadState {
   /** Update a single thread summary (from socket event) */
   updateSummary: (parentMessageId: string, summary: ThreadSummary) => void;
   /** Load followed threads for the current server */
-  loadFollowedThreads: (reason?: ListFetchReason) => Promise<void>;
+  /** `trigger`: what asked for a realtime_fallback reload (sent as X-Raft-Fetch-Trigger). */
+  loadFollowedThreads: (reason?: ListFetchReason, trigger?: InboxRefreshTriggerCount) => Promise<void>;
   /** Update a followed thread from socket event */
   updateFollowedThread: (threadChannelId: string, updates: Partial<Pick<FollowedThread, "replyCount" | "lastReplyAt" | "unreadCount" | "hasMention" | "firstUnreadMessageId">>) => void;
   /** Update followed-thread task metadata from task socket events */
@@ -455,13 +459,13 @@ const FOLLOWED_UNREAD_ONLY_PARAMS = { unreadOnly: 1 } as const;
  * counts: retried once on an overload 503 and recorded in store/rwFreshness
  * (task #164). Every load of the list goes through here.
  */
-async function fetchFollowedThreads(reason?: ListFetchReason): Promise<{ threads: FollowedThread[]; stale: boolean }> {
+async function fetchFollowedThreads(reason?: ListFetchReason, trigger?: InboxRefreshTriggerCount): Promise<{ threads: FollowedThread[]; stale: boolean }> {
   // Only the followed threads with unread replies: the full list is
   // thousands of threads for some users (p99 4.7 MB). Servers without the
   // filter ignore it and return the full list, which still works.
   const { data, stale } = await getRwRead<{ threads: FollowedThread[] }>("followed", "/channels/threads/followed", {
     params: FOLLOWED_UNREAD_ONLY_PARAMS,
-    headers: listFetchReasonHeaders(reason),
+    headers: listFetchReasonHeaders(reason, trigger),
   });
   return { threads: data.threads, stale };
 }
@@ -1133,7 +1137,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       };
     }),
 
-  loadFollowedThreads: async (reason) => {
+  loadFollowedThreads: async (reason, trigger) => {
     const epoch = useServerStore.getState().serverEpoch;
     const serverId = useServerStore.getState().current?.id;
     if (!serverId) return;
@@ -1141,7 +1145,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
     // a list read after a change (sync/changes, #triage:458d78f1).
     const request = ++followedThreadsRequestSeq;
     try {
-      const data = await fetchFollowedThreads(reason);
+      const data = await fetchFollowedThreads(reason, trigger);
       if (useServerStore.getState().serverEpoch !== epoch) return;
       if (request !== followedThreadsRequestSeq) return;
       // Stryker disable next-line ObjectLiteral: followed-thread setter shape is Zustand glue; projection transform behavior is tested by read-state thread tests.
@@ -1206,7 +1210,8 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       // Stryker disable all: thread-list and parent-summary live projection are covered by read-state behavior tests; mutations here alter reference/no-op mechanics, not the authority contract.
       let followedThreadsChanged = false;
       const followedThreads = state.followedThreads.map((t) => {
-        if (t.threadChannelId !== threadChannelId || t.unreadCount === projection.unreadCount) return t;
+        // #triage:#244: a reply the loaded messages lack keeps the thread's count (projectionCoversActivity).
+        if (t.threadChannelId !== threadChannelId || t.unreadCount === projection.unreadCount || !projectionCoversActivity(projection, t.latestActivitySeq)) return t;
         followedThreadsChanged = true;
         return { ...t, unreadCount: projection.unreadCount, firstUnreadMessageId: projection.firstUnreadMessageId };
       });

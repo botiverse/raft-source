@@ -1,0 +1,46 @@
+{
+  "formatVersion": 1,
+  "id": "predicate_own_message_mentioning_self",
+  "rule": "predicate",
+  "title": "The viewer's own message that mentions them does not count or light the @",
+  "why": "Own messages are excluded before mentions.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/web/src/store/inboxInPlaceUnread.ts (liveActivityUnread, liveUnreadFields)",
+      "packages/web/src/store/inboxRowPosition.ts (rowPositionVerdict, with inbox_row_position_v1 on)"
+    ],
+    "server": [
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (unread_count FILTER)",
+      "packages/server/src/services/inboxUnreadEligibility.ts (isMessageUnreadEligibleForReceiver)"
+    ]
+  },
+  "given": {
+    "viewer": {
+      "type": "user",
+      "id": "viewer-1"
+    },
+    "scope": {
+      "rowKind": "dm"
+    },
+    "message": {
+      "senderType": "user",
+      "senderId": "viewer-1",
+      "messageType": "chat",
+      "systemSubtype": null,
+      "mentions": [
+        {
+          "type": "user",
+          "id": "viewer-1"
+        }
+      ]
+    }
+  },
+  "steps": [],
+  "expect": {
+    "verdict": {
+      "counts": false,
+      "mention": false
+    }
+  }
+}

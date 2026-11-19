@@ -3,6 +3,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { eq, sql } from "drizzle-orm";
 import type { Request, RequestHandler, Response } from "express";
+import { vi } from "vitest";
 import {
   PUBLIC_SERVER_FEATURE_FLAG_KEY,
   PUBLIC_SERVER_SEARCH_INDEX_FEATURE_FLAG_KEY,
@@ -105,6 +106,10 @@ test("public search service access: per-request keys, no anonymous fallback, sha
     for (const name of Object.keys(originals) as (keyof typeof originals)[]) {
       console[name] = (...args: unknown[]) => { logged.push(args.map(String).join(" ")); };
     }
+    // The service bucket is keyed by wall-clock minute; freeze Date (timers stay
+    // real) so the 13 counted requests share one window. Pinned 1ms before a
+    // minute boundary: a clock that still moved would split them and the 429 below would fail.
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.UTC(2026, 0, 1, 12, 0, 59, 999) });
     try {
       await setFlag(PUBLIC_SERVER_FEATURE_FLAG_KEY, true);
       await setFlag(PUBLIC_SERVER_SEARCH_INDEX_FEATURE_FLAG_KEY, true);
@@ -177,6 +182,7 @@ test("public search service access: per-request keys, no anonymous fallback, sha
         assert.ok(!logged.some((line) => line.includes(secret)), `no log line carries ${secret.slice(0, 6)}…`);
       }
     } finally {
+      vi.useRealTimers();
       Object.assign(console, originals);
       await app.close();
     }

@@ -51,6 +51,14 @@
  * `raft:host-state` event on the window. All three are kept in the URL by the keeper: a navigation that dropped
  * `hostToolbar` would bring the App's bar back over the page's.
  *
+ * `hostLoaded=1` (#proj-workspace:#302, Lagoon, mobile #4829): with the host shell, the page writes it into its
+ * address once, the moment the Artifact's loading splash would start its ending (the page in the frame, or the file
+ * Raft draws, has arrived) or leaves for a screen of its own (a failure: no splash left on screen). The App draws the
+ * same splash natively over the WebView from the start (artifactSplash.ts) and plays its ending when it sees this, so
+ * one splash is seen, never two. Not kept by the keeper: it reports a moment, not a mode, and a document that starts
+ * with it in its address (a reload) drops it first. The App also keeps a limit of its own: a page whose script never
+ * runs says nothing.
+ *
  * Legacy `embed=1` is deliberately NOT supported (@artin: 不用兼容). An old client
  * therefore falls back to a normal page — one extra web header, not a double header.
  */
@@ -142,8 +150,21 @@ let latched: EmbedMode | null = null;
 export function getEmbedMode(): EmbedMode {
   if (latched === null) {
     latched = typeof window === "undefined" ? NOT_EMBEDDED : parseEmbedMode(window.location.search);
+    if (latched.embedded && latched.shell === "host") dropStaleHostLoaded();
   }
   return latched;
+}
+
+/**
+ * `hostLoaded=1` says a moment of THIS document (markHostPageShown). A reload or a restored WebView loads the
+ * address it was written into, so it is dropped as the document starts: the App then sees it only when this load
+ * writes it again.
+ */
+function dropStaleHostLoaded(): void {
+  const url = new URL(window.location.href);
+  if (!url.searchParams.has("hostLoaded")) return;
+  url.searchParams.delete("hostLoaded");
+  window.history.replaceState(window.history.state, "", url);
 }
 
 /** Test seam: force the latched mode, and get back a function that restores it. */
@@ -196,6 +217,22 @@ export function hostToolbarDrawn(): boolean {
 export function markHostToolbarDrawn(): boolean {
   if (toolbarDrawn || hostMenuItems().length === 0) return false;
   toolbarDrawn = true;
+  return true;
+}
+
+/** Whether this document has told the App its Artifact is on screen (`hostLoaded=1`). */
+let pageShown = false;
+
+/**
+ * Tells the App, once per document and only with the host shell, that the Artifact's loading is over: `hostLoaded=1`
+ * in the address (replaceState: the Artifact page takes no router; another param or the hash is never touched).
+ */
+export function markHostPageShown(): boolean {
+  if (pageShown || !isHostShell() || typeof window === "undefined") return false;
+  pageShown = true;
+  const url = new URL(window.location.href);
+  url.searchParams.set("hostLoaded", "1");
+  window.history.replaceState(window.history.state, "", url);
   return true;
 }
 
@@ -278,7 +315,7 @@ export function needsEmbedRepair(search: string): boolean {
 export const __embedTestInternals = {
   parseEmbedMode,
   SUPPORTED_EMBED,
-  reset: () => { latched = null; toolbarDrawn = false; lastHostDesktop = null; },
+  reset: () => { latched = null; toolbarDrawn = false; lastHostDesktop = null; pageShown = false; },
 };
 
 /**

@@ -276,12 +276,15 @@ test("unseen comments hold a push as the owner by the ASSISTANT's read position 
   assert.equal(read.position, theirs.position);
   assert.ok(read.activity && read.activity.read !== null && read.activity.read >= read.activity.last, "the owner has read it");
 
-  // Held all the same: the assistant hasn't been shown it. Its read position moves over it; the owner's doesn't.
+  // Held all the same: the assistant hasn't been shown it. Neither read position moves: the person door's caller
+  // doesn't show a hold's comments, so only `seen` gets past it (Tenny, #33).
+  const assistantBefore = await readPositionOf(assistant, id);
   const held = await push("two");
   assert.deepEqual(refusal(held), [409, "UNSEEN_CHANGES"]);
   assert.equal((await versionRows(id)).length, 1);
-  assert.equal(await readPositionOf(assistant, id), theirs.position);
+  assert.equal(await readPositionOf(assistant, id), assistantBefore);
   assert.deepEqual(await ownerState(), read);
+  assert.deepEqual(refusal(await push("two")), [409, "UNSEEN_CHANGES"], "the same push again is held again");
 
   // The owner's own comment holds it too (the owner wrote it; the assistant wasn't shown it).
   const own = await comment(world.owner, "And the title.");
@@ -298,10 +301,10 @@ test("unseen comments hold a push as the owner by the ASSISTANT's read position 
   assert.equal(pushed.body.version, 2);
   assert.ok(own.position < last.position);
   // The owner's read position and Activity are as they were. The assistant's
-  // stops before the comment it was never shown (`seen` only lifts the hold:
-  // publish.ts step 6, as for any agent).
+  // stays before the first comment it was never shown (no hold moved it, and
+  // `seen` only lifts the hold: publish.ts step 6, as for any agent).
   assert.deepEqual(await ownerState(), beforePush);
-  assert.equal(await readPositionOf(assistant, id), own.position);
+  assert.equal(await readPositionOf(assistant, id), assistantBefore);
 });
 
 test("a repeated create as the owner replays only an Artifact with the same assistant's mark", async ({ seed }) => {

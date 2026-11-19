@@ -1,0 +1,42 @@
+{
+  "formatVersion": 1,
+  "id": "predicate_read_on_arrival",
+  "rule": "predicate",
+  "title": "A message the client reads as it arrives does not count",
+  "why": "The open conversation at its bottom (read saved), a read queued past it, or a read hold. Client-only: the server counts it until the read lands.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/web/src/store/inboxInPlaceUnread.ts (liveActivityUnread, liveUnreadFields)",
+      "packages/web/src/store/inboxRowPosition.ts (rowPositionVerdict, with inbox_row_position_v1 on)"
+    ],
+    "server": [
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (unread_count FILTER)",
+      "packages/server/src/services/inboxUnreadEligibility.ts (isMessageUnreadEligibleForReceiver)"
+    ]
+  },
+  "given": {
+    "viewer": {
+      "type": "user",
+      "id": "viewer-1"
+    },
+    "scope": {
+      "rowKind": "channel",
+      "readOnArrival": true
+    },
+    "message": {
+      "senderType": "user",
+      "senderId": "user-2",
+      "messageType": "chat",
+      "systemSubtype": null,
+      "mentions": []
+    }
+  },
+  "steps": [],
+  "expect": {
+    "verdict": {
+      "counts": false,
+      "mention": false
+    }
+  }
+}

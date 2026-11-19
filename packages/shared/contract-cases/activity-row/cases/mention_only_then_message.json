@@ -1,0 +1,42 @@
+{
+  "formatVersion": 1,
+  "id": "mention_only_then_message",
+  "rule": "position",
+  "title": "A mention-only row turns into a normal unread row when a counted message arrives above it",
+  "why": "A mention-only row's position is its highest mention seq (068-chain-mention-v6-consumers.sql: COALESCE(latest message seq, max mention seq)).",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/shared/src/activityRowPosition.ts (reduceActivityRow; not wired yet, step 2)"
+    ],
+    "server": [
+      "packages/server/src/services/channelService.ts (latestActivitySeqSameSource; the row's latestActivitySeq)",
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (unread_count and latest_seq from one materialized row)"
+    ]
+  },
+  "given": {
+    "row": {
+      "unreadCount": 0,
+      "hasMention": true,
+      "position": "100",
+      "mentionOnly": true
+    }
+  },
+  "steps": [
+    {
+      "act": "liveMessage",
+      "seq": "101",
+      "counts": true,
+      "mentionsViewer": false
+    }
+  ],
+  "expect": {
+    "row": {
+      "unreadCount": 1,
+      "hasMention": true,
+      "position": "101",
+      "mentionOnly": false
+    },
+    "reread": false
+  }
+}

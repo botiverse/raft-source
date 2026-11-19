@@ -7,6 +7,7 @@ import {
 } from "./serverTracer";
 import type { TraceExportSummaryRow } from "./traceExportSummary";
 import { setPrivacyModeForTest } from "../config/privacyMode";
+import { agentIdHashAttrs, traceMachineIdHash } from "./traceIdentity";
 
 test("createServerTracerFromEnv defaults to noop when OTLP endpoint is unset", () => {
   const runtime = createServerTracerFromEnv({});
@@ -358,4 +359,43 @@ test("a schema check that reads a matching catalog emits no schema_check_skipped
 
   assert.ok(fake.counts.rowsSent >= 2);
   assert.deepEqual(events, []);
+});
+
+test("the real server tracer exports the keyed hash beside a raw agent or machine id, and never a raw user id", async () => {
+  const savedSecret = process.env.JWT_SECRET;
+  process.env.JWT_SECRET = "server-tracer-id-hash-test-secret";
+  const agentId = "0b1c2d3e-4f50-4617-8a9b-0c1d2e3f4a5b";
+  const machineId = "1c2d3e4f-5061-4728-9bac-1d2e3f4a5b6c";
+  const userId = "3e4f5061-7283-494a-9dce-3f4a5b6c7d8e";
+  const bodies: string[] = [];
+  let agentHash: string | undefined;
+  let machineHash: string | null = null;
+  try {
+    // agentIdHashAttrs is what the request span uses (requestObservability.ts), so the two join.
+    agentHash = agentIdHashAttrs(agentId).agent_id_hash;
+    machineHash = traceMachineIdHash(machineId);
+    const runtime = createServerTracerFromEnv({
+      SLOCK_TRACE_OTLP_ENDPOINT: "http://collector:4318",
+      SLOCK_TRACE_SERVICE_NAME: "slock-server-test",
+      DEPLOYMENT_ENV: "test",
+    }, undefined, {
+      otlpFetch: async (input, init) => {
+        if (String(input).endsWith("/v1/traces")) bodies.push(String(init?.body));
+        return { ok: true, status: 200, text: async () => "" };
+      },
+    });
+    const span = runtime.tracer.startSpan("server.agent.wake", { surface: "server", attrs: { agent_id: agentId, user_id: userId } });
+    span.addEvent("machine.ready.pending_inbox_wake.planned", { machine_id: machineId });
+    span.end();
+    await runtime.shutdown();
+  } finally {
+    if (savedSecret === undefined) delete process.env.JWT_SECRET;
+    else process.env.JWT_SECRET = savedSecret;
+  }
+  const exported = bodies.join("\n");
+  assert.ok(agentHash && machineHash, "the hashes exist with a secret");
+  assert.ok(exported.includes(`"key":"agent_id_hash","value":{"stringValue":"${agentHash}"}`), "the span carries the agent hash");
+  assert.ok(exported.includes(`"key":"machine_id_hash","value":{"stringValue":"${machineHash}"}`), "the span event carries the machine hash");
+  assert.ok(exported.includes(agentId) && exported.includes(machineId), "the raw agent and machine ids stay");
+  assert.ok(!exported.includes(userId), "the raw user id is never exported");
 });

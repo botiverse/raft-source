@@ -23,8 +23,26 @@ export interface ServerLevelRow {
   level: NotificationLevel;
 }
 
+/**
+ * The account settings as the server answers them: `followedThreadReplies`
+ * only while the server offers that switch (its flag,
+ * notification_followed_thread_replies_switch, contract §2.1); absent, the
+ * server treats it as on and the row is not shown.
+ */
+export type AccountNotificationSettingsView =
+  Omit<NotificationAccountSettings, "followedThreadReplies"> & Partial<Pick<NotificationAccountSettings, "followedThreadReplies">>;
+
+/**
+ * Whether Settings shows "Replies in threads I follow" (the row and its search
+ * entry): while the settings load (null) the row stands, disabled; once
+ * loaded, only when the server sent the field.
+ */
+export function followedThreadRepliesShown(account: AccountNotificationSettingsView | null): boolean {
+  return account === null || account.followedThreadReplies !== undefined;
+}
+
 export interface AccountNotificationSettingsResponse {
-  settings: NotificationAccountSettings;
+  settings: AccountNotificationSettingsView;
   servers: ServerLevelRow[];
 }
 
@@ -35,8 +53,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 const isMinute = (value: unknown): value is number =>
   typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 1439;
 
-/** Closed parse of NotificationAccountSettings; null when malformed. */
-export function parseNotificationAccountSettings(value: unknown): NotificationAccountSettings | null {
+/** Closed parse of the account settings; null when malformed. */
+export function parseNotificationAccountSettings(value: unknown): AccountNotificationSettingsView | null {
   if (!isRecord(value)) return null;
   const quiet = value.quietHours;
   if (!isRecord(quiet)) return null;
@@ -51,8 +69,8 @@ export function parseNotificationAccountSettings(value: unknown): NotificationAc
     sound: value.sound,
     // Added in contract v1.1; an older server sends none (its behaviour is `inactive`).
     mobileDelay: isNotificationMobileDelay(value.mobileDelay) ? value.mobileDelay : "inactive",
-    // Added in contract v1.2; an older server sends none (its behaviour is on).
-    followedThreadReplies: value.followedThreadReplies !== false,
+    // Contract v1.2; sent only while the server offers the switch (absent: on, and not shown).
+    ...(typeof value.followedThreadReplies === "boolean" ? { followedThreadReplies: value.followedThreadReplies } : {}),
     version: value.version,
   };
 }
@@ -80,8 +98,8 @@ export type AccountNotificationSettingsPatch = Partial<
 >;
 
 export type PatchAccountSettingsResult =
-  | { kind: "ok"; settings: NotificationAccountSettings }
-  | { kind: "conflict"; settings: NotificationAccountSettings | null }
+  | { kind: "ok"; settings: AccountNotificationSettingsView }
+  | { kind: "conflict"; settings: AccountNotificationSettingsView | null }
   | { kind: "error" };
 
 export async function patchAccountNotificationSettings(patch: AccountNotificationSettingsPatch): Promise<PatchAccountSettingsResult> {

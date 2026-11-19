@@ -22,6 +22,7 @@ import { setProductAnalyticsOptOut } from "../services/productAnalyticsGate";
 import { requestClientPlatform } from "../services/productEventContext";
 import { getProductEventSink } from "../services/productEventIngest";
 import { recordServerProductEvent } from "../services/serverProductEvents";
+import { parseSignupCampaign, type SignupCampaign } from "../services/signupCampaign";
 import {
   recordAccountProfileCompleted,
   recordEmailVerificationSent,
@@ -554,6 +555,7 @@ function recordAccountCreated(
   userId: string,
   method: "email" | SocialAuthProvider,
   creationSource: "signup" | "oauth" | "invite",
+  campaign: SignupCampaign = {},
 ): void {
   void recordServerProductEvent(getProductEventSink(req.app), {
     event: "account_created",
@@ -563,6 +565,7 @@ function recordAccountCreated(
       platform: requestClientPlatform(req.get("x-raft-client-platform"), req.get("user-agent")),
       method,
       invited: creationSource === "invite",
+      ...campaign,
     },
   });
 }
@@ -874,7 +877,7 @@ authRouter.post("/register", async (req, res) => {
         onVerificationEmail: (result) => { verificationEmail = result; },
       },
     );
-    recordAccountCreated(req, user.id, "email", creationSource);
+    recordAccountCreated(req, user.id, "email", creationSource, parseSignupCampaign(req.body));
     if (verificationEmail) recordEmailVerificationSent(req, user.id, "signup", verificationEmail);
     // E2E-only opt-in: verify ephemeral test users (e.g. the removed-dm DM-seed
     // peer) so they can post. Double-gated — the SLOCK_E2E_AUTO_VERIFY_EMAIL
@@ -1436,7 +1439,7 @@ authRouter.post("/:provider/complete", async (req, res, next) => {
         creationSource,
         { deferProfileSetup: true },
       );
-      recordAccountCreated(req, user.id, provider.id, creationSource);
+      recordAccountCreated(req, user.id, provider.id, creationSource, parseSignupCampaign(req.body));
       userId = user.id;
     }
 

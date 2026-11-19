@@ -2237,6 +2237,11 @@ test("runtime start rejection leaves no active runtime or idle fallback behind",
     assert.equal(startFailureSpan.attrs?.error_present, true);
     assert.equal(startFailureSpan.attrs?.failure_reason, "runtime_spawn_failed", "an untyped failure gets the generic code");
     assert.equal(typeof startFailureSpan.attrs?.runtime_error_fingerprint, "string", "the scrubbed fingerprint lands on disk");
+    assert.equal(
+      startFailureSpan.attrs?.runtime_error_message_excerpt,
+      "spawn failed before process attachment",
+      "a failed start carries the scrubbed excerpt, since it never emits daemon.runtime.error",
+    );
 
     await manager.startAgent("agent-1", makeConfig({ name: "agent-1", sessionId: "session-1" }));
     assert.equal(driver.spawnCalls.length, 2);
@@ -2913,7 +2918,7 @@ test("stop during failed idle auto-restart prevents restart snapshot resurrectio
     (manager as any).startAgent = (agentId: string) => {
       markAgentStarting(manager, agentId);
       resolveEnteredStart();
-      return new Promise<void>((_resolve, reject) => {
+      return new Promise<never>((_resolve, reject) => {
         rejectStart = () => {
           (manager as any).agentStarts.clearStarting(agentId);
           reject(new Error("spawn failed after stop"));
@@ -7330,6 +7335,143 @@ test("task #389: a per-turn runtime is not respawned for an already-announced me
     await waitFor(() => driver.spawnCalls.length === 3, "wake for the new message");
     assert.match(driver.spawnCalls[2].prompt, /a real follow-up/);
   }, { driver, tracer });
+});
+
+// Cursor, and the legacy Antigravity, Gemini and Copilot drivers, end their
+// process by themselves after each turn (`exit: "natural"`); the daemon never
+// marked that exit as a turn end, so Task #389's deferral did not apply. A
+// server-built onboarding wake (seq 0, a synthetic id no read can return)
+// stayed queued and restarted the agent after every turn, with the same notice:
+// 633 turns on one agent. The natural end of a turn is a turn end too.
+for (const runtime of ["cursor", "antigravity", "gemini", "copilot"] as const) {
+  test(`${runtime}: a per-turn runtime that exits by itself is not restarted for a seq-0 onboarding message it already announced`, async () => {
+    const sink = new MemoryTraceSink();
+    const tracer = new BasicTracer({ sink });
+    const driver = new FakeCodexDriver({ id: runtime, supportsStdinNotification: false, busyDeliveryMode: "none" });
+    assert.equal(driver.lifecycle.kind === "per_turn" && driver.lifecycle.exit, "natural");
+
+    await withManager(async ({ manager }) => {
+      await manager.startAgent("agent-1", makeConfig({ runtime, sessionId: "session-1" }));
+      driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+      driver.processes[0].stdout.emit("data", Buffer.from("turn-end\n"));
+      await flush();
+      driver.processes[0].exit(0);
+      driver.processes[0].close(0);
+      await flush();
+      await flush();
+      assert.equal(driver.spawnCalls.length, 1);
+
+      // The opener ledger wakes the agent: a new process whose prompt announces it.
+      manager.deliverMessage("agent-1", makeMessage("Onboarding task (system-triggered): brief", {
+        message_id: "opener-v2-ledger-server-1",
+        seq: 0,
+      }));
+      await waitFor(() => driver.spawnCalls.length === 2, "wake for the onboarding message");
+      assert.match(driver.spawnCalls[1].prompt, /Raft inbox notice/);
+
+      // The turn ends cleanly and the process exits by itself with the message unread.
+      driver.processes[1].stdout.emit("data", Buffer.from("turn-end\n"));
+      await flush();
+      driver.processes[1].exit(0);
+      driver.processes[1].close(0);
+      await flush();
+      await flush();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(driver.spawnCalls.length, 2, "no restart for a message this process already announced");
+      const dropped = traceRows(sink).filter((span) => span.name === "daemon.agent.inbox.dropped_on_exit").at(-1);
+      assert.equal(dropped?.attrs?.exit_reason, "clean_exit_deferred");
+      assert.equal(dropped?.attrs?.dropped_count, 1);
+
+      // A genuinely new message still wakes it.
+      manager.deliverMessage("agent-1", makeMessage("a real follow-up", { message_id: "message-follow-up", seq: 7 }));
+      await waitFor(() => driver.spawnCalls.length === 3, "wake for the new message");
+      assert.match(driver.spawnCalls[2].prompt, /a real follow-up/);
+    }, { driver, tracer });
+  });
+}
+
+// #proj-runtime:#60: on Computer 1.0.68+ the Server sends the onboarding
+// briefing and #all greeting as `system.onboarding` inbox items (app events
+// with a row) instead of seq-0 messages. A Cursor agent woken by one is not
+// restarted once it exits cleanly: read, the event leaves the queue by its id;
+// left unread, the clean natural exit is a turn end (#14982) and the item was
+// already announced to that process.
+const ONBOARDING_ITEM_EVENT_ID = "0b0a0d01-0000-4000-8000-000000000060";
+function onboardingItemMessage(): AgentMessage {
+  return makeMessage("System event: Onboarding briefing (system-triggered). Continue onboarding @Owner in #onboarding-owner channel.", {
+    channel_id: "third-party-agent-events:agent-1",
+    channel_name: "third-party-agent-events:agent-1",
+    channel_type: "dm",
+    sender_id: "system.onboarding",
+    sender_name: "system.onboarding",
+    sender_type: "third_party_app",
+    message_id: ONBOARDING_ITEM_EVENT_ID,
+    seq: 0,
+    third_party_event: {
+      id: ONBOARDING_ITEM_EVENT_ID,
+      kind: "event",
+      client_id: "system.onboarding",
+      client_name: "system.onboarding",
+      system_app: "system.onboarding",
+      inbox_item_target: "app:system.onboarding/opener:server-1",
+    },
+  } as Partial<AgentMessage>);
+}
+
+for (const read of [true, false]) {
+  test(`cursor: a system.onboarding inbox item ${read ? "read by id" : "left unread"} does not restart the agent after its clean exit`, async () => {
+    const driver = new FakeCodexDriver({ id: "cursor", supportsStdinNotification: false, busyDeliveryMode: "none" });
+    await withManager(async ({ manager }) => {
+      await manager.startAgent("agent-1", makeConfig({ runtime: "cursor", sessionId: "session-1" }));
+      driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+      driver.processes[0].stdout.emit("data", Buffer.from("turn-end\n"));
+      await flush();
+      driver.processes[0].exit(0);
+      driver.processes[0].close(0);
+      await flush();
+      await flush();
+      assert.equal(driver.spawnCalls.length, 1);
+
+      const message = onboardingItemMessage();
+      manager.deliverMessage("agent-1", message);
+      await waitFor(() => driver.spawnCalls.length === 2, "wake for the onboarding item");
+      assert.equal((manager as any).pendingVisibleMessages("agent-1", "agent-event:0b0a0d01").length, 1);
+
+      if (read) {
+        // `raft inbox read` / `message read --target agent-event:<id>`: consumed by its id.
+        const coordinator = (manager as any).createAgentProxyInboxCoordinator("agent-1");
+        coordinator.consumeVisibleMessages({ target: "agent-event:0b0a0d01", messages: [message], source: "agent_api_history" });
+        assert.equal((manager as any).pendingVisibleMessages("agent-1", "agent-event:0b0a0d01").length, 0);
+      }
+
+      driver.processes[1].stdout.emit("data", Buffer.from("turn-end\n"));
+      await flush();
+      driver.processes[1].exit(0);
+      driver.processes[1].close(0);
+      await flush();
+      await flush();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(driver.spawnCalls.length, 2, "no restart after the clean exit");
+    }, { driver });
+  });
+}
+
+test("a per-turn runtime that exits by itself still restarts for a message that arrived during its turn", async () => {
+  const driver = new FakeCodexDriver({ id: "cursor", supportsStdinNotification: false, busyDeliveryMode: "none" });
+
+  await withManager(async ({ manager }) => {
+    await manager.startAgent("agent-1", makeConfig({ runtime: "cursor", sessionId: "session-1" }));
+    driver.parsedLines.set("turn-end", [{ kind: "turn_end", sessionId: "session-1" }]);
+    // During the first turn a message arrives: it was never announced to this process.
+    manager.deliverMessage("agent-1", makeMessage("arrived mid-turn", { message_id: "message-mid-turn", seq: 5 }));
+    await flush();
+    driver.processes[0].stdout.emit("data", Buffer.from("turn-end\n"));
+    await flush();
+    driver.processes[0].exit(0);
+    driver.processes[0].close(0);
+    await waitFor(() => driver.spawnCalls.length === 2, "restart for the unannounced message");
+    assert.match(driver.spawnCalls[1].prompt, /arrived mid-turn/);
+  }, { driver });
 });
 
 test("task #389: a message that arrived during the announced turn is not treated as announced, so turn_end still respawns for it", async () => {
@@ -15722,7 +15864,7 @@ test("RFC 071 held start: the context never arrives; a stop completes at once, n
       await waitFor(() => outbox.heldCapabilityWaits() === 1, "the start is held");
       assert.equal(startSlots(manager).starting, true);
       await Promise.race([manager.stopAgent("agent-1"), new Promise((_, reject) => setTimeout(() => reject(new Error("stop did not complete")), 1_000))]);
-      await started;
+      assert.equal(await started, "cancelled", "the wake reached no process");
       assert.equal(outbox.heldCapabilityWaits(), 0, "the waiter is removed");
       assert.deepEqual(startSlots(manager), { active: 0, starting: false }, "the slot and starting state are released");
       assert.deepEqual(startOutcomesFor(sent, "launch-held"), [{ kind: "not_spawned", reason: "cancelled" }], "settled once, cancelled");
@@ -15743,14 +15885,14 @@ for (const how of ["outbox stop", "manager stopAll"] as const) {
     outbox.onDisconnected();
     try {
       await withManager(async ({ driver, sent, manager }) => {
-        const started: Array<Promise<void>> = [];
+        const started: Array<Promise<unknown>> = [];
         for (const agentId of ["agent-1", "agent-2"]) {
           assert.equal(manager.noteServerStartAccepted(agentId, `launch-${agentId}`), true);
           started.push(manager.startAgent(agentId, makeConfig(), undefined, undefined, undefined, `launch-${agentId}`));
         }
         await waitFor(() => outbox.heldCapabilityWaits() === 2, "both held");
         if (how === "outbox stop") outbox.stop(); else await manager.stopAll();
-        await Promise.all(started);
+        assert.deepEqual(await Promise.all(started), ["cancelled", "cancelled"]);
         assert.equal(outbox.heldCapabilityWaits(), 0);
         assert.equal(driver.spawnCalls.length, 0);
         for (const agentId of ["agent-1", "agent-2"]) {
@@ -15764,6 +15906,31 @@ for (const how of ["outbox stop", "manager stopAll"] as const) {
     }
   });
 }
+
+// A delivery that restarts an idle agent answers for that start (machine
+// ca4239b1, 11-15). RED proof: return "started" for the cancelled capability
+// wait in spawnAgentProcess (`wait_cancelled`) and the delivery resolves true,
+// which the core acks.
+test("RFC 071 held start: a delivery whose idle restart waits for the capability is not delivered when the daemon stops", async () => {
+  const { outbox, gate, cleanup } = await unreliableGate();
+  outbox.onDisconnected();
+  try {
+    await withManager(async ({ driver, manager }) => {
+      (manager as any).lifecycleRecords.idleRestartSnapshots.set("agent-1", {
+        config: makeConfig({ sessionId: "session-1" }),
+        sessionId: "session-1",
+        launchId: "launch-1",
+      });
+      const accepted = manager.deliverMessage("agent-1", makeMessage("wake from idle while the capability is unknown"));
+      await waitFor(() => outbox.heldCapabilityWaits() === 1, "the restart is held");
+      await manager.stopAll();
+      assert.equal(await accepted, false);
+      assert.equal(driver.spawnCalls.length, 0);
+    }, { daemonInstanceId: "daemon-rfc071", runtimeProcessGate: gate, runtimeStartScheduler: { minStartIntervalMs: 0 } });
+  } finally {
+    await cleanup();
+  }
+});
 
 test("RFC 071 held start vs the runtime start-up timeout: a start held longer than the timeout is not failed by it (the timer starts only at spawn); after the context it spawns once with one result", async () => {
   const { outbox, gate, cleanup } = await unreliableGate();
@@ -16918,3 +17085,38 @@ for (const inboxItems of [true, false]) {
     }, { driver, appInboxForAgent: () => store });
   });
 }
+
+test("a per_turn runtime whose turn_end comes at the end of stdout (OpenCode 2.x) completes the turn: final reply shown, turn_completed sent", async () => {
+  class StdoutEndDriver extends FakeCodexDriver {
+    replyFinished = false;
+    parseStdoutEnd(): ParsedEvent[] {
+      return this.replyFinished ? [{ kind: "turn_end", sessionId: "session-1" }] : [];
+    }
+  }
+  // stdout usually ends before the exit; after it when a descendant still holds the pipe.
+  for (const [replyFinished, endBeforeExit] of [[true, true], [true, false], [false, true]] as const) {
+    const driver = new StdoutEndDriver({ id: "opencode", supportsStdinNotification: false, busyDeliveryMode: "none", terminateProcessOnTurnEnd: true });
+    driver.replyFinished = replyFinished;
+    await withManager(async ({ manager, sent }) => {
+      await manager.startAgent("agent-1", makeConfig({ runtime: "opencode", sessionId: "session-1" }), undefined, undefined, undefined, "launch-1");
+      // The final reply lands well inside the trajectory coalescing window, right before the process ends.
+      emitRuntimeLines(driver, 0, "final-reply", [{ kind: "text", text: "FINAL-REPLY-TEXT" }]);
+      const child = driver.processes[0];
+      if (endBeforeExit) child.stdout.emit("end");
+      child.exit(0);
+      if (!endBeforeExit) child.stdout.emit("end");
+      child.close(0);
+      await flush();
+      await flush();
+      const shown = sent.some((msg) => msg.type !== "agent:runtime:outcome" && JSON.stringify(msg).includes("FINAL-REPLY-TEXT"));
+      if (replyFinished) {
+        assert.equal(turnCompletedFrames(sent).length, 1, "the end-of-stdout turn_end completes the turn");
+        assert.ok(shown, "the final reply row is shown, not dropped with the timers");
+      } else {
+        // Control: a turn closed only by process exit misses this bookkeeping (why the driver must emit turn_end).
+        assert.equal(turnCompletedFrames(sent).length, 0);
+        assert.equal(shown, false, "and drops the held final reply row");
+      }
+    }, { driver, daemonInstanceId: "daemon-stdout-end" });
+  }
+});

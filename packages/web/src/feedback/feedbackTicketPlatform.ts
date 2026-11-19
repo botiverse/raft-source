@@ -1,10 +1,13 @@
 // Which Hands app a feedback ticket lives in, when it is not the web's.
 //
-// A ticket filed in a mobile App lives in that App's Hands app, and its link
-// says so: `.../settings/feedback/ticket/<id>?platform=android`. The web
-// remembers that per ticket, so every call about the ticket (detail, reply,
-// close, attachment) asks the same app (`?platform=`, server
-// routes/productFeedback.ts). Memory only: the link is the durable record.
+// A ticket filed in a mobile App lives in that App's Hands app. The web learns
+// that from the ticket's `source` on a merged list page or a detail response
+// (`?sources=all`, server #14722), or from its link:
+// `.../settings/feedback/ticket/<id>?platform=android`. The web remembers it
+// per ticket, so every call about the ticket (detail, reply, close,
+// attachment) asks the same app (`?platform=`, server
+// routes/productFeedback.ts). Memory only: the list and the link are the
+// durable records.
 //
 // No feedback SDK import here: the settings panel and the transport share it.
 
@@ -15,13 +18,17 @@ const MOBILE_PLATFORMS: readonly FeedbackTicketPlatform[] = ["ios", "android", "
 
 const platformByTicket = new Map<string, FeedbackTicketPlatform>();
 
-/** The mobile App a link's query names, else null: the web's own app. */
-export function feedbackTicketPlatformFromSearch(search: string): FeedbackTicketPlatform | null {
-  const value = new URLSearchParams(search).get("platform");
-  return (MOBILE_PLATFORMS as readonly string[]).includes(value ?? "") ? (value as FeedbackTicketPlatform) : null;
+/** The mobile App a ticket's `source` names, else null: the web's own app (or a value this build doesn't know). */
+export function feedbackTicketPlatformOf(source: unknown): FeedbackTicketPlatform | null {
+  return (MOBILE_PLATFORMS as readonly unknown[]).includes(source) ? (source as FeedbackTicketPlatform) : null;
 }
 
-/** Records the App a ticket's link named. A link without one changes nothing. */
+/** The mobile App a link's query names, else null: the web's own app. */
+export function feedbackTicketPlatformFromSearch(search: string): FeedbackTicketPlatform | null {
+  return feedbackTicketPlatformOf(new URLSearchParams(search).get("platform"));
+}
+
+/** Records the App a ticket lives in. Null (the web's own app) changes nothing. */
 export function rememberFeedbackTicketPlatform(ticketId: string, platform: FeedbackTicketPlatform | null): void {
   if (platform !== null) platformByTicket.set(ticketId, platform);
 }

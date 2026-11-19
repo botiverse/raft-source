@@ -3,6 +3,7 @@ import { createHash, generateKeyPairSync, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { and, eq, sql } from "drizzle-orm";
 import { afterEach, beforeEach } from "vitest";
+import { BasicTracer, MemoryTraceSink } from "@botiverse/raft-shared";
 import { createApiTest } from "../test/integration/apiTest";
 import { tokenForHuman } from "../test/integration/credentials";
 import type { Database, DatabaseExecutor } from "../db";
@@ -16,14 +17,16 @@ import { addMember } from "../services/serverService";
 import { __setPreviewHttpForTests, __settleAppLinkPreviewRechecksForTests } from "../services/appLinkPreviewService";
 import { PreviewNotSentError } from "../services/appLinkPreviewHttp";
 import { __resetLinkCardActionLimitsForTests, admitLinkCardAction, LINK_CARD_EXECUTE_PER_MINUTE, LINK_CARD_RECOVERY_PER_MINUTE } from "../services/linkCardActionLimits";
-import { __setLinkCardActionHooksForTests, LINK_CARD_STATE_HINTS, linkCardRequestSha256 } from "../services/linkCardActionService";
+import {
+  __setLinkCardActionHooksForTests, LINK_CARD_EXECUTE_ANSWER_FIELDS_DROPPED_EVENT, LINK_CARD_STATE_HINTS, linkCardRequestSha256,
+} from "../services/linkCardActionService";
 import { __observeLinkCardLiveStateForTests } from "../services/linkCardLiveState";
 import { __resetLinkCardReadBudgetForTests } from "../services/linkCardReadService";
 import { sweepLinkCardFirstSendDeadlines } from "../services/linkCardSweeps";
-import { linkCardActionEndpointSha256, linkCardExecuteJti, linkCardUrlSha256, nativeInstallationKey } from "../services/linkCardTokens";
+import { linkCardActionEndpointSha256, linkCardExecuteJti, linkCardUrlSha256, nativeInstallationKey, verifyLinkCardHandle } from "../services/linkCardTokens";
 import { oidcIssuer } from "../services/oidcService";
 import {
-  ALL_CAPABILITIES, appAnswer, barrier, cardFixture, clientRequestId, handleFor, insertOperations, post, stubApp, type CardFixture,
+  ALL_CAPABILITIES, appAnswer, appAuth, barrier, cardFixture, clientRequestId, handleFor, insertOperations, post, sendCardUpdate, stubApp, type CardFixture,
 } from "../test/linkCardActionFixture";
 import { seedBoundGuest } from "../test/guestFixture";
 
@@ -54,7 +57,9 @@ afterEach(async () => {
 const sha256 = (value: string) => createHash("sha256").update(value, "utf8").digest("hex");
 /** The fixed hints as defined, copied before any request runs. */
 const HINTS = structuredClone(LINK_CARD_STATE_HINTS) as Record<string, { tone: string; text: string }>;
-const execute = (baseUrl: string, fx: { headers: Record<string, string> }, body: unknown) => post(baseUrl, "execute", fx, body);
+/** A client that declared execute.toast.v1: a final execute answer's toast reaches it (RFC 076 §6.3). */
+const TOAST_CAPABLE = [...ALL_CAPABILITIES, "execute.toast.v1"];
+const execute =(baseUrl: string, fx: { headers: Record<string, string> }, body: unknown) => post(baseUrl, "execute", fx, body);
 const actionCalls = <T extends { url: string }>(calls: T[], fx: CardFixture) => calls.filter((call) => call.url === fx.actionEndpoint);
 const countRows = async (db: Database) => ({
   operations: (await db.select().from(linkCardOperations)).length,
@@ -91,7 +96,7 @@ test("execute end to end: a read's handle, one transaction, one dispatch record,
   assert.equal(res.headers.get("cache-control"), "private, no-store");
   const operationId = res.body.operation_id as string;
   assert.deepEqual(res.body, { operation_id: operationId, state: "accepted", toast: HINTS.accepted },
-    "only the fixed hint for the state: the App's toast, code and attribution never reach the client from the synchronous answer");
+    "only the fixed hint for the state: the App's toast, code and attribution never reach the client from an open operation's answer");
 
   const [call, ...more] = actionCalls(calls, fx);
   assert.ok(call); assert.equal(more.length, 0, "sent once");
@@ -110,7 +115,9 @@ test("execute end to end: a read's handle, one transaction, one dispatch record,
     iss: oidcIssuer(undefined, fx.server.id), aud: `urn:raft:card-action:${fx.client.clientId}`, sub: fx.owner.id, iat: 0, nbf: 0, exp: 0,
     jti: linkCardExecuteJti(operationId), token_use: "card_action", type: "human", phase: "execute", server_id: fx.server.id, server_role: "owner",
     installation_id: fx.install.id, message_id: fx.message.id, url_sha256: linkCardUrlSha256(fx.url), body_sha256: sha256(call.raw),
-  }, "iss by Server id, body_sha256 over the exact bytes sent, the one execute jti of this operation");
+    // RFC 086 §5.3: the request itself (what a sealed card form value's JWE header binds); no prepared claims for an undo action.
+    handle_sha256: sha256(handle), action_id: "approve", client_request_id: crid, handle_exp: verifyLinkCardHandle(handle, new Date())!.claims.exp,
+  }, "iss by Server id, body_sha256 over the exact bytes sent, the one execute jti of this operation, the request it executes");
   assert.ok(Number(call.claims.exp) - Number(call.claims.iat) <= 30);
   assert.ok(Number(call.claims.exp) <= Math.floor(op.firstSendDeadline.getTime() / 1000), "exp never passes the first-send deadline");
 
@@ -139,7 +146,7 @@ test("execute end to end: a read's handle, one transaction, one dispatch record,
   assert.ok(lifetime >= 599_000 && lifetime <= 601_000, `update token lives 10 minutes from the dispatch (${lifetime})`);
 });
 
-test("the synchronous answer table: accepted|executing -> accepted, done|refused|failed_not_sent -> terminal, unknown/timeout/failure/invalid -> unknown, nothing sent -> failed_not_sent; the toast is always the fixed hint", async ({ app, db, seed }) => {
+test("the synchronous answer table: accepted|executing -> accepted, done|refused|failed_not_sent -> terminal, unknown/timeout/failure/invalid -> unknown, nothing sent -> failed_not_sent; without execute.toast.v1 the toast is always the fixed hint", async ({ app, db, seed }) => {
   const fx = await cardFixture(db, seed);
   __setLinkCardActionHooksForTests({ budgetMs: 100 });
   const appToast = { toast: { tone: "success", text: "Merged secret-repo#9" }, code: "X", attribution: "bob" };
@@ -176,6 +183,117 @@ test("the synchronous answer table: accepted|executing -> accepted, done|refused
     const terminal = ["done", "refused", "failed_not_sent"].includes(state);
     assert.equal(view?.pendingOperationId, terminal ? null : op!.operationId, `${name}: a terminal state releases the view`);
   }
+});
+
+test("an execute answer's code, attribution and toast have status's bounds (one parser); unlike status, one outside them keeps the App's status as the transition and drops all three (no app_result), with one trace event naming the App and the fields; at the bounds, counted in code points, they are kept", async ({ app, db, seed }) => {
+  const sink = new MemoryTraceSink();
+  app.app.set("serverTracer", new BasicTracer({ sink }));
+  const drops = () => sink.getAllLogEvents().filter((event) => event.name === LINK_CARD_EXECUTE_ANSWER_FIELDS_DROPPED_EVENT)
+    .map(({ attrs }) => ({ app_id: attrs?.app_id, fields: attrs?.fields }));
+  const fx = await cardFixture(db, seed);
+  const ok = { tone: "success", text: "Merged" };
+  // name, the App's answer, the state, the fields dropped (null: nothing dropped, the toast shown).
+  const cases: [string, Record<string, unknown>, string, string | null][] = [
+    ["a toast tone outside the protocol", { status: "done", toast: { tone: "error", text: "x" } }, "done", "toast"],
+    ["a toast over 200 code points", { status: "done", toast: { tone: "info", text: "x".repeat(201) } }, "done", "toast"],
+    ["an empty toast text", { status: "refused", toast: { tone: "warning", text: "" } }, "refused", "toast"],
+    ["a toast with a field the protocol lacks", { status: "done", toast: { tone: "info", text: "x", html: "<b>x</b>" } }, "done", "toast"],
+    ["a toast that is not an object", { status: "done", toast: "Merged" }, "done", "toast"],
+    ["a code over 64, beside a valid toast", { status: "done", code: "C".repeat(65), toast: ok }, "done", "code"],
+    ["an empty code", { status: "failed_not_sent", code: "" }, "failed_not_sent", "code"],
+    ["a code that is not a string", { status: "done", code: 7, toast: ok }, "done", "code"],
+    ["an attribution over 200, beside a valid toast", { status: "refused", attribution: "a".repeat(201), toast: ok }, "refused", "attribution"],
+    ["an empty attribution on an open answer", { status: "accepted", attribution: "" }, "accepted", "attribution"],
+    ["all three", { status: "done", code: "", attribution: "", toast: { tone: "error", text: "x" } }, "done", "code,attribution,toast"],
+    ["each at its upper bound", { status: "done", code: "C".repeat(64), attribution: "😀".repeat(200), toast: { tone: "success", text: "😀".repeat(200) } }, "done", null],
+    ["each at its lower bound", { status: "refused", code: "C", attribution: "a", toast: { tone: "warning", text: "x" } }, "refused", null],
+  ];
+  for (const [name, answer, state, dropped] of cases) {
+    sink.clear();
+    const calls = stubApp(() => appAnswer(answer));
+    const res = await execute(app.baseUrl, fx, { client_request_id: clientRequestId(), handle: handleFor(fx, { binding: { capabilities: TOAST_CAPABLE } }).handle });
+    assert.equal(res.status, 200, name);
+    assert.equal(actionCalls(calls, fx).length, 1, `${name}: sent once`);
+    assert.deepEqual(res.body, { operation_id: res.body.operation_id, state, toast: HINTS[state], ...(dropped ? {} : { app_result: { toast: answer.toast } }) },
+      dropped ? `${name}: the App's status kept, nothing of the App's shown` : name);
+    const [op] = await db.select().from(linkCardOperations).where(eq(linkCardOperations.operationId, res.body.operation_id as string));
+    assert.equal(op?.state, state, name);
+    const [attempt] = await db.select().from(linkCardAttempts).where(eq(linkCardAttempts.operationId, res.body.operation_id as string));
+    assert.equal(attempt?.outcome, `answered:${answer.status as string}`, name);
+    assert.deepEqual(drops(), dropped ? [{ app_id: fx.client.id, fields: dropped }] : [], `${name}: the trace`);
+  }
+  // Structure still decides validity, as before: a status execute doesn't have is an invalid answer.
+  sink.clear();
+  stubApp(() => appAnswer({ status: "not_visible", toast: ok }));
+  const invalid = await execute(app.baseUrl, fx, { client_request_id: clientRequestId(), handle: handleFor(fx, { binding: { capabilities: TOAST_CAPABLE } }).handle });
+  assert.deepEqual(invalid.body, { operation_id: invalid.body.operation_id, state: "unknown", toast: HINTS.unknown });
+  assert.deepEqual(drops(), [], "an invalid answer drops nothing: it is not read");
+});
+
+test("the App's toast on execute's answer (RFC 076 §6.3, rule 6): a final answer's toast reaches a client that declared execute.toast.v1 as app_result, in status's shape; never an open state's, never the code or attribution, never without the capability or from Raft's own conclusions", async ({ app, db, seed }) => {
+  const fx = await cardFixture(db, seed);
+  __setLinkCardActionHooksForTests({ budgetMs: 100 });
+  const hidden = { code: "SECRET_CODE", attribution: "secret-attribution" };
+  const toastOf = (text: string, tone = "success") => ({ tone, text });
+  const cases: [string, () => unknown, string[], string, { toast: { tone: string; text: string } } | null][] = [
+    ["done", () => appAnswer({ status: "done", toast: toastOf("Merged #1 into staging"), ...hidden }), TOAST_CAPABLE, "done", { toast: toastOf("Merged #1 into staging") }],
+    ["refused", () => appAnswer({ status: "refused", toast: toastOf("Checks are failing", "warning"), ...hidden }), TOAST_CAPABLE, "refused", { toast: toastOf("Checks are failing", "warning") }],
+    ["failed_not_sent", () => appAnswer({ status: "failed_not_sent", toast: toastOf("GitHub is down, nothing ran", "warning") }), TOAST_CAPABLE, "failed_not_sent",
+      { toast: toastOf("GitHub is down, nothing ran", "warning") }],
+    ["done without a toast", () => appAnswer({ status: "done", ...hidden }), TOAST_CAPABLE, "done", null],
+    ["accepted", () => appAnswer({ status: "accepted", toast: toastOf("secret-open-toast"), ...hidden }), TOAST_CAPABLE, "accepted", null],
+    ["executing", () => appAnswer({ status: "executing", toast: toastOf("secret-open-toast") }), TOAST_CAPABLE, "accepted", null],
+    ["unknown", () => appAnswer({ status: "unknown", toast: toastOf("secret-open-toast") }), TOAST_CAPABLE, "unknown", null],
+    ["done, for a client without execute.toast.v1", () => appAnswer({ status: "done", toast: toastOf("secret-undeclared-toast") }), ALL_CAPABILITIES, "done", null],
+    ["no answer within the budget", () => new Promise(() => undefined), TOAST_CAPABLE, "unknown", null],
+    ["refused before any byte left", () => { throw new PreviewNotSentError("Preview host unavailable"); }, TOAST_CAPABLE, "failed_not_sent", null],
+  ];
+  for (const [name, answer, capabilities, state, appResult] of cases) {
+    stubApp(answer);
+    const res = await execute(app.baseUrl, fx, { client_request_id: clientRequestId(), handle: handleFor(fx, { binding: { capabilities } }).handle });
+    assert.equal(res.status, 200, name);
+    assert.deepEqual(res.body, { operation_id: res.body.operation_id, state, toast: HINTS[state], ...(appResult ? { app_result: appResult } : {}) }, name);
+    for (const leaked of ["SECRET_CODE", "secret-attribution", "secret-open-toast", "secret-undeclared-toast"]) {
+      assert.ok(!JSON.stringify(res.body).includes(leaked), `${name}: no ${leaked}`);
+    }
+  }
+});
+
+test("the App's toast on execute's answer passes status's gates in that request: lost access while the App was asked, or another outcome recorded first, shows only Raft's hint; a recovered answer never has it, and Raft stores none of it", async ({ app, db, seed }) => {
+  const fx = await cardFixture(db, seed);
+  const merged = { tone: "success", text: "secret-merged-toast" };
+  const capable = () => handleFor(fx, { binding: { capabilities: TOAST_CAPABLE } }).handle;
+
+  // Shown, then the same request again: Raft's records answer, without it.
+  stubApp(() => appAnswer({ status: "done", toast: merged }));
+  const body = { client_request_id: clientRequestId(), handle: capable() };
+  const first = await execute(app.baseUrl, fx, body);
+  assert.deepEqual(first.body, { operation_id: first.body.operation_id, state: "done", toast: HINTS.done, app_result: { toast: merged } });
+  assert.deepEqual((await execute(app.baseUrl, fx, body)).body, { operation_id: first.body.operation_id, state: "done", toast: HINTS.done },
+    "recovery answers from Raft's records: never the App's words, so never replayed");
+
+  // The viewer's consent is revoked while the App is asked: the outcome is
+  // recorded (recording is separate from showing), nothing private is shown.
+  stubApp(async () => {
+    await db.update(oauthUserConsents).set({ revokedAt: new Date() }).where(eq(oauthUserConsents.userId, fx.owner.id));
+    return appAnswer({ status: "done", toast: merged });
+  });
+  const lost = await execute(app.baseUrl, fx, { client_request_id: clientRequestId(), handle: capable() });
+  assert.deepEqual(lost.body, { operation_id: lost.body.operation_id, state: "done", toast: HINTS.done }, "access asked again after the App answered");
+  await db.update(oauthUserConsents).set({ revokedAt: null }).where(eq(oauthUserConsents.userId, fx.owner.id));
+
+  // The App's terminal update recorded `refused` before its synchronous `done`
+  // was applied: the operation keeps `refused`, and the `done` toast is not its.
+  stubApp(async (call) => {
+    const update = await sendCardUpdate(app.baseUrl, appAuth(fx), { update_token: call.body.update_token, update_id: "u-1", outcome: "refused" });
+    assert.equal(update.status, 200, JSON.stringify(update.body));
+    return appAnswer({ status: "done", toast: merged });
+  });
+  const raced = await execute(app.baseUrl, fx, { client_request_id: clientRequestId(), handle: capable() });
+  assert.deepEqual(raced.body, { operation_id: raced.body.operation_id, state: "refused", toast: HINTS.refused });
+
+  const stored = JSON.stringify(await Promise.all([linkCardOperations, linkCardAttempts, linkCardClientRequests, linkCardUpdateTokens, linkCardViews].map((table) => db.select().from(table))));
+  assert.ok(!stored.includes("secret-merged-toast"), "Raft stores no App text");
 });
 
 test("recovery first: the same id and intent returns the same operation without a second call or write (handle expired, eligibility revoked too); a different intent is 409", async ({ app, db, seed }) => {

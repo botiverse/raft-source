@@ -37,12 +37,18 @@ import { useColumnWidth } from "../store/columnWidthStore";
 import { COLUMN_BOUNDS, fittedColumnStyles } from "../lib/panelBounds";
 import { getApiErrorResponse } from "../utils/apiErrorResponse";
 import { getPublicPersonalSettingsTabIds } from "../utils/translationContract";
+import { preloadSignInPage } from "./landingPages";
 import type { Channel } from "../store/channelStore";
 import type { Message } from "../store/messageStore";
 import { useTranslationStore } from "../store/translationStore";
 import { getServerSurfaceCapabilities } from "@botiverse/raft-shared";
 import type { PublicVisitorIdMode } from "@botiverse/raft-shared";
 import { ReleaseNotesPanel, SettingsPanel } from "./publicServerSettingsPanels";
+
+// Signed out, this page's Sign in buttons start the sign-in page's code as
+// they are pointed at, focused or pressed: boot doesn't start it here
+// (pages/landingPages.ts startsSignInPageEarly), as most visitors only read.
+const SIGN_IN_WARMUP = { onPointerEnter: preloadSignInPage, onFocus: preloadSignInPage, onPointerDown: preloadSignInPage };
 
 const PUBLIC_PANEL_RESIZE_QUERY = "(min-width: 640px)";
 
@@ -695,7 +701,7 @@ export default function PublicServerPage({
     actions={authenticated ? null : (
       <div className="flex items-center gap-2">
         <Button size="md" variant="accent" onClick={onRegister}><UserPlus className="size-4" />{formatMessage({ id: "pages.publicServer.join" })}</Button>
-        <Button size="md" variant="outline" onClick={onSignIn}><LogIn className="size-4" />{formatMessage({ id: "pages.publicServer.signIn" })}</Button>
+        <Button size="md" variant="outline" onClick={onSignIn} {...SIGN_IN_WARMUP}><LogIn className="size-4" />{formatMessage({ id: "pages.publicServer.signIn" })}</Button>
       </div>
     )}
   >
@@ -906,7 +912,7 @@ export default function PublicServerPage({
       </div>
 
       {serverSelectionNotice ? (
-        <Banner intent="info" density="sm" className={FLOATING_NOTICE_CLASS_TOP} data-testid="public-server-selection-notice" actions={<Button size="md" variant="outline" onClick={onSignIn}>{formatMessage({ id: "pages.publicServer.signIn" })}</Button>}>
+        <Banner intent="info" density="sm" className={FLOATING_NOTICE_CLASS_TOP} data-testid="public-server-selection-notice" actions={<Button size="md" variant="outline" onClick={onSignIn} {...SIGN_IN_WARMUP}>{formatMessage({ id: "pages.publicServer.signIn" })}</Button>}>
           {formatMessage({ id: "pages.publicServer.banner" })}
           <Button type="button" size="icon-md" variant="ghost" className={FLOATING_NOTICE_CLOSE_CLASS} onClick={dismissServerSelectionNotice} aria-label={formatMessage({ id: "common.close" })} data-testid="public-server-selection-notice-close">
             <X aria-hidden="true" />

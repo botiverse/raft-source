@@ -4,7 +4,7 @@
 // projection, written under the server row lock by projectPaidSourceServerPlan
 // and by the hourly lapse sweep.
 import { and, asc, eq, gt, inArray, isNull, sql } from "drizzle-orm";
-import { PRO_PREPAID_GRACE_DAYS, type PrepaidEntitlement, type ProPrepaidMonths } from "@botiverse/raft-shared";
+import { PRO_PREPAID_GRACE_DAYS, prepaidGrantOf, type PrepaidEntitlement, type ProPrepaidMonths } from "@botiverse/raft-shared";
 import type { DatabaseExecutor } from "../db/index";
 import { prepaidProPurchases, servers, subscriptions } from "../db/schema";
 import { getActiveAppSumoGrants } from "./appSumoLicenseService";
@@ -39,36 +39,7 @@ export function prepaidPeriodWindow(paidThrough: Date | null, now: Date, months:
   return { startsAt, endsAt: addCalendarMonthsUtc(startsAt, months) };
 }
 
-/** Derive one Server's grant from its paid rows. Exported for tests. */
-export function prepaidGrantOf(rows: readonly GrantRow[], now: Date): PrepaidEntitlement | null {
-  const periods = rows.filter(row => row.kind === "period").sort((a, b) => a.startsAt.getTime() - b.startsAt.getTime());
-  let covering: GrantRow | null = null;
-  for (const period of periods) {
-    if (period.startsAt.getTime() > now.getTime()) continue;
-    if (!covering || period.endsAt.getTime() > covering.endsAt.getTime()) covering = period;
-  }
-  if (!covering) return null;
-  // Periods bought ahead start where the previous one ends: follow the chain.
-  let chainEnd = covering.endsAt.getTime();
-  for (const period of periods) {
-    if (period.startsAt.getTime() <= chainEnd && period.endsAt.getTime() > chainEnd) chainEnd = period.endsAt.getTime();
-  }
-  if (now.getTime() >= chainEnd + GRACE_MS) return null;
-  // In grace, the seats are the ones at the end of the paid time.
-  const at = Math.min(now.getTime(), chainEnd - 1);
-  const covers = (row: GrantRow) => row.startsAt.getTime() <= at && at < row.endsAt.getTime();
-  let base: GrantRow | null = null;
-  for (const period of periods) {
-    if (covers(period) && (!base || period.startsAt.getTime() >= base.startsAt.getTime())) base = period;
-  }
-  const added = rows.filter(row => row.kind === "seats" && covers(row)).reduce((sum, row) => sum + row.seatQuantity, 0);
-  return {
-    endsAt: new Date(chainEnd).toISOString(),
-    graceEndsAt: new Date(chainEnd + GRACE_MS).toISOString(),
-    inGrace: now.getTime() >= chainEnd,
-    seatQuantity: (base ?? covering).seatQuantity + added,
-  };
-}
+export { prepaidGrantOf };
 
 /** Paid, non-conflicting purchases of normal, live Servers that can still matter at `now`. */
 async function grantRows(executor: DatabaseExecutor, serverIds: readonly string[], now: Date): Promise<GrantRow[]> {

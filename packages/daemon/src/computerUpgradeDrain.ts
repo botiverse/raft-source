@@ -66,6 +66,8 @@ export interface ComputerUpgradeDrainChannelDeps {
 interface ActiveDrain {
   request: ComputerUpgradeDrainRequestFile;
   finished: ComputerUpgradeDrainFinished | null;
+  /** Agents the drain waited for, once it finished (written to the state file for the service's `drain` step). */
+  waitedFor: number | null;
   lastReported: string | null;
 }
 
@@ -138,7 +140,7 @@ export class ComputerUpgradeDrainChannel {
     const beginDrain = this.deps.hosts.beginDrain;
     if (!beginDrain) return;
     const deadlineMs = Math.max(0, request.deadlineAtMs - this.now());
-    const active: ActiveDrain = { request, finished: null, lastReported: null };
+    const active: ActiveDrain = { request, finished: null, waitedFor: null, lastReported: null };
     this.active = active;
     this.deps.recordEvent("daemon.computer_upgrade.drain.began", {
       request_id: request.requestId,
@@ -148,6 +150,7 @@ export class ComputerUpgradeDrainChannel {
     void beginDrain.call(this.deps.hosts, { deadlineMs }).then((summary) => {
       if (this.active !== active) return;
       active.finished = summary.finished;
+      active.waitedFor = summary.waitedFor.length;
       this.deps.recordEvent("daemon.computer_upgrade.drain.finished", {
         request_id: request.requestId,
         finished: summary.finished,
@@ -198,6 +201,7 @@ export class ComputerUpgradeDrainChannel {
       live: progress.live,
       notQuietAgentIds,
       ...(active.finished ? { finished: active.finished } : {}),
+      ...(active.waitedFor !== null ? { waitedFor: active.waitedFor } : {}),
       updatedAtMs: this.now(),
     };
     this.writeState(state);

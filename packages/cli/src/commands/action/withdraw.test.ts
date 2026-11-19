@@ -86,6 +86,21 @@ test("raft action withdraw: already withdrawn — exit 0, nothing changed", asyn
   assert.equal(run.stdout, `Question card already withdrawn: message ${CARD} (short 1a2b3c4d, ref: deploy-1); nothing changed. @tenny cannot answer it.\n`);
 });
 
+test("raft action withdraw: a request card (request:prepare) — the receipt says the person can no longer confirm it", async () => {
+  const request = { type: "request:prepare", operation: "agent:stop", addressee: TENNY };
+  const run = await runPinned(["action", "withdraw", "--message", "1a2b3c4d"], [withdrawn(request)]);
+  assert.equal(run.exitCode, 0, run.stderr);
+  assert.equal(run.stdout, `Request card withdrawn: message ${CARD} (short 1a2b3c4d). @tenny can no longer confirm it. No reply is posted for a withdrawal; this is your receipt.\n`);
+  const again = await runPinned(["action", "withdraw", "--message", "1a2b3c4d"], [withdrawn(request, true)]);
+  assert.equal(again.stdout, `Request card already withdrawn: message ${CARD} (short 1a2b3c4d); nothing changed. @tenny cannot confirm it.\n`);
+  // A card that names no person (an older or odd card): said plainly.
+  const nobody = { type: "request:prepare", operation: "agent:stop" };
+  assert.equal((await runPinned(["action", "withdraw", "--message", "1a2b3c4d"], [withdrawn(nobody)])).stdout,
+    `Request card withdrawn: message ${CARD} (short 1a2b3c4d). No one can confirm it now. No reply is posted for a withdrawal; this is your receipt.\n`);
+  assert.equal((await runPinned(["action", "withdraw", "--message", "1a2b3c4d"], [withdrawn(nobody, true)])).stdout,
+    `Request card already withdrawn: message ${CARD} (short 1a2b3c4d); nothing changed. No one can confirm it now.\n`);
+});
+
 test("raft action withdraw --json: the state, the full message id and the card's metadata", async () => {
   const run = await runPinned(["action", "withdraw", "--message", "1a2b3c4d", "--json"], [withdrawn()]);
   assert.equal(run.exitCode, 0, run.stderr);

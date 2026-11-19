@@ -730,7 +730,7 @@ function GithubConnectionRow({
       )}
       {dialog === "disconnect" && current && (
         <ConfirmDialog
-          title={formatMessage({ id: "agent.detail.connections.disconnectConnector" })}
+          title={formatMessage({ id: "agent.detail.connections.disconnectConnectorTitle" })}
           message={formatMessage(
             { id: "agent.detail.connections.disconnectConnectorMessage" },
             { connection: disconnectSubject(current), agent: agentName },

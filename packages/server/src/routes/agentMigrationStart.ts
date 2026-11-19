@@ -21,6 +21,7 @@ import * as agentMigrationService from "../services/agentMigrationService";
 import type { AgentOrchestrator, MachineMigrationTransportState } from "../services/agentOrchestrator";
 import { emitAgentMigrationUpdated } from "../services/agentMigrationRealtime";
 import { findAccessRevokedMachineIds } from "../services/computerAgents";
+import { providerConnectionProviderId } from "../services/providerConnectionService";
 import { BuiltInModelCatalogError, isBuiltInCatalogCheckedSelection } from "../services/builtinModelCatalogCompatibility";
 import { MachineCatalogStaleError } from "../services/machineCatalogAuthority";
 import { requireTeamBillingFeature } from "../services/planService";
@@ -90,6 +91,8 @@ export async function validateBuiltInPresetForWrite(
   agentOrchestrator: AgentOrchestrator,
   machineId: string,
   runtimeConfig: RuntimeConfig,
+  /** A saved connection's provider (builtInCatalogSelection). */
+  connectionProviderId: string | null,
 ): Promise<
   Awaited<ReturnType<AgentOrchestrator["validateBuiltInPresetForMachine"]>>
 > {
@@ -97,6 +100,7 @@ export async function validateBuiltInPresetForWrite(
     return await agentOrchestrator.validateBuiltInPresetForMachine(
       machineId,
       runtimeConfig,
+      connectionProviderId,
     );
   } catch (error) {
     if (
@@ -455,7 +459,8 @@ export async function validateComputerMigrationStart(input: {
 
 /**
  * The target Computer's Built-in model catalog check, for an agent on a
- * Built-in preset: answered by the replica holding the target's connection
+ * Built-in preset, or on a typed model through a saved preset connection
+ * (builtInCatalogSelection): answered by the replica holding the target's connection
  * (the request is replayed there when it is another one). "handled": the
  * response was sent (a refusal, or the owner replica's answer). Otherwise
  * the catalog authority to release once the start is done.
@@ -466,7 +471,11 @@ export async function acquireMigrationTargetCatalogAuthority(
   agentOrchestrator: AgentOrchestrator | undefined,
   validated: Pick<ValidatedComputerMigration, "targetMachineId" | "runtimeConfig">,
 ): Promise<"handled" | (() => void)> {
-  if (!isBuiltInCatalogCheckedSelection(validated.runtimeConfig)) return () => undefined;
+  const config = validated.runtimeConfig;
+  const connectionProviderId = config.runtime === "builtin" && config.provider.kind === "connection" && config.model.kind === "custom"
+    ? await providerConnectionProviderId(req.serverId!, config.provider.connectionId)
+    : null;
+  if (!isBuiltInCatalogCheckedSelection(config, connectionProviderId)) return () => undefined;
   if (!agentOrchestrator) {
     sendBuiltInCatalogUnavailable(res);
     return "handled";
@@ -485,7 +494,8 @@ export async function acquireMigrationTargetCatalogAuthority(
   const catalogValidation = await validateBuiltInPresetForWrite(
     agentOrchestrator,
     validated.targetMachineId,
-    validated.runtimeConfig,
+    config,
+    connectionProviderId,
   );
   if (!catalogValidation) return () => undefined;
   return agentOrchestrator.acquireBuiltInCatalogAuthority(validated.targetMachineId, catalogValidation.authority);

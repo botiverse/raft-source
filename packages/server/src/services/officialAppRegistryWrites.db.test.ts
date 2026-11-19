@@ -430,7 +430,6 @@ test("every refusal carries its SQLSTATE and changes nothing", async ({ db, seed
   const { client: unregistered } = await app(seed, db);
   const { client: builtin } = await app(seed, db, { appType: "slock_builtin" });
   const { client: serverLocal } = await app(seed, db, { appType: "server_local" });
-  const { client: requested } = await app(seed, db, { publishStatus: "publish_requested" });
   const { client: oddKey } = await app(seed, db, { clientId: `Odd_Key_${randomUUID().slice(0, 8)}` });
   const { client: platform } = await app(seed, db);
   await db.insert(externalAppRegistrations).values({
@@ -438,7 +437,8 @@ test("every refusal carries its SQLSTATE and changes nothing", async ({ db, seed
     providerAppId: `A_${randomUUID().slice(0, 8)}`, providerOAuthClientId: `platform-${randomUUID().slice(0, 8)}`,
     capabilityManifestVersion: 1, capabilityManifestHash: `manifest-${randomUUID().slice(0, 8)}`,
   });
-  // Registered and disabled, then the App went private: it cannot be re-enabled.
+  // Registered and disabled, then the App went private: it stays eligible
+  // (#proj-apps:#71), so only the disabled entry's own refusals apply.
   const { client: wentPrivate } = await app(seed, db);
   await register(db, { clientId: wentPrivate.id, purpose: "Went private.", ...human });
   await update(db, { clientId: wentPrivate.id, expectedRevision: 1, status: "disabled", ...human });
@@ -462,7 +462,6 @@ test("every refusal carries its SQLSTATE and changes nothing", async ({ db, seed
     ["register: slock_builtin", reg({ clientId: builtin.id }), "ORG03"],
     ["register: external registration", reg({ clientId: platform.id }), "ORG03"],
     ["register: server_local", reg({ clientId: serverLocal.id }), "ORG03"],
-    ["register: not published", reg({ clientId: requested.id }), "ORG03"],
     ["register: client key the registry does not accept", reg({ clientId: oddKey.id }), "ORG03"],
     ["register: already registered", reg({ clientId: registered.id }), "ORG04"],
     ["register: already registered and disabled", reg({ clientId: wentPrivate.id }), "ORG04"],
@@ -482,7 +481,6 @@ test("every refusal carries its SQLSTATE and changes nothing", async ({ db, seed
     ["update: same purpose, once trimmed", upd({ purpose: " Registered. " }), "ORG06"],
     ["update: same status with a new purpose", upd({ status: "approved", purpose: "New." }), "ORG06"],
     ["update: disable a disabled entry", upd({ clientId: wentPrivate.id, status: "disabled" }), "ORG06"],
-    ["update: re-enable a private App", upd({ clientId: wentPrivate.id, status: "approved" }), "ORG03"],
   ];
 
   const before = await world(db);
@@ -491,10 +489,34 @@ test("every refusal carries its SQLSTATE and changes nothing", async ({ db, seed
   }
   assert.deepEqual(await world(db), before);
 
-  // A re-enable refused for eligibility is a disable's business only: the
-  // private App's entry can still have its purpose edited.
+  // The private App's entry can have its purpose edited, and be re-enabled:
+  // official no longer needs the App published.
   const edited = await update(db, { clientId: wentPrivate.id, expectedRevision: 2, purpose: "Still private.", ...human });
   assert.deepEqual([edited.status, edited.revision], ["disabled", 3]);
+  const reenabled = await update(db, { clientId: wentPrivate.id, expectedRevision: 3, status: "approved", ...human });
+  assert.deepEqual([reenabled.status, reenabled.revision], ["approved", 4]);
+});
+
+test("an unpublished App shared beyond its Server can be registered and approved; a server-local one cannot", async ({ db, seed }) => {
+  const operator = await botiverseHuman(seed, db);
+  const human = { actorType: "human", actorId: operator.id } as const;
+  for (const publishStatus of ["private", "publish_requested", "in_review", "rejected"] as const) {
+    const { source, client } = await app(seed, db, { publishStatus });
+    process.env.RAFT_OFFICIAL_PUBLISHER_SERVER_ID = source.id;
+    const registered = await register(db, { clientId: client.id, purpose: "Shared, not published.", ...human });
+    assert.equal(registered.status, "pending_review", publishStatus);
+    const approved = await update(db, { clientId: client.id, expectedRevision: 1, status: "approved", ...human });
+    assert.deepEqual([approved.status, approved.autoInstall], ["approved", false], publishStatus);
+    assert.equal(await isApprovedOfficialAppClient(client.id), true, publishStatus);
+    // Being official publishes nothing.
+    const [after] = await db.select({ publishStatus: oauthClients.publishStatus, visible: oauthClients.humanMarketplaceVisible })
+      .from(oauthClients).where(eq(oauthClients.id, client.id));
+    assert.equal(after!.publishStatus, publishStatus);
+    assert.equal(after!.visible, client.humanMarketplaceVisible);
+  }
+  const { client: local } = await app(seed, db, { appType: "server_local", publishStatus: "private" });
+  assert.equal(await refusal(() => register(db, { clientId: local.id, purpose: "Never shared.", ...human })), "ORG03");
+  assert.equal(await entry(db, local.id), null);
 });
 
 test("two operators shown the same revision: the second write is refused, the first one stands", async ({ db, seed }) => {

@@ -830,13 +830,18 @@ export type AppReadAsUserAnswer =
 /** A publish by a personal assistant, as itself, for its owner (FirstPartyApp.actingFor.publishAs). */
 export interface AppPublishAsInput {
   serverId: ServerId;
-  /** Who the Artifact and its version are by: the assistant itself (step 2 of #proj-assistant:#31). */
-  author: { type: "agent"; id: string };
+  /**
+   * Who the Artifact and its version are by: the assistant itself (step 2 of #proj-assistant:#31), or its owner
+   * (#proj-assistant:#33). A person author is the caller's to vouch for: the owner from the assistant's own record,
+   * with "send as me" on, never a person the request names. The app checks a person by their own rules.
+   */
+  author: { type: "agent" | "user"; id: string };
   /** The assistant publishing: a new Artifact's mark, and the mark a new version's Artifact must carry. */
   publishedByAssistantAgentId: string;
   /**
    * The one conversation the assistant may publish into (checked by the caller): a new Artifact's home, and the
-   * home an existing one must still have for a new version (else the one not-visible).
+   * home an existing one must still have for a new version (else the one not-visible). For a person author, a
+   * new Artifact's home must be one they may post in now (else 404 TARGET_NOT_FOUND).
    */
   home: string;
   request: AgentApiAssistantOwnerArtifactPublishBody;

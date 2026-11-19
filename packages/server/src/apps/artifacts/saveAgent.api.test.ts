@@ -23,6 +23,7 @@ import {
   artifactLinkId,
   artifactWebPaths,
   asArtifactId,
+  RAFT_HINTS,
   type ArtifactWebAttachmentSaves,
 } from "@botiverse/raft-shared";
 import { getDb } from "../../db/index";
@@ -223,7 +224,7 @@ test("refused, nothing saved: a message the agent can't see (or no such attachme
   const big = await world.attach("big.bin", Buffer.from("x"), { channelId: world.team.id, messageId: world.message.id, sizeBytes: ARTIFACT_SAVE_MAX_BINARY_BYTES + 1 });
   assert.deepEqual(await save(app, world.keys.a, big.id), {
     status: 422,
-    body: refusalBody({ code: "ATTACHMENT_NOT_SAVABLE", error: attachmentTooLargeError(ARTIFACT_SAVE_MAX_BINARY_BYTES), details: { attachmentId: big.id, reason: "too_large", limit: ARTIFACT_SAVE_MAX_BINARY_BYTES } }),
+    body: refusalBody({ code: "ATTACHMENT_NOT_SAVABLE", error: attachmentTooLargeError(ARTIFACT_SAVE_MAX_BINARY_BYTES), next: RAFT_HINTS.artifactPublish({ target: "<conversation>" }), details: { attachmentId: big.id, reason: "too_large", limit: ARTIFACT_SAVE_MAX_BINARY_BYTES } }),
   });
   assert.deepEqual(await savesOf(big.id), []);
 

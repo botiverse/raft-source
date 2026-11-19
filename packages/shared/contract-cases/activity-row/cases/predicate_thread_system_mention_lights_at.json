@@ -1,0 +1,49 @@
+{
+  "formatVersion": 1,
+  "id": "predicate_thread_system_mention_lights_at",
+  "rule": "predicate",
+  "title": "On a thread row, a system message the viewer caused that mentions them lights the @ without counting",
+  "why": "The mention arm is separate from the unread count.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/web/src/store/inboxInPlaceUnread.ts (liveActivityUnread, liveUnreadFields)",
+      "packages/web/src/store/inboxRowPosition.ts (rowPositionVerdict, with inbox_row_position_v1 on)"
+    ],
+    "server": [
+      "infra/risingwave/sql/075-inbox-cursor-decouple.sql (unread_count FILTER)",
+      "packages/server/src/services/inboxUnreadEligibility.ts (isMessageUnreadEligibleForReceiver)"
+    ]
+  },
+  "given": {
+    "viewer": {
+      "type": "user",
+      "id": "viewer-1"
+    },
+    "scope": {
+      "rowKind": "thread",
+      "threadFollowed": true
+    },
+    "message": {
+      "senderType": "system",
+      "senderId": "system",
+      "messageType": "system",
+      "causalActorType": "user",
+      "causalActorId": "viewer-1",
+      "systemSubtype": "channel.member_joined",
+      "mentions": [
+        {
+          "type": "user",
+          "id": "viewer-1"
+        }
+      ]
+    }
+  },
+  "steps": [],
+  "expect": {
+    "verdict": {
+      "counts": false,
+      "mention": true
+    }
+  }
+}

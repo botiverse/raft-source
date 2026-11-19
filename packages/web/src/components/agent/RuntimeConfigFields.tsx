@@ -1,5 +1,5 @@
 import { ChevronDown, ChevronRight, RefreshCw } from "lucide-react";
-import type { RefObject, ReactNode } from "react";
+import type { ReactNode } from "react";
 import { Fragment, useCallback, useMemo, useState } from "react";
 import {
   isRuntimeFormV2FieldVisible,
@@ -181,17 +181,16 @@ export function RuntimeSelectControl({
   onValueChange,
   options,
   placeholder,
-  portalContainer,
   testId,
   listAction,
   "data-invalid": dataInvalid,
   "aria-describedby": ariaDescribedBy,
+  "aria-required": ariaRequired,
 }: {
   value: string;
   onValueChange: (value: string) => void;
   options: readonly RuntimeOption[];
   placeholder: string;
-  portalContainer?: RefObject<HTMLElement | null>;
   testId?: string;
   /** A row after the options that changes what the list shows; see RuntimeSelectListActionRow. */
   listAction?: RuntimeSelectListAction;
@@ -209,14 +208,12 @@ export function RuntimeSelectControl({
    *  only if this component passes it along. Caught by the visual suite's
    *  "every field's control is wired" check, not by the unit teeth. */
   "aria-describedby"?: string;
+  /** Likewise: a required field's label carries no mark, so the trigger says it. */
+  "aria-required"?: "true";
 }) {
   const handleValueChange = useCallback(
     (nextValue: string | null) => commitRuntimeSelectValue(options, nextValue, onValueChange),
     [options, onValueChange],
-  );
-  const contentPortalProps = useMemo(
-    () => (portalContainer ? { container: portalContainer } : undefined),
-    [portalContainer],
   );
   // The trigger says Experimental and what the computer lacks too; `items`
   // labels stay the plain name for type-to-search, so both are drawn here
@@ -236,14 +233,14 @@ export function RuntimeSelectControl({
       onValueChange={handleValueChange}
       items={options}
     >
-      <SelectTrigger className="w-full" data-testid={testId} data-invalid={dataInvalid} aria-describedby={ariaDescribedBy}>
+      <SelectTrigger className="w-full" data-testid={testId} data-invalid={dataInvalid} aria-describedby={ariaDescribedBy} aria-required={ariaRequired}>
         <SelectValue placeholder={placeholder}>{hasDecoratedLabel ? renderValue : undefined}</SelectValue>
         <SelectIcon />
       </SelectTrigger>
       {/* With a list action the popup is a column and the list may shrink: in a
           short window the list scrolls inside the popup instead of being cut
           off below it, so its last row, the action, stays reachable. */}
-      <SelectContent portalProps={contentPortalProps} className={listAction ? "flex flex-col" : undefined}>
+      <SelectContent className={listAction ? "flex flex-col" : undefined}>
         <SelectList className={listAction ? "min-h-0" : undefined}>
           {renderSelectItems(options)}
           {listAction ? <RuntimeSelectListActionRow action={listAction} /> : null}
@@ -394,7 +391,6 @@ interface RuntimeConfigFieldsProps {
   /** Re-ask the computer which runtimes are installed. Omit to hide the control. */
   onRescanRuntimes?: () => void;
   runtimesRescanning?: boolean;
-  selectPortalContainer?: RefObject<HTMLElement | null>;
   /**
    * The selected runtime's protocol v2 form. Anything but a ready form (loading,
    * a failed load, a form this build cannot render, a runtime without a v2 form)
@@ -439,7 +435,6 @@ export default function RuntimeConfigFields({
   runtimeListAction,
   onRescanRuntimes,
   runtimesRescanning = false,
-  selectPortalContainer,
   runtimeFormV2,
   providerConnections = NO_PROVIDER_CONNECTIONS,
   onEditProviderConnection,
@@ -485,7 +480,6 @@ export default function RuntimeConfigFields({
           options={runtimeOptions}
           listAction={runtimeListAction}
           placeholder={formatMessage({ id: "common.select.placeholder" })}
-          portalContainer={selectPortalContainer}
         />
       </Field>
 
@@ -499,7 +493,6 @@ export default function RuntimeConfigFields({
             showValidationErrors={showValidationErrors}
             serverErrors={runtimeFormV2.serverErrors}
             editing={runtimeFormV2.editing}
-            portalContainer={selectPortalContainer}
             onRetrySource={runtimeFormV2.state.retrySource}
             retryingSourceIds={runtimeFormV2.state.retryingSourceIds}
             savedConnections={savedConnectionsForV2}
@@ -535,7 +528,6 @@ export function RuntimeFormV2Fields({
   showValidationErrors,
   serverErrors,
   editing = false,
-  portalContainer,
   onRetrySource,
   retryingSourceIds = NO_SOURCE_IDS,
   savedConnections,
@@ -549,7 +541,6 @@ export function RuntimeFormV2Fields({
   serverErrors?: Record<string, string>;
   /** Edit: blank writeOnly (secret) fields keep the stored value. */
   editing?: boolean;
-  portalContainer?: RefObject<HTMLElement | null>;
   /** `option_source.status`: re-request a source (`?refresh=1`). */
   onRetrySource?: (sourceId: string) => void;
   retryingSourceIds?: readonly string[];
@@ -625,7 +616,6 @@ export function RuntimeFormV2Fields({
         // A secret that cannot keep the stored value is edited like on create:
         // required, without the "leave blank to keep" hint.
         editing={editing && errors[field.key] !== "secret_reentry_required"}
-        portalContainer={portalContainer}
         onRetrySource={onRetrySource}
         retryingSourceIds={retryingSourceIds}
         connectionActive={connectionActive}

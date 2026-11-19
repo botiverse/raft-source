@@ -87,9 +87,32 @@ export function mergeThreadMessages(existing: Message[], incoming: Message[]): M
       optimisticIdsToDrop.add(matchingOptimistic.id);
     }
   }
-  const next = sortThreadMessages(merged.filter((msg) => !optimisticIdsToDrop.has(msg.id)));
+  const next = sortThreadMessages(placeSendingRowsLast(merged.filter((msg) => !optimisticIdsToDrop.has(msg.id))));
 
   return sameMessageList(existing, next) ? existing : next;
+}
+
+/**
+ * A row being sent sorts by the display seq the store gave it: one past the
+ * highest seq the store has seen (`addOptimisticMessage`). The replies this
+ * panel shows are read by the panel itself (its first page, catch-up, live
+ * `thread:updated` replies), not through the store, so they can all be above
+ * that number, and the row sorted above them: at the top of the thread until
+ * its echo replaced it at the bottom. Its seq will be above every reply this
+ * panel has seen (one that arrives before the echo was numbered first), so
+ * on every merge it goes past the highest seq shown. Rows being sent keep
+ * their send order (equal display seqs fall to createdAt, then the id).
+ */
+function placeSendingRowsLast(rows: Message[]): Message[] {
+  let maxShownSeq = 0;
+  for (const row of rows) {
+    if (typeof row.seq === "number" && row.seq > maxShownSeq) maxShownSeq = row.seq;
+  }
+  return rows.map((row) => {
+    if (typeof row.seq === "number" || !row.id.startsWith("optimistic-")) return row;
+    if ((row.optimisticDisplaySeq ?? 0) > maxShownSeq) return row;
+    return { ...row, optimisticDisplaySeq: maxShownSeq + 1 };
+  });
 }
 
 /**

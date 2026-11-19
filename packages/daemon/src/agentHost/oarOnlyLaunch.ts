@@ -1,6 +1,6 @@
-// Qwen Code, Qoder and CodeBuddy Code on OAR (RFC 060): the runtimes with no
-// legacy driver (drivers/oarOnly.ts). OAR drives Qwen and Qoder through their
-// native stream-json control protocol, CodeBuddy through ACP. Raft supplies what a driver would around the session, from
+// Qwen Code and Qoder on OAR (RFC 060): the runtimes with no legacy driver
+// (drivers/oarOnly.ts). OAR drives both through their native stream-json
+// control protocol. Raft supplies what a driver would around the session, from
 // the same preparation as Grok's: Raft's CLI transport in the launch
 // environment (daemon credentials removed), the standing prompt as the
 // runtime's system prompt, model, effort and the native session to resume.
@@ -10,8 +10,7 @@
 // `SessionOptions.mcpServers` when the agent has managed MCP tools and its
 // CLI is at least QWEN_MIN_HTTP_MCP_VERSION; OAR sends it in Qwen's
 // `initialize` control request. Qoder gets none: OAR would write the token to
-// a `--mcp-config` file the agent could read (oarManagedMcp.ts). Nor does
-// CodeBuddy yet: what it keeps of a session's MCP entries is not audited.
+// a `--mcp-config` file the agent could read (oarManagedMcp.ts).
 
 import type { AvailableInstallation } from "@botiverse/oar";
 import { hydrateRuntimeConfig, runtimeConfigToLaunchFields } from "@botiverse/raft-shared";
@@ -36,14 +35,13 @@ function nonEmpty(value: string | null | undefined): string | null {
 
 /**
  * How a delivery to a busy session lands. Qoder steers natively (a `priority:
- * next` user message joins at a tool boundary, OAR #478). Qwen and CodeBuddy
- * have no steer: OAR would queue the input itself, out of the host's sight, so
- * the host holds it and prompts it after the turn end.
+ * next` user message joins at a tool boundary, OAR #478). Qwen has no steer:
+ * OAR would queue the input itself, out of the host's sight, so the host holds
+ * it and prompts it after the turn end.
  */
 const BUSY_DELIVERY: Record<OarOnlyRuntimeId, OarLaunch["busyDelivery"]> = {
   qwen: "after_turn",
   qoder: "now",
-  codebuddy: "after_turn",
 };
 
 /**
@@ -55,9 +53,6 @@ const BUSY_DELIVERY: Record<OarOnlyRuntimeId, OarLaunch["busyDelivery"]> = {
 export const OAR_ONLY_MANAGED_MCP: Record<OarOnlyRuntimeId, boolean> = {
   qwen: true,
   qoder: false,
-  // ACP `mcpServers[].headers` on `session/new` (stdin), but neither whether
-  // CodeBuddy takes an HTTP server nor what it stores of one is verified.
-  codebuddy: false,
 };
 
 /**

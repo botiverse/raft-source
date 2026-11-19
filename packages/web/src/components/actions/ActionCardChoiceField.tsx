@@ -26,7 +26,7 @@ import { useCallback, useMemo, useRef } from "react";
 import type { ChangeEvent, KeyboardEvent, MouseEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
 import { Check } from "lucide-react";
-import { Button, Input, Label, LabelAsterisk, LabelOptional, MessageActionCardActions } from "@botiverse/raft-ui";
+import { Button, Input, Label, LabelOptional, MessageActionCardActions } from "@botiverse/raft-ui";
 import { ChoiceList } from "@botiverse/raft-ui/wip";
 import type { ChoiceListItem } from "@botiverse/raft-ui/wip";
 import type { ActionCardChoiceValue, ActionCardFormIssue, ActionCardFormValue, ActionCardSpecField } from "@botiverse/raft-shared";
@@ -220,7 +220,7 @@ export function ChoiceFieldControl({ id, field, value, issue, disabled, onChange
       <Label render={<span id={labelId} />} className="block cursor-auto">
         {number !== undefined ? <span className="mr-1 font-mono tabular-nums after:content-['.']" data-action-card-question-number="">{number}</span> : null}
         <ActionCardPlainText value={field.label} />
-        {field.required ? <LabelAsterisk className="ml-1" /> : <OptionalMark />}
+        {field.required ? null : <OptionalMark />}
       </Label>
       {field.description ? <p id={descriptionId} className={PICKER_HELP_CLASS}><ActionCardPlainText value={field.description} /></p> : null}
       {/* The question's description and its hint or issue describe the whole list (ChoiceList takes no aria-describedby). */}

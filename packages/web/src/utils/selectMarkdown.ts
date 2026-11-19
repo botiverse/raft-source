@@ -1,6 +1,7 @@
 import type { IntlShape } from "react-intl";
 import type { Message } from "../store/messageStore";
 import { dataUrlToBlob } from "./dataUrlBlob";
+import { messageCardFallbackText } from "./messageCardFallbackText";
 
 type FormatMessage = IntlShape["formatMessage"];
 
@@ -40,7 +41,7 @@ export function selectionToMarkdown(
   });
   return sorted
     .map((m) => {
-      const line = `**${m.senderName ?? unknownLabel}**: ${m.content.trim()}`;
+      const line = `**${m.senderName ?? unknownLabel}**: ${messageCardFallbackText(m.content).trim()}`;
       return m.isThreadChild ? `  ↳ ${line}` : line;
     })
     .join("\n\n");

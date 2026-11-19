@@ -1030,6 +1030,61 @@ Not here: the login itself (an `app_not_available` refusal is a login answer,
 not one of these reads), and Agent Events (`POST /api/oauth/agent-events`),
 which takes an agent's resource-bound token rather than a person's login.
 
+### Card forms: opening sealed SecretInput values
+
+A card your App sends may ask for a secret (a `SecretInput` on a form, RFC
+086). The person's device seals the value to your card encryption key, and
+Raft forwards it as `sealed_inputs` in the execute request to your action
+endpoint. `openSealedInputs` is the reference check: verify the execute JWT
+first (signature against Raft's JWKS, `iss`, `aud`, `exp`, `phase`), then pass
+its payload; the sealed value's header is compared with those claims, never
+with the request body.
+
+```ts
+import { createSealedInputsMemory, openSealedInputs } from "@botiverse/raft-sdk/app";
+
+const memory = createSealedInputsMemory();           // one process; see below
+const opened = await openSealedInputs({
+  jwe: body.sealed_inputs,
+  keys: [privateJwk],                                // your private JWK(s); the header's kid picks one
+  claims: verifiedExecuteJwtPayload,
+  remember: memory.remember,
+});
+if (!opened.ok) return refuse(opened.reason);       // log the reason, never the ciphertext
+save(opened.values.value);                           // values by field id: check them against your form
+```
+
+- Result: `{ ok: true, values }` or `{ ok: false, reason }`, where `reason` is
+  the first that applies, in this order: `claims_invalid`, `malformed`,
+  `compression_not_allowed`, `unsupported_algorithm`, `unknown_kid`,
+  `aud_mismatch` / `srv_mismatch` / `sub_mismatch` / `hnd_mismatch` /
+  `act_mismatch` / `pid_mismatch` / `pdg_mismatch` / `crq_mismatch` /
+  `exp_mismatch`, `expired`, `decryption_failed`, `plaintext_invalid`,
+  `value_too_long` (over 4096 UTF-8 bytes), `replayed`. It throws only when a
+  key can't be imported.
+- `expired` can come from a legitimate press: the handle expired between Raft
+  admitting the execute and your check. Answer the person "try again", not as
+  if the request were forged.
+- `remember({ hnd, crq, exp })` records an accepted delivery and returns false
+  when that pair was accepted before. It is called only once everything else
+  passed. `createSealedInputsMemory` keeps them in this process until `exp`;
+  with more than one instance, use a shared store (a unique row on
+  `(hnd, crq)` with its expiry).
+- Never echo a value, or anything derived from one, in your answer, a card or
+  a log.
+- `sealInputs({ key, binding, values })` seals as a person's client does (a
+  fresh ephemeral key and IV each time): the same code the Raft web app seals
+  with, for Node clients and your tests. `sealedInputsBinding({ handle,
+  serverId, userId, appClientKey, actionId, prepared, clientRequestId,
+  handleExp })` builds `binding` from what a client has (`appClientKey` is
+  the read's `app.client_key`, `prepared` the prepare answer's
+  `{ id, digest }` or null, `handleExp` the action's `handle_exp`; `hnd` is
+  the handle's SHA-256 by WebCrypto).
+- The JOSE work is [`jose`](https://github.com/panva/jose)'s (WebCrypto),
+  bundled into `./app`. The shared vectors this is tested with, which web,
+  iOS, Android and Vault run too, are in the Raft repository
+  (`packages/shared/src/sealedInputs.v1.vector.json`; its keys are test-only).
+
 ## Managed MCP tools (`raft.mcp`)
 
 Connectors whose credentials Raft holds for the server (Notion and the like,

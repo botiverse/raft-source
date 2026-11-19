@@ -69,6 +69,14 @@ function officialPublisherServerIds(): ReadonlySet<string> {
   return new Set([...(primary ? [primary] : []), ...extraOfficialPublisherServerIds()]);
 }
 
+/**
+ * Whether a Server is an official publisher (officialPublisherServerIds): the
+ * Servers whose Apps may be named as Raft (appNameReservation.ts).
+ */
+export function isOfficialPublisherServer(serverId: string): boolean {
+  return officialPublisherServerIds().has(serverId.toLowerCase());
+}
+
 export async function projectOfficialAppDiscovery(input: {
   clientId: string;
   sourceServerId: string;
@@ -149,6 +157,46 @@ export async function isApprovedOfficialAppClient(
     ))
     .limit(1);
   const [entry] = options.forShare ? await query.for("share", { of: officialAppRegistry }) : await query;
+  return Boolean(entry);
+}
+
+/**
+ * Whether the App has an official registry entry in any status (pending
+ * review, approved or disabled), FOR SHARE on that row inside a transaction.
+ * From registration on, an unpublished App is reviewed like a published one:
+ * a new action endpoint and new permission groups or events wait for review
+ * (#proj-apps:#71), since the official registry no longer needs the App
+ * published. A disabled entry keeps it, so disabling and re-enabling cannot
+ * slip an unreviewed change in between. Ignores the publisher-Server gate on
+ * purpose: it only ever adds review.
+ */
+export async function hasOfficialAppRegistryEntry(
+  clientId: string,
+  dbOrTx: DbExecutor = getDb(),
+): Promise<boolean> {
+  const [entry] = await dbOrTx.select({ id: officialAppRegistry.oauthClientId })
+    .from(officialAppRegistry)
+    .where(eq(officialAppRegistry.oauthClientId, clientId))
+    .limit(1)
+    .for("share");
+  return Boolean(entry);
+}
+
+/**
+ * Whether an App's official registry entry is approved: Raft vouches for it.
+ * Used where official standing grants something (a reserved App name on
+ * rename, oauthService.assertAppRenameAllowed); a pending or disabled entry
+ * grants nothing. hasOfficialAppRegistryEntry (any status) only ever adds
+ * review and keeps its meaning.
+ */
+export async function hasApprovedOfficialAppRegistryEntry(
+  clientId: string,
+  dbOrTx: DbExecutor = getDb(),
+): Promise<boolean> {
+  const [entry] = await dbOrTx.select({ id: officialAppRegistry.oauthClientId })
+    .from(officialAppRegistry)
+    .where(and(eq(officialAppRegistry.oauthClientId, clientId), eq(officialAppRegistry.status, "approved")))
+    .limit(1);
   return Boolean(entry);
 }
 

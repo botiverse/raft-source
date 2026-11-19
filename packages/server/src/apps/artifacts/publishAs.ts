@@ -34,7 +34,8 @@
 //   who follows it). The unseen-comments hold is the ASSISTANT's (Tenny,
 //   option 2): its read position, comments by anyone but it (the owner's
 //   too), and only its read position moves; the owner's read position and
-//   Activity never do. Notices leave out the assistant (it isn't told of its
+//   Activity never do. A hold moves nothing (its caller doesn't show the
+//   comments): only a request carrying `seen` gets past it (Tenny, #33). Notices leave out the assistant (it isn't told of its
 //   own push), and a quota refusal offers no upgrade card (the card is an
 //   agent's to post). The answer names the home by id only, never by an
 //   agent's names for conversations.
@@ -202,6 +203,9 @@ async function publishAsPerson(input: ArtifactPublishAsInput, userId: string): P
   const publisher: Publisher = { actor: { type: "user", id: userId }, serverId: input.serverId, reader: agentActor({ agentId: assistantAgentId, serverId: input.serverId }) };
   return publishedAs(await operations.publishWith(publisher, body, input.outbox, {
     assistantAgentId,
+    // The caller doesn't show a hold's comments (the assistant's route strips them): a hold moves no read position,
+    // so the same request again is held again until it carries `seen` (Tenny, #33).
+    holdMovesReadPosition: false,
     summaryOf: (items) => summarizeForPerson({ userId, serverId: input.serverId }, items),
     locate: async () => located,
   }));

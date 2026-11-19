@@ -108,3 +108,10 @@ test("migration transfer summary: excludedIgnoredBySource is strict and bounded 
     assert.equal(agentMigrationTransferSummarySchema.safeParse(candidate).success, false, JSON.stringify(candidate.excludedIgnoredBySource));
   }
 });
+
+test("migration transfer summary: excludedIgnoredPartial is only `true`, and only with excludedIgnored", () => {
+  const withIgnored = { ...VALID_SUMMARY, excludedIgnored: IGNORED, excludedIgnoredPartial: true };
+  assert.deepEqual(agentMigrationTransferSummarySchema.parse(withIgnored), withIgnored);
+  assert.equal(agentMigrationTransferSummarySchema.safeParse({ ...withIgnored, excludedIgnoredPartial: false }).success, false);
+  assert.equal(agentMigrationTransferSummarySchema.safeParse({ ...VALID_SUMMARY, excludedIgnoredPartial: true }).success, false);
+});

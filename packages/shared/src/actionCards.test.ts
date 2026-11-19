@@ -7,6 +7,7 @@ import {
   ACTION_CARD_RESULT_KEYS,
   ACTION_CARD_EXPIRED_ERROR_CODE,
   ACTION_CARD_EXPIRY_MS,
+  actionCardActionCrossFieldIssue,
   actionCardActionSchema,
   actionCardExpiresAt,
   actionCardSchemaIssues,
@@ -773,4 +774,22 @@ test("ACTION_CARD_RESULT_KEYS: for each kind, what it marks v2-keeps is exactly 
   }
   // Every kind the App lists is one the server has.
   for (const kind of Object.keys(APP_KEPT_ACTION_CARD_RESULT_KEYS_BY_KIND)) assert.ok(Object.hasOwn(ACTION_CARD_RESULT_KEYS, kind), kind);
+});
+
+test("agent:create suggestedRuntime: an optional runtime id, kept as written; not with a cloud agent", () => {
+  const parsed = actionCardActionSchema.parse({ type: "agent:create", name: "scout", suggestedRuntime: " codex ", suggestedComputer: "mac-mini" });
+  assert.equal(parsed.type === "agent:create" && parsed.suggestedRuntime, "codex");
+  assert.equal(actionCardActionCrossFieldIssue(parsed), null);
+  // Absent is fine: older cards and agents that leave it out.
+  const plain = actionCardActionSchema.parse({ type: "agent:create", name: "scout" });
+  assert.equal(plain.type === "agent:create" && plain.suggestedRuntime, undefined);
+  // Shape only here: which ids are offered is the server's answer at prepare.
+  assert.equal(actionCardActionSchema.safeParse({ type: "agent:create", name: "scout", suggestedRuntime: "" }).success, false);
+  assert.equal(actionCardActionSchema.safeParse({ type: "agent:create", name: "scout", suggestedRuntime: "x".repeat(41) }).success, false);
+  assert.equal(actionCardActionSchema.safeParse({ type: "agent:create", name: "scout", suggestedRuntime: 7 }).success, false);
+  const hosted = actionCardActionSchema.parse({ type: "agent:create", name: "scout", hosting: "antiproton", suggestedRuntime: "claude" });
+  assert.equal(actionCardActionCrossFieldIssue(hosted)?.path, "suggestedRuntime");
+  assert.match(actionCardActionCrossFieldIssue(hosted)?.message ?? "", /hosting: "antiproton".*leave out suggestedRuntime/);
+  // The mobile App's V2 copy drops it, as it drops hosting and model.
+  assert.equal(ACTION_CARD_ACTION_KEYS.suggestedRuntime, "v2-drops");
 });

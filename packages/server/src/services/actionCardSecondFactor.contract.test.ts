@@ -44,6 +44,8 @@ const EXPECTED: Record<StoredActionCardActionType, ActionCardSecondFactorRule["s
   "question:ask": "none",
   // Confirm runs the owner's own route on their own session, with that route's own step-ups.
   "assistant:owner_action": "none",
+  // RFC 085: the same, the person's own route through its own middleware; its list never holds a security-sensitive route.
+  "request:prepare": "none",
 };
 
 /** Kinds whose execute issues a credential or grants access: never `none`. */

@@ -1183,3 +1183,72 @@ test("external mention profile URL restores with parent channelId in a thread", 
   assert.equal(useProfileStore.getState().profileType, "external");
   assert.equal(useProfileStore.getState().externalProfileChannelId, "parent-channel-1");
 });
+
+// Hands 52c09462: View in channel to the message the URL already anchors
+// (`?msg=` unchanged: the thread was opened from a link to it, from Activity,
+// or after an earlier View in channel) doesn't reload the channel, so nothing
+// located the message again. The jump itself asks for the highlight.
+test("View in channel to the same ?msg= anchor locates the parent again", () => {
+  resetStores();
+  installWindowLocation("/s/acme/channel/channel-1", "?msg=parent-1&thread=channel-1%3Aparent-1");
+  useMessageStore.setState({ highlightedMessageId: null, channelMessages: { "channel-1": [{ id: "parent-1", channelId: "channel-1" } as never] } });
+  const nonceBefore = useMessageStore.getState().highlightNonce;
+  openThreadParentMessageRoute({
+    isDesktop: true,
+    parentRouteKind: "channel",
+    parentChannelId: "channel-1",
+    parentMessageId: "parent-1",
+    serverSlug: "acme",
+    // As BrowserRouter does: the URL changes at once, so the anchor must be read before navigating.
+    navigate: (to) => {
+      const [path, search] = to.split("?");
+      installWindowLocation(path, `?${search}`);
+    },
+    recordMobileBackNavigation: () => {},
+  });
+  assert.equal(useMessageStore.getState().highlightedMessageId, "parent-1");
+  assert.equal(useMessageStore.getState().highlightNonce, nonceBefore + 1, "a new jump, so it lights again");
+});
+
+test("View in channel to a new ?msg= anchor leaves the highlight to the channel's load", () => {
+  resetStores();
+  installWindowLocation("/s/acme/channel/channel-1", "?thread=channel-1%3Aparent-1");
+  useMessageStore.setState({ highlightedMessageId: null, channelMessages: { "channel-1": [{ id: "parent-1", channelId: "channel-1" } as never] } });
+  const nonceBefore = useMessageStore.getState().highlightNonce;
+  openThreadParentMessageRoute({
+    isDesktop: true,
+    parentRouteKind: "channel",
+    parentChannelId: "channel-1",
+    parentMessageId: "parent-1",
+    serverSlug: "acme",
+    navigate: (to) => {
+      const [path, search] = to.split("?");
+      installWindowLocation(path, `?${search}`);
+    },
+    recordMobileBackNavigation: () => {},
+  });
+  assert.equal(useMessageStore.getState().highlightedMessageId, null);
+  assert.equal(useMessageStore.getState().highlightNonce, nonceBefore);
+});
+
+test("View in channel to the same anchor, parent not loaded: loads its window instead of a highlight with nothing to show", () => {
+  resetStores();
+  installWindowLocation("/s/acme/channel/channel-1", "?msg=parent-1&thread=channel-1%3Aparent-1");
+  const loads: string[] = [];
+  useMessageStore.setState({
+    highlightedMessageId: null,
+    channelMessages: { "channel-1": [{ id: "other", channelId: "channel-1" } as never] },
+    loadMessageContext: async (channelId: string, messageId: string) => { loads.push(`${channelId}:${messageId}`); },
+  });
+  openThreadParentMessageRoute({
+    isDesktop: true,
+    parentRouteKind: "channel",
+    parentChannelId: "channel-1",
+    parentMessageId: "parent-1",
+    serverSlug: "acme",
+    navigate: () => {},
+    recordMobileBackNavigation: () => {},
+  });
+  assert.deepEqual(loads, ["channel-1:parent-1"]);
+  assert.equal(useMessageStore.getState().highlightedMessageId, null, "the context load highlights it once loaded");
+});

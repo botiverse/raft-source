@@ -18,8 +18,8 @@ it shares with it through narrow callbacks that `core.ts` wires
 (`OarAgentHostDeps`), and the legacy driver's launch preparation through
 `drivers/index` (`prepareGrokLaunch`, `prepareCodexLaunch`).
 
-Runtimes on the OAR host: **grok**, and the OAR-only **qwen** (Qwen Code),
-**qoder** (Qoder) and **codebuddy** (CodeBuddy Code). The OAR-only runtimes have no legacy driver: their driver
+Runtimes on the OAR host: **grok**, and the OAR-only **qwen** (Qwen Code) and
+**qoder** (Qoder). The OAR-only runtimes have no legacy driver: their driver
 shell (`drivers/oarOnly.ts`, `oarOnly: true`) gives detection, OAR model
 listing and the standing prompt, and never spawns. The router sends every
 start of them to the OAR host whatever `runtimeHost` says, and a start the OAR
@@ -27,14 +27,6 @@ host cannot run (Windows, a missing CLI, an RFC 071 refusal, an unresumable
 session) fails with `OarOnlyStartError` instead of reaching the legacy host.
 They have no server flag: whether one can be used for a new agent or a switch
 is what the Computer reports (server `runtimeAdmissionService.ts`).
-**codebuddy** (CodeBuddy Code): OAR drives it through ACP (`codebuddy
---acp`): the standing prompt as `systemPrompt` (a private
-`--system-prompt-file`, not re-applied on resume as far as Raft knows, so
-`standingPromptRefreshesOnResume` is off), the model as an ACP config option,
-the effort as its `thought_level` (listed for its current model only). No
-steer (`after_turn`), no single-task stop, no managed MCP yet (whether it
-takes an HTTP entry and what it stores of one are not verified). Not run with
-a real CodeBuddy login in Raft yet: hence experimental.
 
 **antigravity** has an OAR launch (`oarAntigravityLaunch.ts`) behind
 `agent_runtime_oar_antigravity` (#oar-raft:#2; on a server where it is on, new
@@ -150,6 +142,74 @@ for Cursor.
 Not run against a real Cursor account (no run through the real SDK in
 subprocess mode yet, here or in OAR).
 
+**opencode** has an OAR launch (`oarOpencodeLaunch.ts`) behind
+`agent_runtime_oar_opencode` (server-scoped, default off), only from a Computer
+that advertises `runtime-host:oar:opencode`
+(`DAEMON_CAPABILITY_RUNTIME_HOST_OAR_OPENCODE`: the OAR host on, not Windows),
+so older Computers keep the driver. OAR runs `opencode acp`, one session across
+turns, where the driver runs `opencode run` per turn.
+
+- Version: OpenCode 1.x from 1.18.30, 2.x from 2.0.27, below 3 (what OAR's
+  adapter was checked against): `supports()` reads the ready frame's version
+  (`opencode_version_unsupported`), and the launch reads `opencode --version`
+  again and declines (`OarLaunchDeclined`, the same reason, or
+  `opencode_version_unknown`). The version read goes to OAR as the
+  installation's `version`, so OAR runs no `--version` of its own.
+- Standing prompt: in Raft's own injected config (`OPENCODE_CONFIG_CONTENT`,
+  the `slock` agent) with `default_agent: slock`, as the driver builds it
+  (`prepareOpenCodeOarEnvironment`, the driver's `buildOpenCodeLaunchEnv`).
+  Never `systemPrompt` / `appendSystemPrompt`: OAR refuses both on 2.x, and on
+  1.x they need `OPENCODE_CONFIG_CONTENT` unset.
+- Environment: the driver's: Raft's CLI transport, the injected config, on 2.x
+  no project config and an empty config directory (no user plugins), and
+  `PWD` = the workspace (2.x takes its directory from `$PWD`, #14872). 1.x
+  gets `--pure` as a launch argument (`opencode acp --pure`), as the driver
+  runs `opencode run --pure`.
+- Managed MCP: `mcpServers` with a bearer header, always attached as the
+  driver attaches it ([Managed MCP](#managed-mcp)); no longer in the config text.
+- Model: OAR's `model`; `default` leaves OpenCode's. No effort.
+- Resume: OpenCode's own session id in OpenCode's own store, so either host
+  resumes the other's. Raft's rule stands: never across OpenCode major lines
+  (`decideOpenCodeSessionResume` and the driver's record file
+  `<raft home>/opencode-sessions/<agent>.json`); a session the rule refuses is
+  declined (`opencode_session_refused:<reason>`) and the driver shows its
+  refusal. A session this host opens is recorded the same way before its first
+  input (`OarLaunch.sessionOpened`; a failed write disposes it and hands the
+  start back, `open_failed:session_record`). Any open failure hands the start
+  back on the same session, never a new empty session, except one: on 2.x a
+  resume OAR refuses because the session lives in another directory
+  (`UnsupportedOptionError` on `cwd`; 2.x sessions made before #14872 ran in
+  the daemon's `$PWD`) starts a new session on this host
+  (`newSessionOnResumeElsewhere`): `daemon.agent.oar.resume_elsewhere_new_session`,
+  invalidate `runtime_host_migration`, and an Activity Log `system` row
+  (`OPENCODE_SESSION_ELSEWHERE_TEXT`), as for a Cursor CLI session.
+- Opens: one OpenCode session open at a time per daemon process
+  (`openOpencodeSerially`, `OarLaunch.openGate`), since several first opens
+  on a fresh OpenCode database race on its table creation. A start stopped
+  while it waits leaves the queue without opening.
+- Delivery: prompt first (`OarLaunch.promptFirst`): after background
+  sub-agents OAR's status never reads idle again (OAR #777), so a delivery is
+  always offered as a prompt, and only OAR's `busy` answer makes it a busy
+  delivery: steered where the session has `steer` (1.x; 2.x from 2.2.7, which
+  advertises `_session/steering`, OAR 0.105+), through the same path as the
+  other runtimes (a steer that lands `queued` is withdrawn and held), else held
+  for the turn end. Other runtimes keep the status-led delivery.
+- Kept as before: no idle process stop, cold-idle stop, warm recycle or
+  turn-end compaction for OpenCode (none of those runtime sets name it), so an
+  idle OpenCode agent keeps its process. Context use shows from OAR's `usage`
+  events (the session summary); per-turn token totals stay off
+  (`RUNTIMES_REPORTING_TURN_TOKENS` does not name it). Sign-in and the model
+  list keep their paths (`runtimeAuth/opencodeProviderSignIn.ts`, OAR's
+  `listModels`).
+- An empty start (no message) opens the session and runs a first turn, as
+  for the other OAR runtimes; the driver defers its spawn until a message.
+
+Not run against a real OpenCode yet (unit tests on OAR's scripted runtime
+only). Unverified: that `opencode acp` honors `default_agent` for the
+session's agent, and that 1.x `acp` takes `--pure`; either failing shows as
+the agent running without Raft's prompt, or an open failure handed back to the
+driver.
+
 ## Managed MCP
 
 The managed MCP apps an agent has (Notion, Linear, ...) reach a runtime as one
@@ -168,8 +228,8 @@ token goes as a header. It goes again on every open, resume included.
 | grok | none (the driver sends ACP `mcpServers: []`) | `mcpServers` when the agent has managed MCP tools: ACP `mcpServers[].headers` on `session/new` / `session/resume` (grok declares `mcpCapabilities.http`) |
 | qwen | none | `mcpServers` when the agent has managed MCP tools and `qwen --version` is at least `QWEN_MIN_HTTP_MCP_VERSION` (0.26.0, OAR's Qwen baseline): the stream-json `initialize` control request. Below it, or unreadable, nothing is attached and a warning is logged: Qwen has no legacy driver, so a refused entry would fail the start |
 | qoder | none | none: OAR's channel is a 0600 `--mcp-config` file for the process's lifetime, which the agent (the same OS user) could read; a runtime that never had the token in a file doesn't start having it there (`OAR_ONLY_MANAGED_MCP`) |
-| codebuddy | none | none yet (`OAR_ONLY_MANAGED_MCP`): OAR would send ACP `mcpServers` on `session/new` (stdin), but neither CodeBuddy's HTTP MCP support nor what it stores of an entry is verified |
 | cursor | the workspace's `.cursor/mcp.json` with the token in the URL path, readable by the agent | `mcpServers`: the SDK's `mcpServers` record with `headers` on create and on resume (over IPC to the session's child, never its environment or argv). Whether the SDK keeps the entry on disk (its agent store, transcripts) is not audited yet |
+| opencode | `OPENCODE_CONFIG_CONTENT`'s `mcp` entry, with the token in the URL path, in the runtime's environment | `mcpServers`: ACP `mcpServers[].headers` on `session/new` / `session/resume` (stdin), always attached as the driver does; the config text no longer carries it |
 | antigravity | the workspace's `.agents/mcp_config.json` (token in the URL path, a 0600 file removed with the launch) | unchanged: OAR refuses an entry with `headers` or `env` (`mcpServerCredentials`), because `agy` stores session entries in plain text in its conversation database. Raft's entry always carries a token. Putting it in the URL would get past the check, but the token would still be stored |
 
 Grok and qwen attach the server only when the Server's snapshot lists a tool
@@ -200,8 +260,10 @@ Per start, never per session:
    daemon advertised `runtime-host:oar` (`DAEMON_CAPABILITY_RUNTIME_HOST_OAR`)
    and the Server's flag for the agent's runtime is on
    (`agent_runtime_oar_grok`, `agent_runtime_oar_antigravity`,
-   `agent_runtime_oar_cursor`, server-scoped, default off; no row = off).
-   Cursor also needs `runtime-host:oar:cursor` (see **cursor** above). Codex has no flag and needs
+   `agent_runtime_oar_cursor`, `agent_runtime_oar_opencode`, server-scoped,
+   default off; no row = off).
+   Cursor also needs `runtime-host:oar:cursor` (see **cursor** above), and
+   OpenCode `runtime-host:oar:opencode` (see **opencode** above). Codex has no flag and needs
    `runtime-host:oar:codex` instead
    (`DAEMON_CAPABILITY_RUNTIME_HOST_OAR_CODEX`): earlier Computers advertise
    `runtime-host:oar` with an unfinished Codex launch. Grok likewise needs
@@ -406,7 +468,7 @@ turn abort is in flight (`stop.pendingAbortIds`). Holds: the credential's
 provider limit (or its wait) and an invalid credential (the OAR host has no
 runtime-error delivery backoff). Delivery mode: a launch that steers
 (`busyDelivery: "now"`: codex, qoder) is a direct-stdin runtime; `after_turn`
-(grok, qwen, codebuddy) holds input for the next turn, so it is a non-stdin runtime,
+(grok, qwen) holds input for the next turn, so it is a non-stdin runtime,
 alive (an exit would have released the agent): 60 minutes, and any open tool
 holds it. Open tools: the root agent's `tool_call_started` with no
 `tool_call_ended` in the running turn; OAR has no tool diagnostic snapshots or
@@ -424,7 +486,8 @@ acked on custody, so a rejection finds nothing pending, and the server starts
 no agent on an exit. A restart OAR cannot run (`fallback`: a refused resume, the
 gate) shows the agent stopped (`daemon.agent.oar.stall_restart_failed`, status
 `inactive`, an error activity); a held tracked mention is handed back for the
-server's wake and plain deliveries stay unread for its next start. The
+server's wake and plain deliveries stay unread for its next start (app events
+are reported, below). The
 triggers are the legacy host's: a delivery held for a committed session
 (`delivery_arrived`), the sweep (it now also runs while any session has
 deliveries waiting), and one stall-deadline timer per launch (`stall_deadline`;
@@ -614,7 +677,24 @@ never started (`processNotStarted`).
   `busy`/`no_active_turn`. What a stop, exit or terminal failure drops before
   the runtime took it stays unread on the server, and the next start's unread
   summary and catch-up carry it (task #353; traced as
-  `daemon.agent.oar.held_dropped`, a warning unless it was a stop).
+  `daemon.agent.oar.held_dropped`, a warning unless it was a stop). That
+  catch-up is chat's only: the app events among them (custody, not transient)
+  are reported in `agent:inbox:dropped_app_events` (`reportDroppedAppEvents`,
+  as the legacy host does), and the server sends them again at the agent's next
+  runtime start. So are those of a restart that cannot run (`restart_failed`),
+  of a refused first input (`first_input_refused`; they wait for the agent's
+  next start, since this session already reported its runtime ready), of an
+  input the live session refused other than for good (`refused_<code>`: not
+  one too long or `unsupported`) and of a start the router fails
+  (`oar_only_failed`, `oar_kept_failed`). A start's own input carries the app
+  event it came with (its wake: the server's `converted_to_wake` leaves that
+  row `delivering` and sends it no more), so a held first input dropped by a
+  stop or exit reports it too. Reports are at least once: a delivery whose
+  input was in flight when the session ended is reported though the runtime
+  may have taken it (one late re-send). Idle hand-overs (`cold_idle_recycle`,
+  `idle_process_stop`, `warm_recycle`) hold nothing and send nothing; one that
+  ever drops app events is traced (`daemon.agent.oar.dropped_app_events`,
+  `skipped_idle_handover`).
 - A server re-send of a held or taken delivery is the same delivery, matched by
   message id or, for one without (a transient notice), by delivery id: it is
   acked and never reaches the runtime twice. Taken ids are remembered per
@@ -641,6 +721,11 @@ never started (`processNotStarted`).
   turn ends and then go in as a new turn; they never use OAR's queue, which
   for grok is held in the daemon process only (`queue.durable: false`), out
   of the host's sight.
+  Since OAR 0.105 a steer with no turn to join, while the status still shows
+  that turn running (an abort pending, a reply the runtime started on its
+  own), lands in OAR's queue (`landed: "queued"`) instead of `no_active_turn`:
+  the host withdraws it and holds it the same way. Only an input OAR will not
+  give back (no `withdraw`, or a refused one) stays with OAR as delivered.
 - A launch that steers (`busyDelivery: "now"`: codex, qoder, grok,
   antigravity) does not steer
   into a turn that is compacting (`compaction_started` .. `compaction_ended`)
@@ -847,7 +932,12 @@ Not replicated: the legacy runtime-error fingerprint fence (E1
 delivery backoff for errors that are not provider limits. An OAR-hosted agent
 whose turns keep failing the same way (other than a provider limit) keeps
 taking deliveries; crash loops are still seen through
-`process_exited`/status exits.
+`process_exited`/status exits. Nor the legacy wake-loop guard
+(`agentWakeLoopGuard.ts`: a message that started 3 clean turns in a row with
+no tool call, read or send is held once, then no longer offered until the
+agent is stopped), so an
+OAR-hosted agent woken again and again by the same message is not stopped by
+the daemon.
 
 ## What falls back to the legacy host (`supports()`)
 
@@ -933,6 +1023,7 @@ fallbacks above:
 - `oarLaunch.ts`: what one OAR launch is (`OarLaunch`, `PrepareOarLaunch`).
 - `oarGrokLaunch.ts`: grok's launch from the driver's `prepareGrokLaunch`.
 - `oarCursorLaunch.ts`: cursor's launch (the SDK in OAR's child per session, its clean environment; #oar-raft:#10).
+- `oarOpencodeLaunch.ts`: opencode's launch (`opencode acp` in the driver's environment, the version gate, the major-line rule, the open queue).
 - `oarActivity.ts`: OAR event to Raft activity fact (pure).
 - `oarSessionSummary.ts`: OAR records to the agent's session summary on disk.
 
@@ -982,4 +1073,9 @@ OAR-hosted agent loads neither.
   steer.
 - `core.test.ts` ("RFC 060"): the capability in `ready`, and an OAR-hosted
   grok start through the real core, process manager and outbox.
+- `oarOpencodeLaunch.test.ts`, `oarAgentHost.opencode.test.ts`: OpenCode's
+  launch options and environment, the version gate, the major-line rule and
+  its record, the open queue, prompt-first delivery with a status stuck on
+  running, busy delivery with and without a steer, a 2.x session outside the
+  workspace (a new session) and every other open failure (handed back).
 - Server: `agentOrchestrator.runtimeHost.test.ts` (flag and capability gate).

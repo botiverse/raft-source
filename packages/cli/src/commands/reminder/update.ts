@@ -24,7 +24,7 @@ export const reminderUpdateCommand = defineCommand(
     name: "update",
     description: "Update one field on a scheduled reminder",
     options: [
-      { flags: "--id <id>", description: "Reminder id (full uuid or short prefix)" },
+      { flags: "--id <id>", description: "Reminder id (full uuid, short prefix, or reminder:<id> as raft inbox check prints it)" },
       { flags: "--fire-at <iso>", description: "New absolute next fire time" },
       { flags: "--in <duration>", description: "New relative next fire time, e.g. 30m, 2h" },
       { flags: "--cadence <rule>", description: "New recurrence rule: every:15m | daily@09:00 | weekly:mon,fri@09:00" },

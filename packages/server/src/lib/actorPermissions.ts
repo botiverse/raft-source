@@ -183,6 +183,22 @@ export function roleCanInspectAgentPrivateSurfaces(
 }
 
 /**
+ * Raft voice "status now" (#wg-runtime-form:#22, agentVoiceService.ts): what
+ * the agent's activity already shows its viewers, so a non-guest member whose
+ * current role can view agents; a personal assistant answers its owner only.
+ * `callerRole` is the caller's current role in the agent's server.
+ */
+export function roleCanReadAgentVoiceStatus(
+  callerRole: ServerRole | null | undefined,
+  userId: string,
+  agent: { assistantOwnerUserId: string | null },
+): boolean {
+  if (!callerRole || callerRole === "guest") return false;
+  if (agent.assistantOwnerUserId) return agent.assistantOwnerUserId === userId;
+  return hasServerCapability(callerRole, "viewAgents");
+}
+
+/**
  * View Context (status, view, who viewed): the private-surface rule, and never
  * a Guest, even one recorded as the agent's creator (legacy rows). One check
  * for every View Context route and the result relay's re-check, so they cannot

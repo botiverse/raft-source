@@ -236,6 +236,8 @@ const ANDROID_ASSETLINKS = [
       sha256_cert_fingerprints: [
         "B4:91:93:81:D8:F9:CE:DE:4F:8E:B8:F6:D1:32:F6:DF:E0:D6:D1:5B:F6:D1:F6:30:57:D5:EB:A0:45:16:1A:45",
         "5F:08:BB:E8:2A:27:CC:DA:D2:6C:13:52:3A:60:B5:67:0D:3A:A7:63:3E:8E:D2:FD:71:FA:6B:57:51:F9:B0:B1",
+        // Play App Signing: what Google signs the Play Store build with (Play Console › App integrity).
+        "D7:70:71:84:A6:BE:7F:0C:EC:D6:2E:3F:F9:E0:89:D4:58:A8:4F:AF:A3:BD:8E:2F:AE:4B:3B:60:D8:C5:6A:D6",
       ],
     },
   },
@@ -841,7 +843,7 @@ function legacyArtifactLinkResponse(request) {
 }
 
 function applySecurityHeaders(headers) {
-  headers.set("Content-Security-Policy", "base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'sha256-9/rA/fGEYHRZyCw7+bvhgE1lOzeGdFvDtZBQrvBmyVU=' 'wasm-unsafe-eval' https://challenges.cloudflare.com https://static.cloudflareinsights.com; worker-src 'self' blob:");
+  headers.set("Content-Security-Policy", "base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'sha256-vCeVb6Oby2chaPjjDa45zxm0QvOzX5eRGPxl4DNYPFs=' 'wasm-unsafe-eval' https://challenges.cloudflare.com https://static.cloudflareinsights.com; worker-src 'self' blob:");
   headers.set("X-Frame-Options", "DENY");
   headers.set("Referrer-Policy", "no-referrer");
   headers.set("X-Content-Type-Options", "nosniff");

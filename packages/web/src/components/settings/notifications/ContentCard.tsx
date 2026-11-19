@@ -3,10 +3,12 @@
 // §1.3: when the phone rings while you're active on a computer) and "Replies
 // in threads I follow" (followedThreadReplies, contract §1.2, #triage:#357:
 // off, a followed thread alerts only when a reply @mentions you; it stays in
-// Activity), applied by the server to every device. One ListRowGroup of settings rows (DS Forms › A
+// Activity), applied by the server to every device. That last row shows only
+// while the server offers the switch (its flag; followedThreadRepliesShown):
+// loaded without the field, the row is left out. One ListRowGroup of settings rows (DS Forms › A
 // setting's row; Jasper + cindyz, #triage:c95a5e53): the preview Select and the
 // sound Switch end their rows (the Select under the text where the row is under
-// 32rem wide); Phone alerts' Select stays under its text for now.
+// 32rem wide); Phone alerts' too, now that its options are short (#triage:c95a5e53).
 
 import { useCallback, useMemo } from "react";
 import { useIntl } from "react-intl";
@@ -33,6 +35,7 @@ import { NOTIFICATION_PREVIEW_MODES, isNotificationMobileDelay, isNotificationPr
 import type { NotificationMobileDelay, NotificationPreviewMode } from "@botiverse/raft-shared";
 import type { MessageId } from "../../../i18n/messages";
 import { useNotificationSettingsStore } from "../../../store/notificationSettingsStore";
+import { followedThreadRepliesShown } from "../../../notifications/notificationApi";
 import type { AccountNotificationSettingsPatch } from "../../../notifications/notificationApi";
 import SectionHeader from "../../ui/SectionHeader";
 
@@ -106,60 +109,61 @@ export function ContentCard() {
             </Select>
           </div>
         </ListRow>
-        <ListRow id="notification-mobile-delay" variant="plain" interactive={false}>
+        <ListRow id="notification-mobile-delay" variant="plain" interactive={false} className="@max-lg:flex-wrap">
           <ListRowBody>
             <ListRowTitle id="notification-mobile-delay-label">{formatMessage({ id: "settings.notifications.mobileDelay.title" })}</ListRowTitle>
-            {/* What "active" means, or nobody knows why their phone didn't ring (Kirby). */}
+            {/* The condition lives here, so the options only say what differs (Jasper, cindyz: #triage:c95a5e53);
+                what "active" means, or nobody knows why their phone didn't ring (Kirby). */}
             <ListRowDescription id="notification-mobile-delay-description" wrap>{formatMessage({ id: "settings.notifications.mobileDelay.description" })}</ListRowDescription>
-            {/* Stays under the text, unlike the other settings selects: its options are long
-                phrases and their copy is pending (#triage:c95a5e53). */}
-            <div className="pt-2">
-              <Select value={mobileDelay} onValueChange={handleMobileDelay} disabled={disabled} items={delayOptions}>
-                <SelectTrigger className="w-full max-w-sm" aria-labelledby="notification-mobile-delay-label" aria-describedby="notification-mobile-delay-description" data-testid="notification-mobile-delay-select">
-                  <SelectValue />
-                  <SelectIcon />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectList>
-                    {delayOptions.map((option) => (
-                      <SelectItem key={option.value} value={option.value} data-testid={`notification-mobile-delay-${option.value}`}>
-                        <SelectItemText>{option.label}</SelectItemText>
-                        <SelectItemIndicator />
-                      </SelectItem>
-                    ))}
-                  </SelectList>
-                </SelectContent>
-              </Select>
-            </div>
           </ListRowBody>
+          <div className="shrink-0 @max-lg:basis-full">
+            <Select value={mobileDelay} onValueChange={handleMobileDelay} disabled={disabled} items={delayOptions}>
+              <SelectTrigger fit className="@max-lg:w-full @max-lg:max-w-sm" aria-labelledby="notification-mobile-delay-label" aria-describedby="notification-mobile-delay-description" data-testid="notification-mobile-delay-select">
+                <SelectValue />
+                <SelectIcon />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectList>
+                  {delayOptions.map((option) => (
+                    <SelectItem key={option.value} value={option.value} data-testid={`notification-mobile-delay-${option.value}`}>
+                      <SelectItemText>{option.label}</SelectItemText>
+                      <SelectItemIndicator />
+                    </SelectItem>
+                  ))}
+                </SelectList>
+              </SelectContent>
+            </Select>
+          </div>
         </ListRow>
         <ListRow id="notification-sound" variant="plain" interactive={false}>
           <ListRowBody>
             <ListRowTitle id="notification-sound-label">{formatMessage({ id: "settings.notifications.sound.title" })}</ListRowTitle>
           </ListRowBody>
           <Switch
-            checked={account?.sound !== false}
+            checked={account ? account.sound !== false : false}
             disabled={disabled}
             onCheckedChange={handleSound}
             aria-labelledby="notification-sound-label"
             data-testid="notification-sound-switch"
           />
         </ListRow>
-        <ListRow id="notification-followed-thread-replies" variant="plain" interactive={false}>
+        {followedThreadRepliesShown(account) && <ListRow id="notification-followed-thread-replies" variant="plain" interactive={false}>
           <ListRowBody>
             <ListRowTitle id="notification-followed-thread-replies-label">{formatMessage({ id: "settings.notifications.followedThreadReplies.title" })}</ListRowTitle>
             {/* What off keeps, or people think they lose the thread (#triage:#357). */}
             <ListRowDescription id="notification-followed-thread-replies-description" wrap>{formatMessage({ id: "settings.notifications.followedThreadReplies.description" })}</ListRowDescription>
           </ListRowBody>
+          {/* Off until the settings load, or a stored off flashes on (#triage:#357);
+              once loaded, a missing field hides the row (above). */}
           <Switch
-            checked={account?.followedThreadReplies !== false}
+            checked={account ? account.followedThreadReplies !== false : false}
             disabled={disabled}
             onCheckedChange={handleFollowedThreadReplies}
             aria-labelledby="notification-followed-thread-replies-label"
             aria-describedby="notification-followed-thread-replies-description"
             data-testid="notification-followed-thread-replies-switch"
           />
-        </ListRow>
+        </ListRow>}
       </ListRowGroup>
     </div>
   );

@@ -16,6 +16,7 @@ import { createManagedMcpServer, listManagedMcpServerCatalog, rethrowIfMcpAppNam
 import { __resetMcpAppTemplatesForTests, findActiveMcpAppTemplate, findMcpAppTemplate, findMcpAppTemplateRow, listMcpAppTemplates, parseMcpAppTemplates } from "./mcpAppTemplates";
 import * as mcpTemplateCatalog from "./mcpAppTemplates";
 import type { McpProbeResult } from "./managedMcpProbe";
+import { assertBoundedLockTimeout } from "../test/migrationLockTimeout";
 
 const originalCredentialKey = process.env.SLOCK_MCP_CREDENTIAL_KEY;
 
@@ -216,6 +217,7 @@ test("⭐ recommended Apps are server data: validated, and the legacy recommenda
   assert.deepEqual(keys, [
     "notion", "linear", "atlassian", "figma", "gmail", "drive", "calendar", "sentry", "airtable",
     "monday", "asana", "hubspot", "stripe", "supabase", "sheets", "docs", "slides", "workiq", "canva",
+    "perplexity",
   ]);
   const valid = { key: "x", name: "X", description: "d", homepageUrl: "https://x.example.test", logoUrl: null, category: "Other", endpointUrl: "https://x.example.test/mcp", authKind: "oauth" };
   assert.throws(() => parseMcpAppTemplates({ templates: [{ ...valid, endpointUrl: "http://x.example.test/mcp" }] }), "https only");
@@ -447,22 +449,56 @@ test("fresh migrated catalog matches the bundled fallback, including the Supabas
   assert.equal(migrated.find(({ key }) => key === "supabase")?.endpointUrl, "https://mcp.supabase.com/mcp");
 });
 
+/** A migration's SQL, found by tag suffix: numbers change on every renumber. */
+function migrationSql(suffix: string): string {
+  const journal = JSON.parse(readFileSync(new URL("../../drizzle/meta/_journal.json", import.meta.url), "utf8")) as { entries: Array<{ tag: string }> };
+  const entry = journal.entries.find(({ tag }) => tag.endsWith(suffix));
+  assert.ok(entry, `${suffix} is in the journal`);
+  return readFileSync(new URL(`../../drizzle/${entry.tag}.sql`, import.meta.url), "utf8");
+}
+
 test("catalog expansion preserves administrator edits and retirement when replayed", async () => {
   const [edited] = await getDb().update(mcpAppTemplates).set({
     name: "Company Asana", endpointUrl: "https://custom.example.test/mcp", logoUrl: "https://custom.example.test/asana.svg", status: "retired", revision: 3,
   }).where(eq(mcpAppTemplates.key, "asana")).returning();
   assert.ok(edited);
   await getDb().delete(mcpAppTemplates).where(eq(mcpAppTemplates.key, "figma"));
-  const journal = JSON.parse(readFileSync(new URL("../../drizzle/meta/_journal.json", import.meta.url), "utf8")) as { entries: Array<{ tag: string }> };
-  const entry = journal.entries.find(({ tag }) => tag.endsWith("_mcp_template_catalog_expansion"));
-  assert.ok(entry);
-  const expansion = readFileSync(new URL(`../../drizzle/${entry.tag}.sql`, import.meta.url), "utf8");
+  const expansion = migrationSql("_mcp_template_catalog_expansion");
   await getDb().execute(sql.raw(expansion));
   await getDb().execute(sql.raw(expansion));
   const [preserved] = await getDb().select().from(mcpAppTemplates).where(eq(mcpAppTemplates.key, "asana"));
   assert.deepEqual(preserved, edited, "no admin-owned field, id, or timestamp is overwritten");
   const all = await getDb().select().from(mcpAppTemplates);
-  assert.equal(all.length, 19, "replay adds missing rows without duplicates");
+  assert.equal(all.length, 20, "replay adds missing rows without duplicates");
   assert.equal(all.filter((row) => row.key === "figma").length, 1);
   assert.equal((await listMcpAppTemplates()).some((template) => template.key === "asana"), false, "retired rows stay hidden");
+});
+
+test("the Perplexity template migration is one bounded INSERT that leaves an administrator's row alone", async () => {
+  const steps = migrationSql("_mcp_template_perplexity")
+    .split("--> statement-breakpoint")
+    .map((step) => step.split("\n").filter((line) => !line.trim().startsWith("--")).join("\n").trim())
+    .filter(Boolean);
+  assertBoundedLockTimeout(steps[0], "the catalog insert's lock wait");
+  assert.equal(steps.length, 2);
+  assert.match(steps[1]!, /^INSERT INTO "mcp_app_templates"/);
+  assert.match(steps[1]!, /ON CONFLICT \("key"\) DO NOTHING;$/);
+  const replay = () => getDb().transaction(async (tx) => {
+    for (const step of steps) await tx.execute(sql.raw(step));
+  });
+
+  const [edited] = await getDb().update(mcpAppTemplates).set({
+    name: "Company Perplexity", endpointUrl: "https://custom.example.test/mcp", status: "retired", revision: 2,
+  }).where(eq(mcpAppTemplates.key, "perplexity")).returning();
+  assert.ok(edited, "the migrated catalog has the row");
+  await replay();
+  const [preserved] = await getDb().select().from(mcpAppTemplates).where(eq(mcpAppTemplates.key, "perplexity"));
+  assert.deepEqual(preserved, edited, "no admin-owned field, id, or timestamp is overwritten");
+
+  await getDb().delete(mcpAppTemplates).where(eq(mcpAppTemplates.key, "perplexity"));
+  await replay();
+  await replay();
+  const rows = await getDb().select().from(mcpAppTemplates).where(eq(mcpAppTemplates.key, "perplexity"));
+  assert.equal(rows.length, 1, "replay adds the missing row once");
+  assert.deepEqual([rows[0]!.status, rows[0]!.endpointUrl, rows[0]!.authKind, rows[0]!.oauthClientMode], ["active", "https://api.perplexity.ai/mcp", "oauth", "either"]);
 });

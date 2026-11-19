@@ -5,6 +5,7 @@ import { useIntl } from "react-intl";
 import apiClient from "../../api/client";
 import type { SkillInfo } from "@botiverse/raft-shared";
 import SectionHeader from "../ui/SectionHeader";
+import { skillSections } from "./skillSections";
 
 interface SkillsData {
   global: SkillInfo[];
@@ -100,11 +101,10 @@ function PathGroup({ path, skills }: { path: string; skills: SkillInfo[] }) {
   );
 }
 
-function SkillSubSection({ label, icon: Icon, skills, emptyText }: {
+function SkillSubSection({ label, icon: Icon, skills }: {
   label: string;
   icon: typeof Globe;
   skills: SkillInfo[];
-  emptyText: string;
 }) {
   const groups = groupByPath(skills);
 
@@ -117,15 +117,11 @@ function SkillSubSection({ label, icon: Icon, skills, emptyText }: {
         </span>
         <span className="font-mono text-mono-meta text-foreground-hint">({skills.length})</span>
       </div>
-      {skills.length > 0 ? (
-        <div className="stack-y-4">
-          {[...groups.entries()].map(([path, pathSkills]) => (
-            <PathGroup key={path} path={path} skills={pathSkills} />
-          ))}
-        </div>
-      ) : (
-        <p className="text-caption text-foreground-hint">{emptyText}</p>
-      )}
+      <div className="stack-y-4">
+        {[...groups.entries()].map(([path, pathSkills]) => (
+          <PathGroup key={path} path={path} skills={pathSkills} />
+        ))}
+      </div>
     </div>
   );
 }
@@ -180,7 +176,8 @@ export default function AgentSkills({ agentId, embedded }: { agentId: string; em
     );
   }
 
-  const totalSkills = (data?.global?.length || 0) + (data?.workspace?.length || 0);
+  const sections = skillSections(data?.global ?? EMPTY_SKILLS, data?.workspace ?? EMPTY_SKILLS);
+  const totalSkills = sections.reduce((total, section) => total + section.skills.length, 0);
 
   const body = (
     <div className="px-(--surface-inset) py-4">
@@ -203,21 +200,17 @@ export default function AgentSkills({ agentId, embedded }: { agentId: string; em
           </TextLink>
         </p>
       )}
-      {totalSkills > 0 && (
-      <div className="stack-y-4">
-        <SkillSubSection
-          label={formatMessage({ id: "agent.skills.global" })}
-          icon={Globe}
-          skills={data?.global || EMPTY_SKILLS}
-          emptyText={formatMessage({ id: "agent.skills.globalEmpty" })}
-        />
-        <SkillSubSection
-          label={formatMessage({ id: "agent.skills.workspace" })}
-          icon={FolderOpen}
-          skills={data?.workspace || EMPTY_SKILLS}
-          emptyText={formatMessage({ id: "agent.skills.workspaceEmpty" })}
-        />
-      </div>
+      {sections.length > 0 && (
+        <div className="stack-y-4">
+          {sections.map((section) => (
+            <SkillSubSection
+              key={section.scope}
+              label={formatMessage({ id: section.scope === "global" ? "agent.skills.global" : "agent.skills.workspace" })}
+              icon={section.scope === "global" ? Globe : FolderOpen}
+              skills={section.skills}
+            />
+          ))}
+        </div>
       )}
     </div>
   );

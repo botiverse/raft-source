@@ -26,6 +26,8 @@ export const SPEC_HANDBACK_START_DEADLINE_MS = 60_000;
 export class SpecHandbacks {
   /** When each handback was set (the owning host's clock). */
   private readonly setAt = new Map<string, number>();
+  /** Handbacks from an idle stop, waiting for the next delivery (`park`). */
+  private readonly parked = new Set<string>();
   private readonly deadlineTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly deadlineMs: number;
   private readonly onDeadline: ((agentId: string) => void) | undefined;
@@ -43,6 +45,18 @@ export class SpecHandbacks {
     this.setAt.set(agentId, this.now());
   }
 
+  /**
+   * An intentional idle stop (#proj-runtime:#63: a cold-idle recycle, an idle
+   * process stop): no start is expected until the agent's next delivery,
+   * which may be hours away, so the deadline counts from that delivery's
+   * refusal, not from now. Until then the handback stays.
+   */
+  park(agentId: string): void {
+    this.clearDeadlineTimer(agentId);
+    this.setAt.set(agentId, this.now());
+    this.parked.add(agentId);
+  }
+
   has(agentId: string): boolean {
     return this.setAt.has(agentId);
   }
@@ -52,8 +66,13 @@ export class SpecHandbacks {
    * server's start. Past the deadline the handback ends here: the refusal
    * reports the runtime unavailable.
    */
-  awaitingStart(agentId: string): boolean {
-    if (this.remainingMs(agentId) > 0) return true;
+  awaitingStart(agentId: string): false | "handback" | "idle_stop" {
+    // A parked handback's wait starts with this refusal (`park`).
+    if (this.parked.delete(agentId)) {
+      this.setAt.set(agentId, this.now());
+      return "idle_stop";
+    }
+    if (this.remainingMs(agentId) > 0) return "handback";
     this.forget(agentId);
     return false;
   }
@@ -65,12 +84,13 @@ export class SpecHandbacks {
    * (#13385), so a firing before the deadline re-arms for the remainder.
    */
   armDeadline(agentId: string): void {
-    if (!this.onDeadline || this.deadlineTimers.has(agentId) || !this.setAt.has(agentId)) return;
+    if (!this.onDeadline || this.deadlineTimers.has(agentId) || !this.setAt.has(agentId) || this.parked.has(agentId)) return;
     this.scheduleDeadline(agentId);
   }
 
   forget(agentId: string): void {
     this.setAt.delete(agentId);
+    this.parked.delete(agentId);
     this.clearDeadlineTimer(agentId);
   }
 

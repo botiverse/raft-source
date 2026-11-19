@@ -1,5 +1,8 @@
 // Interactive link cards (RFC 076 §4). The rule: every action endpoint in
-// force on a published App has been reviewed by a marketplace reviewer.
+// force on a published App has been reviewed by a marketplace reviewer. An
+// unpublished App with an official registry entry is reviewed the same way
+// (appLinkPreviewService; the registry approver approves the endpoint live
+// at approval, #proj-apps:#71).
 // Removing one never waits. Publish approval enforces it in
 // public.marketplace_decide_publish_review: an endpoint set while the App was
 // unpublished goes back to review there.

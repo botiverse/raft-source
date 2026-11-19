@@ -1,0 +1,41 @@
+{
+  "formatVersion": 1,
+  "id": "predicate_task_chat_counts",
+  "rule": "predicate",
+  "title": "On a task conversation row, a chat message counts",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/web/src/store/inboxInPlaceUnread.ts (liveActivityUnread, liveUnreadFields)",
+      "packages/web/src/store/inboxRowPosition.ts (rowPositionVerdict, with inbox_row_position_v1 on)"
+    ],
+    "server": [
+      "infra/risingwave/sql/078-task-conversations.sql (rw_task_conversation_unread_v1)",
+      "packages/server/src/services/inboxUnreadEligibility.ts (countsTowardTaskConversationUnread)"
+    ]
+  },
+  "given": {
+    "viewer": {
+      "type": "user",
+      "id": "viewer-1"
+    },
+    "scope": {
+      "rowKind": "task",
+      "threadFollowed": true
+    },
+    "message": {
+      "senderType": "user",
+      "senderId": "user-2",
+      "messageType": "chat",
+      "systemSubtype": null,
+      "mentions": []
+    }
+  },
+  "steps": [],
+  "expect": {
+    "verdict": {
+      "counts": true,
+      "mention": false
+    }
+  }
+}

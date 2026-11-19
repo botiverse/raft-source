@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 
 import { vi } from "vitest";
 import type { AgentApiArtifactCheckResponse } from "@botiverse/raft-shared";
-import { formatArtifactCheck } from "@botiverse/raft-shared/src/agentCliSurface";
+import { formatArtifactCheck, RAFT_HINTS } from "@botiverse/raft-shared/src/agentCliSurface";
 
 import { runPinned, type FakeRoute, type PinRun } from "../registryPin/harness";
 import { scanDir } from "./_dir";
@@ -38,7 +38,9 @@ function answer(status: Status | null, over: Record<string, unknown> = {}, versi
 
 const checkRoute = (data: unknown): FakeRoute => ({ method: "GET", path: /\/artifacts\/[^/]+\/check(\?|$)/, data });
 const shotRoute = (shot: "desktop" | "phone", bytes = PNG): FakeRoute => ({ method: "GET", path: new RegExp(`/check/${shot}(\\?|$)`), bytes });
-const refusal = (status: number, code: string): FakeRoute["response"] => ({ ok: false, status, data: null, error: code.toLowerCase(), errorCode: code } as never);
+/** A refusal as the Server words it: its sentence and its structured next step. */
+const refusalSaying = (status: number, code: string, error: string, next?: object): FakeRoute["response"] => ({ ok: false, status, data: null, error, errorCode: code, errorBody: { error, code, ...(next ? { next } : {}) } } as never);
+const NOT_VISIBLE_SENTENCE = "No artifact you can see has that id, link or title: it may not exist, may have been deleted, or may not be shared with you.";
 
 /** Run in a fresh temp directory as the current directory (the default --output is relative to it). */
 async function inTempDir<T>(body: (dir: string) => Promise<T>): Promise<T> {
@@ -169,7 +171,9 @@ test("check done: the screenshots go to .raft-check in the current directory (ma
 
 test("check done: a screenshot that can't be downloaded is named with why, the rest saved; still exit 0", async () => {
   await inTempDir(async (dir) => {
-    const routes: FakeRoute[] = [checkRoute(answer("done")), shotRoute("desktop"), { method: "GET", path: /\/check\/phone(\?|$)/, response: refusal(404, "SCREENSHOT_NOT_FOUND") }];
+    // The Server's SCREENSHOT_NOT_FOUND (checkRead.ts) through the binary route: its sentence as sent.
+    const noShot = "Version 13 of this artifact has no phone screenshot: only a finished publish check has screenshots, and only the newest three checked versions keep them, so read the version's check first.";
+    const routes: FakeRoute[] = [checkRoute(answer("done")), shotRoute("desktop"), { method: "GET", path: /\/check\/phone(\?|$)/, response: refusalSaying(404, "SCREENSHOT_NOT_FOUND", noShot, RAFT_HINTS.artifactCheck({ artifact: "pt_abc", version: 13 })) }];
     const run = await runPinned(["artifact", "check", "pt_abc"], routes);
     assert.equal(run.exitCode, 0, run.stderr);
     assert.equal(run.stderr, "");
@@ -178,7 +182,7 @@ test("check done: a screenshot that can't be downloaded is named with why, the r
       "Nothing found: no console errors, every resource loaded, the page isn't blank, and it fits a phone's width.",
       "Screenshots (look at them to see the page as people do):",
       "  desktop 1280x800: .raft-check/pt_abc-v13-desktop.png",
-      `  phone 390x844 at 2x: not saved: the download failed: v13 of "pt_abc" has no phone screenshot from its publish check.`,
+      `  phone 390x844 at 2x: not saved: the download failed: ${noShot}`,
       "",
     ].join("\n"));
     assert.ok(existsSync(join(dir, ".raft-check", "pt_abc-v13-desktop.png")));
@@ -215,21 +219,22 @@ test("check --json: the check, the state and the screenshots saved; a refusal as
   assert.equal(JSON.parse(waited.stdout).timedOut, true);
   const none = await runPinned(["artifact", "check", "pt_abc", "--json"], [checkRoute(answer(null))]);
   assert.deepEqual(JSON.parse(none.stdout), { ok: true, state: "none", ...answer(null), timedOut: false, saved: [] });
-  const refused = await runPinned(["artifact", "check", "pt_zzz", "--json"], [{ method: "GET", path: /\/check/, response: refusal(404, "NOT_VISIBLE") }]);
+  const refused = await runPinned(["artifact", "check", "pt_zzz", "--json"], [{ method: "GET", path: /\/check/, response: refusalSaying(404, "NOT_VISIBLE", NOT_VISIBLE_SENTENCE, RAFT_HINTS.artifactList({})) }]);
   assert.equal(refused.exitCode, 1);
   assert.equal(refused.stdout, "");
   const error = JSON.parse(refused.stderr) as { ok: boolean; error: { code: string; message: string; next_action: string } };
   assert.equal(error.ok, false);
   assert.equal(error.error.code, "NOT_VISIBLE");
-  assert.equal(error.error.message, `No artifact "pt_zzz" that you can see (by that id, link or exact title).`);
-  assert.equal(error.error.next_action, "List the ones you can: raft artifact list");
+  assert.equal(error.error.message, NOT_VISIBLE_SENTENCE);
+  assert.equal(error.error.next_action, "raft artifact list");
 });
 
 test("check: refusals exit 1 in the Artifacts' words; a bad --rev or no artifact is refused before any request", async () => {
-  const missing = await runPinned(["artifact", "check", "pt_abc", "--rev", "40"], [{ method: "GET", path: /\/check/, response: refusal(404, "VERSION_NOT_FOUND") }]);
+  const noVersion = "This artifact has no version 40 that you can read (the current one is v13): read the current version, or name one it has.";
+  const missing = await runPinned(["artifact", "check", "pt_abc", "--rev", "40"], [{ method: "GET", path: /\/check/, response: refusalSaying(404, "VERSION_NOT_FOUND", noVersion, RAFT_HINTS.artifactRead({ artifact: "pt_abc" })) }]);
   assert.equal(missing.exitCode, 1);
   assert.equal(missing.stdout, "");
-  assert.ok(missing.stderr.includes(`"pt_abc" has no version 40 that you can read.`), missing.stderr);
+  assert.ok(missing.stderr.includes(noVersion), missing.stderr);
   assert.ok(missing.stderr.includes("VERSION_NOT_FOUND"), missing.stderr);
   // A version after the artifact is refused, not read as the current one.
   const extra = await runPinned(["artifact", "check", "pt_abc", "12"], [checkRoute(answer("done"))]);

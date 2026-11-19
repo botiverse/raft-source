@@ -146,7 +146,7 @@ async function lookupInstallation(baseUrl: string, clientKey: string, secret: st
     body: JSON.stringify({ server_id: serverId }),
   });
   assert.equal(res.status, 200, await res.clone().text());
-  return await res.json() as { installation_id: string; bot: unknown };
+  return await res.json() as { installation_id: string; app_page_url: string; bot: unknown };
 }
 
 test("App lists carry the bot offer for the current Server: pending, granted, revoked, absent without a bot", async ({ app }) => {
@@ -694,6 +694,13 @@ test("the installation lookup tells the App its bot: not_added (undecided or pen
 
   assert.equal(install.botGrant, null);
   assert.deepEqual((await lookup()).bot, { handle: fx.handle, state: "not_added", add_url: addUrl });
+  // Its page link names the App by the id the Apps page matches `installed_app`
+  // against: the installed row's `id` in the list the web reads, not client_id.
+  const listed = await fetch(`${app.baseUrl}/api/integrations/marketplace`, { headers: headers(fx.adminToken, fx.server.id) });
+  const row = (await listed.json() as Array<AppRow & { clientId: string }>).find((item) => item.clientId === fx.client.clientId);
+  assert.ok(row);
+  assert.notEqual(row.id, row.clientId);
+  assert.equal((await lookup()).app_page_url, `${getAppUrl()}/s/${fx.server.slug}/apps?installed_app=${row.id}`);
   await getDb().update(oauthClientInstalls).set({ botGrant: "pending" }).where(eq(oauthClientInstalls.id, install.id));
   assert.deepEqual((await lookup()).bot, { handle: fx.handle, state: "not_added", add_url: addUrl });
 

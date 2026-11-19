@@ -90,7 +90,7 @@ export {
   AGENT_BODY_CONTINUATION_PREFIX,
   AGENT_BODY_LINE_SEPARATOR,
 } from "./agentMessageText";
-export { formatAgentActionCardPosted, formatAgentQuestionAnsweredFirst, formatAgentQuestionWithdrawn, prepareActionCard, withdrawQuestionCard } from "./agentOps/actions";
+export { formatAgentActionCardPosted, formatAgentQuestionAnsweredFirst, formatAgentQuestionWithdrawn, formatPreparableOperations, listPreparableOperations, prepareActionCard, withdrawQuestionCard } from "./agentOps/actions";
 export { formatAgentAppConfig } from "./agentOps/apps";
 export { CONTEXT_GENERATION_FILENAME, CONTEXT_GENERATION_MAX_BYTES } from "./agentOps/contextGeneration";
 export {

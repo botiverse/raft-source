@@ -49,8 +49,9 @@ export const COMPUTER_KEY_REVOKED_REASON = "computer_key_revoked";
  * The security revokes of a web session that reach what it approved (approverSessionGrants.ts); `repair` is maintenance's.
  * `account_deletion_requested`: the person asked to delete the account (services/accountDeletion), which revokes every family `revoke_all`.
  * `second_factor_recovered`: an email recovery of two-step verification finished (services/secondFactor/recovery.ts), which revokes every family `revoke_all` before the new sign-in.
+ * `user_revoked`: the person revoked their own sign-in(s) as a lost device from their sign-in list (services/mySessions.ts).
  */
-export type ApproverSessionRevokeTrigger = "password_change" | "password_reset" | "account_retired" | "account_deletion_requested" | "second_factor_recovered" | "device_login_revoked" | "repair";
+export type ApproverSessionRevokeTrigger = "password_change" | "password_reset" | "account_retired" | "account_deletion_requested" | "second_factor_recovered" | "device_login_revoked" | "user_revoked" | "repair";
 
 export type ComputerKeyRevoker =
   | { via: "revoke_link" }

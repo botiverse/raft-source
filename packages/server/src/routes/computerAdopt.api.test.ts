@@ -525,6 +525,39 @@ test("adopt-legacy A3: member registrant adopts a never-migrated machine and res
   });
 });
 
+test("adopt-legacy A3: after an admin adopted a member's machine and revoked it, the member registrant does not take it back by re-running setup", async () => {
+  await withEnv(true, async (app) => {
+    const owner = await seedUser("owner");
+    const registrant = await seedUser("registrant");
+    const slug = `adopt-daemon-${randomUUID()}`;
+    const server = await createServer("Adopt Co", slug, owner.id);
+    await addMember(server.id, registrant.id, "member");
+    const { machine } = await registerMachine(server.id, registrant.id, "member-daemon");
+
+    const adminAdopted = await adoptByDaemonId(app, owner.bearer, slug, machine.id);
+    assert.equal(adminAdopted.status, 201);
+    const revoke = await fetch(`${app.baseUrl}/api/servers/${server.id}/machines/${machine.id}/revoke-computer-key`, {
+      method: "POST",
+      headers: jsonHeaders({ Authorization: `Bearer ${owner.bearer}`, "X-Server-Id": server.id }),
+      body: "{}",
+    });
+    assert.equal(revoke.status, 200, await revoke.clone().text());
+
+    // Migrated, no live Computer, the machine row still names the registrant: the state between the
+    // adopter's revoke and their DELETE. The most recent attach record names the admin.
+    const db = getDb();
+    const before = await db.select({ id: computers.id, revokedAt: computers.revokedAt }).from(computers).where(eq(computers.machineId, machine.id));
+    assert.equal(before.length, 1);
+    assert.notEqual(before[0].revokedAt, null);
+
+    const refused = await adoptByDaemonId(app, registrant.bearer, slug, machine.id);
+    assert.equal(refused.status, 403, JSON.stringify(refused.body));
+    assert.equal(refused.body.code, "requires_admin");
+    const after = await db.select({ id: computers.id, attachedByUserId: computers.attachedByUserId }).from(computers).where(eq(computers.machineId, machine.id));
+    assert.deepEqual(after.map((row) => row.attachedByUserId), [owner.id], "no Computer attached by the registrant");
+  });
+});
+
 test("adopt-legacy A3: manager gets typed legacy_machine_not_found for missing or wrong-server row", async () => {
   await withEnv(true, async (app) => {
     const manager = await seedUser("manager");

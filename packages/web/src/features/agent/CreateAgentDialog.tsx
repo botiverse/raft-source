@@ -43,7 +43,6 @@ import StableField, { FieldSelectTrigger } from "../../components/agent/StableFi
 import SetupSessionFooter from "../../components/onboarding/SetupSessionFooter";
 import { SETUP_PAPER, SETUP_PAPER_DOT_GRID, SETUP_STICKER_CARD } from "../../components/onboarding/setupPaper";
 import { readCreateAgentLastConfig, writeCreateAgentLastConfig } from "../../utils/createAgentLastConfig";
-import type { CreateAgentLastConfig } from "../../utils/createAgentLastConfig";
 import { isCapacityLimitError } from "../../utils/capacityLimitError";
 import { trackPaywallAction, usePaywallShown } from "../../analytics/paywall";
 import { noteBillingEntry } from "../../analytics/billingEntry";
@@ -54,6 +53,8 @@ import { useLocalComputerMachineId } from "../../components/machine/localCompute
 import { useAddThisComputer } from "../../components/machine/localComputer/useAddThisComputer";
 import { useNeedsComputerCopy } from "./useNeedsComputerCopy";
 import { machineMeetsDaemonRequirement, pickFallbackMachine } from "./pickFallbackMachine";
+import { pickCreateAgentRuntime, suggestedRuntimeUnavailable } from "./pickCreateAgentRuntime";
+import { SuggestedRuntimeNotice } from "./SuggestedRuntimeNotice";
 import { showCreatedAgentToast } from "./createdAgentToast";
 
 const AddSeatsDialog = deferredDialog(() => import("../../components/billing/AddSeatsDialog"));
@@ -68,30 +69,6 @@ function takenAgentNames(): string[] {
 const MAX_AGENT_DESCRIPTION_LENGTH = 3000;
 /** The computer picker's value for "hosted by Raft": no computer, the agent runs on the provider. */
 const HOSTED_COMPUTER_CHOICE = "__hosted_runtime__";
-
-const ONBOARDING_RUNTIME_PRIORITY = ["claude", "codex", "grok", "builtin"];
-
-function pickCreateAgentRuntime(
-  availableRuntimes: readonly string[],
-  supportedRuntimes: ReadonlySet<string>,
-  onboarding: boolean,
-  rememberedConfig: CreateAgentLastConfig | null,
-): string {
-  if (onboarding) {
-    return ONBOARDING_RUNTIME_PRIORITY.find((id) => availableRuntimes.includes(id) && supportedRuntimes.has(id))
-      || availableRuntimes.find((id) => supportedRuntimes.has(id))
-      || availableRuntimes[0]
-      || "";
-  }
-  if (
-    rememberedConfig
-    && availableRuntimes.includes(rememberedConfig.runtime)
-    && supportedRuntimes.has(rememberedConfig.runtime)
-  ) {
-    return rememberedConfig.runtime;
-  }
-  return availableRuntimes.find((id) => supportedRuntimes.has(id)) || availableRuntimes[0] || "";
-}
 
 type ServerSetupProjection = {
   surface: "none" | "computer_runtime" | "create_agent" | "complete" | "retry";
@@ -143,6 +120,7 @@ export function CreateAgentDialog({
   prefilledMachineMode,
   prefilledHosting,
   prefilledHostedModel,
+  prefilledRuntime,
   minimumDaemonVersion,
   onCreated,
   onOnboardingComplete,
@@ -189,6 +167,8 @@ export function CreateAgentDialog({
   prefilledHosting?: "computer" | "antiproton";
   /** The card's hosted model, preselected only while the provider still offers it. */
   prefilledHostedModel?: string;
+  /** A card's suggested runtime, preselected (pickCreateAgentRuntime, SuggestedRuntimeNotice). */
+  prefilledRuntime?: string;
   /** Optional feature-specific hard gate for the Computer daemon. */
   minimumDaemonVersion?: string;
   /**
@@ -273,17 +253,7 @@ export function CreateAgentDialog({
   const currentServer = useServerStore((s) => s.current);
   const rescanRuntimes = useMachineStore((s) => s.rescanRuntimes);
   const [runtimesRescanning, setRuntimesRescanning] = useState(false);
-  // Portal target for the Create Cindy runtime selects — points at the modal
-  // content so the Runs on / Model popovers open within the modal's stacking
-  // context instead of behind it: the onboarding Create Cindy screen renders
-  // inside the setup gate's Modal at layer 1 (z-[60]), where a body-level portal (the
-  // default) lands under that layer and the popovers become invisible.
-  const cindyRuntimeSelectPortalRef = useRef<HTMLElement>(null);
-  // Keep the regular Create Agent popovers in the dialog's own layer too.
-  // This matters when the shared dialog is opened from another modal surface,
-  // such as Channel Settings: a body-level popup otherwise lands behind the
-  // surrounding modal layer and its options cannot be selected.
-  const createAgentSelectPortalRef = useRef<HTMLFormElement>(null);
+  const createAgentFormRef = useRef<HTMLFormElement>(null);
 
   // A fresh create starts with a suggested name (`adjective-noun`) instead of
   // an empty field; the dice button next to the label rolls another. The name
@@ -331,7 +301,6 @@ export function CreateAgentDialog({
   );
   const selectedMachine = machines.find((m) => m.id === selectedMachineId);
   const selectedMachineMeetsDaemonRequirement = machineMeetsDaemonRequirement(selectedMachine, minimumDaemonVersion);
-  const createAgentSelectPortalProps = useMemo(() => ({ container: createAgentSelectPortalRef }), []);
 
   const machineOptions: SelectOption[] = useMemo(() => machines.map((machine) => {
     const isOffline = machine.status !== "online";
@@ -396,6 +365,7 @@ export function CreateAgentDialog({
     supportedSet,
     onboarding,
     rememberedConfig,
+    prefilledRuntime,
   );
   const [runtime, setRuntime] = useState(defaultRuntime);
   const selectedRuntimeAdmission = runtimeAdmissionOptions.find((option) => option.runtimeId === runtime);
@@ -501,15 +471,28 @@ export function CreateAgentDialog({
   });
   const runtimeOptions = runtimePicker.options;
   const runtimeListAction = useRuntimeShowAllAction(runtimePicker.canToggle, showAllRuntimes, setShowAllRuntimes);
+  // A card's suggested runtime: never a quiet fallback where this computer cannot run it.
+  const suggestedRuntimeMissing = previewOnly || selectedMachine?.status !== "online" ? null : suggestedRuntimeUnavailable({
+    suggestedRuntime: prefilledRuntime,
+    runtime,
+    catalogReady: !runtimeSelectionCatalog.loading && runtimeAdmissionOptions.length > 0,
+    availableRuntimes,
+    supportedRuntimes: supportedSet,
+    computerRuntimes: machineRuntimeIds,
+    admittedRuntimes: new Set(runtimeAdmissionOptions.filter((option) => option.availableForNew).map((option) => option.runtimeId)),
+  });
   const runtimeBelowDescription = (
-    // Signed out is said, never enforced: Create stays as it is.
-    <RuntimeSignInNotice
-      serverId={currentServer?.id}
-      machineId={selectedMachineId}
-      machineName={runtimeComputerName}
-      runtimeId={runtime}
-      enabled={canViewMachineRuntimeAccountUsage(selectedMachine, currentUserId, capabilities)}
-    />
+    <>
+      <SuggestedRuntimeNotice suggestedRuntime={prefilledRuntime} runtime={runtime} unavailable={suggestedRuntimeMissing} computerName={runtimeComputerName} />
+      {/* Signed out is said, never enforced: Create stays as it is. */}
+      <RuntimeSignInNotice
+        serverId={currentServer?.id}
+        machineId={selectedMachineId}
+        machineName={runtimeComputerName}
+        runtimeId={runtime}
+        enabled={canViewMachineRuntimeAccountUsage(selectedMachine, currentUserId, capabilities)}
+      />
+    </>
   );
 
   const handleUpgradeToBilling = useCallback(() => {
@@ -639,10 +622,12 @@ export function CreateAgentDialog({
       supportedSet,
       onboarding,
       rememberedConfig,
+      prefilledRuntime,
     ));
   }, [
     availableRuntimes,
     onboarding,
+    prefilledRuntime,
     rememberedConfig,
     runtime,
     selectedMachineId,
@@ -972,7 +957,7 @@ export function CreateAgentDialog({
   const handleSeatsAdded = useCallback(() => {
     setSeatNeed(null);
     resumingAfterSeats.current = true;
-    createAgentSelectPortalRef.current?.requestSubmit();
+    createAgentFormRef.current?.requestSubmit();
   }, []);
   const dialogTitle = isExternalMode
     ? formatMessage({ id: "agent.create.dialogTitleExternal" })
@@ -984,7 +969,7 @@ export function CreateAgentDialog({
   if (onboarding) {
     const formId = "create-cindy-onboarding-form";
     const content = (
-      <CreateCindyFrame modal={onboardingShell === "modal"} onClose={onClose} portalRef={cindyRuntimeSelectPortalRef} className="w-full max-w-[calc(100vw-1rem)] md:max-w-[960px] md:h-[min(720px,calc(100dvh-2rem))] md:min-h-0">
+      <CreateCindyFrame modal={onboardingShell === "modal"} onClose={onClose} className="w-full max-w-[calc(100vw-1rem)] md:max-w-[960px] md:h-[min(720px,calc(100dvh-2rem))] md:min-h-0">
         <header className="flex shrink-0 items-start justify-between gap-3 border-b border-line-seam px-6 pb-4 pt-6 sm:px-9">
           <div className="min-w-0">
             <SectionEyebrow as="div">
@@ -1113,7 +1098,6 @@ export function CreateAgentDialog({
                   reserveRuntimeMessage={false}
                   runtimesRescanning={runtimesRescanning}
                   onRescanRuntimes={selectedMachineId ? handleRescanRuntimes : undefined}
-                  selectPortalContainer={cindyRuntimeSelectPortalRef}
                 />
               </div>
               )}
@@ -1233,7 +1217,7 @@ export function CreateAgentDialog({
             RuntimeConfigFields renders its fields as direct children of this form,
             so one class governs the whole rhythm; Agent Details has its own
             container and is untouched. */}
-        <form ref={createAgentSelectPortalRef} noValidate onSubmit={handleSubmit} className="stack-y-1">
+        <form ref={createAgentFormRef} noValidate onSubmit={handleSubmit} className="stack-y-1">
           {/* The add-members entry promised "joins #channel after creation";
               that promise must not vanish once this dialog covers the entry
               (task #584). Plain persistent line, not a Banner — it is context,
@@ -1325,7 +1309,7 @@ export function CreateAgentDialog({
                     <SelectValue placeholder={formatMessage({ id: "agent.create.selectPlaceholder" })} />
                     <SelectIcon />
                   </FieldSelectTrigger>
-                  <SelectContent portalProps={createAgentSelectPortalProps}>
+                  <SelectContent>
                     <SelectList>
                       {renderSelectItems(computerOptions)}
                     </SelectList>
@@ -1408,7 +1392,7 @@ export function CreateAgentDialog({
             </p>
           )}
           <StableField
-            label={formatMessage({ id: "agent.create.description" })}
+            label={formatMessage({ id: "agent.create.description" })} optional
             // The counter goes through FormField's helper row rather than being an
             // extra child after the control. As a loose child it added its own
             // margin on top of the field's spacing, making the gap to the next
@@ -1457,7 +1441,6 @@ export function CreateAgentDialog({
               runtimeListAction={runtimeListAction}
               providerConnections={providerConnectionCatalog.connections}
               onEditProviderConnection={capabilities.manageExternalAuth ? setEditingProviderConnection : undefined}
-              selectPortalContainer={createAgentSelectPortalRef}
             />
             </>
           )}

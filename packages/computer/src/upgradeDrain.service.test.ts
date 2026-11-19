@@ -14,7 +14,7 @@ import { vi } from "vitest";
 import * as externalInstaller from "./externalInstaller";
 import { readLastRemoteUpgradeReceipt } from "./externalInstaller";
 import { serverUpgradeDrainRequestPath, serverUpgradeDrainStatePath } from "./paths";
-import { collectRemoteUpgradeSteps } from "./remoteUpgradeTrace";
+import { collectRemoteUpgradeSteps, noteServiceTransitionForRemoteUpgrade } from "./remoteUpgradeTrace";
 import { runService, runServiceStartupRecovery, type RunServiceDeps } from "./service";
 import { clearUpgradeDrainRequests, waitForUpgradeDrain, type UpgradeDrainRunner } from "./upgradeDrain";
 import type { ServiceIpcMutations } from "./serviceIpcSeam";
@@ -77,9 +77,9 @@ async function withMutations(fn: (mutations: ServiceIpcMutations) => Promise<voi
   assert.equal(exercised, true);
 }
 
-function writeRunnerState(home: string, serverId: string, requestId: string, finished?: "quiet" | "deadline" | "ended", notQuietAgentIds: string[] = []) {
+function writeRunnerState(home: string, serverId: string, requestId: string, finished?: "quiet" | "deadline" | "ended", notQuietAgentIds: string[] = [], waitedFor?: number) {
   writeFileSync(serverUpgradeDrainStatePath(home, serverId), JSON.stringify({
-    formatVersion: 1, requestId, pid: process.pid, live: 1, notQuietAgentIds, ...(finished ? { finished } : {}), updatedAtMs: Date.now(),
+    formatVersion: 1, requestId, pid: process.pid, live: 1, notQuietAgentIds, ...(finished ? { finished } : {}), ...(waitedFor !== undefined ? { waitedFor } : {}), updatedAtMs: Date.now(),
   }));
 }
 
@@ -120,6 +120,58 @@ test("step 13: with drain, every runner is asked to drain and the installer is s
         ["installer_spawned", "ok", undefined],
       ]);
       assert.ok(existsSync(serverUpgradeDrainRequestPath(home, SERVER)), "kept: the installer stops the service next, with the work still held");
+    } finally {
+      launch.spy.mockRestore();
+    }
+  });
+});
+
+// Computer 1.25.3 (11-15): minutes between the drain's end and the old
+// service's stop, and the runners' `drain.finished` sometimes never arrived.
+// The drain's outcome is in the step log (which survives the restart) before
+// the spawn, and every step says when it happened and how long after the
+// step before it. RED proof: drop the `drain` step's counts, `at_ms`'s source
+// (`atMs`) or the gaps and the assertions below fail.
+test("step 13: the drain's outcome is in the step log before the spawn; each step carries its own time and the gap since the step before", async () => {
+  await withServiceHome(async (home) => {
+    let drainAtSpawn: unknown;
+    const launch = fakeLaunch();
+    launch.spy.mockImplementation(async (_home, _args, _id, _env, stats, beforeSpawn) => {
+      if (stats) stats.resolved = true;
+      await beforeSpawn?.("/fake/raft-computer-installer");
+      // What the step log holds the moment the installer is spawned.
+      drainAtSpawn = (await collectRemoteUpgradeSteps(home, { serverId: SERVER })).events.find((event) => event.step === "drain");
+      launch.log.push("spawned");
+      return 4321;
+    });
+    try {
+      await withMutations(async (mutations) => {
+        assert.equal((await mutations.upgradeStart(remote("req-t1", { deadlineMs: 60_000 }))).status, "draining");
+        writeRunnerState(home, SERVER, "req-t1", "quiet", [], 2);
+        writeRunnerState(home, OTHER, "req-t1", "quiet", [], 1);
+        await until(() => launch.log.length === 1, "the spawn after quiet");
+      });
+      assert.ok(drainAtSpawn, "the drain step was written before the spawn");
+      // The installer stops the old service (its SIGTERM handler).
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await noteServiceTransitionForRemoteUpgrade(home, "service_stopped", "1.0.98");
+      const events = (await collectRemoteUpgradeSteps(home, { serverId: SERVER })).events;
+      const step = (name: string) => events.find((event) => event.step === name)!;
+      const drain = step("drain");
+      assert.deepEqual([drain.phase, drain.waitedFor, drain.notQuiet, drain.runners], ["quiet", 3, 0, 2]);
+      for (const name of ["received", "download", "drain", "installer_spawned", "service_stopped"]) {
+        assert.equal(typeof step(name).atMs, "number", `${name} carries when it happened`);
+      }
+      const drainEnd = drain.atMs + drain.durationMs!;
+      const spawned = step("installer_spawned");
+      assert.equal(spawned.sinceStep, "drain");
+      assert.equal(spawned.sinceStepMs, spawned.atMs - drainEnd);
+      assert.equal(spawned.durationMs, undefined, "duration_ms keeps one meaning; the gap is since_step_ms");
+      const stopped = step("service_stopped");
+      assert.equal(stopped.sinceStep, "installer_spawned");
+      assert.equal(stopped.sinceStepMs, stopped.atMs - spawned.atMs);
+      // A timer may fire a little early: a loose bound.
+      assert.ok(stopped.sinceStepMs! >= 10, `since_step_ms ${stopped.sinceStepMs}`);
     } finally {
       launch.spy.mockRestore();
     }
@@ -192,8 +244,8 @@ test("step 13: a spawn that fails after the drain is the request's failed receip
         assert.equal((await mutations.upgradeStart(remote("req-d5", { deadlineMs: 60_000 }))).status, "draining");
         writeRunnerState(home, SERVER, "req-d5", "quiet");
         writeRunnerState(home, OTHER, "req-d5", "quiet");
-        await until(() => !existsSync(serverUpgradeDrainRequestPath(home, SERVER)), "the request removed");
-        assert.equal(existsSync(serverUpgradeDrainRequestPath(home, OTHER)), false);
+        // The requests are removed one server after the other: wait for both.
+        await until(() => !existsSync(serverUpgradeDrainRequestPath(home, SERVER)) && !existsSync(serverUpgradeDrainRequestPath(home, OTHER)), "both requests removed");
       });
       await until(() => existsSync(join(home, "computer", "installer", "receipts")), "receipt");
       const receipt = await readLastRemoteUpgradeReceipt(home);

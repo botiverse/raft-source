@@ -1,14 +1,16 @@
 import { registerAppLinkPreview, readAppLinkPreview, deleteAppLinkPreview, AppLinkPreviewConfigError } from "../services/appLinkPreviewService";
+import { setAppCardEncryptionKey, removeAppCardEncryptionKey, AppCardEncryptionKeyError } from "../services/appCardEncryptionKeyService";
 import { coalesceWakeIntoUnreadItem } from "../services/appItemWakeCoalescing";
 import { getAppInstallationSetup, updateAppInstallationSetup, AppSetupConflictError } from "../services/appSetupService";
 import {
+  appInstalledPageUrl,
   deriveAppBotHandle,
   issueManagedAppBotCredential,
   readAppFacingInstallationBot,
   setManagedAppBotStatus,
   type ManagedAppBotCredentialRefusal,
 } from "../services/appBotIdentityService";
-import { asAppSetupInstallationId, AppSetupValidationError } from "@botiverse/raft-shared";
+import { AGENT_SIDE_ASK_QUESTION_MAX_CHARS, asAppSetupInstallationId, asMachineOperationId, asServerId, type MachineOperationStarted, AppSetupValidationError } from "@botiverse/raft-shared";
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { Router, type Request, type Response, type Router as RouterType } from "express";
@@ -75,6 +77,9 @@ import {
 import { requestLinkCardHints, sendLinkCardResponse } from "./linkCards";
 import { resolveOAuthClientByKey } from "../services/oauthClientKeys";
 import { resolveRelatedConversationForAgent } from "../services/agentInboxItems";
+import { mayStillAskAgent, prepareVoiceAsk } from "../services/agentVoiceService";
+import { readMachineOperation, startMachineOperation } from "../services/machineOperations";
+import { refuse } from "../lib/refusal";
 
 // mergeParams: the OIDC endpoints are additionally mounted under
 // /oidc/:server/api/oauth, and the handlers read that segment as the
@@ -430,12 +435,22 @@ const OIDC_SCOPED_ROUTES = new Set([
   "GET /jwks",
   "GET /serverinfo",
   "GET /agents",
+  "GET /apps",
+  "POST /agents/:agentId/voice/status",
+  "POST /agents/:agentId/voice/ask",
+  "GET /agents/:agentId/voice/operations/:operationId",
 ]);
 
-/** `METHOD /path` of a request beneath either mount, as the sets above name routes: HEAD as GET, no trailing slash. */
+/**
+ * `METHOD /path` of a request beneath either mount, as the sets above name
+ * routes: HEAD as GET, no trailing slash, the agent id of a voice route as
+ * `:agentId`.
+ */
 function mountRouteKey(req: Pick<Request, "method" | "path">): string {
   const method = req.method === "HEAD" ? "GET" : req.method;
-  const path = req.path.length > 1 ? req.path.replace(/\/+$/, "") : req.path;
+  const path = (req.path.length > 1 ? req.path.replace(/\/+$/, "") : req.path)
+    .replace(/^\/agents\/[^/]+\/voice\/(status|ask)$/, "/agents/:agentId/voice/$1")
+    .replace(/^\/agents\/[^/]+\/voice\/operations\/[^/]+$/, "/agents/:agentId/voice/operations/:operationId");
   return `${method} ${path}`;
 }
 
@@ -471,6 +486,10 @@ const OAUTH_IDENTITY_ROUTES = new Set([
   "GET /membership",
   "GET /serverinfo",
   "GET /agents",
+  "GET /apps",
+  "POST /agents/:agentId/voice/status",
+  "POST /agents/:agentId/voice/ask",
+  "GET /agents/:agentId/voice/operations/:operationId",
 ]);
 
 /**
@@ -648,6 +667,31 @@ oauthRouter.delete("/link-preview", async (req, res) => {
   await deleteAppLinkPreview(client);
   res.status(204).end();
 });
+// RFC 086 §5.2: the App's card encryption key (the public key card
+// SecretInputs are sealed to), on its link-preview registration. Only the
+// App's own Basic client credentials (requireOAuthClient, as above) may set or
+// remove it: a session, a Server admin or an agent has no route to it.
+// Refusals never echo the body. The App reads it back in GET /link-preview.
+oauthRouter.put("/link-preview/encryption-key", async (req, res) => {
+  res.setHeader("Cache-Control", "private, no-store");
+  const client = await requireOAuthClient(req, res);
+  if (!client) return;
+  try {
+    const key = await setAppCardEncryptionKey(client, req.body);
+    res.json({ encryption_key: { jwk: key.jwk, kid: key.kid, set_at: key.setAt.toISOString() } });
+  } catch (error) {
+    if (error instanceof AppCardEncryptionKeyError) { res.status(error.status).json({ error: error.message, code: error.code }); return; }
+    console.error("[AppCardEncryptionKey] set failed", error instanceof Error ? error.name : "unknown");
+    res.status(500).json({ error: "Card encryption key unavailable" });
+  }
+});
+oauthRouter.delete("/link-preview/encryption-key", async (req, res) => {
+  res.setHeader("Cache-Control", "private, no-store");
+  const client = await requireOAuthClient(req, res);
+  if (!client) return;
+  await removeAppCardEncryptionKey(client);
+  res.status(204).end();
+});
 // The App's terminal update for one interactive link card operation (RFC 076
 // §6.5; services/linkCardUpdateService.ts). Basic client credentials only (the
 // body is raw bytes, parsed strictly, and carries no client fields); not on the
@@ -750,6 +794,10 @@ oauthRouter.post("/installations/lookup", async (req, res) => {
     res.json({
       installation_id: installation.installationId,
       server_id: installation.serverId,
+      // The Server's slug and name as they are now: show them, don't store them.
+      server: { id: installation.serverId, slug: installation.serverSlug, name: installation.serverName },
+      // This App's page on the Server, for a person to open now.
+      app_page_url: appInstalledPageUrl({ serverSlug: installation.serverSlug, appId: client.id }),
       setup: await getAppInstallationSetup({ clientId: client.id, serverId: installation.serverId }),
       // The App's bot here (null when it ships none). Read it again right
       // before showing `add_url` to a person; never store the link.
@@ -1398,6 +1446,7 @@ oauthRouter.post("/authorize/human", requireAuth, async (req, res) => {
       returnUrl,
       scopes,
       approverSessionFamilyId: webSessionFamilyOf(req),
+      approvalSource: oauthService.authorizationApprovalSource(req.body?.source),
     });
 
     const authorizationCode = oidc === true
@@ -1556,6 +1605,7 @@ oauthRouter.post("/authorize/account", requireAuth, async (req, res) => {
       scopes,
       serverHinted,
       approverSessionFamilyId: webSessionFamilyOf(req),
+      approvalSource: oauthService.authorizationApprovalSource(req.body?.source),
     });
     const authorizationCode = oidc === true
       ? encodeOidcAuthorizationCode({
@@ -2353,6 +2403,191 @@ oauthRouter.get("/agents", async (req, res) => {
   }
 });
 
+// Raft voice (#wg-runtime-form:#22): what an agent is doing now, or one
+// question to it, asked as the signed-in person (`agent:voice`). People only.
+// The Server is the token's, or the one an account-mode token names; who may
+// ask which agent is agentVoiceService's, and every refusal there is the same
+// 404 as an unknown agent. `outcome` is the daemon's (AGENT_SIDE_ASK_OUTCOMES)
+// or `computer_offline` / `computer_upgrade_required`; `text` only when
+// `answered`.
+async function voiceAskCaller(req: Request, res: Response): Promise<{ serverId: string; userId: string; clientRecordId: string } | null> {
+  const token = await requireBearerIdentity(req, res);
+  if (!token) return null;
+  let access: oauthService.AppServerAccess;
+  if (isAccountIdentity(token)) {
+    const named = await checkNamedAccountServerAccess(req, res, token, ["agent:voice"]);
+    if (!named) return null;
+    access = named;
+  } else {
+    if (!bearerTokenMatchesPathScope(req, token)) {
+      // refusal-ok: the OAuth identity endpoints' own wire format, as on /agents and /apps.
+      res.status(401).json({ error: "Access token was issued for a different Server than this issuer" });
+      return null;
+    }
+    access = token.principalType === "human"
+      ? await oauthService.checkAppServerAccess({
+        token,
+        serverId: namedServerId(req) ?? token.serverId,
+        requiredScopes: ["agent:voice"],
+        allowGuests: false,
+      })
+      : { ok: false };
+  }
+  if (!access.ok || !token.humanId) {
+    sendServerAccessDenied(res);
+    return null;
+  }
+  return { serverId: access.server.id, userId: token.humanId, clientRecordId: token.clientRecordId };
+}
+
+async function answerVoiceAsk(req: Request, res: Response, kind: "status" | "question"): Promise<void> {
+  res.set("Cache-Control", "no-store");
+  try {
+    let question = "";
+    if (kind === "question") {
+      question = typeof req.body?.question === "string" ? req.body.question.trim() : "";
+      if (!question || question.length > AGENT_SIDE_ASK_QUESTION_MAX_CHARS) {
+        refuse(res, 400, {
+          code: "invalid_question",
+          error: `The question must be between 1 and ${AGENT_SIDE_ASK_QUESTION_MAX_CHARS} characters.`,
+        });
+        return;
+      }
+    }
+    const caller = await voiceAskCaller(req, res);
+    if (!caller) return;
+    const result = await prepareVoiceAsk({
+      orchestrator: req.app.get("agentOrchestrator") as AgentOrchestrator,
+      serverId: caller.serverId,
+      userId: caller.userId,
+      agentId: String(req.params.agentId),
+      ask: kind === "status" ? { kind } : { kind, question },
+      clientRecordId: caller.clientRecordId,
+    });
+    if (!result.ok && result.code === "rate_limited") {
+      refuse(res, 429, {
+        code: "voice_rate_limited",
+        error: "Too many requests to this agent. Try again later.",
+        retryAfterSeconds: result.retryAfterSeconds,
+      });
+      return;
+    }
+    if (!result.ok) {
+      refuse(res, 404, { code: "agent_not_found", error: "Agent not found." });
+      return;
+    }
+    // A side question waits up to a minute: the edge closes a request silent
+    // for 30 s, so a caller may take 202 `{operationId}` and read the answer
+    // from GET …/voice/operations/:operationId (machineOperations.ts).
+    if (req.body?.respondAsync === true) {
+      const operationId = await startMachineOperation(
+        { userId: caller.userId, serverId: asServerId(caller.serverId), surface: voiceOperationSurface(caller.clientRecordId, String(req.params.agentId), kind) },
+        async () => ({ status: 200, body: await result.ask() }),
+        { status: 500, body: { error: "Failed to ask the agent" } },
+      );
+      res.status(202).json({ operationId } satisfies MachineOperationStarted);
+      return;
+    }
+    res.json(await result.ask());
+  } catch (err) {
+    sendJsonServerError(req, res, {
+      error: "Failed to ask the agent",
+      logPrefix: "OAuth agent voice error:",
+      err,
+    });
+  }
+}
+
+/**
+ * A voice ask's kept answer belongs to the token's app, the agent and the kind
+ * of ask (Tenny's 1.28.0 review): read under another agent's path it is
+ * unknown, and the kind says which right the read re-checks.
+ */
+function voiceOperationSurface(clientRecordId: string, agentId: string, kind: "status" | "question"): string {
+  return `voice:${clientRecordId}:${agentId}:${kind}`;
+}
+
+oauthRouter.post("/agents/:agentId/voice/status", (req, res) => answerVoiceAsk(req, res, "status"));
+oauthRouter.post("/agents/:agentId/voice/ask", (req, res) => answerVoiceAsk(req, res, "question"));
+// The answer of a voice ask started with `respondAsync`: the same token's
+// person only; anyone else, an unknown id or an expired one is 404.
+oauthRouter.get("/agents/:agentId/voice/operations/:operationId", async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  try {
+    const caller = await voiceAskCaller(req, res);
+    if (!caller) return;
+    const operationId = asMachineOperationId(req.params.operationId);
+    const agentId = String(req.params.agentId);
+    let view: Awaited<ReturnType<typeof readMachineOperation>> = null;
+    for (const kind of ["status", "question"] as const) {
+      if (view || !operationId) break;
+      const found = await readMachineOperation({ userId: caller.userId, serverId: asServerId(caller.serverId), surface: voiceOperationSurface(caller.clientRecordId, agentId, kind) }, operationId);
+      // The right to ask, read again: lost since the ask, the answer is not shown.
+      if (found && await mayStillAskAgent({ serverId: caller.serverId, userId: caller.userId, agentId, kind })) view = found;
+    }
+    if (!view) {
+      refuse(res, 404, { code: "operation_not_found", error: "This operation is unknown or has expired." });
+      return;
+    }
+    res.json(view);
+  } catch (err) {
+    sendJsonServerError(req, res, { error: "Failed to read the operation", logPrefix: "OAuth agent voice error:", err });
+  }
+});
+
+// The Server's Apps, for an App's own menus. People only, and never a guest
+// (who cannot open the Apps page either): an Agent has `raft integration list`.
+// An account-mode token names its Server, and that Server's installation must
+// have approved the scope (checkAccountAppServerAccess).
+oauthRouter.get("/apps", async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  try {
+    const token = await requireBearerIdentity(req, res);
+    if (!token) return;
+    let access: oauthService.AppServerAccess;
+    if (isAccountIdentity(token)) {
+      const named = await checkNamedAccountServerAccess(req, res, token, ["app:read"]);
+      if (!named) return;
+      access = named;
+    } else {
+      if (!bearerTokenMatchesPathScope(req, token)) {
+        // refusal-ok: the OAuth identity endpoints' own wire format, as on /agents and /serverinfo.
+        res.status(401).json({ error: "Access token was issued for a different Server than this issuer" });
+        return;
+      }
+      access = token.principalType === "human"
+        ? await oauthService.checkAppServerAccess({
+          token,
+          serverId: namedServerId(req) ?? token.serverId,
+          requiredScopes: ["app:read"],
+          allowGuests: false,
+        })
+        : { ok: false };
+    }
+    if (!access.ok) {
+      sendServerAccessDenied(res);
+      return;
+    }
+    const directory = await oauthService.listOAuthAppDirectory(access.server.id);
+    res.json({ apps: directory.flatMap((app) => {
+      // An App with no page to open is not a menu item.
+      const homepageUrl = publicHttpsUrl(app.homepageUrl);
+      return homepageUrl === null ? [] : [{
+        client_id: app.clientId,
+        name: app.name,
+        picture: publicHttpsUrl(userinfoPictureUrl(app.logoUrl, req)),
+        homepage_url: homepageUrl,
+      }];
+    }) });
+  } catch (err) {
+    sendJsonServerError(req, res, {
+      error: "Failed to load apps",
+      logPrefix: "OAuth app directory error:",
+      err,
+    });
+  }
+});
+
 oauthRouter.get("/serverinfo", async (req, res) => {
   try {
     const token = await requireBearerIdentity(req, res);
@@ -2477,6 +2712,16 @@ oauthRouter.get("/membership", async (req, res) => {
     });
   }
 });
+
+/**
+ * `value` when another App may put it in a link or an image: https, and no
+ * user name or password in it. Anything else, unparsable included, is null.
+ */
+function publicHttpsUrl(value: string | null): string | null {
+  if (!value || !URL.canParse(value)) return null;
+  const url = new URL(value);
+  return url.protocol === "https:" && !url.username && !url.password ? url.href : null;
+}
 
 function userinfoPictureUrl(avatarUrl: string | null, req: Request): string | null {
   if (!avatarUrl) return null;

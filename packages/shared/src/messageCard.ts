@@ -17,8 +17,10 @@
 // nothing on a card calls anyone back.
 //
 // Stored on the message as `action_metadata = { kind: "message-card", card,
-// revision, updatedAt }`. Card text lengths count Unicode code points, so Go,
-// Kotlin and TypeScript agree.
+// revision, updatedAt }`; an App's card with acting buttons adds `actions` and
+// `for` next to the card (RFC 086, messageCardActions.ts), which leaves the
+// card itself as every client reads it. Card text lengths count Unicode code
+// points, so Go, Kotlin and TypeScript agree.
 
 import { z } from "zod";
 import { lazySchema } from "./lazySchema";
@@ -32,6 +34,7 @@ import {
 } from "./messageCardMarkdown";
 import { createRaftUserRefRegex, extractRaftMentionHandles, RAFT_REF_USER_NAME_PATTERN } from "./raftRefs";
 import { formatUtcTimestamp } from "./utcTimestamp";
+import type { MessageCardActions } from "./messageCardActions";
 
 /** `actionMetadata.kind` of a message card (the stored spelling; never rename it). */
 export const MESSAGE_CARD_KIND = "message-card";
@@ -93,6 +96,21 @@ export const MESSAGE_CARD_ERROR_CODES = {
   notFound: "message_card_not_found",
   /** Update (409): `expectedRevision` is not the card's current revision (`currentRevision`). */
   revisionConflict: "card_revision_conflict",
+  /**
+   * RFC 086 §4.1 (400, nothing stored): `actions` or `for` that can't be
+   * stored: the sender is not an App's bot, the App can't act on this Server
+   * now, a joint target, a `for` who is not a member (not a guest) able to
+   * read the conversation, an `actions` key naming no Button, an action that
+   * doesn't validate, or a fallback page off the App's verified origin.
+   */
+  actionsNotAllowed: "message_card_actions_not_allowed",
+  /**
+   * RFC 086 §5.2 (400, nothing stored): an acting button's form holds a
+   * SecretInput, and the App has no card encryption key registered
+   * (`PUT /api/oauth/link-preview/encryption-key`), so no value could be
+   * sealed to it.
+   */
+  encryptionKeyRequired: "message_card_encryption_key_required",
 } as const;
 
 /** The next step every card refusal names (Sage, RFC 082 §4.2). */
@@ -258,6 +276,10 @@ export interface MessageCardMetadata {
   card: MessageCard;
   revision: number;
   updatedAt: string;
+  /** RFC 086: an App's acting buttons, Button element id -> RFC 076 execute action (messageCardActions.ts). Absent: the buttons only navigate. */
+  actions?: MessageCardActions;
+  /** RFC 086: the one person who may press the acting buttons, as a user id (an App's bot names them by App subject; Raft stores the resolved user id); fixed at send. */
+  for?: string;
 }
 
 /** Whether `value` is a message card's metadata (kind and revision; the card is not re-validated). */
@@ -268,14 +290,24 @@ export function isMessageCardMetadata(value: unknown): value is MessageCardMetad
     && !!metadata.card && typeof metadata.card === "object";
 }
 
-/** The metadata a send stores: revision 1, updated when it was sent. */
-export function messageCardMetadataAtSend(card: MessageCard, sentAt: Date): MessageCardMetadata {
-  return { kind: MESSAGE_CARD_KIND, card, revision: 1, updatedAt: sentAt.toISOString() };
+/** The metadata a send stores: revision 1, updated when it was sent; an App's `actions` and `for` (RFC 086) when given. */
+export function messageCardMetadataAtSend(card: MessageCard, sentAt: Date, acting: { actions?: MessageCardActions; for?: string } = {}): MessageCardMetadata {
+  return {
+    kind: MESSAGE_CARD_KIND, card, revision: 1, updatedAt: sentAt.toISOString(),
+    ...(acting.actions ? { actions: acting.actions } : {}), ...(acting.for ? { for: acting.for } : {}),
+  };
 }
 
-/** The metadata an update stores: the new card, the next revision, updated now. */
-export function messageCardMetadataAfterUpdate(current: MessageCardMetadata, card: MessageCard, updatedAt: Date): MessageCardMetadata {
-  return { kind: MESSAGE_CARD_KIND, card, revision: current.revision + 1, updatedAt: updatedAt.toISOString() };
+/**
+ * The metadata an update stores: the new card, the next revision, updated
+ * now. RFC 086: the update's `actions` replace the acting buttons (none given:
+ * they end); `for` is the send's, kept.
+ */
+export function messageCardMetadataAfterUpdate(current: MessageCardMetadata, card: MessageCard, updatedAt: Date, actions?: MessageCardActions): MessageCardMetadata {
+  return {
+    kind: MESSAGE_CARD_KIND, card, revision: current.revision + 1, updatedAt: updatedAt.toISOString(),
+    ...(actions ? { actions } : {}), ...(typeof current.for === "string" ? { for: current.for } : {}),
+  };
 }
 
 /**
@@ -548,9 +580,13 @@ export function messageCardFallbackProblem(card: MessageCard, content: string | 
   };
 }
 
-/** The content a send or an update stores: the sender's when it wrote one, else the fallback derived from the card. */
-export function messageCardStoredContent(card: MessageCard, content: string | undefined): string {
-  return typeof content === "string" && content.length > 0 ? content : deriveMessageCardFallback(card);
+/**
+ * The content a send or an update stores: the sender's when it wrote one, else
+ * the fallback derived from the card (RFC 086: `actingButtons`, the element
+ * ids of an App's acting buttons, read as acting buttons there).
+ */
+export function messageCardStoredContent(card: MessageCard, content: string | undefined, actingButtons?: ReadonlySet<string>): string {
+  return typeof content === "string" && content.length > 0 ? content : deriveMessageCardFallback(card, { actingButtons });
 }
 
 /** A card (or any JSON value) as canonical JSON: object keys sorted, so equal values give equal bytes. */
@@ -802,6 +838,21 @@ function cardButtonRun(props: MessageCardElementProps<"Button">): CardMarkdownTo
 }
 
 /**
+ * An App's acting button (RFC 086 §4.4): people press it in Raft, so agents
+ * read where and for whom, never its fallback page or the reason an older
+ * client shows: `label (in Raft)`, or `label (in Raft, for @name)` when the
+ * card is for one person (the handle as inline code, like every `@handle` in
+ * card text: it mentions no one), `for one person` when Raft can't name them.
+ */
+function cardActingButtonRun(props: MessageCardElementProps<"Button">, acting: MessageCardActingButtons): CardMarkdownToken[] {
+  const label = foldCardText(props.label);
+  if (!label) return [];
+  const name = acting.for?.name ? foldCardText(acting.for.name) : "";
+  const whom = acting.for === undefined ? [] : name ? [{ text: ", for " }, ...cardTextTokens(`@${name}`)] : [{ text: ", for one person" }];
+  return [...cardTextTokens(label, { lineStart: true }), { text: " (in Raft" }, ...whom, { text: ")" }];
+}
+
+/**
  * The header (RFC 082 §4.8): its title in bold, the subtitle on the next
  * line, the tags as `[text]` on one line. Every text escaped as plain text.
  */
@@ -850,11 +901,21 @@ function cardFieldsTokens(props: MessageCardElementProps<"Fields">): CardMarkdow
 /** A Divider: a rule, `---`, a block of its own. */
 const CARD_MARKDOWN_DIVIDER = "---";
 
+/** RFC 086 §4.4: which Buttons of a card act (an App's `actions`), and the one person they are for. */
+export interface MessageCardActingButtons {
+  /** The acting Buttons' element ids. */
+  ids: ReadonlySet<string>;
+  /** Present when the card is for one person: their handle, or null when Raft can't name them. */
+  for?: { name: string | null };
+}
+
 interface CardMarkdownOptions {
   /** Buttons as links; left out to see whether the card says anything else. */
   buttons: boolean;
   /** Dividers as `---`; left out to see whether the card says anything else (a rule says nothing). */
   dividers: boolean;
+  /** RFC 086: these Buttons read as acting buttons. */
+  acting?: MessageCardActingButtons;
 }
 
 /**
@@ -878,7 +939,9 @@ function cardElementRuns(card: MessageCard, id: string, depth: number, inline: b
     case "Badge": tokens = cardBadgeRun(node.props); break;
     case "RelativeTime": tokens = [{ text: formatUtcTimestamp(node.props.at) }]; break;
     case "Duration": tokens = [{ text: `${formatUtcTimestamp(node.props.start)} –${node.props.end ? ` ${formatUtcTimestamp(node.props.end)}` : ""}` }]; break;
-    case "Button": tokens = options.buttons ? cardButtonRun(node.props) : []; break;
+    case "Button":
+      tokens = !options.buttons ? [] : options.acting?.ids.has(id) ? cardActingButtonRun(node.props, options.acting) : cardButtonRun(node.props);
+      break;
     case "Markdown": tokens = cardMarkdownElementTokens(node.props); block = true; break;
     case "Fields": tokens = cardFieldsTokens(node.props); block = true; break;
     case "Divider": tokens = options.dividers ? [{ text: CARD_MARKDOWN_DIVIDER }] : []; block = true; break;
@@ -938,7 +1001,9 @@ function cardMarkdown(card: MessageCard, maxCodePoints: number, options: CardMar
  * - Badge: `[text]`;
  * - RelativeTime: its UTC time (`2026-11-03 12:03:00Z`); Duration: `start –
  *   end`, or `start –` while it runs;
- * - Button: `[label](url)`; a disabled one `label (disabled: reason)`;
+ * - Button: `[label](url)`; a disabled one `label (disabled: reason)`; an
+ *   acting one (RFC 086, `actingButtons`) `label (in Raft)` or `label (in
+ *   Raft, for @name)`;
  * - Markdown (v2.0): its content as it stands;
  * - Fields (v2.0): a line per row, `**label:** value` (`mono` as inline code);
  * - Divider (v2.0): `---`.
@@ -949,8 +1014,10 @@ function cardMarkdown(card: MessageCard, maxCodePoints: number, options: CardMar
  * bold, a link, a code block or a badge still ends it). Empty when the card
  * shows no text.
  */
-export function renderMessageCardMarkdown(card: MessageCard, options: { maxCodePoints?: number } = {}): string {
-  return cardMarkdown(card, options.maxCodePoints ?? MESSAGE_CARD_LIMITS.agentTextMaxCodePoints, { buttons: true, dividers: true });
+export function renderMessageCardMarkdown(card: MessageCard, options: { maxCodePoints?: number; actingButtons?: MessageCardActingButtons } = {}): string {
+  return cardMarkdown(card, options.maxCodePoints ?? MESSAGE_CARD_LIMITS.agentTextMaxCodePoints, {
+    buttons: true, dividers: true, ...(options.actingButtons ? { acting: options.actingButtons } : {}),
+  });
 }
 
 /**
@@ -958,10 +1025,16 @@ export function renderMessageCardMarkdown(card: MessageCard, options: { maxCodeP
  * (RFC 082 §4.1): the card as markdown (renderMessageCardMarkdown), at most
  * 500 code points (cut with "…"). Pure. Empty when the card shows no text.
  * It never mentions anyone: an `@handle` in it is inline code, and the send
- * resolves no mention from a derived fallback anyway.
+ * resolves no mention from a derived fallback anyway. RFC 086: an App's
+ * acting buttons (`actingButtons`, their element ids) read `label (in Raft)`,
+ * never the disabled reason older clients show on the card, since this text
+ * is what notifications and clients that draw no card show; whom the card is
+ * for is named by the mention Raft appends, not here. Without acting buttons
+ * the rendering is the one it always was.
  */
-export function deriveMessageCardFallback(card: MessageCard): string {
-  return renderMessageCardMarkdown(card, { maxCodePoints: MESSAGE_CARD_LIMITS.fallbackMaxCodePoints });
+export function deriveMessageCardFallback(card: MessageCard, options: { actingButtons?: ReadonlySet<string> } = {}): string {
+  const acting = options.actingButtons && options.actingButtons.size > 0 ? { actingButtons: { ids: options.actingButtons } } : {};
+  return renderMessageCardMarkdown(card, { maxCodePoints: MESSAGE_CARD_LIMITS.fallbackMaxCodePoints, ...acting });
 }
 
 /**
@@ -994,12 +1067,27 @@ export interface AgentMessageCardMarker {
   text?: string;
 }
 
-/** The agent-facing marker of a message's `action_metadata`; null when it is not a message card. */
-export function agentMessageCardMarker(actionMetadata: unknown): AgentMessageCardMarker | null {
+/**
+ * The agent-facing marker of a message's `action_metadata`; null when it is
+ * not a message card. An App's acting buttons (RFC 086 `actions`) read as
+ * acting buttons; `forName` is the handle of the person the card is for (its
+ * `for`), when the caller could find it.
+ */
+export function agentMessageCardMarker(actionMetadata: unknown, options: { forName?: string | null } = {}): AgentMessageCardMarker | null {
   if (!isMessageCardMetadata(actionMetadata)) return null;
   const marker: AgentMessageCardMarker = { revision: actionMetadata.revision, updated_at: actionMetadata.updatedAt };
   // Read through the stored-card schema, as the web reads it: a card this Server can't read gets no text, never a guess.
   const card = messageCardSchema.safeParse(actionMetadata.card);
-  const text = card.success ? renderMessageCardMarkdown(card.data) : "";
+  const actingButtons = card.success ? storedActingButtons(actionMetadata, card.data, options.forName ?? null) : undefined;
+  const text = card.success ? renderMessageCardMarkdown(card.data, actingButtons ? { actingButtons } : {}) : "";
   return text ? { ...marker, text } : marker;
+}
+
+/** The acting Buttons stored metadata names (own keys of `actions` naming a Button of the card), or undefined when there are none. */
+function storedActingButtons(metadata: MessageCardMetadata, card: MessageCard, forName: string | null): MessageCardActingButtons | undefined {
+  const actions: unknown = metadata.actions;
+  if (!actions || typeof actions !== "object" || Array.isArray(actions)) return undefined;
+  const ids = new Set(Object.keys(actions).filter((id) => Object.hasOwn(card.elements, id) && card.elements[id]!.type === "Button"));
+  if (ids.size === 0) return undefined;
+  return typeof metadata.for === "string" && metadata.for ? { ids, for: { name: forName } } : { ids };
 }

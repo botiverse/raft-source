@@ -21,8 +21,10 @@ import { AgentOrchestrator } from "./agentOrchestrator";
 import * as channelService from "./channelService";
 import { createMessage, deliverMessageToAgent } from "./messageService";
 import { runtimeAuthService } from "./runtimeAuthService";
+import { launchIdHashAttrs } from "../tracing/traceIdentity";
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await closeTestDatabase();
 });
 
@@ -313,6 +315,9 @@ const lifts = (events: Array<{ name: string; attrs: Record<string, unknown> }>) 
   .filter((event) => event.name === "wake.block_lifted").map((event) => event.attrs);
 
 test("step 4b: the daemon's credential-restored frame lifts only a block of its reason, and the trace says daemon_frame", async ({ db: _db }) => {
+    // A trace identity key, so the launch hash below is a real value and the assertion is not {} == {}.
+    vi.stubEnv("JWT_SECRET", "launch-hash-test-secret");
+    assert.match(String(launchIdHashAttrs("launch-1").launch_id_hash), /^[0-9a-f]{16}$/);
   const { owner, server, machine, agent } = await seed();
   const orchestrator = new CapturingOrchestrator();
   orchestrator.setIO(fakeIo());
@@ -335,6 +340,7 @@ test("step 4b: the daemon's credential-restored frame lifts only a block of its 
     assert.equal(await breaker.automaticWakeHold(agent.id, Date.now()), null);
     assert.deepEqual(lifts(events), [{
       cause: "credential_restored", source: "daemon_frame", release_cause: "model_output", lifted_reason: "user_reauth", launch_id_present: true,
+      ...launchIdHashAttrs("launch-1"),
     }]);
 
     // The next message wakes the agent as usual.

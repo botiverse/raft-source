@@ -121,7 +121,7 @@ test("localizing changes only display copy and never the input form", () => {
   }
   const builtin = localizeRuntimeFormV2(buildRuntimeFormV2("builtin"), "zh-cn");
   assert.equal(builtin.uiSchema?.localization?.providerId?.label, "提供方");
-  assert.equal(builtin.uiSchema?.localization?.model?.hint, "请填写所选提供方支持的模型 ID。");
+  assert.equal(builtin.uiSchema?.localization?.model?.hint, "从列表里选一个模型。提供方支持时，也可以直接填写模型 ID。");
 });
 
 test("option sources translate generic labels only; values and model names stay", () => {

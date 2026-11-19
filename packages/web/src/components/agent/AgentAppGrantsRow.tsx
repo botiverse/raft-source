@@ -59,7 +59,9 @@ function GrantDetailRow({ grant, appName, canRevoke, onRevoke }: {
 /**
  * One ordinary App on the Agent's Apps tab, however many grants it holds (an App can hold several,
  * e.g. one from the agent's sign-in and one for notifications). The row says in one plain line
- * what the App can do across them ("Can sign in and send notifications"), not raw scopes.
+ * what the App can do across them, with the App as its subject ("Stamp can sign in as this agent
+ * and send notifications"), not raw scopes. The App's agent manifest is a developer detail and
+ * isn't on the row (xxchan, #proj-apps:c84d58d9).
  *
  * Revoke access takes every grant of the App, after a confirmation that lists each one. With more
  * than one grant, Details opens them under the row, grouped by how access was granted, each with
@@ -81,9 +83,9 @@ export function AgentAppGrantsRow({ app, canManageAgentAccess, onRevoke }: {
     const abilities = appAbilities(app.grants.flatMap((grant) => grant.scopes))
       .map((ability) => (ability.short ? formatMessage({ id: ability.short }) : ability.scopes[0]));
     return abilities.length > 0
-      ? formatMessage({ id: "agent.apps.canSummary" }, { abilities: formatList(abilities, { type: "conjunction" }) })
+      ? formatMessage({ id: "agent.apps.canSummary" }, { app: app.name, abilities: formatList(abilities, { type: "conjunction" }) })
       : null;
-  }, [app.grants, formatMessage, formatList]);
+  }, [app.grants, app.name, formatMessage, formatList]);
 
   // Every grant from one source: the row says how, as before. Several sources: Details says it per grant.
   const sources = new Set(app.grants.map((grant) => grant.grantSource));
@@ -144,11 +146,6 @@ export function AgentAppGrantsRow({ app, canManageAgentAccess, onRevoke }: {
       ) : null}
     >
       {summary ? <div className="text-callout text-foreground" data-testid="agent-app-abilities">{summary}</div> : null}
-      {app.agentManifestUrl ? (
-        <div className="break-all font-mono text-mono-meta text-foreground-hint">
-          {formatMessage({ id: "agent.detail.agentManifest" }, { url: app.agentManifestUrl })}
-        </div>
-      ) : null}
       {multiple && open ? (
         <div id={detailsId} className="stack-y-3" data-testid={`agent-app-grant-details-${app.clientId}`}>
           {grantsBySource(app.grants).map(({ source: grantSource, grants }) => {

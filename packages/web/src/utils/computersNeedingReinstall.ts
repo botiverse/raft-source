@@ -4,7 +4,7 @@ import type { Machine } from "../store/machineStore";
 import { canManageMachine } from "./canManageMachine";
 import { computerVersionTier } from "./computerVersionTier";
 
-type ReinstallMachine = Pick<Machine, "id" | "isComputer" | "status" | "computerVersion" | "versionGate" | "computerAttachedByCurrentUser" | "creator">;
+type ReinstallMachine = Pick<Machine, "id" | "isComputer" | "status" | "computerVersion" | "versionGate" | "computerAttachedByCurrentUser" | "controlledByCurrentUser" | "creator">;
 
 /**
  * The Notification Center's `computer-reinstall` entry: machines in the

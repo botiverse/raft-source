@@ -251,6 +251,22 @@ export interface DesktopComputerHostState {
    * an older Raft Desktop.
    */
   migrationReportsPending?: number;
+  /**
+   * Installed, but `--version` or `status --json` failed: the secret-free
+   * reason (null when it read fine, or nothing is installed). Its presence
+   * also says this Raft Desktop runs diagnostics (`doctor --json`) and
+   * Repair while what the Computer can do is unknown. Absent from an older
+   * Raft Desktop.
+   */
+  readError?: string | null;
+  /**
+   * Nothing is installed at the official location, yet the Computer home
+   * holds server attachments (and no K slots): an older Raft Desktop's
+   * embedded Computer that never moved (Windows, Linux). Install then
+   * finishes the move (asked, never automatic). Absent from an older Raft
+   * Desktop.
+   */
+  leftoverAttachments?: boolean;
 }
 
 /**
@@ -356,7 +372,12 @@ export interface DesktopComputerBridge {
   openComputerLogs?(): Promise<void>;
   /** Raft Desktop's own log folder. */
   openDesktopLogs?(): Promise<void>;
-  /** Computer's own update path (`raft-computer upgrade`). */
+  /**
+   * Computer's own update path (`raft-computer upgrade`); a Computer whose
+   * status cannot be read is repaired with the bundled installer. Nothing
+   * installed: installs it, and starts it when it is attached somewhere;
+   * with leftoverAttachments, finishes the move from the embedded Computer.
+   */
   updateComputer?(): Promise<void>;
   /** Retry a failed move from the embedded Computer (resumes where it stopped). */
   retryMigration?(): Promise<void>;
@@ -458,9 +479,237 @@ export interface DesktopWebPreviewState {
   loading: boolean;
 }
 
+/**
+ * What a tab's page asked for and the shell refused (packages/shared
+ * linkRouter.ts: a page-initiated action is never dropped without a word):
+ * - `raft`: a navigation to one of Raft's own pages (they open in the app);
+ * - `raft-sign-in`: the same, for Raft's sign-in for another site
+ *   (isRaftAuthorizeUrl), and a sign-in the app took and Raft's server then
+ *   refused (`url` is then the tab's own page, never the address asked for);
+ * - `scheme`: a link another application opens (mailto:, tel:, a custom
+ *   protocol);
+ * - `popup`: a window with no address of its own (window.open() then a
+ *   script fills it), which the built-in browser has no place for yet.
+ * - `download`: a file the page started to download, which the built-in
+ *   browser does not save itself: the shell hands its address to the system
+ *   browser, and the tab says so (`file`: its name, when the page gave one),
+ *   so a click on a download is never answered by nothing
+ *   (#proj-workspace:#292). A shell before it said nothing, and a web before
+ *   it shows nothing for it (an unknown reason is no notice).
+ * Or what the shell refused the tab itself:
+ * - `storage`: no page is made for the tab (`url` is the address it would
+ *   show), because the browser's saved site data could not be cleared for
+ *   the account signed in; said on a tab that has no page.
+ * - `media-system`: the person allowed the site the microphone or camera
+ *   (`media`: which), but the operating system has not given Raft itself
+ *   access (macOS System Settings > Privacy & Security): the page was told
+ *   no. A web before it shows nothing for it.
+ * `at` tells one refusal from the next (the web keeps a dismissal by it).
+ */
+export interface DesktopWebPreviewBlocked {
+  url: string;
+  reason: "raft" | "raft-sign-in" | "scheme" | "popup" | "storage" | "download" | "media-system";
+  /** A download's file name (`download` only), at most 200 characters, when the page named one. */
+  file?: string;
+  /** What the system refused (`media-system` only). */
+  media?: DesktopWebPreviewMediaKind[];
+  at: number;
+}
+
+/** A device a page of the built-in browser may ask to use (a `media` permission: audio is the microphone, video the camera). */
+export type DesktopWebPreviewMediaKind = "microphone" | "camera";
+
+/** What a site may do with one device, as the person set it: always, never, or ask each time (the default). */
+export type DesktopWebPreviewSiteSetting = "allow" | "block" | "ask";
+
+/** A tab's site (its main frame's origin) and what it may do with each device. */
+export interface DesktopWebPreviewSitePermissions {
+  /** The origin the settings are kept for (`https://deck.raft.build`). */
+  origin: string;
+  microphone: DesktopWebPreviewSiteSetting;
+  camera: DesktopWebPreviewSiteSetting;
+}
+
+/**
+ * A page asked to use a device and the shell waits for the person (the prompt bar under the address row):
+ * `kinds` are the devices it asks for that the site has no answer for yet. Answered with
+ * DesktopWebPreviewTabsBridge.answerPermission, by `id`.
+ */
+export interface DesktopWebPreviewPermissionPrompt {
+  id: string;
+  origin: string;
+  kinds: DesktopWebPreviewMediaKind[];
+}
+
 /** One tab of the built-in browser, as the shell reports it after every navigation, title or loading change. */
 export interface DesktopWebPreviewTabState extends DesktopWebPreviewState {
   tabId: string;
+  /** The last thing the page asked for that was refused, until its next navigation; absent on shells that predate it. */
+  blocked?: DesktopWebPreviewBlocked | null;
+  /** The device prompt waiting for the person in this tab, or null. Absent on shells that predate site permissions. */
+  permissionPrompt?: DesktopWebPreviewPermissionPrompt | null;
+  /** The tab's site and its device settings; null where the page is not one that may ask (not a secure origin). */
+  site?: DesktopWebPreviewSitePermissions | null;
+  /** The devices the page was given since its document loaded (the tab strip's and the address row's indicator). */
+  media?: DesktopWebPreviewMediaKind[];
+  /** Sound comes out of the page (the speaker on the tab). Absent on shells that predate it: no speaker shows. */
+  audible?: boolean;
+  /** The person muted the tab (`setMuted`). Absent on shells that predate it. */
+  muted?: boolean;
+}
+
+/**
+ * What a tab's page asks the browser for, which only the web can do (it keeps
+ * the tab list): `open-tab`, a new tab on `url` (a link opened in a new tab or
+ * window, target=_blank, window.open), behind the tab in front when
+ * `background`, placed after the tab that asked (`openerTabId`); or a
+ * `command`.
+ */
+export type DesktopWebPreviewTabRequest =
+  | { type: "open-tab"; url: string; background: boolean; openerTabId: string }
+  /**
+   * A browser command pressed with the keyboard focus in a tab's page
+   * (`tabId`), which acts on the tab list: close that tab, a new tab, the
+   * tab after / before the one in front, the address field, the tab at
+   * `index` (-1: the last one). The shell decided the key (its one shortcut
+   * table); the web only carries the command out.
+   *
+   * `find`, `find-next`, `find-previous`: the find field for that tab's
+   * page, and the match after / before the one marked. The shell sends
+   * `find` only to a page that listens for matches (`onFound`), and the
+   * other two only while that tab's page has a search running; until then
+   * the keys stay the page's own.
+   */
+  | { type: "command"; command: "close-tab" | "new-tab" | "next-tab" | "previous-tab" | "focus-address" | "select-tab" | "find" | "find-next" | "find-previous"; index?: number; tabId: string };
+
+/** A search's result in a tab's page (find in page): how many matches, and which one is marked (1-based; 0: none). */
+export interface DesktopWebPreviewFound {
+  tabId: string;
+  matches: number;
+  active: number;
+}
+
+/** One tab of the list the shell owns (DesktopWebPreviewTabListBridge): `url` null is an empty tab. */
+export interface DesktopWebPreviewListedTab {
+  id: string;
+  url: string | null;
+  title: string;
+  loading: boolean;
+}
+
+/** One conversation's browser in that list: its tabs in order and the one in front. */
+export interface DesktopWebPreviewListedBrowser {
+  /** The conversation the browser belongs to. */
+  owner: string;
+  tabs: DesktopWebPreviewListedTab[];
+  /** The one of its own tabs last in front. */
+  activeId: string;
+  /** A pinned tab is in front of the conversation's own (DesktopWebPreviewPinnedTabs.activeId). */
+  pinnedFront?: boolean;
+}
+
+/**
+ * The window's pinned tabs (#proj-workspace:#297): they belong to the window, not to a conversation, lead every
+ * conversation's strip, keep their pages when the window goes to another conversation, and are kept across a
+ * restart.
+ */
+export interface DesktopWebPreviewPinnedTabs {
+  tabs: DesktopWebPreviewListedTab[];
+  /** The pinned tab last in front. */
+  activeId: string;
+  /** The pinned tabs show beside a conversation with no tabs of its own (the browser's panel is open there). */
+  open: boolean;
+}
+
+/** The window's browsers, as the shell keeps them. */
+export interface DesktopWebPreviewTabList {
+  browsers: DesktopWebPreviewListedBrowser[];
+  /** The window's pinned tabs. Absent: none (or a shell from before them). */
+  pinned?: DesktopWebPreviewPinnedTabs;
+  /**
+   * Which change of the list this is: it only grows for the shell's life, over `get`, `dispatch` and `onChange`
+   * alike, so of two lists the one with the larger number is the newer (an answer that arrives after a newer
+   * change is dropped). Absent: not ordered, and taken as it comes.
+   */
+  revision?: number;
+}
+
+/**
+ * What the web asks of the shell's tab list. The shell validates every part
+ * (an address by the same rule as an open) and keeps its own caps:
+ * - `open`: `url` in front, in the tab already on it, else a new tab (at the
+ *   cap it takes the tab in front); makes the browser where there is none;
+ * - `open-tab`: a new tab on `url` after `afterTabId` (else last), behind the
+ *   one in front when `background`;
+ * - `new-tab`: a new empty tab in front;
+ * - `close-tab`: the last tab closes the browser; `close`: the whole browser;
+ * - `move`: to where the tab `to` stands, or one place `left` or `right`; a
+ *   pinned tab moves among the pinned ones only, any other among its own.
+ *
+ * On a shell with `pins` (DesktopWebPreviewTabListBridge), where `owner` is the
+ * conversation the strip is beside and `tabId` may name a pinned tab in every
+ * intent above:
+ * - `pin`: the tab becomes the window's (last of the pinned ones); refused
+ *   where a strip would pass the cap, which counts pinned and own tabs together;
+ * - `unpin`: the pinned tab becomes the first of `owner`'s own tabs;
+ * - `duplicate`: a new tab on the tab's address, in front, after it (a pinned
+ *   tab's: first of `owner`'s own);
+ * - `close-others`, `close-right`: close `owner`'s own tabs but this one, or
+ *   after this one; a pinned tab is never closed by them.
+ */
+export type DesktopWebPreviewTabIntent =
+  | { type: "open"; owner: string; url: string }
+  | { type: "open-tab"; owner: string; url: string; background?: boolean; afterTabId?: string }
+  | { type: "new-tab"; owner: string }
+  | { type: "activate"; owner: string; tabId: string }
+  | { type: "close-tab"; owner: string; tabId: string }
+  | { type: "move"; owner: string; tabId: string; to: string }
+  | { type: "navigate"; owner: string; tabId: string; url: string }
+  | { type: "pin" | "unpin" | "duplicate" | "close-others" | "close-right"; owner: string; tabId: string }
+  | { type: "close"; owner: string };
+
+/**
+ * The built-in browser's tab list, owned by the shell (#proj-workspace:#295):
+ * the shell names the tabs, keeps their order, the one in front, each one's
+ * address, title and loading state, makes and destroys their views, and
+ * keeps the list across a reload of the app's page and across a restart (a
+ * tab that comes back is an address and a title until it is shown). The web
+ * mirrors it and sends intents. With it, the web does not call `open`,
+ * `activate`, `close` or `closeAll` of DesktopWebPreviewTabsBridge.
+ */
+export interface DesktopWebPreviewTabListBridge {
+  /**
+   * The window's list for the signed-in `account` (an opaque key: the user's
+   * id). The shell keeps one account's list: asked for another account, the
+   * list before is dropped. Called once per page load, before anything else
+   * here.
+   */
+  get(account: string): Promise<DesktopWebPreviewTabList>;
+  /**
+   * Resolves with the list after the intent (unchanged where the shell refused it). Rejects when the shell does not
+   * hold this page as the list's owner (before `get`, or after it dropped the list on a sign-out): nothing changed.
+   */
+  dispatch(intent: DesktopWebPreviewTabIntent): Promise<DesktopWebPreviewTabList>;
+  /**
+   * Which conversation's browser the window is on (`owner`; null: none, and
+   * only the pinned tabs keep their views), and whether its panel is on screen (`showing`: the tab
+   * in front shows; it may be a conversation with no tabs of its own, whose strip is the pinned ones).
+   * Views exist only for that conversation's own tabs, and for the pinned ones.
+   *
+   * `options.backgroundMedia`: this web shows a speaker on a tab that plays and can mute it (`setMuted`), so a tab
+   * behind plays on, heard, as a Chrome background tab, and a page of a conversation left that plays keeps playing
+   * (#proj-workspace:#299). Absent (a web from before): every tab not in front is muted and the pages of a
+   * conversation left are destroyed, as before. A shell from before ignores it.
+   */
+  present(owner: string | null, showing: boolean, options?: { backgroundMedia?: boolean }): void;
+  /** The list after each change. Returns unsubscribe. */
+  onChange(handler: (list: DesktopWebPreviewTabList) => void): () => void;
+  /**
+   * The shell has pinned tabs (#proj-workspace:#297): `pin`, `unpin`, `duplicate`, `close-others` and `close-right`
+   * are intents it knows, and its list carries `pinned`. Absent on a shell from before them: the web offers none
+   * of the five (the shell would refuse them).
+   */
+  pins?: true;
 }
 
 /**
@@ -487,12 +736,120 @@ export interface DesktopWebPreviewTabsBridge {
   back(tabId: string): void;
   forward(tabId: string): void;
   reload(tabId: string): void;
+  /**
+   * Find in page. `find` searches the tab's page for `text` (not empty):
+   * `fresh` starts a search, else it moves to the match after (`forward`) or
+   * before the one marked. `stopFind` ends the search and clears its marks;
+   * `focusPage` hands the page the keyboard. `onFound` reports each search's
+   * matches. All three absent on shells that predate find in page: the web
+   * shows no find field.
+   */
+  find?(tabId: string, text: string, options: { forward: boolean; fresh: boolean }): void;
+  stopFind?(tabId: string, focusPage: boolean): void;
+  onFound?(handler: (found: DesktopWebPreviewFound) => void): () => void;
   /** Where the showing tab's view goes; every tab shares the one placeholder. */
   setBounds(bounds: DesktopWebPreviewBounds): void;
   /** As DesktopWebPreviewBridge.setVisible, for the active tab's view. */
   setVisible(visible: boolean): Promise<string | null>;
   /** Each tab's page after each change. Returns unsubscribe. */
   onState(handler: (state: DesktopWebPreviewTabState) => void): () => void;
+  /** What a tab's page asks the browser for. Returns unsubscribe. Absent on shells that predate it: a page's new windows go to the system browser. */
+  onRequest?(handler: (request: DesktopWebPreviewTabRequest) => void): () => void;
+  /**
+   * The person's answer to the tab's device prompt (DesktopWebPreviewTabState.permissionPrompt, by its id): `allow`
+   * and `block` are kept for the site, `dismiss` answers no this time only (the site asks again next time). Absent,
+   * with `setSitePermission`, on shells that predate site permissions.
+   */
+  answerPermission?(tabId: string, promptId: string, answer: "allow" | "block" | "dismiss"): void;
+  /**
+   * The person changed what the tab's site may do with a device (the site settings at the address row's start). The
+   * shell keeps it for the site the tab shows now, never one the web names; taking away a device the page was given
+   * reloads the page, so it stops using it.
+   */
+  setSitePermission?(tabId: string, kind: DesktopWebPreviewMediaKind, setting: DesktopWebPreviewSiteSetting): void;
+  /**
+   * Mute or unmute the tab's page (the speaker on the tab, as Chrome's): kept for the tab across its navigations,
+   * reported back as DesktopWebPreviewTabState.muted. Absent on shells that predate it: the web shows no speaker.
+   */
+  setMuted?(tabId: string, muted: boolean): void;
+  /** The tab list as the shell's own state. Absent on shells that predate it: the web keeps the list and drives the views with the methods above. */
+  list?: DesktopWebPreviewTabListBridge;
+}
+
+/**
+ * The pane of the workspace grid that holds the keyboard focus in the app's own page: its kind (one the shell knows
+ * a shortcut table for: "browser"), whose it is (the conversation), and its tab in front (null: none).
+ */
+export interface DesktopPaneFocus {
+  kind: string;
+  owner: string;
+  tabId: string | null;
+}
+
+/**
+ * Keys belong to the pane that holds the keyboard focus (apps/desktop paneKeys.ts): the shell offers each key to
+ * that pane's shortcut table first, and only a key it does not claim reaches the window's menu. The web says which
+ * pane that is (packages/web paneFocus.ts), and null as soon as none: the focus left every pane, the pane went.
+ * The shell also drops it when this page reloads or navigates.
+ */
+export interface DesktopPaneFocusBridge {
+  set(focus: DesktopPaneFocus | null): void;
+}
+
+/** A page of the built-in browser asked to sign in with Raft, and Raft's server accepted the request. */
+export interface DesktopWebPreviewRaftSignInRequest {
+  /** The shell's id for the request: what `complete` and `cancel` name. */
+  requestId: string;
+  /**
+   * The query of the Login with Raft setup address the server answered with
+   * (`?flow=oidc&client_id=…&return_to=…`): what the consent is fed, in place
+   * of the setup page's own `window.location.search`.
+   */
+  setupSearch: string;
+}
+
+/**
+ * "Sign in with Raft" from a page of the built-in browser
+ * (desktop_browser_raft_sign_in_v0), without a second Raft sign-in: the shell
+ * stops the page's navigation to Raft's authorize endpoint, asks the server
+ * about it, and has the web show Raft's consent in the app's own window. The
+ * web approves with its own session and hands the app's return address back;
+ * the shell loads it in the tab that asked, after checking it. Absent on
+ * shells that predate it: that navigation is only stopped, as before.
+ */
+export interface DesktopWebPreviewRaftSignInBridge {
+  /**
+   * The feature is on for what this window shows and `accountKey` (an opaque
+   * id of the signed-in account) is signed in. An account other than the one
+   * the browser's storage belongs to empties that storage first.
+   */
+  arm(accountKey: string): void;
+  /**
+   * `accountKey` is signed in, whether or not the feature is on: browser
+   * storage the shell recorded as another account's is emptied, as at a
+   * sign-out (an account can follow another with no signed-out state in
+   * between, on a Server where the feature is off). Said before `arm`.
+   * Absent on the first shells with this bridge.
+   */
+  account?(accountKey: string): void;
+  /** The feature is off for what this window shows now: its pending requests are dropped. */
+  disarm(): void;
+  /** Nobody is signed in: every pending request is dropped and the browser's storage emptied (if this feature ever served it). */
+  signedOut(): void;
+  /** A request to show the consent for. Returns unsubscribe. */
+  onRequest(handler: (request: DesktopWebPreviewRaftSignInRequest) => void): () => void;
+  /** The shell dropped this request (its tab closed or navigated, it expired): close its consent. Returns unsubscribe. */
+  onClosed(handler: (requestId: string) => void): () => void;
+  /** The address the consent would have navigated to (the app's return address with the code, or with an error). One use. */
+  complete(requestId: string, url: string): void;
+  /** The person dismissed the consent. */
+  cancel(requestId: string): void;
+  /**
+   * The web will not show the consent for this request (it names another return address than the App is registered
+   * with, or carries what Raft has no words for): the request ends as with `cancel`, and its tab says Raft's sign-in
+   * was not available there. Absent on shells that predate it: `cancel` then.
+   */
+  refuse?(requestId: string): void;
 }
 
 /**
@@ -531,6 +888,8 @@ export interface DesktopWebPreviewBridge {
   onOpenLinkBeside?(handler: (url: string) => void): () => void;
   /** The built-in browser's tabs. Absent on shells that predate them: one page, through the methods above. */
   tabs?: DesktopWebPreviewTabsBridge;
+  /** Sign in with Raft from a page of the built-in browser. Absent on shells that predate it. */
+  raftSignIn?: DesktopWebPreviewRaftSignInBridge;
 }
 
 export interface RaftDesktopBridge {
@@ -622,4 +981,6 @@ export interface RaftDesktopBridge {
   };
   /** The web preview's native browser view. Absent on shells that predate it. */
   webPreview?: DesktopWebPreviewBridge;
+  /** Which pane of the workspace holds the keyboard focus, for its keys. Absent on shells that predate it. */
+  paneFocus?: DesktopPaneFocusBridge;
 }

@@ -25,6 +25,13 @@
 // and a step this version already sent may be sent once more by it. A start the
 // installer killed (45 s) leaves no step.
 //
+// Every step carries when it happened (`atMs`, sent as `at_ms`), not only when
+// it was reported: the steps of one upgrade are mostly sent together by the
+// new version. The steps on the way from the drain to the new service also say
+// how long after the step before them they happened (`sinceStep`,
+// `sinceStepMs`): drain end → installer_spawned → service_stopped →
+// service_started → start_command.
+//
 // Every receipt also yields `installer_finished` (success included) with what
 // the installer left behind, read from files the deployed installers already
 // write (rust/operation.rs, rust/host.rs, k-carrier state.rs): the receipt's
@@ -32,10 +39,14 @@
 // `detail.diagnostic`, which the receipt's may hide behind "upgrade still
 // requires recovery"), K's operation phase/outcome/reason (k/operation.json)
 // and the last start the installer made (product-state.json `lastStart`).
+// From raft-computer-installer#82 on, also how long each of the installer's
+// phases took (`detail.phasesMs`) and, on a refusal behind an earlier
+// installation, the code the request itself failed with (`detail.requestCode`).
 import { createHash } from "node:crypto";
 import { appendFile, mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { computerDir } from "./paths";
+import { normalizeComputerUpgradeInstallerCode } from "@botiverse/raft-shared";
 import { REMOTE_UPGRADE_FAILURE_WATCH_MS } from "./externalInstaller";
 import type { StartReadinessReport } from "./machineReadiness";
 
@@ -68,6 +79,15 @@ export interface RemoteUpgradeStepRecord {
   reason?: string;
   supervisor?: string;
   killMode?: string;
+  /**
+   * On `received`: the Computer's saved release channel (`latest`, `alpha`,
+   * `pinned:<v>`, a named channel) and the channel the installer binary is
+   * fetched from (`RAFT_COMPUTER_INSTALLER_CHANNEL`, default `main`). An rc
+   * installer on a machine after the stable went out is explained by the
+   * second (#67, 11-13); which release channel a machine follows by the first.
+   */
+  channel?: string;
+  installerChannel?: string;
   bytes?: number;
   version?: string;
   phase?: string;
@@ -85,6 +105,10 @@ export interface RemoteUpgradeStepRecord {
   installerVersion?: string;
   /** The receipt's own outcome, snake_case (`promoted`, `repaired`, `rolled_back`, `unresolved`, …). */
   receiptOutcome?: string;
+  /** The receipt's `detail.phasesMs` (installerPhasesMs): `{"candidate_check":41250,...}`, bounded. */
+  installerPhasesMs?: string;
+  /** The receipt's `detail.requestCode`: what the request itself failed with before an earlier installation turned it into `earlier_recovery_pending` / `recovery_unresolved`. */
+  installerRequestCode?: string;
   /** The installer's engine error from plan.json `detail.diagnostic`, bounded and redacted. */
   engineDiagnostic?: string;
   /** K's operation record for this request (k/operation.json): phase, outcome, reason (redacted). */
@@ -100,6 +124,21 @@ export interface RemoteUpgradeStepRecord {
   lastStartExitCode?: number;
   /** A service stop/start recorded after the receipt existed. */
   afterReceipt?: boolean;
+  /**
+   * The step this one follows on the way to the new service (STEP_BEFORE) and
+   * how long after that step ended this one happened (a `drain` or `download`
+   * ends at `atMs + durationMs`, every other step at `atMs`).
+   */
+  sinceStep?: RemoteUpgradeStep;
+  sinceStepMs?: number;
+  /**
+   * On `drain`: what the runners' own drain ended with, so the step log (which
+   * survives the restart) carries what `daemon.computer_upgrade.drain.finished`
+   * does: agents the runners waited for, agents not quiet at the end, runners.
+   */
+  waitedFor?: number;
+  notQuiet?: number;
+  runners?: number;
   /** The service process of an `afterReceipt` transition (dedupe only; not sent). */
   pid?: number;
 }
@@ -179,6 +218,39 @@ export async function appendRemoteUpgradeStep(slockHome: string, record: RemoteU
   }
 }
 
+/** The step before each step on the way from the drain to the new service. */
+const STEP_BEFORE: Partial<Record<RemoteUpgradeStep, RemoteUpgradeStep>> = {
+  installer_spawned: "drain",
+  service_stopped: "installer_spawned",
+  service_started: "service_stopped",
+  start_command: "service_started",
+};
+
+/** When a step ended: a `drain` or `download` lasts `durationMs` from `atMs`; any other step is an instant. */
+export function remoteUpgradeStepEndMs(record: Pick<RemoteUpgradeStepRecord, "step" | "atMs" | "durationMs">): number {
+  return record.step === "drain" || record.step === "download" ? record.atMs + Math.max(0, record.durationMs ?? 0) : record.atMs;
+}
+
+/**
+ * `sinceStep` / `sinceStepMs` for `step` happening at `atMs`: the last
+ * successful step before it in the request's log. Empty when there is none
+ * (no drain, an older version's log) or the clock went backwards.
+ */
+export async function remoteUpgradeStepGap(slockHome: string, requestId: string, step: RemoteUpgradeStep, atMs: number): Promise<Pick<RemoteUpgradeStepRecord, "sinceStep" | "sinceStepMs">> {
+  const before = STEP_BEFORE[step];
+  if (!before) return {};
+  let records: RemoteUpgradeStepRecord[];
+  try {
+    records = parseLog(await readFile(join(traceDir(slockHome), `${requestKey(requestId)}.jsonl`), "utf8"));
+  } catch {
+    return {};
+  }
+  const previous = records.filter((record) => record.step === before && record.outcome === "ok").at(-1);
+  if (!previous) return {};
+  const gap = atMs - remoteUpgradeStepEndMs(previous);
+  return gap >= 0 ? { sinceStep: before, sinceStepMs: gap } : {};
+}
+
 /** The request the last web upgrade launched, if it is still inside the server's deadline. */
 async function readLaunchMarker(slockHome: string): Promise<{ requestId: string; launchedAtMs: number; targetVersion?: string; originServerId?: string; drainMs?: number } | null> {
   try {
@@ -224,6 +296,7 @@ export async function noteServiceTransitionForRemoteUpgrade(slockHome: string, s
     outcome: "ok",
     atMs: nowMs,
     durationMs: nowMs - marker.launchedAtMs,
+    ...await remoteUpgradeStepGap(slockHome, marker.requestId, step, nowMs),
     version,
     ...(marker.targetVersion ? { targetVersion: marker.targetVersion } : {}),
     ...(marker.originServerId ? { originServerId: marker.originServerId } : {}),
@@ -282,6 +355,7 @@ export async function noteStartCommandForRemoteUpgrade(slockHome: string, start:
       outcome: start.outcome,
       atMs: nowMs,
       durationMs: nowMs - marker.launchedAtMs,
+      ...await remoteUpgradeStepGap(slockHome, marker.requestId, "start_command", nowMs),
       version: traceSafeText(start.version, 64),
       // A Computer error code is an identifier; anything else is not sent.
       ...(start.errorCode ? { errorCode: /^[A-Za-z][A-Za-z0-9_]{0,63}$/u.test(start.errorCode) ? start.errorCode : "unknown" } : {}),
@@ -309,6 +383,36 @@ interface RawReceipt {
   refusedByComputer: boolean;
   diagnostic?: string;
   startFailureRef?: string;
+  phasesMs?: string;
+  requestCode?: string;
+}
+
+/** The most phases one receipt states and the largest duration (raft-computer-installer rust/report.rs PHASES_MAX, PHASE_MS_MAX). */
+const INSTALLER_PHASES_MAX = 16;
+const INSTALLER_PHASE_MS_MAX = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * A receipt's `detail.phasesMs` (a JSON object of phase names to whole
+ * milliseconds, written by raft-computer-installer#82 on) re-serialized for a
+ * trace attribute, or null when it is anything else: names and counts only,
+ * at most INSTALLER_PHASES_MAX phases.
+ */
+export function installerPhasesMs(value: unknown): string | null {
+  if (typeof value !== "string" || value.length > 2048) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+  const entries = Object.entries(parsed);
+  if (entries.length === 0 || entries.length > INSTALLER_PHASES_MAX) return null;
+  for (const [name, ms] of entries) {
+    if (!/^[a-z_]{1,32}$/u.test(name)) return null;
+    if (typeof ms !== "number" || !Number.isSafeInteger(ms) || ms < 0 || ms > INSTALLER_PHASE_MS_MAX) return null;
+  }
+  return JSON.stringify(Object.fromEntries(entries));
 }
 
 async function readRawReceipt(slockHome: string, requestId: string): Promise<RawReceipt | null> {
@@ -317,6 +421,8 @@ async function readRawReceipt(slockHome: string, requestId: string): Promise<Raw
     if (raw.length > 65_536) return null;
     const receipt = JSON.parse(raw);
     if (receipt?.protocol !== "raft-computer-installer/v3" || receipt.id !== requestId || receipt.operation !== "upgrade") return null;
+    const phasesMs = installerPhasesMs(receipt.detail?.phasesMs);
+    const requestCode = normalizeComputerUpgradeInstallerCode(receipt.detail?.requestCode);
     return {
       outcome: typeof receipt.outcome === "string" ? receipt.outcome : "unknown",
       ...(typeof receipt.installerVersion === "string" ? { installerVersion: receipt.installerVersion } : {}),
@@ -330,6 +436,8 @@ async function readRawReceipt(slockHome: string, requestId: string): Promise<Raw
       refusedByComputer: receipt.detail?.refusedBy === "raft-computer",
       ...(typeof receipt.detail?.diagnostic === "string" ? { diagnostic: receipt.detail.diagnostic } : {}),
       ...(typeof receipt.detail?.startFailureDiagnostic === "string" ? { startFailureRef: receipt.detail.startFailureDiagnostic } : {}),
+      ...(phasesMs ? { phasesMs } : {}),
+      ...(requestCode ? { requestCode } : {}),
     };
   } catch {
     return null;
@@ -439,6 +547,8 @@ async function receiptDetail(slockHome: string, requestId: string, receipt: RawR
   return {
     ...(receipt.installerVersion ? { installerVersion: traceSafeText(receipt.installerVersion, 64) } : {}),
     receiptOutcome: receiptOutcome(receipt),
+    ...(receipt.phasesMs ? { installerPhasesMs: receipt.phasesMs } : {}),
+    ...(receipt.requestCode ? { installerRequestCode: receipt.requestCode } : {}),
     ...(plan?.diagnostic ? { engineDiagnostic: plan.diagnostic } : {}),
     ...await readEngineOperation(slockHome, requestId),
     ...await readLastStart(slockHome, requestId),

@@ -251,7 +251,7 @@ test("a start of another runtime that arrives while the old runtime's process re
     // The Built-in start arrives while the Kimi start is being prepared:
     // deferred, then taken after Kimi registered (`already_starting_late`).
     const buildSpawnConfig = (ctx.manager as any).buildSpawnConfig.bind(ctx.manager);
-    let late: Promise<void> | undefined;
+    let late: Promise<unknown> | undefined;
     (ctx.manager as any).buildSpawnConfig = async (agentId: string, config: AgentConfig) => {
       if (!late) late = ctx.manager.startAgent(agentId, builtinConfig(), message(7), undefined, undefined, "launch-builtin");
       return buildSpawnConfig(agentId, config);

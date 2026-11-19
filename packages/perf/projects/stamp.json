@@ -1,0 +1,5 @@
+{
+  "project": "stamp",
+  "envs": { "production": { "origin": "https://stamp.build" } },
+  "pages": [{ "name": "sign-in", "path": "/sign-in", "ready": { "selector": "h1" } }]
+}

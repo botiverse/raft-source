@@ -103,7 +103,7 @@ test("canonical message manifest v4: merge policies and exclusion ledger are com
   assert.deepEqual([...ex.taskDomainProjection.fields].sort(), [
     "taskAssigneeId", "taskAssigneeName", "taskAssigneeType", "taskClaimedAt", "taskCompletedAt", "taskCurrentProjection", "taskNumber", "taskStatus",
   ]);
-  assert.deepEqual([...ex.emittedUnconsumed.fields], ["updatedAt", "delegatedBy", "delegatedByAgentId"]);
+  assert.deepEqual([...ex.emittedUnconsumed.fields], ["updatedAt", "delegatedBy", "delegatedByAgentId", "voiceCallId"]);
   assert.deepEqual([...ex.storageOnlySealed.fields].sort(), ["agentSendKey", "searchText", "searchVector"]);
   for (const entry of Object.values(ex)) {
     assert.ok(entry.migrationStatus.length > 0, "every exclusion entry carries migration status");

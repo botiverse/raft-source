@@ -6,6 +6,70 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.37.0] — 2026-11-16
+
+All changes are additions.
+
+### Added
+
+- The raw client reaches `assistant.publishArtifactAsOwner(...)`
+  (`POST /assistant/owner-artifact/as-owner`, #14681, #proj-assistant:#33): a
+  personal assistant publishes an Artifact AS its owner (the owner is its
+  author) into a conversation the owner may post in now, named as the owner
+  names it (`home`: `#channel`, `dm:@peer` or an id), or a new version of one
+  it published as them (`artifact` + `base`, no `home`). Only while the owner
+  has "send as me" on (else 403 `assistant_send_as_owner_off`). Any home it
+  can't use answers one `TARGET_NOT_FOUND`; joint (shared) channels are not
+  supported yet. A 409 `UNSEEN_CHANGES` carries counts and a position, never
+  comment text: read with `assistant.ownerArtifact`, then resend with `seen`.
+  Raft posts a receipt in the owner's DM with the assistant. Older Servers
+  answer 404.
+- `asMessageId` (and the `MessageId` type) from the package root: turns a
+  message id you stored as a plain string into the id the raw client's routes
+  take, e.g. `routes.messages.updateCard` for a card that keeps acting
+  buttons.
+
+## [0.36.0] — 2026-11-15
+
+All changes are additions, apart from the license (see Changed).
+
+### Added
+
+- The raw client's `messages.sendV2` and `messages.updateCard` take `actions`
+  and `for` (RFC 086 step 1, #14723): an App's bot sends a card whose
+  Buttons act for one person. `actions` maps a Button element id to an RFC
+  076 execute action (`{ kind: "execute", action_id, confirm: "prepare" }` or
+  `{ kind: "execute", action_id, undoWindowMs }`, at most 4); `for` is the App
+  subject (`sub`) of the one person who may press them, fixed at send. The
+  Server refuses them with 400 `message_card_actions_not_allowed` unless the
+  App may send acting buttons there; older Servers ignore both.
+- `agent:create` cards (`actions.prepare`) take an optional `suggestedRuntime`
+  (#14755): the runtime id the Create Agent dialog starts on, only when the
+  person named that runtime; not with `hosting: "antiproton"`. An id the
+  Server does not offer is refused (`RUNTIME_NOT_OFFERED`, naming the offered
+  ids). The field is in `operations.json`.
+- `./app`: `openSealedInputs`, the App-side check for a card form's sealed
+  `SecretInput` values (RFC 086 §5.3). It compares the JWE protected header
+  with the claims of the execute JWT you verified, decrypts with your private
+  key, checks the values (strings of at most 4096 UTF-8 bytes) and refuses a
+  second delivery of the same `(hnd, crq)` through `remember`; a refusal is a
+  typed `reason`; `expired` can be a legitimate press (the handle expired
+  before your check): answer the person "try again". Also `sealInputs` (seal
+  as a person's client does: the code the Raft web app seals with, for Node
+  clients and tests), `sealedInputsBinding` (the header binding from what a
+  client has: handle, Server, user, `app.client_key`, action, prepared
+  action, client request id, `handle_exp`) and `createSealedInputsMemory`
+  (one process's replay memory).
+  `jose` does the JOSE work and is bundled into `./app`, which grows from
+  about 9 kB to 68 kB (3 kB to 18 kB gzipped); the root and `./agent` don't
+  change. See "Card forms: opening sealed SecretInput values" in the README.
+
+### Changed
+
+- The package's `license` is now `LicenseRef-Raft-License`: the Raft License
+  (FSL-1.1-ALv2 with additional conditions; #14688), effective 2026-11-13.
+  See the repository's `LICENSE`.
+
 ## [0.35.1] — 2026-11-13
 
 ### Fixed

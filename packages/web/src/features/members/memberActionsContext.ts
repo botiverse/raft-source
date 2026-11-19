@@ -19,6 +19,8 @@ export interface MemberActions {
   requestStop: (agent: Agent) => void;
   /** Restart / reset opens its chooser, as on the profile. */
   requestReset: (agent: Agent) => void;
+  /** Edit agent opens its Edit runtime config dialog, as the profile's Runtime config pencil does. */
+  requestEdit: (agent: Agent) => void;
 }
 
 export const MemberActionsContext = createContext<MemberActions | null>(null);

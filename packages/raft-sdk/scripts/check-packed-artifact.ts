@@ -230,6 +230,21 @@ try {
     }
     if (urls.length !== 2 || urls[1] !== "https://raft.example/api/oauth/membership?server_id=" + serverId)
       throw new Error("packed requests went wrong: " + urls.join(", "));
+    // RFC 086 §5.3: the bundled jose seals and opens in this module format.
+    for (const name of ["openSealedInputs", "sealInputs", "sealedInputsBinding", "createSealedInputsMemory"]) {
+      if (typeof app[name] !== "function") throw new Error(name + " export missing from ./app");
+      if (name in root || name in agent) throw new Error(name + " must stay off the root and ./agent");
+    }
+    const pair = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+    const { kty, crv, x, y, d } = await crypto.subtle.exportKey("jwk", pair.privateKey);
+    const sealKey = { kty, crv, use: "enc", alg: "ECDH-ES", kid: "pack-smoke", x, y };
+    const binding = await app.sealedInputsBinding({ handle: "v1.pack-smoke", serverId, userId: "u", appClientKey: "pack", actionId: "save",
+      prepared: { id: "p", digest: "g" }, clientRequestId: "crq-pack-smoke-0001", handleExp: 4102444800 });
+    const sealed = await app.sealInputs({ key: sealKey, binding, values: { value: "pack" } });
+    const claims = { aud: "urn:raft:card-action:pack", sub: "u", server_id: serverId, handle_sha256: binding.hnd, action_id: "save",
+      prepared_action_id: "p", prepared_digest: "g", client_request_id: binding.crq, handle_exp: binding.exp };
+    const opened = await app.openSealedInputs({ jwe: sealed, keys: [{ ...sealKey, d }], claims, remember: app.createSealedInputsMemory().remember });
+    if (!opened.ok || opened.values.value !== "pack") throw new Error("packed sealed inputs did not round-trip: " + JSON.stringify(opened));
   `;
   const fillApp = (load) => appSmoke
     .replace("LOAD_APP", load("@botiverse/raft-sdk/app"))
@@ -357,7 +372,12 @@ import {
 } from "@botiverse/raft-sdk/agent";
 import {
   createRaftAppClient,
+  createSealedInputsMemory,
+  openSealedInputs,
+  sealedInputsBinding,
   RaftAppError,
+  type OpenSealedInputsResult,
+  type SealedInputsBinding,
   type RaftAppClient,
   type RaftAppServer,
   type RaftAppServerClient,
@@ -390,6 +410,14 @@ void appClient.servers().then(({ servers }) => {
 void appClient.serverinfo();
 // @ts-expect-error userinfo names no Server.
 void appClient.userinfo({ server_id: "95f993fa-1c2d-4e5f-8a9b-0c1d2e3f4a5b" });
+void openSealedInputs({ jwe: "", keys: [], claims: {}, remember: createSealedInputsMemory().remember }).then((opened: OpenSealedInputsResult) => {
+  const values: Readonly<Record<string, string>> | null = opened.ok ? opened.values : null;
+  void values;
+});
+void sealedInputsBinding({ handle: "h", serverId: "s", userId: "u", appClientKey: "a", actionId: "act", prepared: null, clientRequestId: "c", handleExp: 1 })
+  .then((binding: SealedInputsBinding) => void binding.hnd);
+// @ts-expect-error A replay memory is required: the check refuses a second delivery.
+void openSealedInputs({ jwe: "", keys: [], claims: {} });
 // @ts-expect-error A plain string is not a ServerId.
 const notMinted: ServerId = "95f993fa-1c2d-4e5f-8a9b-0c1d2e3f4a5b";
 void notMinted;

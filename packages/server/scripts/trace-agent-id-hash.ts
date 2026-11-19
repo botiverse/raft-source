@@ -1,6 +1,6 @@
 #!/usr/bin/env -S node --import=@oxc-node/core/register
 // Incident helper: id -> the keyed hash its spans carry (agent_id_hash by
-// default; --kind server|machine|message|conversation|feedback-reporter|job for the other kinds), so you can find them in
+// default; --kind server|machine|message|conversation|feedback-reporter|job|launch|context for the other kinds), so you can find them in
 // ScopeDB. Needs the same JWT_SECRET as the servers. There is deliberately no
 // reverse direction here.
 import "dotenv/config";
@@ -14,17 +14,18 @@ if (kindAt !== -1) {
   const kinds: Record<string, TraceIdentityKind> = {
     agent: "agent_id_hash", server: "server_id_hash", machine: "machine_id_hash", message: "message_id_hash",
     conversation: "conversation_id_hash", "feedback-reporter": "feedback_reporter_hash", job: "job_id_hash",
+    launch: "launch_id_hash", context: "context_id_hash",
   };
   const selected = value ? kinds[value] : undefined;
   if (!selected) {
-    console.error("--kind must be agent, server, machine, message, conversation, feedback-reporter or job");
+    console.error("--kind must be agent, server, machine, message, conversation, feedback-reporter, job, launch or context");
     process.exit(2);
   }
   kind = selected;
   args.splice(kindAt, 2);
 }
 if (!args.length) {
-  console.error("usage: pnpm --filter @botiverse/raft-server trace:agent-id-hash [--kind agent|server|machine|message|conversation|feedback-reporter|job] <id>...");
+  console.error("usage: pnpm --filter @botiverse/raft-server trace:agent-id-hash [--kind agent|server|machine|message|conversation|feedback-reporter|job|launch|context] <id>...");
   process.exit(2);
 }
 for (const id of args) {

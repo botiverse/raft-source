@@ -141,7 +141,7 @@ export function AgentArchiveSection({ agent, canManage }: { agent: Agent; canMan
       )}
       {confirmDelete && (
         <ConfirmDialog
-          title={formatMessage({ id: "agent.archive.action.deleteWorkspace" })}
+          title={formatMessage({ id: "agent.archive.confirm.deleteWorkspaceTitle" })}
           message={formatMessage({ id: "agent.archive.confirm.deleteWorkspace" }, { computer })}
           confirmLabel={formatMessage({ id: "agent.archive.action.deleteWorkspace" })}
           confirmVariant="danger"

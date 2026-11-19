@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { useIntl } from "react-intl";
 import { useLocation, useNavigate } from "react-router-dom";
@@ -19,6 +19,7 @@ import CloseButton from "../ui/CloseButton";
 import { opensInNewTabAriaLabel } from "../ui/LeavingRaftMark";
 import { isAppClaimedPath } from "../../utils/appClaimedPath";
 import { parseMessageLink } from "../../utils/messageLinkLanding";
+import { trackMobileDownloadClicked } from "../../analytics/appDownload";
 import { MOBILE_DOWNLOAD_CHOOSER_PATH, mobileDownloadUrl } from "../../utils/mobileDownloadUrl";
 import {
   hasAppMissingMarker,
@@ -28,6 +29,18 @@ import {
   withoutAppMissingMarker,
 } from "../../utils/openInAppLink";
 import { answerPageLandingOffer, isPageLandingOfferAnswered } from "../../utils/pageLanding";
+import {
+  openInAppLinkOf,
+  reportOpenInAppDownload,
+  reportOncePerOffer,
+  reportOpenInAppMissing,
+  reportOpenInAppOffered,
+  reportOpenInAppOpen,
+  reportOpenInAppStay,
+} from "../../utils/openInAppTrace";
+import type { OpenInAppContext } from "../../utils/openInAppTrace";
+import { useAuthStore } from "../../store/authStore";
+import ReportShown from "./ReportShown";
 import { useOpenInAppOfferFlag, usePageLanding } from "./deepLinksFlag";
 import { useOpenInAppRowSlot } from "./openInAppRowSlots";
 
@@ -125,34 +138,63 @@ function OpenInAppOfferGate({ landing }: { landing: Landing }) {
     );
   }, [location.hash, location.pathname, location.search, markerInAddress, navigate]);
 
+  // What the offer's events say about it (utils/openInAppTrace: kinds, never the address).
+  const signedIn = useAuthStore((s) => s.user !== null);
+  const link = openInAppLinkOf(landing.pathname, landing.search);
+  const rowEvent = useMemo<OpenInAppContext>(() => ({ surface: "phone_row", link, signedIn }), [link, signedIn]);
+  const sheetEvent = useMemo<OpenInAppContext>(() => ({ surface: "phone_sheet", link, signedIn }), [link, signedIn]);
+
   const dismissBar = useCallback(() => {
     writeDismissed();
     answerPageLandingOffer();
     setBarDismissed(true);
-  }, []);
+    reportOpenInAppStay(rowEvent);
+  }, [rowEvent]);
   const closeSheet = useCallback(() => {
     writeDismissed();
     answerPageLandingOffer();
     setSheetClosed(true);
-  }, []);
+    reportOpenInAppStay(sheetEvent);
+  }, [sheetEvent]);
+  const openApp = useCallback(() => {
+    answerPageLandingOffer();
+    reportOpenInAppOpen(rowEvent);
+  }, [rowEvent]);
+  // The trace's step (slock.open_in_app) and the product event (app_download_clicked), both at the click.
+  // The sheet says where its button goes, so the count cannot differ from the link.
+  const downloadFromSheet = useCallback((target: SheetDownloadTarget) => {
+    reportOpenInAppDownload(sheetEvent, "opening");
+    trackMobileDownloadClicked("phone_sheet", target, "new_tab"); // the sheet's button opens beside this page
+  }, [sheetEvent]);
 
-  if (!enabled) return null;
   const appMissing = hasAppMissingMarker(landing.search);
   const href = openInAppUrl(landing.pathname, landing.search, window.location.host);
+  const showsBar = enabled && !appMissing && !barDismissed && !!href;
+  const showsSheet = enabled && appMissing && !sheetClosed;
+  // Once per landed page each, when it first shows: the row offered, the sheet's "not installed"
+  // (the row moves between the shell's strip and a composer's footer, mounting again).
+  const [reportRowOffered] = useState(() => reportOncePerOffer(reportOpenInAppOffered));
+  const [reportSheetMissing] = useState(() => reportOncePerOffer(reportOpenInAppMissing));
+  const rowShown = useCallback(() => reportRowOffered(rowEvent), [reportRowOffered, rowEvent]);
+  const sheetShown = useCallback(() => reportSheetMissing(sheetEvent), [reportSheetMissing, sheetEvent]);
+
+  if (!enabled) return null;
   // Back with app=missing: the sheet takes the row's place.
-  const bar = appMissing || barDismissed || !href ? null : (
+  const bar = !showsBar || !href ? null : (
     <OpenInAppBar
       href={href}
       message={parseMessageLink(landing.pathname, landing.search) !== null}
       aboveComposer={slot !== null}
-      onOpen={answerPageLandingOffer}
+      onOpen={openApp}
       onDismiss={dismissBar}
     />
   );
   return (
     <>
       {bar && slot ? createPortal(bar, slot) : bar}
-      {appMissing && !sheetClosed ? <AppMissingSheet onClose={closeSheet} /> : null}
+      {bar ? <ReportShown onShown={rowShown} /> : null}
+      {showsSheet ? <AppMissingSheet onClose={closeSheet} onDownload={downloadFromSheet} /> : null}
+      {showsSheet ? <ReportShown onShown={sheetShown} /> : null}
     </>
   );
 }
@@ -224,7 +266,10 @@ function OpenInAppBar({ href, message, aboveComposer, onOpen, onDismiss }: {
   );
 }
 
-function AppMissingSheet({ onClose }: { onClose: () => void }) {
+/** Where the sheet's button goes: the App Store on iOS, the /download page on Android. */
+type SheetDownloadTarget = "ios" | "download_page";
+
+function AppMissingSheet({ onClose, onDownload }: { onClose: () => void; onDownload: (target: SheetDownloadTarget) => void }) {
   const { formatMessage } = useIntl();
   const ios = isIosUserAgent(typeof navigator === "undefined" ? "" : navigator.userAgent);
   // iOS: the App Store through the download entry, as the download page does.
@@ -232,6 +277,8 @@ function AppMissingSheet({ onClose }: { onClose: () => void }) {
   // without Google Play). Both open beside this page, so the link stays.
   const downloadHref = ios ? mobileDownloadUrl("ios") : MOBILE_DOWNLOAD_CHOOSER_PATH;
   const downloadLabel = formatMessage({ id: "openInApp.missing.download" });
+  // The target reported is the one the link above goes to.
+  const handleDownload = useCallback(() => onDownload(ios ? "ios" : "download_page"), [onDownload, ios]);
   // Swiping the sheet away is Keep Using the Web.
   const handleOpenChange = useCallback((next: boolean) => {
     if (!next) onClose();
@@ -262,6 +309,7 @@ function AppMissingSheet({ onClose }: { onClose: () => void }) {
                   aria-label={opensInNewTabAriaLabel(formatMessage, downloadLabel)}
                 />
               )}
+              onClick={handleDownload}
               data-testid="open-in-app-download"
             >
               {downloadLabel}

@@ -21,9 +21,10 @@ function HeaderValueInput({
   const id = useId();
   const handleChange = useCallback((event: ChangeEvent<HTMLInputElement>) => onChange(name, event.target.value), [name, onChange]);
   return (
-    <FormField label={<span className="font-mono">{name}</span>} size="compact" htmlFor={id} required>
+    <FormField label={<span className="font-mono">{name}</span>} size="compact" htmlFor={id}>
       <Input
         id={id}
+        aria-required="true"
         type="password"
         autoComplete="new-password"
         value={value}
@@ -113,9 +114,10 @@ export function McpConnectionForm({
       {title ? <h4 className="text-subhead font-bold text-foreground">{title}</h4> : null}
 
       {mode === "add" ? (
-        <FormField label={formatMessage({ id: "settings.mcpApp.connections.nameLabel" })} size="compact" required>
+        <FormField label={formatMessage({ id: "settings.mcpApp.connections.nameLabel" })} size="compact">
           <Input
             type="text"
+            aria-required="true"
             value={name}
             onChange={handleName}
             className="w-full"

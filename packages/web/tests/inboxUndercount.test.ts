@@ -146,7 +146,7 @@ test("a message the store first got from a sync:resume counts once when its mess
     served = [channel({ lastMessageId: "a-2", latestActivitySeq: "101", unreadCount: 1 })];
     await useInboxStore.getState().loadInbox({ reset: true, background: true, reason: "realtime_fallback" });
     assert.equal(details.length, 1);
-    assert.match(details[0], /;result=match;.*;counts=1;late=0;via=sync$/);
+    assert.match(details[0], /;result=match;.*;counts=1;late=0;via=sync;open=0;event=message:new$/);
   } finally { restore(); }
 });
 

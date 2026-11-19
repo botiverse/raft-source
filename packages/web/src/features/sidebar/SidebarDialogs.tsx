@@ -57,7 +57,7 @@ export function SidebarDialogs({ data, view, menuActions }: {
       })()}
       {deleteConfirm?.type === "channel" && (() => {
         const label = {
-          title: formatMessage({ id: "layout.sidebar.deleteChannelTitle" }),
+          title: formatMessage({ id: "layout.sidebar.deleteChannelConfirmTitle" }),
           confirmLabel: formatMessage({ id: "layout.sidebar.deleteChannelTitle" }),
           message: formatMessage({ id: "layout.sidebar.deleteChannelMessage" }, { name: deleteConfirm.name }),
         };
@@ -131,7 +131,7 @@ export function SidebarDialogs({ data, view, menuActions }: {
 
       {deleteSectionConfirm && (
         <ConfirmDialog
-          title={formatMessage({ id: "layout.sidebar.deleteSection" })}
+          title={formatMessage({ id: "layout.sidebar.deleteSectionTitle" })}
           message={formatMessage(
             { id: "layout.sidebar.deleteSectionMessage" },
             { name: deleteSectionConfirm.name },

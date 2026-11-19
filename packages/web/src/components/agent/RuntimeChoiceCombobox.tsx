@@ -13,10 +13,11 @@ import {
 import type { ComboboxProps } from "@botiverse/raft-ui";
 import { ChevronDown } from "lucide-react";
 import { useCallback, useMemo, useRef, useState } from "react";
-import type { ReactNode, RefObject } from "react";
+import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
 import StableField from "./StableField";
 import type { RuntimeOption } from "./RuntimeConfigFields";
+import { shownOptionId } from "./runtimeChoiceOptionId";
 
 /** Item value of the "use what I typed" row (custom value fields only). */
 const CUSTOM_ITEM_PREFIX = "__runtime_form_v2_custom__:";
@@ -51,11 +52,11 @@ type RuntimeChoiceComboboxProps = {
   /** The value is one the person typed on purpose (not a listed choice that went away). */
   customValue?: boolean;
   placeholder: string;
-  portalContainer?: RefObject<HTMLElement | null>;
   testId: string;
   /** Set by StableField on its adopted control; forwarded to the input, as RuntimeSelectControl does. */
   "data-invalid"?: string;
   "aria-describedby"?: string;
+  "aria-required"?: "true";
 };
 
 /**
@@ -91,10 +92,10 @@ export function RuntimeChoiceCombobox({
   allowCustom,
   customValue = false,
   placeholder,
-  portalContainer,
   testId,
   "data-invalid": dataInvalid,
   "aria-describedby": ariaDescribedBy,
+  "aria-required": ariaRequired,
 }: RuntimeChoiceComboboxProps) {
   const { formatMessage } = useIntl();
   const [query, setQuery] = useState("");
@@ -162,7 +163,6 @@ export function RuntimeChoiceCombobox({
     setOpen(next);
     setQuery("");
   }, []);
-  const portalProps = useMemo(() => (portalContainer ? { container: portalContainer } : undefined), [portalContainer]);
   const groups = useMemo(() => groupOptions(filtered), [filtered]);
   return (
     <>
@@ -189,12 +189,13 @@ export function RuntimeChoiceCombobox({
             data-testid={testId}
             data-invalid={dataInvalid}
             aria-describedby={ariaDescribedBy}
+            aria-required={ariaRequired}
             suppressPasswordManager
           />
           <ChevronDown aria-hidden />
         </ComboboxControl>
         {/* The popup is as wide as the whole field, not just its text input. */}
-        <ComboboxContent align="start" anchor={controlRef} className="w-(--anchor-width)" portalProps={portalProps}>
+        <ComboboxContent align="start" anchor={controlRef} className="w-(--anchor-width)">
           <ComboboxList>
             {groups.map((group) => group.label ? (
               <ComboboxGroup key={group.label}>
@@ -221,7 +222,7 @@ export function RuntimeChoiceCombobox({
 }
 
 function renderOption(option: RuntimeOption) {
-  const id = option.label !== option.value ? option.value : null;
+  const id = shownOptionId(option.value, option.label);
   return (
     <ComboboxItem key={option.value} value={option.value} disabled={option.disabled}>
       <span className="flex min-w-0 flex-col">

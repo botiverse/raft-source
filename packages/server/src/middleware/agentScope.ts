@@ -28,6 +28,12 @@ import {
 } from "@botiverse/raft-shared";
 import { loadAgentScopes, AgentScopesNotFoundError } from "../services/agentScopesService";
 import * as agentService from "../services/agentService";
+import { refuse } from "../lib/refusal";
+import {
+  AGENT_NOT_ON_THIS_COMPUTER_REFUSAL,
+  MACHINE_AGENT_NOT_FOUND_REFUSAL,
+  MACHINE_AUTH_REQUIRED_REFUSAL,
+} from "../routes/agentRouteRefusals";
 import { runWithTraceAttrs } from "../tracing/semanticTrace";
 import { agentIdHashAttrs, serverIdHashAttrs } from "../tracing/traceIdentity";
 
@@ -79,17 +85,18 @@ export function requireAgentScope(scope: AgentScope): RequestHandler<any> {
     }
 
     if (!req.machineId || !req.serverId) {
-      res.status(401).json({ error: "Machine authentication required" });
+      refuse(res, 401, MACHINE_AUTH_REQUIRED_REFUSAL);
       return;
     }
 
     const agent = await agentService.getAgent(agentId);
+    // The same answers as internal.ts loadOwnedMachineAgent, for routes that check there.
     if (!agent || agent.serverId !== req.serverId) {
-      res.status(404).json({ error: "Agent not found" });
+      refuse(res, 404, MACHINE_AGENT_NOT_FOUND_REFUSAL);
       return;
     }
     if (agent.machineId !== req.machineId) {
-      res.status(403).json({ error: "This agent is not assigned to your machine" });
+      refuse(res, 403, AGENT_NOT_ON_THIS_COMPUTER_REFUSAL);
       return;
     }
 
@@ -127,6 +134,7 @@ export function requireAgentScope(scope: AgentScope): RequestHandler<any> {
 
     req.scopeDenyReason = denyReason;
     req.scopeRequired = scope;
+    // refusal-ok: the scope-deny shape: the CLI branches on top-level requiredScope (cli/src/client.ts); internalAgentApi.ts answers the same
     res.status(403).json({
       error: "missing required scope",
       requiredScope: scope,

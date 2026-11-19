@@ -2,8 +2,15 @@
 // evaluateFeatureFlags answers it without Feature Flag Admin, the same for
 // every server and user, and still asks the store for every other key.
 import assert from "node:assert/strict";
+import { DEPLOYMENT_ANSWERED_FEATURE_FLAG_KEYS } from "@botiverse/raft-shared";
+import { firstPartyApps } from "../apps/firstPartyApps";
 import type { DatabaseExecutor } from "../db/index";
-import { __answerFlagForTests, answerFlagFromDeployment, deploymentAnswerOf } from "./deploymentAnsweredFlags";
+import {
+  __answerFlagForTests,
+  answerFlagFromDeployment,
+  deploymentAnswerOf,
+  registeredDeploymentAnsweredFlagKeys,
+} from "./deploymentAnsweredFlags";
 import { evaluateFeatureFlag, evaluateFeatureFlags } from "./featureFlagService";
 
 const KEY = "deployment_answered_test_v0";
@@ -15,6 +22,14 @@ const NO_STORE = new Proxy({}, { get: (_target, property) => { throw new Error(`
 afterEach(() => {
   __answerFlagForTests(KEY, undefined);
   __answerFlagForTests(OTHER, undefined);
+});
+
+test("DEPLOYMENT_ANSWERED_FEATURE_FLAG_KEYS stays in lockstep with server registrations", () => {
+  firstPartyApps();
+  assert.deepEqual(
+    registeredDeploymentAnsweredFlagKeys().filter((key) => key !== KEY).sort(),
+    [...DEPLOYMENT_ANSWERED_FEATURE_FLAG_KEYS].sort(),
+  );
 });
 
 test("a key nobody registered is Feature Flag Admin's: no deployment answer", () => {

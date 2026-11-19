@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 
 import { eq } from "drizzle-orm";
 import {
+  RUNTIME_AUTH_LOGIN_START_LIMIT,
   RUNTIME_AUTH_RUNTIMES,
   RUNTIME_AUTH_V1_RUNTIMES,
   RUNTIME_AUTH_V2_RUNTIMES,
@@ -169,7 +170,7 @@ test("task #17: the attacher and server owners/admins may sign a runtime in; oth
     availability: "ok",
     runtimes: RUNTIME_AUTH_RUNTIMES.filter((runtime) => runtime !== "antigravity"),
     // Pi signs out per provider on a daemon with its capability (this fake's default: every runtime).
-    logoutRuntimes: ["claude", "codex", "kimi", "pi", "grok", "opencode", "codebuddy"],
+    logoutRuntimes: ["claude", "codex", "kimi", "pi", "grok", "opencode"],
     canAct: true,
   }, "Antigravity only where its flag is on");
   assert.equal((await calls.login(tokens.attacher, "qwen")).status, 404, "Qwen Code has a provider key, not a sign-in");
@@ -390,43 +391,6 @@ test("Antigravity is offered only where agent_runtime_oar_antigravity revives it
   const upgrade = await onCalls.login(on.tokens.attacher, "antigravity");
   assert.equal(upgrade.status, 409);
   assert.equal((await upgrade.json() as { code: string }).code, "computer_upgrade_required");
-  assert.equal(older.commands.length, 0);
-});
-
-test("CodeBuddy Code is signed in and out with no server flag, only on a Computer whose daemon knows it", async ({ app }) => {
-  __clearRuntimeAuthLocalStoreForTests();
-  const current = fakeOrchestrator();
-  app.app.set("agentOrchestrator", current.orchestrator);
-  const stored = {
-    collectedAt: "2026-11-13T10:00:00.000Z",
-    runtimes: { claude: { kind: "logged_in" }, codebuddy: { kind: "logged_in" } },
-  } as const;
-  const read = async (calls: ReturnType<typeof api>, token: string) =>
-    await (await calls.status(token)).json() as { status: { runtimes: Record<string, unknown> } | null; runtimes: string[]; logoutRuntimes: string[] };
-
-  // Like Qoder, no server flag: offered, its status read, its login and logout relayed.
-  const seeded = await seedComputer("rtauth-cb");
-  const calls = api(app.baseUrl, seeded.server.id, seeded.machine.id);
-  await runtimeAuthService.recordStatus(seeded.machine.id, stored);
-  const view = await read(calls, seeded.tokens.attacher);
-  assert.deepEqual(view.status?.runtimes, stored.runtimes);
-  assert.ok(view.runtimes.includes("codebuddy") && view.logoutRuntimes.includes("codebuddy"));
-  const started = await calls.login(seeded.tokens.attacher, "codebuddy");
-  assert.equal(started.status, 200);
-  assert.deepEqual(current.commands.at(-1)?.message, { type: "machine:runtime_auth:login:start", loginId: (await started.json() as { loginId: string }).loginId, runtime: "codebuddy" });
-  await endLogin(current.commands.at(-1)!.message.loginId!);
-  const logout = await calls.logout(seeded.tokens.attacher, "codebuddy");
-  assert.equal(logout.status, 200);
-  assert.deepEqual(await logout.json(), { result: { kind: "logged_out" } });
-
-  // A Computer from before CodeBuddy's sign-in: the upgrade answer, nothing sent.
-  const older = fakeOrchestrator({ runtimes: RUNTIME_AUTH_RUNTIMES.filter((runtime) => runtime !== "codebuddy"), logoutRuntimes: ["claude", "codex", "kimi"] });
-  app.app.set("agentOrchestrator", older.orchestrator);
-  assert.ok(!(await read(calls, seeded.tokens.attacher)).runtimes.includes("codebuddy"));
-  for (const upgrade of [await calls.login(seeded.tokens.attacher, "codebuddy"), await calls.logout(seeded.tokens.attacher, "codebuddy")]) {
-    assert.equal(upgrade.status, 409);
-    assert.equal((await upgrade.json() as { code: string }).code, "computer_upgrade_required");
-  }
   assert.equal(older.commands.length, 0);
 });
 
@@ -867,4 +831,16 @@ test("OpenCode is signed in only on a Computer whose daemon knows it (OAR 0.100)
   assert.equal(older.commands.length + older.connects.length, 0);
   const view = await (await calls.status(tokens.attacher)).json() as { runtimes: string[]; logoutRuntimes: string[] };
   assert.ok(!view.runtimes.includes("opencode") && !view.logoutRuntimes.includes("opencode"), "the web offers the upgrade instead");
+});
+
+// Tenny's 1.28.0 review: a sign-out runs on the Computer and can answer at
+// once (respondAsync), so it is bounded per person and Computer like a connect.
+test("sign-outs are bounded per person and Computer", async ({ app }) => {
+  __clearRuntimeAuthLocalStoreForTests();
+  const { server, machine, tokens } = await seedComputer("rtauth-logout-limit");
+  app.app.set("agentOrchestrator", fakeOrchestrator().orchestrator);
+  const calls = api(app.baseUrl, server.id, machine.id);
+  for (let i = 0; i < RUNTIME_AUTH_LOGIN_START_LIMIT; i += 1) assert.equal((await calls.logout(tokens.attacher)).status, 200, `sign-out ${i + 1}`);
+  assert.equal((await calls.logout(tokens.attacher)).status, 429, "over the limit");
+  assert.equal((await calls.logout(tokens.owner)).status, 200, "another person has their own");
 });

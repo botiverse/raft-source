@@ -5,6 +5,7 @@ import Tooltip from "../../../components/ui/Tooltip";
 import SectionEyebrow from "../../../components/ui/SectionEyebrow";
 import {
   OAUTH_SCOPE_PRESENTATION,
+  OAUTH_SCOPE_TIERS,
   hasAgentInboundOAuthScope,
   isVisibleOAuthScope,
   normalizeVisibleOAuthScopes,
@@ -35,11 +36,10 @@ export function OAuthScopeList({
   const visibleScopes = normalizeVisibleOAuthScopes(shownScopes);
   const unrecognizedScopes = shownScopes.filter((scope) => !isVisibleOAuthScope(scope));
   const unrecognizedCopy = formatMessage({ id: "appPermissionSet.unrecognizedScope" });
-  const grouped: Record<OAuthScopeTier, RaftOAuthScopeId[]> = {
-    identity: visibleScopes.filter((scope) => OAUTH_SCOPE_PRESENTATION[scope].tier === "identity"),
-    agent_directory: visibleScopes.filter((scope) => OAUTH_SCOPE_PRESENTATION[scope].tier === "agent_directory"),
-    agent_messaging: visibleScopes.filter((scope) => OAUTH_SCOPE_PRESENTATION[scope].tier === "agent_messaging"),
-  };
+  const grouped = Object.fromEntries(OAUTH_SCOPE_TIERS.map((tier) => [
+    tier,
+    visibleScopes.filter((scope) => OAUTH_SCOPE_PRESENTATION[scope].tier === tier),
+  ])) as Record<OAuthScopeTier, RaftOAuthScopeId[]>;
 
   return (
     <div className="stack-y-3" data-testid="oauth-scope-list">
@@ -72,7 +72,7 @@ export function OAuthScopeList({
         </div>
       ) : (
         <>
-          {(["identity", "agent_directory", "agent_messaging"] as OAuthScopeTier[]).map((tier) => {
+          {OAUTH_SCOPE_TIERS.map((tier) => {
             const tierScopes = grouped[tier];
             if (tierScopes.length === 0) return null;
             return (

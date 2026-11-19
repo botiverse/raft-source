@@ -79,8 +79,6 @@ export function TransferComputerOwnerDialog({
   const [saving, setSaving] = useState(false);
   const [failed, setFailed] = useState(false);
   const controlRef = useRef<HTMLDivElement | null>(null);
-  const formRef = useRef<HTMLFormElement | null>(null);
-  const portalProps = useMemo(() => ({ container: formRef }), []);
   const ready = choice === "public" ? ownerUserId !== null : personId !== null;
 
   const handleOpenChange = useCallback((open: boolean) => {
@@ -121,8 +119,8 @@ export function TransferComputerOwnerDialog({
           </DialogHeader>
         )}
       >
-        <DialogBody className="grid gap-4 font-normal">
-          <form ref={formRef} className="grid gap-4" onSubmit={handleSubmit} noValidate>
+        <DialogBody className="grid gap-4 font-normal" unstable_scrollArea>
+          <form className="grid gap-4" onSubmit={handleSubmit} noValidate>
             <DialogDescription>
               {formatMessage({ id: "machine.owner.dialog.description" }, { computer: computerName })}
             </DialogDescription>
@@ -165,7 +163,7 @@ export function TransferComputerOwnerDialog({
                     />
                     <ChevronDown aria-hidden />
                   </ComboboxControl>
-                  <ComboboxContent align="start" anchor={controlRef} className="w-(--anchor-width)" portalProps={portalProps}>
+                  <ComboboxContent align="start" anchor={controlRef} className="w-(--anchor-width)">
                     <ComboboxList>
                       {(userId: string) => (
                         <ComboboxItem key={userId} value={userId} data-testid={`transfer-owner-person-${userId}`}>

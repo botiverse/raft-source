@@ -26,8 +26,12 @@ delete process.env.SLOCK_DEVICE_LOGIN_ENABLED;
 const capture = installRouteRegistrationCapture();
 afterAll(() => capture.restore());
 
-/** Route ("METHOD /path" as registered) -> where its gate is called and for what. */
-const GATED_ROUTES: Record<string, { file: string; action: StepUpAction }> = {
+/**
+ * Route ("METHOD /path" as registered) -> where its gate is called and for what.
+ * `onlyForReason`: the route is gated by the body's `reason`, only that one
+ * needs the second factor; `handler` is the registration as written in `file`.
+ */
+const GATED_ROUTES: Record<string, { file: string; action: StepUpAction; onlyForReason?: { reason: string; handler: string } }> = {
   "PATCH /api/auth/me": { file: "routes/auth.ts", action: "password_change" },
   "DELETE /api/auth/identities/:provider": { file: "routes/auth.ts", action: "identity_unlink" },
   "POST /api/auth/:provider/link/start": { file: "routes/auth.ts", action: "identity_link" },
@@ -48,6 +52,19 @@ const GATED_ROUTES: Record<string, { file: string; action: StepUpAction }> = {
   "POST /api/integrations/clients": { file: "routes/integrations.ts", action: "integration_app_register" },
   "POST /api/integrations/clients/:clientId/regenerate-secret": { file: "routes/integrations.ts", action: "integration_client_secret_regenerate" },
   "POST /api/integrations/clients/:clientId/app-notifications/webhook/rotate-secret": { file: "routes/integrations.ts", action: "integration_webhook_secret_rotate" },
+  // Signing out the person's other sign-ins, by reason (#triage:#386): `lost_device` (disconnects
+  // what they approved) needs the second factor; `sign_out` (logout-like: what they approved keeps
+  // working) only the recent re-authentication on this sign-in both reasons need.
+  "DELETE /api/me/sessions/:familyId": {
+    file: "routes/mySessions.ts",
+    action: "session_revoke",
+    onlyForReason: { reason: "lost_device", handler: 'mySessionsRouter.delete("/:familyId"' },
+  },
+  "POST /api/me/sessions/revoke-others": {
+    file: "routes/mySessions.ts",
+    action: "session_revoke",
+    onlyForReason: { reason: "lost_device", handler: 'mySessionsRouter.post("/revoke-others"' },
+  },
 };
 
 /**
@@ -115,10 +132,13 @@ const SENSITIVE_ROUTE_PATTERNS: Array<{ kind: string; pattern: RegExp }> = [
   // A path segment naming a token or secret (not a `:token` parameter), and the Login Token exchange.
   { kind: "token or secret", pattern: /^\w+ \/(?:api|internal|oidc)\/(?:.*\/)?[\w-]*(?:token|secret)[\w-]*(?:\/|$)/i },
   { kind: "token or secret", pattern: /^POST \/api\/agent\/login$/ },
+  // Signing out the person's own other sign-ins (routes/mySessions.ts).
+  { kind: "sign-ins", pattern: /^(?:POST|DELETE|PATCH|PUT) \/api\/me\/sessions(?:\/|$)/ },
 ];
 
 /** Matching routes that need no step-up, and why. */
 const EXEMPTIONS: Record<string, string> = {
+  "POST /api/agents/:id/voice/calls/:callId/token": "renews a short-lived media room token for the caller's own running call (start rule re-read); not an account credential or a sensitive action (Tenny, #14860)",
   "POST /api/auth/:provider/callback": "provider redirect; a link is bound to its gated /:provider/link/start (signed state)",
   "POST /api/auth/:provider/complete": "link mode is bound to a gated start; login mode is a sign-in (its pending link waits for the second step)",
   "POST /api/auth/mobile/oauth/complete": "link mode is bound to a gated start's transaction and user; login mode is a sign-in",
@@ -211,6 +231,31 @@ test("the gate calls in the source are exactly GATED_ROUTES, by file and action"
   for (const { file, action } of Object.values(GATED_ROUTES)) (expected[file] ??= []).push(action);
   for (const actions of Object.values(expected)) actions.sort();
   assert.deepEqual(found, expected);
+});
+
+test("a route gated by reason calls the gate for that reason only, once, after re-authentication for every reason", () => {
+  const sources = productionSources();
+  const byReason = Object.entries(GATED_ROUTES).filter(([, { onlyForReason }]) => onlyForReason);
+  assert.deepEqual(byReason.map(([route]) => route).sort(), ["DELETE /api/me/sessions/:familyId", "POST /api/me/sessions/revoke-others"]);
+  for (const [route, { file, action, onlyForReason }] of byReason) {
+    const { reason, handler } = onlyForReason!;
+    const source = sources.get(file) ?? "";
+    const start = source.indexOf(handler);
+    assert.ok(start >= 0, `${route}: ${handler} in ${file}`);
+    const end = source.indexOf("\n});\n", start);
+    const body = source.slice(start, end < 0 ? undefined : end);
+    assert.equal([...body.matchAll(/(?<![\w$])refuseWithoutRecentSecondFactor\(/g)].length, 1, `${route}: one gate call`);
+    const calls = [...body.matchAll(/^\s*if \((.*?)\brefuseWithoutRecentSecondFactor\([^;]*?"([a-z_]+)"\)\) return;$/gm)];
+    assert.deepEqual(
+      calls.map((match) => [match[1], match[2]]),
+      [[`reason === "${reason}" && await `, action]],
+      `${route}: the one gate call is \`if (reason === "${reason}" && await refuseWithoutRecentSecondFactor(..., "${action}")) return;\``,
+    );
+    // Every reason re-authenticates first; the reason is the parsed body's, not a default.
+    const reasonAt = body.indexOf("const reason = reasonOf(req, res);");
+    const reauthAt = body.indexOf("if (await refuseWithoutRecentReauthentication(res, ");
+    assert.ok(reasonAt >= 0 && reauthAt > reasonAt && body.indexOf(calls[0]![0]) > reauthAt, `${route}: reason, then re-authentication, then the gate`);
+  }
 });
 
 test("each approval in APPROVAL_GATED_ROUTES refuses an unverified approver, and no other handler calls it", () => {

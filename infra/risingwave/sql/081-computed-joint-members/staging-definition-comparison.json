@@ -1,0 +1,101 @@
+{
+  "definitionExportSha256": "39b1696fcb5fdd19e0581a44c961d3f7ca08f7f8d719d5f3977963136b5ea7f5",
+  "viewCount": 13,
+  "rows": [
+    {
+      "new": "rw_subs_jcm_v1",
+      "actual": "rw_subs_v2",
+      "whitelistedChanges": [
+        "intentional shared human membership substitution"
+      ],
+      "remainingTokenDifference": false
+    },
+    {
+      "new": "rw_muted_subs_jcm_v1",
+      "actual": "rw_muted_subs_v1",
+      "whitelistedChanges": [
+        "intentional shared human membership substitution"
+      ],
+      "remainingTokenDifference": false
+    },
+    {
+      "new": "rw_inbox_normal_jcm_v1",
+      "actual": "rw_inbox_normal_v5",
+      "whitelistedChanges": [],
+      "remainingTokenDifference": false
+    },
+    {
+      "new": "rw_inbox_muted_full_jcm_v1",
+      "actual": "rw_inbox_muted_full_v2",
+      "whitelistedChanges": [],
+      "remainingTokenDifference": false
+    },
+    {
+      "new": "rw_inbox_muted_prefix_jcm_v1",
+      "actual": "rw_inbox_muted_prefix_v2",
+      "whitelistedChanges": [],
+      "remainingTokenDifference": false
+    },
+    {
+      "new": "rw_task_conversation_unread_jcm_v1",
+      "actual": "rw_task_conversation_unread_v1",
+      "whitelistedChanges": [],
+      "remainingTokenDifference": false
+    },
+    {
+      "new": "rw_inbox_mention_jcm_v1",
+      "actual": "rw_inbox_mention_v7",
+      "whitelistedChanges": [
+        "intentional shared human membership substitution"
+      ],
+      "remainingTokenDifference": false
+    },
+    {
+      "new": "rw_activity_watermark_jcm_v1",
+      "actual": "rw_activity_watermark_v7",
+      "whitelistedChanges": [
+        "intentional shared human membership substitution"
+      ],
+      "remainingTokenDifference": false
+    },
+    {
+      "new": "rw_inbox_items_jcm_v1",
+      "actual": "rw_inbox_items_v13",
+      "whitelistedChanges": [
+        "intentional shared human membership substitution"
+      ],
+      "remainingTokenDifference": false
+    },
+    {
+      "new": "rw_inbox_serving_jcm_v1",
+      "actual": "rw_inbox_serving_v9",
+      "whitelistedChanges": [
+        "five preview joins: lm/fu/tfu/ma sequence, pm parent-id"
+      ],
+      "remainingTokenDifference": false
+    },
+    {
+      "new": "rw_activity_totals_jcm_v1",
+      "actual": "rw_activity_totals_v7",
+      "whitelistedChanges": [],
+      "remainingTokenDifference": false
+    },
+    {
+      "new": "rw_agent_inbox_jcm_v1",
+      "actual": "rw_agent_inbox_v7",
+      "whitelistedChanges": [],
+      "remainingTokenDifference": false
+    },
+    {
+      "new": "rw_conversation_unread_jcm_v1",
+      "actual": "rw_conversation_unread_v4",
+      "whitelistedChanges": [
+        "intentional shared human membership substitution",
+        "conversation sequence preview join",
+        "muted-full v1 to v2 aggregate equivalence requires separate proof"
+      ],
+      "remainingTokenDifference": false
+    }
+  ],
+  "allRemainingExpressionsMatch": true
+}

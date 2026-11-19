@@ -1,5 +1,6 @@
 export const FEATURE_FLAG_ADMIN_OPERATOR_ROLE = "feature_flag_admin_operator";
 export const FEATURE_FLAG_ADMIN_ANNOUNCEMENT_RULES_REACH_FUNCTION = "public.announcement_rules_reach(jsonb, text, uuid[], uuid[], timestamptz)";
+export const FEATURE_FLAG_ADMIN_SERVER_PLAN_ENTITLEMENT_INPUTS_FUNCTION = "public.ffa_server_plan_entitlement_inputs(uuid, timestamptz)";
 
 export const REQUIRED_FEATURE_FLAG_ADMIN_PRIVILEGES = [
   { kind: "schema", object: "public", privilege: "USAGE" },
@@ -140,6 +141,9 @@ export const REQUIRED_FEATURE_FLAG_ADMIN_PRIVILEGES = [
   // Announcement reach with audience rules, 0617: a count-only SECURITY DEFINER function, so the
   // role still cannot read users.created_at / display_language or servers.created_at itself.
   { kind: "function", object: FEATURE_FLAG_ADMIN_ANNOUNCEMENT_RULES_REACH_FUNCTION, privilege: "EXECUTE" },
+  // Single-server plan entitlement inputs for feature-flag preview, 0716: non-secret fields only,
+  // so appsumo_licenses, appsumo_license_bindings, and prepaid_pro_purchases remain unreadable.
+  { kind: "function", object: FEATURE_FLAG_ADMIN_SERVER_PLAN_ENTITLEMENT_INPUTS_FUNCTION, privilege: "EXECUTE" },
 ] as const;
 
 // Column-level writes the operator may hold on lab_definitions (0303). Anything else stays unexpected.
@@ -251,6 +255,7 @@ function isExpectedEffectiveColumnPrivilege(
 export const FORBIDDEN_FEATURE_FLAG_ADMIN_PRIVILEGES = [
   { kind: "schema", object: "public", privilege: "CREATE" },
   { kind: "function", object: FEATURE_FLAG_ADMIN_ANNOUNCEMENT_RULES_REACH_FUNCTION, privilege: "EXECUTE WITH GRANT OPTION" },
+  { kind: "function", object: FEATURE_FLAG_ADMIN_SERVER_PLAN_ENTITLEMENT_INPUTS_FUNCTION, privilege: "EXECUTE WITH GRANT OPTION" },
   { kind: "schema", object: "public", privilege: "USAGE WITH GRANT OPTION" },
   { kind: "schema", object: "public", privilege: "CREATE WITH GRANT OPTION" },
   { kind: "table", object: "public.announcements", privilege: "SELECT WITH GRANT OPTION" },

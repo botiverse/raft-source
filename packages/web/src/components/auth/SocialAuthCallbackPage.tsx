@@ -9,6 +9,7 @@ import type { IntlShape } from "react-intl";
 import { CURRENT_LEGAL_ACCEPTANCE } from "@botiverse/raft-shared";
 import api from "../../api/client";
 import { useAuthStore } from "../../store/authStore";
+import { clearSignupCampaign, signupCampaignBody } from "../../analytics/signupCampaign";
 import { getExternalBrowserLoginUrl, isEmbeddedUserAgentProviderError, PENDING_INVITE_STORAGE_KEY, sanitizeReturnTo, takePendingInviteRedirectPath } from "../../utils/socialAuth";
 import { completeSocialAuthWithOneLinkRefresh } from "../../utils/socialAuthCompletion";
 import { refreshTokensWithDedupe } from "../../utils/refreshCoordinator";
@@ -164,6 +165,8 @@ export default function SocialAuthCallbackPage() {
       const completionBody = {
         ...(pendingLink ? { pendingLinkToken: pendingLink.token } : {}),
         code: callbackParams.code,
+        // The campaign link this tab landed on, for account_created: either post can be the one that creates the account.
+        ...(callbackParams.mode === "link" ? {} : signupCampaignBody()),
         ...(includeLegalAcceptance
           ? {
               acceptTerms: true,
@@ -185,6 +188,8 @@ export default function SocialAuthCallbackPage() {
       const completion = includeLegalAcceptance ? requestCompletion() : initialCompletion.current!.result;
       if (!includeLegalAcceptance) pendingLink = initialCompletion.current!.pendingLink;
       const { data } = await completion;
+      // The completion was taken (an account was created or signed in): a later account in this tab is not that campaign's.
+      clearSignupCampaign();
 
       if (epoch !== completionEpoch.current) return;
 

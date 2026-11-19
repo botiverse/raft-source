@@ -221,15 +221,22 @@ export class RuntimeAuthService {
    * Counts one provider list or connect by this person on this Computer (each
    * starts the runtime's own process there); false once over its limit in
    * the login window. Connects have the login start limit; lists, read each
-   * time the dialog opens, a higher one, counted apart.
+   * time the dialog opens, a higher one, counted apart. A sign-out (`logout`,
+   * Tenny's 1.28.0 review: since it can answer at once and leave the wait
+   * running, nothing else bounds it) has the login start limit too.
    */
-  async allowProviderRequest(kind: "list" | "connect", userId: string, machineId: string): Promise<boolean> {
+  async allowProviderRequest(kind: "list" | "connect" | "logout", userId: string, machineId: string): Promise<boolean> {
     const count = await this.backend.incrementWindow(`${PROVIDER_REQUESTS_PREFIX}:${kind}:${userId}:${machineId}`, STARTS_WINDOW_SECONDS);
     return count <= (kind === "list" ? RUNTIME_AUTH_PROVIDER_LIST_REQUEST_LIMIT : RUNTIME_AUTH_LOGIN_START_LIMIT);
   }
 
   /** Counts one Claude limit-reset read or redeem; false once the person is over the limit on this Computer. */
-  async allowClaudeLimitResetRequest(kind: "read" | "redeem", userId: string, machineId: string): Promise<boolean> {
+  /**
+   * Per person and Computer. Claude's reads and redeems each start Claude Code;
+   * a Codex redeem (`codex_redeem`) is bounded the same way, now that a request
+   * can answer at once and leave the wait running (machineOperations.ts).
+   */
+  async allowClaudeLimitResetRequest(kind: "read" | "redeem" | "codex_redeem", userId: string, machineId: string): Promise<boolean> {
     const count = await this.backend.incrementWindow(`${CLAUDE_LIMIT_RESET_REQUESTS_PREFIX}:${kind}:${userId}:${machineId}`, STARTS_WINDOW_SECONDS);
     return count <= CLAUDE_LIMIT_RESET_REQUEST_LIMIT;
   }

@@ -172,3 +172,50 @@ test("[#480] sortThreadMessages delegates to the shared comparator (returns all 
   assert.equal(sorted.length, 2, "all rows preserved (not emptied)");
   assert.deepEqual(sorted.map((m) => m.id), ["p1", "optimistic-c"], "returns sorted, not input order");
 });
+
+// The thread panel reads its replies itself (useThreadTimeline: first page, catch-up, live thread:updated), outside
+// the store: they raise neither the thread's bucket nor `lastSeq`. The store numbers a row being sent past what it
+// saw (lastSeq 1000), below every reply the panel shows (1100..1102); merged as-is it sorted first, at the top of the
+// thread until its echo replaced it at the bottom.
+const { mergeThreadBucketWithinWindow, mergeThreadMessages } = await import("../threadMessages");
+const reply = (seq: number, minute: number) => msg({ id: `r${seq}`, channelId: "t1", seq, content: `reply ${seq}`, createdAt: `2026-07-03T10:${String(minute).padStart(2, "0")}:00Z` });
+const shownReplies = () => [reply(1100, 0), reply(1101, 1), reply(1102, 2)];
+function sendInThread(id: string, randomId: string, minute: number): Message {
+  useMessageStore.getState().addOptimisticMessage(msg({ id, randomId, channelId: "t1", content: `sent ${id}`, createdAt: `2026-07-03T10:${minute}:00Z` }));
+  return useMessageStore.getState().channelMessages.t1!.find((m) => m.id === id)!;
+}
+const ids = (rows: Message[]) => rows.map((m) => m.id);
+
+test("a reply sent in a thread whose loaded replies the store never saw lands at the bottom, not at the top", () => {
+  useMessageStore.setState({ lastSeq: 1000, channelMessages: {} });
+  sendInThread("optimistic-new", "rnd-new", 5);
+  const merged = mergeThreadBucketWithinWindow(shownReplies(), useMessageStore.getState().channelMessages.t1!, false);
+  assert.deepEqual(ids(merged), ["r1100", "r1101", "r1102", "optimistic-new"]);
+});
+
+test("a reply sent before the thread's first page came stays at the bottom when the page lands", () => {
+  useMessageStore.setState({ lastSeq: 1000, channelMessages: {} });
+  sendInThread("optimistic-early", "rnd-early", 5);
+  // The panel had no replies yet: the bucket brings the row in alone, then the page merges over it (mergeIntoThread).
+  const beforePage = mergeThreadBucketWithinWindow([], useMessageStore.getState().channelMessages.t1!, false);
+  const afterPage = mergeThreadMessages(beforePage, shownReplies());
+  assert.deepEqual(ids(afterPage), ["r1100", "r1101", "r1102", "optimistic-early"]);
+  // And a later bucket change does not put it back at the top.
+  assert.deepEqual(ids(mergeThreadBucketWithinWindow(afterPage, useMessageStore.getState().channelMessages.t1!, false)), ["r1100", "r1101", "r1102", "optimistic-early"]);
+});
+
+test("a reply that comes between the send and its echo goes above the sent rows, and the echo takes their place", () => {
+  useMessageStore.setState({ lastSeq: 1000, channelMessages: {} });
+  sendInThread("optimistic-1", "rnd-1", 5);
+  sendInThread("optimistic-2", "rnd-2", 6);
+  let rows = mergeThreadBucketWithinWindow(shownReplies(), useMessageStore.getState().channelMessages.t1!, false);
+  assert.deepEqual(ids(rows), ["r1100", "r1101", "r1102", "optimistic-1", "optimistic-2"], "sent rows keep their send order");
+  // Numbered before our messages on the server, so it sorts above them now and after their echoes.
+  rows = mergeThreadMessages(rows, [reply(1103, 7)]);
+  assert.deepEqual(ids(rows), ["r1100", "r1101", "r1102", "r1103", "optimistic-1", "optimistic-2"]);
+  rows = mergeThreadMessages(rows, [msg({ id: "e1", randomId: "rnd-1", channelId: "t1", seq: 1104, content: "sent optimistic-1", createdAt: "2026-07-03T10:05:01Z" })]);
+  assert.deepEqual(ids(rows), ["r1100", "r1101", "r1102", "r1103", "e1", "optimistic-2"], "the echo replaces the row in place");
+  // The store's bucket still holds the second row at its own (low) number: merging it again keeps it last.
+  rows = mergeThreadBucketWithinWindow(rows, useMessageStore.getState().channelMessages.t1!, false);
+  assert.deepEqual(ids(rows), ["r1100", "r1101", "r1102", "r1103", "e1", "optimistic-2"]);
+});

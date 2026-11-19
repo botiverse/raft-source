@@ -27,6 +27,21 @@ interface Slot {
 }
 
 const TYPESCRIPT_LOADER_PATTERN = /@oxc-node\/core|tsx/;
+const HEAP_SIZE_FLAG = /^--max-(old|semi)-space-size(=|$)/;
+
+/**
+ * The parent's flags without its V8 heap sizes: a Worker refuses them
+ * (ERR_WORKER_INVALID_EXEC_ARGV), and its heap is `resourceLimits` instead.
+ * Local Vitest forks carry `--max-old-space-size` (scripts/vitest/localRunLimits.ts).
+ */
+function withoutHeapSizeFlags(argv: readonly string[]): string[] {
+  const kept: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (!HEAP_SIZE_FLAG.test(argv[i])) kept.push(argv[i]);
+    else if (!argv[i].includes("=") && /^\d+$/.test(argv[i + 1] ?? "")) i++;
+  }
+  return kept;
+}
 
 /**
  * execArgv for spawned workers: the parent's own flags, plus the repo's
@@ -41,7 +56,7 @@ const TYPESCRIPT_LOADER_PATTERN = /@oxc-node\/core|tsx/;
  * exactly like prod instead of falling back to plain-node type stripping.
  */
 function workerExecArgv(): string[] {
-  const argv = process.execArgv;
+  const argv = withoutHeapSizeFlags(process.execArgv);
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--import" && TYPESCRIPT_LOADER_PATTERN.test(argv[i + 1] ?? "")) return argv;
     if (argv[i].startsWith("--import=") && TYPESCRIPT_LOADER_PATTERN.test(argv[i])) return argv;

@@ -3,6 +3,7 @@ import type {
   LimitResetInspection,
   LimitResetKindStatus,
   LimitResetResult,
+  LimitResetStartupScreen,
   LimitResetUnsupportedReason,
   Runtime,
 } from "@botiverse/oar";
@@ -60,8 +61,10 @@ export type OarLimitResetDeps = {
 export type RuntimeLimitResetReport = {
   /** `<kind>` or `<kind>:<reason>`, e.g. `not_attempted:busy`; never account data. */
   oarOutcome?: string;
-  /** The Claude Code version whose screens OAR read (inspection only). */
+  /** The Claude Code version whose screens OAR read (inspection only), or the banner's on a failed start. */
   claudeVersion?: string;
+  /** On `not_attempted:startup_failed`, OAR's word for the last screen (OAR 0.104); never screen text. */
+  startupScreen?: LimitResetStartupScreen;
 };
 
 /**
@@ -137,6 +140,26 @@ function unsupportedReasonOf(reason: LimitResetUnsupportedReason): WireUnsupport
 
 function oarOutcomeOf(result: { kind: string; reason?: string }): string {
   return result.reason ? `${result.kind}:${result.reason}` : result.kind;
+}
+
+const STARTUP_SCREENS: ReadonlySet<string> = new Set<LimitResetStartupScreen>([
+  "blank", "exited", "trust_unrecognised", "dialog", "prompt_with_text", "no_banner", "unsettled", "unknown",
+]);
+
+/**
+ * What OAR saw when Claude Code failed to start (`startup`, OAR 0.104): the
+ * screen's word (one Raft does not know yet reads as `unknown`) and the
+ * banner's version, so a `startup_failed` on a real machine says which
+ * screen stopped it.
+ */
+function startupReportOf(result: LimitResetResult | LimitResetInspection): RuntimeLimitResetReport {
+  if (result.kind !== "not_attempted" || result.reason !== "startup_failed" || !result.startup) return {};
+  const { screen, version } = result.startup;
+  const label = wireLabel(version);
+  return {
+    startupScreen: STARTUP_SCREENS.has(screen) ? screen : "unknown",
+    ...(label ? { claudeVersion: label } : {}),
+  };
 }
 
 /**
@@ -287,7 +310,7 @@ export async function redeemOarLimitReset(input: {
       ...(claude ? { resetId: input.kind } : {}),
       timeoutMs: input.deps?.timeoutMs ?? (claude ? RUNTIME_LIMIT_RESET_CLAUDE_TIMEOUT_MS : RUNTIME_LIMIT_RESET_REDEEM_TIMEOUT_MS),
     });
-    input.observe?.({ oarOutcome: oarOutcomeOf(result) });
+    input.observe?.({ oarOutcome: oarOutcomeOf(result), ...startupReportOf(result) });
     const fiveHourLimit = result.kind === "unsupported" && result.reason === "consent_required" && input.deps?.fiveHourLimit
       ? await input.deps.fiveHourLimit().catch((): ClaudeFiveHourLimit => "unknown")
       : "unknown";
@@ -332,6 +355,7 @@ export async function readOarLimitResets(input: {
     input.observe?.({
       oarOutcome: oarOutcomeOf(inspection),
       ...(inspection.kind === "inspected" && inspection.version ? { claudeVersion: inspection.version } : {}),
+      ...startupReportOf(inspection),
     });
     return projectOarLimitResetInspection(inspection);
   } catch {

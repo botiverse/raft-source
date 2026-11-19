@@ -1,3 +1,4 @@
+import { INBOX_BACKEND_HEADER } from "@botiverse/raft-shared";
 import api from "./client";
 import { markRwFresh, markRwStale, markRwUnavailable } from "../store/rwFreshness";
 import type { RwSurface, RwUnavailableCode } from "../store/rwFreshness";
@@ -107,24 +108,26 @@ export const getWithRwOverloadRetry = (async (url: string, config?: Parameters<t
  * is unavailable (with the body's RisingWave code, so `rw_unconfigured` can
  * say "temporarily unavailable"). The caller still gets the answer or the error, and keeps
  * what it shows on an error as before. `Retry-After` paces the recovery
- * (store/rwRecovery.ts).
+ * (store/rwRecovery.ts). `backend`: the Activity read's `X-Raft-Inbox-Backend`
+ * (which source answered, as the server says it), or null.
  */
 export async function getRwRead<T = unknown>(
   surface: RwSurface,
   url: string,
   config?: Parameters<typeof api.get>[1],
-): Promise<{ data: T; stale: boolean }> {
+): Promise<{ data: T; stale: boolean; backend: string | null }> {
   try {
     const response = await getWithRwOverloadRetry(url, config);
     // The API client resolves with nothing once a refused refresh signs the
     // session out (api/client.ts): that is the session ending, not an answer.
     if (!response) throw new Error(`No response for ${url}: the session ended`);
+    const backend = readHeader(response.headers, INBOX_BACKEND_HEADER.toLowerCase());
     if (rwStaleReason(response)) {
       markRwStale(surface, parseRetryAfterMs(response.headers));
-      return { data: response.data as T, stale: true };
+      return { data: response.data as T, stale: true, backend };
     }
     markRwFresh(surface);
-    return { data: response.data as T, stale: false };
+    return { data: response.data as T, stale: false, backend };
   } catch (error) {
     if (isUnavailableFailure(error)) {
       const response = (error as { response?: ResponseLike }).response;

@@ -140,6 +140,13 @@ test("the OAuth identity endpoints' per-token key is the token's SHA-256, for th
   for (const path of ["/servers", "/membership"]) {
     assert.equal(oauthIdentityTokenRateLimitKey(oauthRequest({ path, authorization: bearer, server: "acme" })), null, `scoped ${path}`);
   }
+  // Raft voice: Deck asks from its backend for every caller, so per token on either mount; any agent id.
+  for (const path of ["/agents/agent-1/voice/status", "/agents/agent-2/voice/ask"]) {
+    for (const server of [undefined, "acme"]) {
+      assert.equal(oauthIdentityTokenRateLimitKey(oauthRequest({ method: "POST", path, authorization: bearer, server })), sha256Hex(token), `${server ?? "root"} ${path}`);
+    }
+  }
+  assert.equal(oauthIdentityTokenRateLimitKey(oauthRequest({ method: "POST", path: "/agents/a/b/voice/ask", authorization: bearer })), null);
 
   // No Bearer token (no header, another scheme, an empty token): the per-IP limit takes it.
   for (const authorization of [undefined, `Basic ${Buffer.from("client:secret").toString("base64")}`, `bearer ${token}`, "Bearer", "Bearer "]) {

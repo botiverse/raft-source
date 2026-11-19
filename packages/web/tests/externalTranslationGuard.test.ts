@@ -121,7 +121,7 @@ test("markdown component class merging preserves upstream class boundaries", () 
     { className: "incoming", children: createElement("li", null, "item") },
   ));
 
-  assert.equal(container.querySelector("ul")?.className, "incoming mb-1 pl-5 list-disc notranslate");
+  assert.equal(container.querySelector("ul")?.className, "incoming mb-1 ps-5 list-disc notranslate");
 });
 
 test("markdown compact density guards every text container without dropping chrome classes", () => {
@@ -150,13 +150,17 @@ test("markdown compact density guards every text container without dropping chro
 
   assertGuardedClass(container.querySelector("p"), ["mb-1"]);
   assertGuardedClass(container.querySelector("a"), ["text-foreground-link", "select-text"]);
-  assertGuardedClass(container.querySelector("blockquote"), ["border-l-2", "my-1"]);
-  assertGuardedClass(container.querySelector("ul"), ["mb-1", "pl-5", "list-disc"]);
-  assertGuardedClass(container.querySelector("ol"), ["mb-1", "pl-5", "list-decimal"]);
+  assertGuardedClass(container.querySelector("blockquote"), ["border-s-2", "my-1"]);
+  assertGuardedClass(container.querySelector("ul"), ["mb-1", "ps-5", "list-disc"]);
+  assertGuardedClass(container.querySelector("ol"), ["mb-1", "ps-5", "list-decimal"]);
   for (const listItem of container.querySelectorAll("li")) {
     assertGuardedClass(listItem, ["mb-0.5"]);
   }
-  assertGuardedClass(container.querySelector("div > table")?.parentElement ?? null, ["my-2", "overflow-x-auto"]);
+  // A wide table scrolls in a horizontal raft-ui ScrollArea, which carries the guard and the block margin.
+  const tableScroll = container.querySelector("table")?.closest("[data-md-table]") ?? null;
+  assertGuardedClass(tableScroll, ["my-2"]);
+  assert.equal(tableScroll?.getAttribute("data-slot"), "table-scroll");
+  assert.equal(tableScroll?.classList.contains("overflow-x-auto"), false);
   // Table chrome rides the DS hairline and the sunken header fill.
   assertGuardedClass(container.querySelector("th"), ["border-line-hairline", "bg-fill-muted", "whitespace-nowrap"]);
   assertGuardedClass(container.querySelector("td"), ["border", "px-2"]);
@@ -185,8 +189,8 @@ test("markdown document density guards reader-scale overrides", () => {
   }));
 
   assertGuardedClass(container.querySelector("p"), ["mb-3"]);
-  assertGuardedClass(container.querySelector("ul"), ["mb-3", "pl-6", "list-disc"]);
-  assertGuardedClass(container.querySelector("ol"), ["mb-3", "pl-6", "list-decimal"]);
+  assertGuardedClass(container.querySelector("ul"), ["mb-3", "ps-6", "list-disc"]);
+  assertGuardedClass(container.querySelector("ol"), ["mb-3", "ps-6", "list-decimal"]);
   for (const listItem of container.querySelectorAll("li")) {
     assertGuardedClass(listItem, ["mb-1"]);
   }

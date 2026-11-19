@@ -29,8 +29,8 @@ function makeAgent(overrides: Partial<Record<string, unknown>> = {}) {
     avatarUrl: null,
     description: "Runtime engineer",
     allChannelIntroSentAt: null,
-    // The briefing only fires for a running agent: it is a transient wake, so
-    // delivering it to a dead agent loses it while still stamping "sent".
+    // The briefing only fires for a running agent: briefing a dead agent could
+    // lose it while still stamping "sent".
     status: "active",
     sessionId: null,
     model: "sonnet",
@@ -87,6 +87,13 @@ function makeDeps(overrides: Record<string, unknown> = {}): any {
     getHostedOnboardingAgentState: async () => null,
     claimOwnerOpener: async () => new Date("2026-10-14T00:00:00Z"),
     releaseOwnerOpenerClaim: async () => {},
+    onboardingWakeRoute: async () => "unchanged",
+    holdOnboardingWake: async () => {},
+    // Computer below 1.0.68 (or unknown): the message path, as before.
+    onboardingInstructionsAsInboxItems: async () => false,
+    sendOnboardingInboxItem: async () => {
+      throw new Error("not on the inbox item path");
+    },
     ...overrides,
   };
 }
@@ -357,6 +364,259 @@ test("a dropped ledger wake does not count as briefed, so the next activation re
 
   assert.equal(fired, false);
   assert.deepEqual(marked, [], "a briefing that was dropped must not burn the one-shot sent flag");
+});
+
+function ledgerDeps(overrides: Record<string, unknown> = {}) {
+  return makeDeps({
+    getServer: async () => makeServer(),
+    getMemberOnboardingPreferences: async () => ({ onboardingDmSentAt: null }),
+    getAgent: async () => makeAgent({ id: "agent-1", name: "Cindy" }),
+    getUser: async () => ({ id: "owner-1", name: "Cindy Zhao", signupSurveyCompletedAt: new Date(), signupRole: "founder" }),
+    listChannels: async () => [
+      { id: "channel-all", name: "all", type: "channel" },
+      { id: "owner-channel", name: "onboarding-owner", type: "channel" },
+    ],
+    broadcastAndDeliver: async () => ({ id: "message-1" }),
+    getOrCreateThread: async () => ({ id: "team-mode-thread" }),
+    createOwnerOpenerArtifactAttachment: async () => ({ id: "team-mode-attachment", filename: "team-mode.html" }),
+    ...overrides,
+  });
+}
+
+test("on an unchanged runtime (Claude, Codex, ...) the ledger and the #all greeting are the same deliverMessage call as before", async () => {
+  const calls: unknown[][] = [];
+  const agentOrchestrator = {
+    async deliverMessage(...args: unknown[]) {
+      calls.push(args);
+      return { status: "queued", reason: "replayable_inbox" };
+    },
+  } as any;
+
+  __setOnboardingServiceDepsForTests(ledgerDeps());
+  assert.equal(await triggerOwnerOnboardingOnAgentActivation(makeIo(), agentOrchestrator, "server-1", "agent-1"), true);
+  __setOnboardingServiceDepsForTests(makeDeps());
+  assert.equal(await triggerNewAgentAllChannelGreeting(makeIo(), agentOrchestrator, "server-1", "agent-1"), true);
+
+  assert.deepEqual(calls.map((args) => [args.length, args[0], (args[1] as any).message_id, (args[1] as any).seq]), [
+    [2, "agent-1", "opener-v2-ledger-server-1", 0],
+    [2, "agent-1", "all-greeting-server-1-agent-1", 0],
+  ], "two arguments: no delivery options, exactly the old call");
+});
+
+test("on a per-turn runtime that is busy the ledger and the greeting are held, not delivered, and still count as sent", async () => {
+  const held: Array<{ agentId: string; kind: string; messageId: string | undefined }> = [];
+  const marked: string[] = [];
+  let released = 0;
+  const holdOnboardingWake = async (agentId: string, kind: string, message: any) => {
+    held.push({ agentId, kind, messageId: message.message_id });
+  };
+  const agentOrchestrator = {
+    async deliverMessage() {
+      throw new Error("must not be delivered while held");
+    },
+  } as any;
+
+  __setOnboardingServiceDepsForTests(ledgerDeps({
+    onboardingWakeRoute: async () => "hold",
+    holdOnboardingWake,
+    updateMemberOnboardingPreferences: async (_serverId: string, userId: string) => {
+      marked.push(userId);
+    },
+    releaseOwnerOpenerClaim: async () => {
+      released += 1;
+    },
+  }));
+  assert.equal(await triggerOwnerOnboardingOnAgentActivation(makeIo(), agentOrchestrator, "server-1", "agent-1"), true);
+  assert.deepEqual(marked, ["owner-1"], "the hold delivers it: the opener is done");
+  assert.equal(released, 0);
+
+  let claimCleared = false;
+  __setOnboardingServiceDepsForTests(makeDeps({
+    onboardingWakeRoute: async () => "hold",
+    holdOnboardingWake,
+    clearAllChannelIntroSentClaim: async () => {
+      claimCleared = true;
+    },
+  }));
+  assert.equal(await triggerNewAgentAllChannelGreeting(makeIo(), agentOrchestrator, "server-1", "agent-1"), true);
+  assert.equal(claimCleared, false, "the claim stays: the held wake is the one greeting");
+
+  assert.deepEqual(held, [
+    { agentId: "agent-1", kind: "owner_opener_ledger", messageId: "opener-v2-ledger-server-1" },
+    { agentId: "agent-1", kind: "all_channel_greeting", messageId: "all-greeting-server-1-agent-1" },
+  ]);
+});
+
+test("on a per-turn runtime whose process is idle the ledger goes transient at once", async () => {
+  const calls: unknown[][] = [];
+  const agentOrchestrator = {
+    async deliverMessage(...args: unknown[]) {
+      calls.push(args);
+      return { status: "queued", reason: "direct_dispatch" };
+    },
+  } as any;
+  __setOnboardingServiceDepsForTests(ledgerDeps({ onboardingWakeRoute: async () => "transient_now" }));
+  assert.equal(await triggerOwnerOnboardingOnAgentActivation(makeIo(), agentOrchestrator, "server-1", "agent-1"), true);
+  assert.deepEqual(calls.map((args) => [(args[1] as any).message_id, args[2]]), [["opener-v2-ledger-server-1", { transient: true }]]);
+});
+
+// Computer 1.0.68+ (#proj-runtime:#60; 1.25.3+ for a per-turn runtime,
+// #15001): both instructions are inbox items of `system.onboarding`. Nothing is
+// held or delivered as a synthetic message. Here a per-turn Cursor agent (its
+// route is `hold`) on a Computer that passes the gate.
+function inboxItemPathDeps(items: any[], overrides: Record<string, unknown> = {}) {
+  return {
+    onboardingInstructionsAsInboxItems: async (agentId: string, input: { perTurnRuntime: boolean }) => {
+      assert.equal(agentId, "agent-1");
+      assert.deepEqual(input, { perTurnRuntime: true });
+      return true;
+    },
+    sendOnboardingInboxItem: async (_deliverer: unknown, input: any) => {
+      items.push(input);
+      return { kind: "created", eventId: `event-${items.length}` };
+    },
+    // Asked only to tell a per-turn runtime (#14955's rule) for the version gate.
+    onboardingWakeRoute: async () => "hold",
+    holdOnboardingWake: async () => {
+      throw new Error("onboarding_held_wakes is not written on the item path");
+    },
+    ...overrides,
+  };
+}
+
+const notDelivered = {
+  async deliverMessage() {
+    throw new Error("no synthetic message on Computer 1.0.68+");
+  },
+} as any;
+
+test("Computer 1.0.68+: the owner briefing is one system.onboarding item per server, living 7 days, and counts as sent once written", async () => {
+  const items: any[] = [];
+  const marked: string[] = [];
+  let released = 0;
+  __setOnboardingServiceDepsForTests(ledgerDeps(inboxItemPathDeps(items, {
+    getAgent: async () => makeAgent({ id: "agent-1", name: "Cindy", runtime: "cursor" }),
+    updateMemberOnboardingPreferences: async (_serverId: string, userId: string) => {
+      marked.push(userId);
+    },
+    releaseOwnerOpenerClaim: async () => {
+      released += 1;
+    },
+  })));
+  assert.equal(await triggerOwnerOnboardingOnAgentActivation(makeIo(), notDelivered, "server-1", "agent-1"), true);
+  assert.deepEqual(marked, ["owner-1"], "the item is the delivery: stamped sent");
+  assert.equal(released, 0);
+  assert.equal(items.length, 1);
+  const [item] = items;
+  assert.equal(item.serverId, "server-1");
+  assert.equal(item.agentId, "agent-1");
+  assert.equal(item.objectRef, "opener:server-1");
+  assert.equal(item.ttlMs, 7 * 24 * 60 * 60 * 1000);
+  assert.equal(item.relatedChannelId, "owner-channel");
+  // `inbox read` shows an app event's first line: the whole instruction is on it.
+  assert.equal(item.summary.includes("\n"), false);
+  assert.match(item.summary, /^Onboarding briefing \(system-triggered\)\. Owner opener v2 ledger: opener_v2_sent=true/);
+  assert.match(item.summary, /Continue onboarding @Cindy Zhao in #onboarding-owner channel from the owner's reply\./);
+  assert.match(item.summary, /They told us their role is: /);
+  assert.match(item.summary, /Do not repeat, rephrase, or send another opener/);
+  assert.deepEqual({ type: item.payload.type, channel_id: item.payload.channel_id, channel_name: item.payload.channel_name }, {
+    type: "owner_briefing",
+    channel_id: "owner-channel",
+    channel_name: "onboarding-owner",
+  });
+});
+
+test("Computer 1.0.68+: a briefing item that cannot be written is not stamped sent, so the next activation retries", async () => {
+  const marked: string[] = [];
+  let released = 0;
+  __setOnboardingServiceDepsForTests(ledgerDeps(inboxItemPathDeps([], {
+    sendOnboardingInboxItem: async () => {
+      throw new Error("db down");
+    },
+    updateMemberOnboardingPreferences: async (_serverId: string, userId: string) => {
+      marked.push(userId);
+    },
+    releaseOwnerOpenerClaim: async () => {
+      released += 1;
+    },
+  })));
+  assert.equal(await triggerOwnerOnboardingOnAgentActivation(makeIo(), notDelivered, "server-1", "agent-1"), false);
+  assert.deepEqual(marked, []);
+  assert.equal(released, 1, "the claim is released for the retry");
+});
+
+test("Computer 1.0.68+: the #all greeting is one system.onboarding item per agent, naming the channel, living 1 day", async () => {
+  const items: any[] = [];
+  let claimCleared = false;
+  __setOnboardingServiceDepsForTests(makeDeps(inboxItemPathDeps(items, {
+    getAgent: async () => makeAgent({ runtime: "cursor" }),
+    clearAllChannelIntroSentClaim: async () => {
+      claimCleared = true;
+    },
+  })));
+  assert.equal(await triggerNewAgentAllChannelGreeting(makeIo(), notDelivered, "server-1", "agent-1"), true);
+  assert.equal(claimCleared, false);
+  assert.equal(items.length, 1);
+  const [item] = items;
+  assert.equal(item.objectRef, "greeting:server-1:agent-1");
+  assert.equal(item.ttlMs, 24 * 60 * 60 * 1000);
+  assert.equal(item.relatedChannelId, "channel-all");
+  assert.equal(item.summary.includes("\n"), false);
+  assert.match(item.summary, /^Onboarding task \(system-triggered\): You have just joined #all,/);
+  assert.match(item.summary, /Post one short, natural self-introduction to #all /);
+  assert.deepEqual(item.payload, { type: "all_channel_greeting", channel_id: "channel-all", channel_name: "all" });
+});
+
+test("the version gate is told whether the agent is a per-turn runtime (#14955's route); below its gate a per-turn agent keeps the hold", async () => {
+  const asked: Array<{ perTurnRuntime: boolean }> = [];
+  const held: string[] = [];
+  // A per-turn Cursor agent on Computer 1.25.2: the gate says no, so the old path holds it.
+  __setOnboardingServiceDepsForTests(makeDeps({
+    onboardingWakeRoute: async () => "hold",
+    onboardingInstructionsAsInboxItems: async (_agentId: string, input: { perTurnRuntime: boolean }) => {
+      asked.push(input);
+      return false;
+    },
+    holdOnboardingWake: async (_agentId: string, kind: string) => {
+      held.push(kind);
+    },
+  }));
+  assert.equal(await triggerNewAgentAllChannelGreeting(makeIo(), notDelivered, "server-1", "agent-1"), true);
+  assert.deepEqual(held, ["all_channel_greeting"]);
+
+  // A runtime that keeps its process (route `unchanged`) is asked as not per-turn.
+  const items: any[] = [];
+  __setOnboardingServiceDepsForTests(makeDeps({
+    onboardingWakeRoute: async () => "unchanged",
+    onboardingInstructionsAsInboxItems: async (_agentId: string, input: { perTurnRuntime: boolean }) => {
+      asked.push(input);
+      return true;
+    },
+    sendOnboardingInboxItem: async (_deliverer: unknown, input: any) => {
+      items.push(input);
+      return { kind: "created", eventId: "event-1" };
+    },
+  }));
+  assert.equal(await triggerNewAgentAllChannelGreeting(makeIo(), notDelivered, "server-1", "agent-1"), true);
+  assert.equal(items.length, 1);
+  assert.deepEqual(asked, [{ perTurnRuntime: true }, { perTurnRuntime: false }]);
+});
+
+test("a Computer version lookup that fails keeps the message path", async () => {
+  const calls: unknown[][] = [];
+  const agentOrchestrator = {
+    async deliverMessage(...args: unknown[]) {
+      calls.push(args);
+      return { status: "queued", reason: "replayable_inbox" };
+    },
+  } as any;
+  __setOnboardingServiceDepsForTests(makeDeps({
+    onboardingInstructionsAsInboxItems: async () => {
+      throw new Error("db down");
+    },
+  }));
+  assert.equal(await triggerNewAgentAllChannelGreeting(makeIo(), agentOrchestrator, "server-1", "agent-1"), true);
+  assert.deepEqual(calls.map((args) => (args[1] as any).message_id), ["all-greeting-server-1-agent-1"]);
 });
 
 // Hosted Cindy (antiproton_cindy): an external agent is never "started", so the

@@ -108,3 +108,8 @@ export type { CreateRaftOptions, Raft } from "./raft";
 // The agent layer's helpers and types, also exported from
 // `@botiverse/raft-sdk/agent`. They stay on the root until 1.0.
 export * from "./agentExports";
+
+// A message id you stored as a plain string, for the raw client's routes that
+// take a MessageId (e.g. `routes.messages.updateCard`), AppFather / Sage 11-14.
+export { asMessageId } from "@botiverse/raft-shared/src/brandedIds";
+export type { MessageId } from "@botiverse/raft-shared/src/brandedIds";

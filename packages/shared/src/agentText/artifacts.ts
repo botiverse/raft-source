@@ -41,11 +41,10 @@ import type {
   AgentApiArtifactSummary,
   AgentApiArtifactVersionSummary,
 } from "../agentApiArtifactsContract";
-import { AGENT_API_ARTIFACT_IMPORT_DEADLINE_MS, AGENT_API_ARTIFACT_MAX_REVIEW_COMMENTS, agentApiArtifactActorSchema, agentApiArtifactCommentExcerptSchema, agentApiArtifactHomeSchema, agentApiArtifactVersionSummarySchema } from "../agentApiArtifactsContract";
+import { AGENT_API_ARTIFACT_MAX_REVIEW_COMMENTS, agentApiArtifactCommentExcerptSchema, agentApiArtifactVersionSummarySchema } from "../agentApiArtifactsContract";
 import { ARTIFACT_CHECK_MAX_BLOCKED_RESOURCES, ARTIFACT_CHECK_MAX_CONSOLE_ERRORS, ARTIFACT_CHECK_VIEWPORTS } from "../artifactCheckContract";
 import { ARTIFACT_AGENT_WRITES_PER_MINUTE, ARTIFACT_COMMENT_IMAGE_MAX_BYTES, ARTIFACT_COMMENT_IMAGE_UPLOADS_PER_MINUTE, ARTIFACT_COMMENT_MAX_IMAGES, type ArtifactCommentImageType } from "../artifactCommentLimits";
 import { artifactFileType } from "../artifactFiles";
-import { parseArtifactId } from "../artifactRef";
 import { channelAnnouncementPushForbiddenText } from "../channelAnnouncement";
 import type { ArtifactCheckShot } from "../webArtifactsContract";
 import { formatUtcTimestamp } from "../utcTimestamp";
@@ -624,7 +623,7 @@ export function formatArtifactReviewCommentImageRefusal(
  * formatArtifactError with `reviewing` says it.
  */
 export function formatArtifactReviewCommentImageUploadRefusal(
-  code: ArtifactErrorCode,
+  code: "FILE_TOO_LARGE" | "IMAGE_REFUSED" | "SIZE_MISMATCH",
   input: ArtifactErrorInput & ArtifactReviewCommentPlace & { named?: string },
   style: RaftHintStyle = "cli",
 ): ArtifactErrorText {
@@ -1299,8 +1298,6 @@ export interface ArtifactErrorInput {
    * upload request) then gives a next step for the whole review.
    */
   uploadingImage?: boolean;
-  /** The refusal came from downloading this comment image (its id as given). */
-  downloadingImage?: string;
   details?: Record<string, unknown> | null;
 }
 
@@ -1318,23 +1315,6 @@ function bytes(value: unknown): string {
   if (n >= 1024 * 1024) return `${Math.round((n / (1024 * 1024)) * 10) / 10} MiB`;
   if (n >= 1024) return `${Math.round(n / 1024)} KiB`;
   return `${n} bytes`;
-}
-
-function ambiguousCandidates(value: unknown): Array<{ id: string; title: string | null; where: string | null }> {
-  if (!Array.isArray(value)) return [];
-  return value.flatMap((c) => {
-    if (typeof c === "string") return [{ id: c, title: null, where: null }];
-    if (!c || typeof c !== "object" || typeof (c as { id?: unknown }).id !== "string") return [];
-    const home = agentApiArtifactHomeSchema.safeParse((c as { home?: unknown }).home);
-    const title = (c as { title?: unknown }).title;
-    return [{ id: (c as { id: string }).id, title: typeof title === "string" ? title : null, where: home.success ? formatArtifactHome(home.data) : null }];
-  });
-}
-
-/** Whether the Server read `artifact` as a title (or an old name): neither an id nor a link (artifactRef.ts). */
-function isTitleRef(artifact: string): boolean {
-  const value = artifact.trim();
-  return value !== "" && parseArtifactId(value) === null && !/^https?:\/\//i.test(value);
 }
 
 /** What a change touched: a file's path, or a setting by name (the title, the entry file, …). */
@@ -1365,10 +1345,20 @@ export interface ArtifactErrorText {
  * the Server sends it), that comment's own error, and that nothing was posted.
  */
 export function formatArtifactReviewCommentRefusal(
+  code: LocalArtifactErrorCode | "EMPTY_COMMENT" | "EMPTY_PATH" | "EMPTY_REPLY_TO",
+  input: ArtifactErrorInput & ArtifactReviewCommentPlace,
+  style?: RaftHintStyle,
+): ArtifactErrorText;
+export function formatArtifactReviewCommentRefusal(
+  code: ArtifactErrorCode | "EMPTY_COMMENT" | "EMPTY_PATH" | "EMPTY_REPLY_TO",
+  input: ArtifactErrorInput & ArtifactReviewCommentPlace,
+  style?: RaftHintStyle,
+): ArtifactErrorText | null;
+export function formatArtifactReviewCommentRefusal(
   code: ArtifactErrorCode | "EMPTY_COMMENT" | "EMPTY_PATH" | "EMPTY_REPLY_TO",
   input: ArtifactErrorInput & ArtifactReviewCommentPlace,
   style: RaftHintStyle = "cli",
-): ArtifactErrorText {
+): ArtifactErrorText | null {
   const { index, total, commentPath, replyTo, ...rest } = input;
   const inner = code === "EMPTY_COMMENT"
     ? { message: "The comment is empty.", nextAction: "Write it, or leave it out of the review." }
@@ -1377,6 +1367,8 @@ export function formatArtifactReviewCommentRefusal(
     : code === "EMPTY_REPLY_TO"
     ? { message: "Its replyTo is empty.", nextAction: "Give the id of the comment it answers (comment=… in comments), or leave replyTo out." }
     : formatArtifactError(code, { ...rest, commenting: true, reviewing: true, ...(commentPath === null ? {} : { path: commentPath }) }, style);
+  // No local words: the Server's sentence already names the comment ("Comment 2 of 5 of the review, nothing of which was posted: …").
+  if (inner === null) return null;
   return reviewCommentFrame(inner, { index, total, commentPath, ...(replyTo === undefined ? {} : { replyTo }) }, style);
 }
 
@@ -1395,22 +1387,77 @@ function capitalized(text: string): string {
   return `${text.charAt(0).toUpperCase()}${text.slice(1)}`;
 }
 
-/** One sentence per Artifacts error code, and a next step. */
-export function formatArtifactError(code: ArtifactErrorCode, input: ArtifactErrorInput, style: RaftHintStyle = "cli"): ArtifactErrorText {
+/**
+ * A move to "anyone with the link", refused here before any request: only a
+ * person turns on link sharing.
+ */
+export function formatArtifactMoveToPublicRefusal(artifact: string, style: RaftHintStyle = "cli"): ArtifactErrorText {
+  return {
+    message: "Only a person can turn on link sharing (anyone with the link can then open it).",
+    nextAction: `Ask a person who manages it to choose "Anyone with the link" under "Who can see" in its ⋯ menu on the web. To let the whole server see it: ${formatHint(RAFT_HINTS.artifactMove({ artifact }), style)}`,
+  };
+}
+
+/**
+ * Codes whose refusal the Server words as well as a client could: no local
+ * words, the caller keeps the Server's sentence and step. The import codes
+ * come only from raft-artifacts.com imports, which no current command makes.
+ */
+export type ServerWordedArtifactErrorCode =
+  | "NOT_VISIBLE"
+  | "AMBIGUOUS_ARTIFACT_NAME"
+  | "VERSION_NOT_FOUND"
+  | "FILE_NOT_FOUND"
+  | "FORBIDDEN"
+  | "NAME_TAKEN"
+  | "DUPLICATE_PATH"
+  | "ENTRY_NOT_FOUND"
+  | "INVALID_CONTENT"
+  | "TOO_MANY_FILES"
+  | "REQUEST_TOO_LARGE"
+  | "UPLOAD_QUOTA_EXCEEDED"
+  | "COMMENT_NOT_FOUND"
+  | "COMMENT_IS_REPLY"
+  | "TOO_MANY_MENTIONS"
+  | "ANCHOR_WITHOUT_PATH"
+  | "HOME_NOT_WIDER"
+  | "ATTACHMENT_NOT_SAVABLE"
+  | "INVALID_NAME"
+  | "IMPORT_UNAVAILABLE"
+  | "NOT_A_LEGACY_LINK"
+  | "LEGACY_OTHER_SERVER"
+  | "LEGACY_NOT_FOUND"
+  | "IMPORT_TOO_LARGE"
+  | "IMPORT_MISMATCH"
+  | "ALREADY_IMPORTED"
+  | "TARGET_HAS_GUESTS"
+  | "TARGET_NOT_SUPPORTED"
+  | "SCREENSHOT_NOT_FOUND"
+  | "IMAGE_NOT_FOUND"
+  | "ARTIFACTS_STORAGE_UNAVAILABLE"
+  | "CONTENT_UNAVAILABLE";
+
+/**
+ * Codes this client words itself: it adds what only it knows (the directory,
+ * the command typed, a local path), or the refusal is its own. SIZE_MISMATCH
+ * is worded here for an image, and for a file only when the Server names its
+ * path (a push's upload names none: the Server's sentence then).
+ */
+export type LocalArtifactErrorCode = Exclude<ArtifactErrorCode, ServerWordedArtifactErrorCode | "SIZE_MISMATCH">;
+
+/**
+ * One sentence per Artifacts error code, and a next step, for the codes this
+ * client words itself; null when the Server's own sentence and step stand
+ * (ServerWordedArtifactErrorCode, a file's SIZE_MISMATCH without its path, or
+ * a code a newer Server sent).
+ */
+export function formatArtifactError(code: LocalArtifactErrorCode, input: ArtifactErrorInput, style?: RaftHintStyle): ArtifactErrorText;
+export function formatArtifactError(code: LocalArtifactErrorCode | "SIZE_MISMATCH", input: ArtifactErrorInput & { uploadingImage: true }, style?: RaftHintStyle): ArtifactErrorText;
+export function formatArtifactError(code: ArtifactErrorCode, input: ArtifactErrorInput, style?: RaftHintStyle): ArtifactErrorText | null;
+export function formatArtifactError(code: ArtifactErrorCode, input: ArtifactErrorInput, style: RaftHintStyle = "cli"): ArtifactErrorText | null {
   const artifact = input.artifact ?? "";
   const details = input.details ?? {};
   switch (code) {
-    case "NOT_VISIBLE":
-      return {
-        // A delete that went through but whose answer was lost finds nothing the second time.
-        message: input.deleting
-          ? `No artifact "${foldAgentOneLineText(artifact)}" that you can see: it may already be deleted, or it lives where you can't see it.`
-          : `No artifact "${foldAgentOneLineText(artifact)}" that you can see (by that id, link or exact title).`,
-        // Looked up as a title: it may have been renamed (task #147), so its id, its link or a search finds it.
-        nextAction: !input.deleting && isTitleRef(artifact)
-          ? `Pass its id or link instead, or search the titles: ${formatHint(RAFT_HINTS.artifactList({ query: "<words>" }), style)}`
-          : `List the ones you can: ${formatHint(RAFT_HINTS.artifactList({}), style)}`,
-      };
     case "INVALID_ARTIFACT_REF":
       return input.legacyVersionLink
         ? {
@@ -1421,34 +1468,6 @@ export function formatArtifactError(code: ArtifactErrorCode, input: ArtifactErro
           message: `"${foldAgentOneLineText(artifact)}" isn't a link to an artifact.`,
           nextAction: `Pass the artifact's id, its link as shared, or its exact title; to find one: ${formatHint(RAFT_HINTS.artifactList({}), style)}`,
         };
-    case "AMBIGUOUS_ARTIFACT_NAME": {
-      const candidates = ambiguousCandidates(details.candidates);
-      const first = candidates[0];
-      const shown = (c: (typeof candidates)[number]) => [c.id, ...(c.title === null ? [] : [`"${foldAgentOneLineText(c.title)}"`]), ...(c.where === null ? [] : [`(${c.where})`])].join(" ");
-      return first
-        ? {
-          message: `Several artifacts you can see are called "${foldAgentOneLineText(artifact)}": ${candidates.map(shown).join(", ")}.`,
-          nextAction: `Pass the id instead, e.g. ${formatHint(RAFT_HINTS.artifactRead({ artifact: first.id }), style)}`,
-        }
-        : { message: `Several artifacts you can see are called "${foldAgentOneLineText(artifact)}".`, nextAction: `Find the id with ${formatHint(RAFT_HINTS.artifactList({}), style)} and pass that instead.` };
-    }
-    case "VERSION_NOT_FOUND": {
-      const current = detail(details, "currentVersion");
-      const now = current ? ` (the current one is v${current})` : "";
-      return {
-        message: `"${oneLine(artifact)}" has no version ${input.version ?? oneLine(detail(details, "version"))} that you can read${now}.`,
-        nextAction: `Read the current one: ${formatHint(RAFT_HINTS.artifactRead({ artifact }), style)}`,
-      };
-    }
-    case "FILE_NOT_FOUND": {
-      const version = oneLine(detail(details, "version")) || (input.version === undefined ? "" : String(input.version));
-      const which = version ? `v${version} of ` : "";
-      return {
-        // The path as sent (a review comment's, or the Server's echo of it): folded, so a line break in it can't start a line.
-        message: `${which}"${oneLine(artifact)}" has no file "${oneLine(input.path ?? detail(details, "path"))}".`,
-        nextAction: `Its files: ${formatHint(RAFT_HINTS.artifactRead({ artifact, version: input.version, files: true }), style)}`,
-      };
-    }
     case "INVALID_PATH": {
       // Quoted with its line breaks and control characters escaped: often why it is refused, and then they can't start a line.
       const path = quoteAgentOneLineText(input.path ?? detail(details, "path"));
@@ -1492,65 +1511,6 @@ export function formatArtifactError(code: ArtifactErrorCode, input: ArtifactErro
     }
     case "CHANNEL_ANNOUNCEMENT_PUSH_FORBIDDEN":
       return channelAnnouncementPushForbiddenText(detail(details, "channel") || "its channel", style);
-    case "FORBIDDEN": {
-      if (input.moveTo === "public") {
-        return {
-          message: "Only a person can turn on link sharing (anyone with the link can then open it).",
-          nextAction: `Ask a person who manages it to choose "Anyone with the link" under "Who can see" in its ⋯ menu on the web. To let the whole server see it: ${formatHint(RAFT_HINTS.artifactMove({ artifact }), style)}`,
-        };
-      }
-      const title = detail(details, "title") || artifact;
-      if (input.moveTo && (details.reason === "manager_cannot_see" || details.reason === "manager_cannot_move")) {
-        const parsed = agentApiArtifactActorSchema.safeParse(details.manager);
-        const manager = parsed.success && parsed.data.name ? ` (${actor(parsed.data)})` : "";
-        if (details.reason === "manager_cannot_move") {
-          return {
-            message: `You can't move "${foldAgentOneLineText(title)}": the person who manages you${manager} may not move it to the whole server either.`,
-            nextAction: `Ask a server owner or admin to use "Make visible to the whole server" on the web, or tell whoever asked you that you can't move it.`,
-          };
-        }
-        const home = detail(details, "target") || "its conversation";
-        return {
-          message: `You can't move "${foldAgentOneLineText(title)}" out of ${home}: the person who manages you${manager} can't see it there, and moving it would show its pages and comments to the whole server.`,
-          nextAction: `Ask a server owner or admin who can see it in ${home} to use "Make visible to the whole server" on the web, or tell whoever asked you that you can't move it.`,
-        };
-      }
-      if (input.moveTo && details.reason === "no_manager") {
-        return {
-          message: `You can't move "${foldAgentOneLineText(title)}": an agent's move needs a person who manages it and can see it, and you have none.`,
-          nextAction: "Ask a server owner or admin to move it on the web, or tell whoever asked you that you can't.",
-        };
-      }
-      if (input.moveTo || input.deleting) {
-        const verb = input.deleting ? "delete" : "move";
-        const author = agentApiArtifactActorSchema.safeParse(details.author);
-        return {
-          message: `You can't ${verb} "${foldAgentOneLineText(title)}": only its author${author.success ? ` (${actor(author.data)})` : ""}, the person who manages an agent author, and the server's owners and admins can.`,
-          nextAction: `Ask its author or one of the server's owners or admins to ${verb} it, or tell whoever asked you.`,
-        };
-      }
-      if (input.resolving && details.reason === "not_resolver") {
-        const parsedThread = agentApiArtifactActorSchema.safeParse(details.threadAuthor);
-        const parsedAuthor = agentApiArtifactActorSchema.safeParse(details.author);
-        const who = [
-          `the thread's author${parsedThread.success ? ` ${actor(parsedThread.data)}` : ""}`,
-          `the artifact's author${parsedAuthor.success ? ` ${actor(parsedAuthor.data)}` : ""} (or whoever manages it, when it's an agent)`,
-          "and the server's owners and admins",
-        ].join(", ");
-        const verb = input.resolving.reopen ? "reopen" : "resolve";
-        return {
-          message: `You can't ${verb} thread ${oneLine(input.resolving.comment)} on "${foldAgentOneLineText(title)}": only ${who} can.`,
-          nextAction: input.resolving.reopen
-            ? `To say it isn't done, reply in it instead (that reopens it): ${formatHint(RAFT_HINTS.artifactComment({ artifact, replyTo: input.resolving.comment }), style)}`
-            : `If you addressed it, say so in a reply and let them resolve it: ${formatHint(RAFT_HINTS.artifactComment({ artifact, replyTo: input.resolving.comment }), style)}`,
-        };
-      }
-      const verb = input.resolving ? (input.resolving.reopen ? "reopen its threads" : "resolve its threads") : input.commenting ? "comment on it" : input.following ? "follow it" : input.publishing ? "push to it" : "change it";
-      return {
-        message: `You can see "${oneLine(artifact)}" but can't ${verb}: only members and agents of its server can.`,
-        nextAction: input.publishing ? "Ask its author or a member of its server to push the change." : "Ask a member of its server to do it, or tell whoever asked you.",
-      };
-    }
     case "TARGET_REQUIRED":
       return {
         message: "A new artifact needs a home: the conversation whose members can see it.",
@@ -1568,26 +1528,6 @@ export function formatArtifactError(code: ArtifactErrorCode, input: ArtifactErro
           ? `A new artifact needs a title: none was given, and its entry page ${entry} has no <title>.`
           : "A new artifact needs a title, and none was given.",
         nextAction: `Add ${flag} with a title people will recognise${page ? `, or give ${entry} a <title>` : ""}, then push again.`,
-      };
-    }
-    case "INVALID_NAME":
-      return {
-        message: details.reserved === true
-          ? `raft-artifacts.com's name "${detail(details, "name")}" is reserved here, so that artifact can't be imported.`
-          : `raft-artifacts.com's name "${detail(details, "name")}" can't be an artifact's name here (lowercase letters, digits and inner hyphens, at most 63), so that artifact can't be imported.`,
-        nextAction: "Tell a human; this artifact can't be imported as it is.",
-      };
-    case "NAME_TAKEN": {
-      if (input.moveTo) {
-        return {
-          message: `Another artifact visible to the whole server is already named "${detail(details, "name")}", so this one can't move there.`,
-          nextAction: `Ask the other one's author or a server admin whether it can be deleted, then run the move again: ${formatHint(RAFT_HINTS.artifactMove({ artifact }), style)}`,
-        };
-      }
-      // Only an import and a move are refused for a name now (Artifacts made since have none); a Server from before titles refused a push.
-      return {
-        message: `That conversation already has an artifact named "${detail(details, "name")}".`,
-        nextAction: `To change the existing one instead, push a new version of it${input.target ? `; the artifacts there: ${formatHint(RAFT_HINTS.artifactList({ target: input.target }), style)}` : ""}.`,
       };
     }
     case "BASE_REQUIRED": {
@@ -1674,15 +1614,6 @@ export function formatArtifactError(code: ArtifactErrorCode, input: ArtifactErro
           : `${readFirst} they don't change what you meant to push, ${style === "cli" ? "run the same command again" : "make the same push call again"}${goes}. Otherwise change your files first.`,
       };
     }
-    case "DUPLICATE_PATH":
-      return { message: `"${detail(details, "path")}" is listed twice, or both sent and deleted.`, nextAction: "List each path once." };
-    case "ENTRY_NOT_FOUND":
-      return {
-        message: `The entry file "${detail(details, "entry")}" isn't in the new version.`,
-        nextAction: `Push that file too, or name an entry file that is in it (${formatHintFlag("entry", "entry", style)}).`,
-      };
-    case "INVALID_CONTENT":
-      return { message: `The content_base64 of "${detail(details, "path")}" isn't valid base64.`, nextAction: "Send it base64-encoded, or as content if it is text." };
     case "SIZE_MISMATCH":
       // An image goes up as raw bytes, no sha256: the Server read another length than the request's
       // Content-Length (`size` sent, `actual` received), a client's bug; the same upload again may go through.
@@ -1693,6 +1624,8 @@ export function formatArtifactError(code: ArtifactErrorCode, input: ArtifactErro
           nextAction: `${style === "cli" ? "Run the same command again" : "Upload it again"}; if it's refused again, tell a human (it's a client bug).`,
         };
       }
+      // A push's upload names no file (`path: null`): the Server's own sentence, not `"" is listed as …`.
+      if (detail(details, "path") === "") return null;
       return {
         message: `"${detail(details, "path")}" is listed as ${detail(details, "size")} bytes, but the bytes for its sha256 are ${detail(details, "actual")}.`,
         nextAction: "Compute the size and sha256 from the same bytes and push again.",
@@ -1721,18 +1654,6 @@ export function formatArtifactError(code: ArtifactErrorCode, input: ArtifactErro
         message: `"${detail(details, "path")}" is ${bytes(details.size)}; the limit for it is ${bytes(details.limit)}.`,
         nextAction: "Make it smaller, or leave it out of the artifact.",
       };
-    case "TOO_MANY_FILES":
-      return {
-        message: `${detail(details, "count")} files is over the limit of ${detail(details, "limit")} (per push, or per version).`,
-        nextAction: style === "cli"
-          ? "Push part of the change first (the files not sent carry over unchanged), then the rest; or remove files the artifact doesn't need."
-          : "Push fewer files at a time (files not listed carry over), or remove files the artifact doesn't need.",
-      };
-    case "REQUEST_TOO_LARGE":
-      return {
-        message: `This push is over the request limit (${bytes(details.limit)}).`,
-        nextAction: "Send fewer or smaller files per push; files not listed carry over, so the rest can follow in the next one.",
-      };
     case "FIELD_TOO_LONG": {
       const field = oneLine(detail(details, "field")) || "text";
       const limit = oneLine(detail(details, "limit"));
@@ -1750,11 +1671,6 @@ export function formatArtifactError(code: ArtifactErrorCode, input: ArtifactErro
       }
       return { message: `The ${field} is over ${limit} characters.`, nextAction: "Shorten it and push again." };
     }
-    case "UPLOAD_QUOTA_EXCEEDED":
-      return {
-        message: `This server holds too many uploaded files that no version uses yet (${bytes(details.used)} of ${bytes(details.limit)}).`,
-        nextAction: "Try again later (unused uploads are removed after a day), or tell a human admin of this server.",
-      };
     case "FILE_UPLOAD_QUOTA_EXCEEDED": {
       const quota = (details.quota && typeof details.quota === "object" ? details.quota : {}) as Record<string, unknown>;
       const billingUrl = oneLine(detail(details, "billingUrl"));
@@ -1787,38 +1703,6 @@ export function formatArtifactError(code: ArtifactErrorCode, input: ArtifactErro
         nextAction: nextAction("the files weren't stored", "Until then, only files the server already has (unchanged ones) can be pushed."),
       };
     }
-    case "COMMENT_NOT_FOUND":
-      if (input.resolving) {
-        return {
-          message: `"${oneLine(input.resolving.comment)}" isn't a comment of "${oneLine(artifact)}".`,
-          nextAction: `Find the thread's first comment (its comment=… id) in its comments: ${formatHint(RAFT_HINTS.artifactComments({ artifact, all: true }), style)}`,
-        };
-      }
-      return {
-        // The replyTo as sent, which the Server echoes (a line break inside it kept): folded, so it can't start a line.
-        message: `"${oneLine(detail(details, "replyTo"))}" isn't a comment of "${oneLine(artifact)}".`,
-        nextAction: `Find the comment's id in its comments: ${formatHint(RAFT_HINTS.artifactComments({ artifact, all: true }), style)}`,
-      };
-    case "COMMENT_IS_REPLY": {
-      const thread = oneLine(detail(details, "thread"));
-      const comment = oneLine(input.resolving?.comment ?? detail(details, "comment"));
-      const reopen = input.resolving?.reopen === true;
-      return {
-        message: `${comment} is a reply: only a whole thread is ${reopen ? "reopened" : "resolved"}, by its first comment${thread ? ` (${thread})` : ""}.`,
-        nextAction: thread
-          ? (reopen ? formatHint(RAFT_HINTS.artifactReopen({ artifact, comment: thread }), style) : formatHint(RAFT_HINTS.artifactResolve({ artifact, comment: thread }), style))
-          : `Find the thread's first comment in its comments: ${formatHint(RAFT_HINTS.artifactComments({ artifact, all: true }), style)}`,
-      };
-    }
-    case "TOO_MANY_MENTIONS": {
-      const limit = oneLine(detail(details, "limit")) || 20;
-      return {
-        message: `This ${input.reviewing && !input.commenting ? "summary" : "comment"} mentions more than ${limit} people or agents; at most ${limit} are looked up.${input.reviewing && !input.commenting ? " Nothing of the review was posted." : ""}`,
-        nextAction: input.reviewing && !input.commenting
-          ? "Mention fewer in the summary: mention the rest in the comments they're about."
-          : "Mention fewer, or split it: a comment, then a reply that mentions the rest.",
-      };
-    }
     case "TOO_MANY_COMMENTS": {
       const limit = oneLine(detail(details, "limit")) || String(AGENT_API_ARTIFACT_MAX_REVIEW_COMMENTS);
       const count = oneLine(detail(details, "count"));
@@ -1841,8 +1725,6 @@ export function formatArtifactError(code: ArtifactErrorCode, input: ArtifactErro
         message: "This Server doesn't take reviews yet. Nothing was posted.",
         nextAction: `Post the comments one at a time instead: ${formatHint(RAFT_HINTS.artifactComment({ artifact, path: "<file>" }), style)} (leave out the path for the whole artifact).`,
       };
-    case "ANCHOR_WITHOUT_PATH":
-      return { message: "An anchor is a place in one file, so it needs the file's path.", nextAction: "Pass the path of the file the anchor is in, or leave the anchor out." };
     case "ARTIFACTS_NOT_ENABLED": {
       // Task 74: here only an Artifact anyone with the link can open (the `public` home), from a server that has them, opens, read-only.
       // Never back to raft-artifacts.com (the `artifact-share` App, being retired): files go out as attachments
@@ -1869,130 +1751,6 @@ export function formatArtifactError(code: ArtifactErrorCode, input: ArtifactErro
         nextAction: `To read one: ${formatHint(RAFT_HINTS.artifactRead({}), style)}. To share ${files.some}, send it ${resend}`,
       };
     }
-    case "ARTIFACTS_STORAGE_UNAVAILABLE": {
-      // A push, import or save is refused before any bytes are stored, so it says what didn't happen.
-      const nextAction = "Tell a human admin of this server; retrying won't help.";
-      const unstored = input.publishing ? "Nothing was pushed." : input.savingAttachment !== undefined ? "Nothing was saved." : null;
-      if (unstored) return { message: `The files couldn't be stored: this server's file storage for Artifacts isn't set up. ${unstored}`, nextAction };
-      if (input.uploadingImage) {
-        return {
-          message: "The image couldn't be stored: this server's file storage for Artifacts isn't set up.",
-          nextAction: input.reviewing ? `${capitalized(reviewWithoutImages(style))}, and tell a human admin of this server.` : "Post the comment without it, and tell a human admin of this server.",
-        };
-      }
-      return { message: "Artifact files can't be read on this server right now: its file storage isn't set up.", nextAction };
-    }
-    case "IMPORT_UNAVAILABLE":
-      if (details.reason === "timeout") {
-        return {
-          message: `The import took longer than ${AGENT_API_ARTIFACT_IMPORT_DEADLINE_MS / 60_000} minutes, so it was stopped. Nothing was imported.`,
-          nextAction: "Try the same import again later; if it keeps happening, tell a human.",
-        };
-      }
-      return details.reason === "not_configured"
-        ? { message: "Importing from raft-artifacts.com isn't set up on this Raft server. Nothing was imported.", nextAction: "Tell a human admin of this server; retrying won't help." }
-        : details.reason === "rate_limited"
-          ? { message: "raft-artifacts.com is busy with other imports right now, so nothing was imported.", nextAction: "Try the same import again in a minute." }
-          : { message: "raft-artifacts.com didn't answer usably, so nothing was imported.", nextAction: "Try the same import again in a minute; if it keeps failing, tell a human." };
-    case "NOT_A_LEGACY_LINK": {
-      const given = detail(details, "from");
-      if (details.reason === "legacy_version_link") {
-        return {
-          message: `"${given}" is an old link to a single version; it doesn't say which artifact it belongs to.`,
-          nextAction: "Ask whoever shared it for the artifact's link, https://raft-artifacts.com/p/<server>/<name>.",
-        };
-      }
-      return {
-        message: `"${given}" isn't a link to an artifact on raft-artifacts.com.`,
-        nextAction: "Pass the artifact's link as https://raft-artifacts.com/p/<server>/<name> (the address its page has on raft-artifacts.com).",
-      };
-    }
-    case "LEGACY_OTHER_SERVER":
-      return {
-        message: `This link's server name "${detail(details, "server")}" now belongs to another server, so it can't be imported here: an import only brings in this server's artifacts, and if this server was renamed, the artifact can't be imported from this link.`,
-        nextAction: "If the artifact is that other server's, ask someone there to import it, or ask its author to share it with you.",
-      };
-    case "LEGACY_NOT_FOUND":
-      return {
-        message: `raft-artifacts.com has no artifact "${detail(details, "name")}" in this server.`,
-        nextAction: "Check the link (the name after /p/<server>/); it may have been deleted there.",
-      };
-    case "IMPORT_TOO_LARGE": {
-      const reason = details.reason;
-      const message = reason === "files"
-        ? `The artifact has ${detail(details, "count")} files; an artifact here holds at most ${detail(details, "limit")}.`
-        : reason === "file"
-          ? `${detail(details, "path")} is ${bytes(details.size)}; a file here may be at most ${bytes(details.limit)}.`
-          : `Importing it needs ${bytes(details.needed)} of new files, more than this server has room for now (${bytes(details.used)} of ${bytes(details.limit)} used by files not in any version yet).`;
-      return {
-        message: `${message} Nothing was imported.`,
-        nextAction: reason === "quota" ? "Try again in a day, when unused uploads are cleared, or tell a human." : "Tell a human; this artifact can't be imported as it is.",
-      };
-    }
-    case "IMPORT_MISMATCH":
-      return {
-        message: `raft-artifacts.com sent ${detail(details, "path")} with other bytes than it listed, so nothing was imported.`,
-        nextAction: "Try the same import again; if it keeps failing, tell a human.",
-      };
-    case "ALREADY_IMPORTED":
-      return {
-        message: "That artifact was already imported, and the result is in a place you can't see.",
-        nextAction: "Ask whoever imported it (or a member of where it lives) to share it with you.",
-      };
-    case "TARGET_HAS_GUESTS": {
-      const where = input.target ?? detail(details, "target");
-      const why = details.reason === "open_to_guests" ? `${where} is open to this server's guests` : `${where} has guests in it`;
-      return {
-        message: `${why}, and an artifact from raft-artifacts.com was visible only to this server's members and agents: importing it there would show it to guests. Nothing was imported.`,
-        nextAction: `Leave out ${formatHintFlag("target", "target", style)} to import it for the whole server (its members and agents, not guests), or pick a conversation without guests.`,
-      };
-    }
-    case "HOME_NOT_WIDER": {
-      const title = detail(details, "title") || artifact;
-      return {
-        message: details.home === "public" ? `Anyone with the link can already open "${foldAgentOneLineText(title)}"; nothing changed.` : `"${foldAgentOneLineText(title)}" is already visible to the whole server; nothing changed.`,
-        nextAction: `Nothing to do. Its home and link: ${formatHint(RAFT_HINTS.artifactRead({ artifact }), style)}`,
-      };
-    }
-    case "ATTACHMENT_NOT_FOUND": {
-      const attachmentId = input.savingAttachment ?? detail(details, "attachmentId");
-      // The view tells the two apart: a file behind the history limit answers HISTORY_LIMITED there.
-      const view = style === "cli" ? RAFT_HINTS.attachmentDownload(attachmentId) : RAFT_HINTS.attachmentView(attachmentId);
-      return {
-        message: `No attachment "${attachmentId}" that you can see. A file from a message older than this server's history limit (30 days on the Free plan) can't be saved either.`,
-        nextAction: `Check the id: it is the one after the file name, (id:…), when you read the conversation: ${formatHint(RAFT_HINTS.messageRead({ target: "<conversation>" }), style)}. If the id is right, ${formatHint(view, style)} answers HISTORY_LIMITED when its message is older than the history limit.`,
-      };
-    }
-    case "ALREADY_SAVED":
-      return {
-        message: "That attachment was already saved as an artifact you can't see; nothing new was made.",
-        nextAction: `Push your own copy: ${ownCopySteps(input.savingAttachment ?? detail(details, "attachmentId"), style)}.`,
-      };
-    case "ATTACHMENT_NOT_SAVABLE": {
-      const limit = typeof details.limit === "number" ? `${bytes(details.limit)} for this kind of file` : "16 MiB for text, 15 MiB for other files";
-      return {
-        message: `That attachment is larger than an artifact file may be (${limit}), so it can't be saved as one.`,
-        nextAction: `Keep it as an attachment, or push a smaller version of the file as an artifact: ${formatHint(RAFT_HINTS.artifactPublish({ target: "<conversation>" }), style)}.`,
-      };
-    }
-    case "CONTENT_UNAVAILABLE":
-      return {
-        message: "Nothing was saved: this server can't store the file as an artifact right now.",
-        nextAction: `Try again later${input.savingAttachment === undefined ? "" : `: ${formatHint(RAFT_HINTS.artifactSave({ attachmentId: input.savingAttachment }), style)}`}; if it keeps failing, tell a human admin of this server.`,
-      };
-    case "IMAGE_NOT_FOUND":
-      // artifactCommentImage: one answer for an id that names no image of a comment the caller can read.
-      if (input.downloadingImage !== undefined) {
-        return {
-          message: `No image ${oneLine(input.downloadingImage)} on a comment of "${foldAgentOneLineText(artifact)}" that you can see.`,
-          nextAction: `Its id is on the comment's Images line: ${formatHint(RAFT_HINTS.artifactComments({ artifact, all: true }), style)}`,
-        };
-      }
-      return {
-        // A review's comment: its frame says nothing of the review was posted.
-        message: `"${oneLine(detail(details, "fileId"))}" isn't an image you uploaded to "${oneLine(artifact)}" that no comment has yet.${input.reviewing && input.commenting ? "" : " Nothing was posted."}`,
-        nextAction: "Upload the image again (an unused upload is gone after an hour, and each upload goes in one comment only), then post the comment with the new id.",
-      };
     case "IMAGE_REFUSED": {
       const reason = detail(details, "reason");
       const why = reason === "too_large" ? `it is larger than ${bytes(details.limit)}`
@@ -2016,27 +1774,63 @@ export function formatArtifactError(code: ArtifactErrorCode, input: ArtifactErro
         nextAction: reason === "server_quota_exceeded" ? full : reason === "uploader_quota_exceeded" ? yours : "Send a smaller PNG, JPEG, WebP or GIF image, or post the comment without it.",
       };
     }
-    case "SCREENSHOT_NOT_FOUND": {
-      const version = detail(details, "version") || (input.version === undefined ? "" : String(input.version));
-      const read = formatHint(RAFT_HINTS.artifactCheck({ artifact, ...(/^[1-9]\d*$/.test(version) ? { version: Number(version) } : {}) }), style);
+    case "ATTACHMENT_NOT_FOUND": {
+      const attachmentId = input.savingAttachment ?? detail(details, "attachmentId");
+      // The view tells the two apart: a file behind the history limit answers HISTORY_LIMITED there.
+      const view = style === "cli" ? RAFT_HINTS.attachmentDownload(attachmentId) : RAFT_HINTS.attachmentView(attachmentId);
       return {
-        message: `${version ? `v${version} of ` : ""}"${artifact}" has no ${detail(details, "shot") || "such"} screenshot from its publish check.`,
-        nextAction: `Read the version's check: ${read}. Only a check that is done has screenshots, and only the newest three checked versions of an Artifact keep theirs.`,
+        message: `No attachment "${attachmentId}" that you can see. A file from a message older than this server's history limit (30 days on the Free plan) can't be saved either.`,
+        nextAction: `Check the id: it is the one after the file name, (id:…), when you read the conversation: ${formatHint(RAFT_HINTS.messageRead({ target: "<conversation>" }), style)}. If the id is right, ${formatHint(view, style)} answers HISTORY_LIMITED when its message is older than the history limit.`,
       };
     }
+    case "ALREADY_SAVED":
+      return {
+        message: "That attachment was already saved as an artifact you can't see; nothing new was made.",
+        nextAction: `Push your own copy: ${ownCopySteps(input.savingAttachment ?? detail(details, "attachmentId"), style)}.`,
+      };
+    // The Server's own sentence and step say these as well as words here could (#wg-ax:#13 P3): the caller
+    // keeps the refusal as the Server sent it.
+    case "NOT_VISIBLE":
+    case "AMBIGUOUS_ARTIFACT_NAME":
+    case "VERSION_NOT_FOUND":
+    case "FILE_NOT_FOUND":
+    case "FORBIDDEN":
+    case "NAME_TAKEN":
+    case "DUPLICATE_PATH":
+    case "ENTRY_NOT_FOUND":
+    case "INVALID_CONTENT":
+    case "TOO_MANY_FILES":
+    case "REQUEST_TOO_LARGE":
+    case "UPLOAD_QUOTA_EXCEEDED":
+    case "COMMENT_NOT_FOUND":
+    case "COMMENT_IS_REPLY":
+    case "TOO_MANY_MENTIONS":
+    case "ANCHOR_WITHOUT_PATH":
+    case "HOME_NOT_WIDER":
+    case "ATTACHMENT_NOT_SAVABLE":
+    case "SCREENSHOT_NOT_FOUND":
+    case "IMAGE_NOT_FOUND":
+    // Deliberate 503s: the caller keeps their sentence too (agentOps serverWordedError), which says whether retrying helps.
+    case "ARTIFACTS_STORAGE_UNAVAILABLE":
+    case "CONTENT_UNAVAILABLE":
+    // raft-artifacts.com imports: no current command or op makes one any more; an older CLI has its own words.
+    case "INVALID_NAME":
+    case "IMPORT_UNAVAILABLE":
+    case "NOT_A_LEGACY_LINK":
+    case "LEGACY_OTHER_SERVER":
+    case "LEGACY_NOT_FOUND":
+    case "IMPORT_TOO_LARGE":
+    case "IMPORT_MISMATCH":
+    case "ALREADY_IMPORTED":
+    case "TARGET_HAS_GUESTS":
     case "TARGET_NOT_SUPPORTED":
-      return {
-        message: `Artifacts can't be imported into a joint channel (${input.target ?? detail(details, "target")}) yet.`,
-        nextAction: `Import it into a channel or DM of this server instead: ${formatHint(RAFT_HINTS.serverInfo({ view: "channels" }), style)}.`,
-      };
+      return null;
     default: {
-      // Every code in the contract has its own words above: a new one fails to compile here until it does.
+      // Every code in the contract is decided above: a new one fails to compile here until it is.
       const unhandled: never = code;
-      // At run time a code this client has no words for (a newer Server) still gets a sentence and a next step.
-      return {
-        message: `The Server refused this (${String(unhandled)}).`,
-        nextAction: `Check what you passed and try again; if it keeps happening, tell a human. Your artifacts: ${formatHint(RAFT_HINTS.artifactList({}), style)}`,
-      };
+      // At run time a code this client doesn't know (a newer Server) keeps the Server's own sentence and step.
+      void unhandled;
+      return null;
     }
   }
 }

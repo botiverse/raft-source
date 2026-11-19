@@ -1,0 +1,183 @@
+{
+  "at": "2026-11-14T18:05:46.780Z",
+  "version": [
+    {
+      "version": "PostgreSQL 13.14.0-RisingWave-3.0.3 (ec07f2eb759bd2d8a12a55b030bf581b82adb4b9)"
+    }
+  ],
+  "rows": [
+    {
+      "file": "01-rw_joint_channel_members_v1.sql",
+      "name": "rw_joint_channel_members_v1",
+      "parallelism": "FIXED(1)",
+      "actors": 4
+    },
+    {
+      "file": "02-rw_joint_channel_admissions_v1.sql",
+      "name": "rw_joint_channel_admissions_v1",
+      "parallelism": "FIXED(1)",
+      "actors": 4
+    },
+    {
+      "file": "03-rw_joint_membership_departures_v1.sql",
+      "name": "rw_joint_membership_departures_v1",
+      "parallelism": "FIXED(1)",
+      "actors": 4
+    },
+    {
+      "file": "04-rw_joint_membership_removals_v1.sql",
+      "name": "rw_joint_membership_removals_v1",
+      "parallelism": "FIXED(1)",
+      "actors": 4
+    },
+    {
+      "file": "05-rw_joint_entry_server_members_v1.sql",
+      "name": "rw_joint_entry_server_members_v1",
+      "parallelism": "FIXED(1)",
+      "actors": 4
+    },
+    {
+      "file": "06-rw_joint_entry_projections_v1.sql",
+      "name": "rw_joint_entry_projections_v1",
+      "parallelism": "FIXED(1)",
+      "actors": 4
+    },
+    {
+      "file": "07-rw_joint_human_entries_v1.sql",
+      "name": "rw_joint_human_entries_v1",
+      "parallelism": "FIXED(1)",
+      "actors": 28
+    },
+    {
+      "file": "08-rw_human_channel_members_v1.sql",
+      "name": "rw_human_channel_members_v1",
+      "parallelism": "FIXED(1)",
+      "actors": 10
+    },
+    {
+      "file": "09-rw_subs_jcm_v1.sql",
+      "name": "rw_subs_jcm_v1",
+      "parallelism": "FIXED(1)",
+      "actors": 17
+    },
+    {
+      "file": "10-rw_muted_subs_jcm_v1.sql",
+      "name": "rw_muted_subs_jcm_v1",
+      "parallelism": "FIXED(1)",
+      "actors": 12
+    },
+    {
+      "file": "11-rw_inbox_normal_jcm_v1.sql",
+      "name": "rw_inbox_normal_jcm_v1",
+      "parallelism": "FIXED(1)",
+      "actors": 8
+    },
+    {
+      "file": "12-rw_inbox_muted_full_jcm_v1.sql",
+      "name": "rw_inbox_muted_full_jcm_v1",
+      "parallelism": "FIXED(1)",
+      "actors": 8
+    },
+    {
+      "file": "13-rw_inbox_muted_prefix_jcm_v1.sql",
+      "name": "rw_inbox_muted_prefix_jcm_v1",
+      "parallelism": "FIXED(1)",
+      "actors": 8
+    },
+    {
+      "file": "14-rw_task_conversation_unread_jcm_v1.sql",
+      "name": "rw_task_conversation_unread_jcm_v1",
+      "parallelism": "FIXED(1)",
+      "actors": 7
+    },
+    {
+      "file": "15-rw_inbox_mention_jcm_v1.sql",
+      "name": "rw_inbox_mention_jcm_v1",
+      "parallelism": "FIXED(1)",
+      "actors": 26
+    },
+    {
+      "file": "16-rw_activity_watermark_jcm_v1.sql",
+      "name": "rw_activity_watermark_jcm_v1",
+      "parallelism": "FIXED(1)",
+      "actors": 19
+    },
+    {
+      "file": "17-rw_inbox_items_jcm_v1.sql",
+      "name": "rw_inbox_items_jcm_v1",
+      "parallelism": "FIXED(1)",
+      "actors": 17
+    },
+    {
+      "file": "18-rw_inbox_preview_need_jcm_v1.sql",
+      "name": "rw_inbox_preview_need_jcm_v1",
+      "parallelism": "FIXED(1)",
+      "actors": 9
+    },
+    {
+      "file": "19-rw_inbox_preview_seq_jcm_v1.sql",
+      "name": "rw_inbox_preview_seq_jcm_v1",
+      "parallelism": "FIXED(1)",
+      "actors": 4
+    },
+    {
+      "file": "20-rw_inbox_serving_jcm_v1.sql",
+      "name": "rw_inbox_serving_jcm_v1",
+      "parallelism": "FIXED(1)",
+      "actors": 24
+    },
+    {
+      "file": "21-idx_rw_inbox_serving_jcm_v1.sql",
+      "name": "idx_rw_inbox_serving_jcm_v1_receiver",
+      "parallelism": "FIXED(1)",
+      "actors": 2
+    },
+    {
+      "file": "22-rw_activity_totals_jcm_v1.sql",
+      "name": "rw_activity_totals_jcm_v1",
+      "parallelism": "FIXED(1)",
+      "actors": 4
+    },
+    {
+      "file": "23-rw_agent_inbox_jcm_v1.sql",
+      "name": "rw_agent_inbox_jcm_v1",
+      "parallelism": "FIXED(1)",
+      "actors": 20
+    },
+    {
+      "file": "24-idx_rw_agent_inbox_jcm_v1.sql",
+      "name": "idx_rw_agent_inbox_jcm_v1_agent_activity",
+      "parallelism": "FIXED(1)",
+      "actors": 2
+    },
+    {
+      "file": "25-rw_conversation_unread_jcm_v1.sql",
+      "name": "rw_conversation_unread_jcm_v1",
+      "parallelism": "FIXED(1)",
+      "actors": 21
+    },
+    {
+      "file": "26-idx_rw_conversation_unread_jcm_v1.sql",
+      "name": "idx_rw_conversation_unread_jcm_v1_receiver",
+      "parallelism": "FIXED(1)",
+      "actors": 2
+    }
+  ],
+  "sum": 272,
+  "scope": "Local empty RW 3.0.3 FIXED(1) measurement, not a live capacity permit; 27-object scans/count provenance in staging-backfill-ledger.json",
+  "missingHelper": {
+    "file": "staging-helper/00-rw_inbox_preview_parent_v1.sql",
+    "name": "rw_inbox_preview_parent_v1",
+    "parallelism": "FIXED(1)",
+    "actors": 4
+  },
+  "plannedDelta": 276,
+  "localAccounting": {
+    "sumWorkerActorCount": 642,
+    "countActors": 642,
+    "sumJobActors": 642,
+    "workerParallelism": 12,
+    "newJobParallelism": 1,
+    "plannedDelta": 276
+  }
+}

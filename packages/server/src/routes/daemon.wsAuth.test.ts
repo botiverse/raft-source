@@ -25,6 +25,7 @@ import {
   MACHINE_CONNECT_RATE_LIMIT_MAX,
   __resetMachineConnectRateLimitForTests,
 } from "../services/machineConnectRateLimit";
+import { __resetDrainStateForTests, markDraining } from "../services/drainState";
 
 
 // task #88 (#wg-raft-computer 2026-06-05): pins the /daemon/connect auth
@@ -447,6 +448,48 @@ test("valid computer attachment → 101 accepted; span carries ids, never the ke
   assert.equal(dump.includes("?key="), false);
   // The correlation handle is the irreversible fingerprint, present + non-key.
   assert.equal(typeof span.startAttrs.api_key_fingerprint, "string");
+});
+
+// Deployment thread 3f292dc3: a daemon accepted in the seconds after a drain
+// starts (the ALB still routes here) is outside the going-away snapshot and
+// was hard-cut at deregistration expiry. A draining task answers 503 before
+// any budget, credential or argon2 work.
+test("draining → 503 server_draining before any auth work, even for a valid key", async () => {
+  const userId = await seedUser();
+  const server = await createRaftServer("Draining Co", `ws-drain-${randomUUID()}`, userId);
+  await addMember(server.id, userId, "owner");
+  const { machine } = await registerMachine(server.id, userId, "drain-m");
+  const mat = await generateComputerApiKeyMaterial();
+  await getDb().insert(computers).values({
+    serverId: server.id,
+    name: "drain-box",
+    apiKeyHash: mat.apiKeyHash,
+    apiKeyPrefix: mat.apiKeyPrefix,
+    attachedByUserId: userId,
+    machineId: machine.id,
+  });
+  const verify = vi.spyOn(argon2, "verify");
+  const holdChecksBefore = handshakeHoldChecks.length;
+  const registeredBefore = registeredPrincipalKinds.length;
+  markDraining();
+  try {
+    const res = await attemptConnect(mat.apiKey);
+    assert.equal(res.status, 503);
+    assert.equal(res.reason, "server_draining");
+    assert.equal(verify.mock.calls.length, 0, "no argon2 verify on a draining task");
+    assert.equal(handshakeHoldChecks.length, holdChecksBefore, "no orchestrator handshake check");
+    assert.equal(registeredPrincipalKinds.length, registeredBefore, "nothing registered");
+    const span = lastSpan();
+    assert.equal(span.ended, true);
+    assert.equal(span.endAttrs?.outcome, "refused");
+    assert.equal(span.endAttrs?.reason, "server_draining");
+    assert.equal(span.endAttrs?.argon2_verify_count, undefined);
+  } finally {
+    __resetDrainStateForTests();
+    verify.mockRestore();
+  }
+  // The same key connects once the process is not draining (a fresh task).
+  assert.equal((await attemptConnect(mat.apiKey)).open, true);
 });
 
 // Task #374: a held duplicate must be refused before the upgrade. A daemon

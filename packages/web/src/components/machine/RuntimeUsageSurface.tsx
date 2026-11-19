@@ -1,7 +1,7 @@
 import { Badge, Status, Button, IconTile, ListRow, ListRowBody, ListRowBottom, ListRowDescription, ListRowGroup, ListRowTitle, ListRowTop, Separator, Spinner, TextLink } from "@botiverse/raft-ui";
 import { Meter, MeterHeader, MeterIndicator, MeterLabel, MeterTrack, MeterValue } from "@botiverse/raft-ui/wip";
 import CloseButton from "../ui/CloseButton";
-import { isClaudeOAuthAppsWindow, runtimeAuthSignsInPerProvider } from "@botiverse/raft-shared";
+import { allModelsUsageAccount, currentTimeMs, isClaudeOAuthAppsWindow, runtimeAuthSignsInPerProvider } from "@botiverse/raft-shared";
 import type { Readiness, RuntimeAccountUsageProvider, RuntimeAccountUsageWindow, RuntimeAuthRuntime, RuntimeAuthSignedInProvider, RuntimeAuthStatus } from "@botiverse/raft-shared";
 import { formatReadiness, readinessBody, readinessHeading, readinessHolds } from "../../utils/readinessCopy";
 import { TriangleAlert, KeyRound, ListChecks, LogIn, LogOut, Plus, RefreshCw, TimerReset, UserRound, X } from "lucide-react";
@@ -10,10 +10,11 @@ import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
 import type { IntlShape } from "react-intl";
 import { runtimeUsagePercentUsed } from "./bulkChangeModelPlan";
+import { usageResetText } from "./rack/rackResetText";
+import { formatRelativeTime } from "../../utils/relativeTime";
 import { hasProviderKey } from "./runtimeProviderKey";
 import { RUNTIME_INSTALL_COMMANDS } from "./runtimeInstallCommands";
 import { RackCommand } from "../../features/computer/RackCommand";
-import { formatRelativeTime } from "../../utils/relativeTime";
 import type { RuntimeAccountUsageReadResult, RuntimeAccountUsageRefreshResult } from "../../utils/runtimeAccountUsageClient";
 import { runtimeAuthComputerSignsOut, runtimeAuthComputerSupports } from "../../utils/runtimeAuthClient";
 import type { RuntimeAuthView } from "../../utils/runtimeAuthClient";
@@ -36,8 +37,9 @@ function UsageWindowMeter({ window }: { window: RuntimeAccountUsageWindow }) {
   const usedUp = window.status === "limit_reached" || (window.usedRatio ?? 0) >= 1;
   const used = usedUp ? 100 : (window.usedRatio ?? 0) * 100;
   const percentUsed = runtimeUsagePercentUsed(window.usedRatio ?? 0);
+  // Counted as the rack's cell counts it (rackReset: down, to the largest unit); one already passed says how long ago (usageResetText).
   const reset = window.resetsAt
-    ? formatRelativeTime(window.resetsAt, locale) ?? formatMessage({ id: "machine.runtimeUsage.later" })
+    ? usageResetText(window.resetsAt, locale, currentTimeMs()) ?? formatMessage({ id: "machine.runtimeUsage.later" })
     : null;
   const valueText = usedUp
     ? reset === null
@@ -133,6 +135,9 @@ export function RuntimeUsageContents({
           const reauth = account.health === "reauth_required";
           const identity = account.maskedLabel ?? account.displayName;
           const resets = account.limitResetsAvailable;
+          // Used up on the all-models basis only: a model's own window at
+          // its limit says so on its own row, not on the account.
+          const health = allModelsUsageAccount(account).account.health;
           return (
             <Fragment key={account.accountKey}>
             {index > 0 ? <Separator /> : null}
@@ -164,10 +169,10 @@ export function RuntimeUsageContents({
                 {/* Raft DS StatusChip: soft wash, a square pixel, one word. */}
                 <Badge
                   appearance="soft"
-                  variant={account.health === "ok" ? "success" : "warning"}
+                  variant={health === "ok" ? "success" : "warning"}
                 >
-                  <Status size="md" variant={account.health === "ok" ? "success" : "warning"} aria-hidden="true" />
-                  {formatMessage({ id: `machine.runtimeUsage.health.${account.health}` })}
+                  <Status size="md" variant={health === "ok" ? "success" : "warning"} aria-hidden="true" />
+                  {formatMessage({ id: `machine.runtimeUsage.health.${health}` })}
                 </Badge>
               </div>
               {account.health === "unsupported" ? null : account.health === "error" ? (
@@ -437,16 +442,18 @@ export interface SurfaceLimitReset {
 
 /**
  * Claude limit resets on the card (claude_limit_reset), for a person who may
- * act: `computer_upgrade_required` says the one step (upgrade); `ok` offers
- * "View available resets" and, at the 5-hour limit, "Use 5-hour reset" as the
- * card's main action. `onView` is null for an account known to be on Claude's
+ * act, on a Computer that can run them; null: nothing is drawn. What each
+ * viewer is offered is `claudeLimitResetOffer`: "View available resets"
+ * (`onView`) and, at the 5-hour limit, "Use 5-hour reset" (`onUseFiveHour`)
+ * as the card's main action; a person who did not connect the Computer gets
+ * only `onView`. `onView` is null for an account known to be on Claude's
  * older program at its 5-hour limit, where opening the list would use it.
- * `ownerOnly`: the viewer (an owner or admin) did not connect this Computer,
- * so they may view its resets but not use one; the card says so.
  */
-export type SurfaceClaudeLimitReset =
-  | { state: "computer_upgrade_required" }
-  | { state: "ok"; atFiveHourLimit: boolean; onView: (() => void) | null; onUseFiveHour: (() => void) | null; ownerOnly?: boolean };
+export interface SurfaceClaudeLimitReset {
+  atFiveHourLimit: boolean;
+  onView: (() => void) | null;
+  onUseFiveHour: (() => void) | null;
+}
 
 export function RuntimeUsageSurface({
   runtimeId,
@@ -579,7 +586,7 @@ export function RuntimeUsageSurface({
                   {formatMessage({ id: "machine.runtimeUsage.limitReset.action" })}
                 </Button>
               ) : null}
-              {claudeLimitReset?.state === "ok" && claudeLimitReset.onView ? (
+              {claudeLimitReset?.onView ? (
                 <Button size="md"
                   variant="outline"
                   type="button"
@@ -591,7 +598,7 @@ export function RuntimeUsageSurface({
                   {formatMessage({ id: "machine.runtimeUsage.claudeReset.viewAction" })}
                 </Button>
               ) : null}
-              {claudeLimitReset?.state === "ok" && claudeLimitReset.onUseFiveHour ? (
+              {claudeLimitReset?.onUseFiveHour ? (
                 <Button size="md"
                   variant="primary"
                   type="button"
@@ -606,11 +613,6 @@ export function RuntimeUsageSurface({
               ) : null}
             </div>
           </div>
-          {claudeLimitReset?.state === "ok" && claudeLimitReset.ownerOnly ? (
-            <p className="mt-1.5 text-caption text-foreground-hint" data-testid="claude-limit-resets-owner-only">
-              {formatMessage({ id: "machine.runtimeUsage.claudeReset.ownerOnly" })}
-            </p>
-          ) : null}
           {statusText ? (
             <p className="mt-1.5 text-caption text-foreground-hint" role="status" data-testid="runtime-usage-status">{statusText}</p>
           ) : null}

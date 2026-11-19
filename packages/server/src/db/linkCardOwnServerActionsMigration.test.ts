@@ -6,8 +6,9 @@ import { assertBoundedLockTimeout } from "../test/migrationLockTimeout";
 
 // RFC 076 §17 on oauth_app_link_previews (read by every link card read): two
 // nullable columns and a CHECK added NOT VALID. A 2 s lock wait, catalog
-// changes only, no backfill, no validating scan. The CHECK itself is exercised
-// in routes/linkCardOwnServerActions.api.test.ts.
+// changes only, no backfill, no validating scan. Since card buttons moved to
+// the installation (cardButtonsPerInstallationMigration.test.ts) nothing reads
+// or writes these columns.
 const DRIZZLE_DIR = path.resolve(import.meta.dirname, "../../drizzle");
 
 function statements(sqlText: string): string[] {

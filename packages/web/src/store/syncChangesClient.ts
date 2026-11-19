@@ -48,7 +48,12 @@ export type SyncSnapshotLoader = {
   load: (reason?: ListFetchReason) => Promise<void> | void;
 };
 
-export type SyncSnapshotLoaders = Record<SyncSnapshotName, SyncSnapshotLoader>;
+/**
+ * `tasks` has no loader: the web skips `task` rows and keeps no task lists
+ * from the change log, so a reset naming it is an unknown name here, which
+ * takes every snapshot (what a reset does anyway).
+ */
+export type SyncSnapshotLoaders = Record<Exclude<SyncSnapshotName, "tasks">, SyncSnapshotLoader> & Partial<Record<"tasks", SyncSnapshotLoader>>;
 
 export type SyncChangesPlan = {
   snapshots: Set<SyncSnapshotName>;

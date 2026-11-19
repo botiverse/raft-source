@@ -781,7 +781,7 @@ function smokeNativeBinary({ outBinary, platform, arch, version, daemonVersion, 
   }
   console.log(`[verify] ${outBinary} context view restore child answered, heap limit ${restoreHeapLimit} MB`);
 
-  // RFC 060: the OAR host loads OAR's runtimes (grok, qwen, qoder, codebuddy), their
+  // RFC 060: the OAR host loads OAR's runtimes (grok, qwen, qoder), their
   // session paths and the observe entry lazily; load them from the binary as a
   // launch would.
   const oarResult = spawnSync(outBinary, ["__verify-bundled-oar"], {

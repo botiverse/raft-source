@@ -391,7 +391,9 @@ test("actionCardActionSchema drops an agent-prefilled runtime on agent:create; a
   // (runtime / model / reasoningEffort) are a human prerogative,
   // not agent-prefillable. Computer placement is now a structured,
   // validated suggested/required constraint. Schema enforces this; the Server
-  // checks every card with this shared schema and validator.
+  // checks every card with this shared schema and validator. The only
+  // runtime an agent may name is `suggestedRuntime`, a starting point the
+  // person can change (the Server checks the id at prepare).
   const result = actionCardActionSchema.safeParse({
     type: "agent:create",
     name: "scout",
@@ -438,4 +440,119 @@ test("question:ask: a question of one option is a valid card; none, or one with 
   assert.equal(actionCardActionSchema.safeParse(card({ kind: "multiple", options: [{ value: "ok", label: "Got it" }] })).success, true);
   assert.equal(actionCardActionSchema.safeParse(card({ options: [] })).success, false);
   assert.equal(actionCardActionSchema.safeParse(card({ options: [{ value: "ok", label: "Got it" }], other: {} })).success, false);
+});
+
+// RFC 085 §4.2 discovery: what the agent can prepare as a request card, as the Server lists it.
+const OPERATIONS = {
+  enabled: true,
+  operations: [
+    {
+      operation: "agent:stop",
+      summary: "Stop an agent.",
+      args: [{ name: "agent", description: "the agent's handle, as `raft server info --agents` lists it", required: true }],
+      confirmer: "a server owner or admin, or the agent's creator",
+      personSees: { title: "Stop <agent>", button: "Stop agent" },
+      example: { agent: "@builder" },
+    },
+    {
+      operation: "channel:remove_admin",
+      summary: "Make a channel admin an ordinary member of the channel (never the other way).",
+      args: [
+        { name: "channel", description: "the channel, as #name", required: true },
+        { name: "member", description: "the channel admin's handle", required: true },
+        { name: "why", description: "a line\nwith a break", required: false },
+      ],
+      confirmer: "a server owner or admin, or a channel admin of that channel",
+      personSees: { title: "Remove channel admin from <member> in <channel>", button: "Remove channel admin" },
+      example: { channel: "#ops", member: "@alice" },
+    },
+  ],
+};
+
+test("raft action prepare --list prints what can be prepared as a request card, ending with the command that prepares the first", async () => {
+  const run = await runPinned(["action", "prepare", "--list"], [{ method: "GET", path: /\/prepare-action\/operations$/, data: OPERATIONS }]);
+  assert.equal(run.exitCode, 0, run.stderr);
+  assert.deepEqual(run.requests.map((request) => request.method), ["GET"], "nothing is prepared or posted");
+  assert.equal(run.stdout, [
+    "Operations you can prepare as a request card here (the person you name confirms; it runs as them):",
+    "",
+    "agent:stop: Stop an agent.",
+    "  arg agent: the agent's handle, as `raft server info --agents` lists it",
+    "  ask: a server owner or admin, or the agent's creator",
+    "  they see: \"Stop <agent>\" and a \"Stop agent\" button",
+    "channel:remove_admin: Make a channel admin an ordinary member of the channel (never the other way).",
+    "  arg channel: the channel, as #name",
+    "  arg member: the channel admin's handle",
+    // A line break in any field never starts a line of its own.
+    "  arg why (optional): a line with a break",
+    "  ask: a server owner or admin, or a channel admin of that channel",
+    "  they see: \"Remove channel admin from <member> in <channel>\" and a \"Remove channel admin\" button",
+    "",
+    "Prepare one where the person can act (a DM with them, or a channel they are in):",
+    "  raft action prepare --target \"dm:@<person>\" <<'RAFTACTION'",
+    "  {\"type\":\"request:prepare\",\"to\":\"@<person>\",\"operation\":\"agent:stop\",\"args\":{\"agent\":\"@builder\"},\"note\":\"<why, in one sentence>\"}",
+    "  RAFTACTION",
+    "",
+  ].join("\n"));
+  // The printed command runs as printed: its here-string is a card the CLI sends as written.
+  const command = /raft action prepare --target "([^"]+)" <<'RAFTACTION'\n {2}(.*)\n {2}RAFTACTION\n$/.exec(run.stdout)!;
+  const sent = await runPinned(["action", "prepare", "--target", command[1]!], [{ method: "POST", path: /prepare-action$/, data: PREPARED }], command[2]!);
+  assert.equal(sent.exitCode, 0, sent.stderr);
+  assert.deepEqual((sent.requests[0]?.body as { action?: unknown }).action, { type: "request:prepare", to: "@<person>", operation: "agent:stop", args: { agent: "@builder" }, note: "<why, in one sentence>" });
+});
+
+test("raft action prepare --list: none to prepare says why and what to do instead; a Server too old to list them says so", async () => {
+  const off = await runPinned(["action", "prepare", "--list"], [{ method: "GET", path: /\/prepare-action\/operations$/, data: { enabled: false, operations: [] } }]);
+  assert.equal(off.exitCode, 0, off.stderr);
+  assert.equal(off.stdout, "You can't prepare any operation as a request card here: request cards are off on this server. Ask the person in a message to do it themselves in Raft: raft message send --target \"dm:@<person>\" <<<'<your reply>'\n");
+  const none = await runPinned(["action", "prepare", "--list"], [{ method: "GET", path: /\/prepare-action\/operations$/, data: { enabled: true, operations: [] } }]);
+  assert.match(none.stdout, /: none is listed on this server yet\. Ask the person in a message/);
+
+  const old = await runPinned(["action", "prepare", "--list"], [{ method: "GET", path: /\/prepare-action\/operations$/, response: { ok: false, status: 404, error: "Not found", data: null } as never }]);
+  assert.equal(old.exitCode, 1);
+  assert.equal(old.stdout, "");
+  assert.equal(old.stderr, [
+    "Error: This Raft Server can't list the operations you can prepare as a request card (it is older than this command).",
+    "Code: LIST_UNAVAILABLE",
+    "Retryable: no",
+    "Next action: Ask the person in a message to do it themselves in Raft: raft message send --target \"dm:@<person>\" <<<'<your reply>'",
+    "",
+  ].join("\n"));
+});
+
+test("raft action prepare: a request card echoes the summary the person sees, whom it is for, where the result arrives and how to withdraw it", async () => {
+  const id = "1a2b3c4d-1111-4222-8333-444455556666";
+  const action = { type: "request:prepare", to: "@tenny", operation: "agent:stop", args: { agent: "@builder" }, note: "It loops." };
+  const answer = {
+    messageId: id,
+    metadata: { kind: "action-card", state: "prepared" },
+    preparedRequest: { summary: "Stop @builder (Agent: @builder)", title: "Stop @builder", for: "@tenny", operation: "agent:stop", result: "reply" },
+  };
+  const run = await runPinned(["action", "prepare", "--target", "#ops"], [{ method: "POST", path: /prepare-action$/, data: answer }], JSON.stringify(action));
+  assert.equal(run.exitCode, 0, run.stderr);
+  assert.equal(
+    run.stdout,
+    `Request card posted to #ops as message ${id} (short 1a2b3c4d) for @tenny. It shows them: Stop @builder. When they confirm or decline it, the result arrives as a reply in the card's thread that @mentions you; you do not need to poll. If you no longer need it, withdraw it with: raft action withdraw --message 1a2b3c4d\n`,
+  );
+  // An older Server that echoes nothing: the generic line.
+  const older = await runPinned(["action", "prepare", "--target", "#ops"], [{ method: "POST", path: /prepare-action$/, data: { messageId: id, metadata: { kind: "action-card" } } }], JSON.stringify(action));
+  assert.match(older.stdout, /^Action card posted to #ops as message /);
+});
+
+test("raft action prepare --help points at --list for request cards", async () => {
+  const help = (await runPinned(["action", "prepare", "--help"], [])).stdout;
+  assert.match(help, /--list +List the operations you can prepare as a request card/);
+  assert.match(help, /request:prepare.*\n.*\n.*\n {2}raft action prepare --list/);
+});
+
+test("actionCardActionSchema keeps agent:create's suggestedRuntime; it is not for a cloud agent", () => {
+  const result = actionCardActionSchema.safeParse({ type: "agent:create", name: "scout", suggestedRuntime: "codex" });
+  assert.ok(result.success);
+  if (result.success) {
+    assert.equal((result.data as Record<string, unknown>).suggestedRuntime, "codex");
+    assert.equal(validateActionCardAction(result.data), null);
+  }
+  const hosted = actionCardActionSchema.safeParse({ type: "agent:create", name: "scout", hosting: "antiproton", suggestedRuntime: "codex" });
+  assert.ok(hosted.success);
+  if (hosted.success) assert.match(validateActionCardAction(hosted.data) ?? "", /leave out suggestedRuntime/);
 });

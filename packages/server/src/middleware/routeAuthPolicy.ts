@@ -381,6 +381,7 @@ export const routeAuthPolicy: readonly RouteAuthPolicyEntry[] = [
   { method: "GET", path: "/internal/agent-api/assistant/owner-messages", principal: "sk_agent", note: "RFC 074 assistant — read an owner-visible conversation, DMs unless the owner turned that off (RFC 077; assistants only)" },
   { method: "GET", path: "/internal/agent-api/assistant/owner-artifact", principal: "sk_agent", note: "RFC 075 assistant — read an Artifact the owner can open, by the web's checks with the owner as reader (#proj-assistant:#31; assistants only)" },
   { method: "POST", path: "/internal/agent-api/assistant/owner-artifact", principal: "sk_agent", note: "RFC 075 assistant — publish an Artifact as itself into its DM with its owner, or a new version of one it published (#proj-assistant:#31; assistants only)" },
+  { method: "POST", path: "/internal/agent-api/assistant/owner-artifact/as-owner", principal: "sk_agent", note: "assistant — publish an Artifact as its owner while \"send as me\" is on, into a conversation the owner may post in, under send-as-owner's rules (#proj-assistant:#33; assistants only)" },
   { method: "GET", path: "/internal/agent-api/assistant/owner-activity", principal: "sk_agent", note: "RFC 077 assistant — the owner's own actions since a time, references only (assistants only)" },
   { method: "GET", path: "/internal/agent-api/assistant/owner-resolve", principal: "sk_agent", note: "RFC 077 assistant — who @name is as the owner would find them; unseen = not found (assistants only)" },
   { method: "POST", path: "/internal/agent-api/assistant/check-state/import", principal: "sk_agent", note: "RFC 077 step 2c assistant — one-time brief-state push when raftCheck turns on (assistants only)" },
@@ -409,6 +410,7 @@ export const routeAuthPolicy: readonly RouteAuthPolicyEntry[] = [
   { method: "POST", path: "/internal/agent-api/integrations/app/prepare", principal: "sk_agent", note: "agent-prepared third-party app registration action card" },
   { method: "GET", path: "/internal/agent-api/integrations/app", principal: "sk_agent", note: "task #163 — requester/owner/admin-scoped app state reconstruction" },
   { method: "GET", path: "/internal/agent-api/integrations/app/status", principal: "sk_agent", note: "task #163 — requester/owner/admin-scoped app status lookup" },
+  { method: "POST", path: "/internal/agent-api/integrations/app/card-buttons", principal: "sk_agent", note: "RFC 076 §17 — read or set whether an App's card buttons act on the agent's Server (manageIntegrations there)" },
   { method: "POST", path: "/internal/agent-api/integrations/app/rotate-secret", principal: "sk_agent", note: "task #163 — resource-maintainer-or-server-admin secret rotation" },
   { method: "POST", path: "/internal/agent-api/integrations/app/transfer-owner", principal: "sk_agent", note: "task #163 — owner-or-server-admin transfer of a source-owned app" },
   { method: "POST", path: "/internal/agent-api/integrations/app/update", principal: "sk_agent", note: "task #163 — owner-or-server-admin update of a source-owned app" },
@@ -443,6 +445,7 @@ export const routeAuthPolicy: readonly RouteAuthPolicyEntry[] = [
   { method: "PATCH", path: "/internal/agent-api/apps/:appId/config", principal: "sk_agent", note: "RAP App Config v0.1 — atomically update config for the bound agent" },
   { method: "POST", path: "/internal/agent-api/prepare-action", principal: "sk_agent", note: "RFC v0.8 — agent-self action card prepare" },
   { method: "POST", path: "/internal/agent-api/actions/:messageId/withdraw", principal: "sk_agent", note: "Question cards — the asking agent withdraws its own unanswered card" },
+  { method: "GET", path: "/internal/agent-api/prepare-action/operations", principal: "sk_agent", note: "RFC 085 — the request-card operations the agent may prepare on its server" },
 
   // ---------------------------------------------------------------------------
   // RFC v0.8 — `/internal/computer/*` mint surface.

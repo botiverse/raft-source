@@ -6,7 +6,7 @@ import { CLIENT_IP_HASH_SALT_ENV } from "../tracing/clientIpHash";
 import { httpRequestDuration, httpRequestsTotal } from "../metrics";
 import { traceAgentIdHash } from "../tracing/traceIdentity";
 import { __traceUserIdForTests, rememberTraceUserId } from "../tracing/traceUserId";
-import { attachAuthTraceIdentity, bucketHttpStatus, inferHttpCallerKind, normalizeObservedRoutePattern, requestClientAttrs, requestObservabilityMiddleware, setRequestTraceComputerCaller, setRequestTraceComputerTarget, setRequestTraceErrorCode } from "./requestObservability";
+import { attachAuthTraceIdentity, bucketHttpStatus, httpOutcomeForStatus, inferHttpCallerKind, normalizeObservedRoutePattern, requestClientAttrs, requestObservabilityMiddleware, setRequestTraceComputerCaller, setRequestTraceComputerTarget, setRequestTraceErrorCode } from "./requestObservability";
 
 const EXPECTED_LABELS = {
   route_pattern: "/api/servers/:id/members/:memberId/profile",
@@ -91,6 +91,39 @@ test("requestObservabilityMiddleware records request totals and duration with no
   );
   assert.ok(countSample);
   assert.equal(countSample.value, 1);
+});
+
+test("httpOutcomeForStatus: 4xx is refused, 5xx is error, the rest is success", () => {
+  for (const status of [200, 204, 301, 304]) assert.equal(httpOutcomeForStatus(status), "success");
+  for (const status of [400, 401, 403, 404, 409, 422, 429, 499]) assert.equal(httpOutcomeForStatus(status), "refused");
+  for (const status of [500, 502, 503, 504]) assert.equal(httpOutcomeForStatus(status), "error");
+});
+
+test("a 4xx request span says outcome=refused, keeps the exact status, and is not an error span", () => {
+  const sink = new MemoryTraceSink();
+  const tracer = new BasicTracer({ sink, traceIdGenerator: () => "5".repeat(32), spanIdGenerator: () => "6".repeat(16) });
+  const req: any = {
+    method: "GET",
+    originalUrl: "/api/agents/abc",
+    url: "/api/agents/abc",
+    baseUrl: "/api/agents",
+    route: { path: "/:id" },
+    app: { get: (key: string) => (key === "serverTracer" ? tracer : undefined) },
+  };
+  for (const [statusCode, outcome, spanStatus] of [[403, "refused", "ok"], [404, "refused", "ok"], [503, "error", "error"]] as const) {
+    const res: any = new EventEmitter();
+    res.statusCode = statusCode;
+    res.locals = {};
+    requestObservabilityMiddleware(req, res, () => {});
+    res.emit("finish");
+    const span = sink.getAllSpans().at(-1)!;
+    assert.equal(span.attrs?.outcome, outcome);
+    assert.equal(span.attrs?.status_code, statusCode);
+    assert.equal(span.status, spanStatus);
+    const finished = span.events.find((event) => event.name === "http.response.finished");
+    assert.equal(finished?.attrs?.outcome, outcome);
+    assert.equal(finished?.attrs?.["http.response.status_code"], statusCode);
+  }
 });
 
 test("requestObservabilityMiddleware records an HTTP root span without sensitive values", () => {

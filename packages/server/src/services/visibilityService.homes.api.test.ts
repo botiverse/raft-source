@@ -4,9 +4,9 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
-import { SERVER_GUEST_FEATURE_FLAG_KEY, asServerId } from "@botiverse/raft-shared";
+import { asServerId } from "@botiverse/raft-shared";
 import { getDb } from "../db/index";
-import { agents, featureFlagRules, serverMembers } from "../db/schema";
+import { agents, serverMembers } from "../db/schema";
 import { dbTest as test } from "../test/integration/dbTest";
 import { seedBoundGuest } from "../test/guestFixture";
 import { createAgent } from "./agentService";
@@ -44,7 +44,6 @@ test("server homes are seen by the server's non-guest members and live agents on
   const peer = await seed.server({ owner: peerOwner });
   await db.update(serverMembers).set({ role: "admin" }).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, admin.id)));
   await seedBoundGuest({ serverId: server.id, userId: guest.id }, db);
-  await db.insert(featureFlagRules).values({ flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [server.id] });
   const label = () => randomUUID().slice(0, 8);
   const agent = await createAgent(server.id, `homes-agent-${label()}`, { runtime: "claude", model: "sonnet" });
   const deletedAgent = await createAgent(server.id, `homes-deleted-${label()}`, { runtime: "claude", model: "sonnet" });

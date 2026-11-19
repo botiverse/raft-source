@@ -5,6 +5,7 @@ import { Card, Separator } from "@botiverse/raft-ui";
 import {
   IDENTITY_SCOPE_GROUP_SUMMARY_ID,
   OAUTH_SCOPE_PRESENTATION,
+  OAUTH_SCOPE_TIERS,
   hasAgentInboundOAuthScope,
   normalizeVisibleOAuthScopes,
   scopeGroupLabelId,
@@ -16,9 +17,12 @@ import type {
 export default function RequestedScopeConsent({
   scopes,
   className = "mt-5",
+  intro = true,
 }: {
   scopes: readonly string[];
   className?: string;
+  /** The sentence under the heading that says what the list is; a dialog that only has room for the list leaves it out. */
+  intro?: boolean;
 }) {
   const { formatMessage } = useIntl();
   const visibleScopes = normalizeVisibleOAuthScopes(scopes);
@@ -30,11 +34,10 @@ export default function RequestedScopeConsent({
       unpresentedScopes.push(trimmed);
     }
   }
-  const grouped: Record<OAuthScopeTier, typeof visibleScopes> = {
-    identity: visibleScopes.filter((scope) => OAUTH_SCOPE_PRESENTATION[scope].tier === "identity"),
-    agent_directory: visibleScopes.filter((scope) => OAUTH_SCOPE_PRESENTATION[scope].tier === "agent_directory"),
-    agent_messaging: visibleScopes.filter((scope) => OAUTH_SCOPE_PRESENTATION[scope].tier === "agent_messaging"),
-  };
+  const grouped = Object.fromEntries(OAUTH_SCOPE_TIERS.map((tier) => [
+    tier,
+    visibleScopes.filter((scope) => OAUTH_SCOPE_PRESENTATION[scope].tier === tier),
+  ])) as Record<OAuthScopeTier, typeof visibleScopes>;
   const hasAgentInboundRequest = hasAgentInboundOAuthScope(visibleScopes);
   // Use complete messages; clause order differs between languages.
   const requestedAccessCopy = formatMessage({
@@ -42,9 +45,13 @@ export default function RequestedScopeConsent({
       ? "oauth.consent.introUnrecognized"
       : visibleScopes.includes("agent:read")
         ? "oauth.consent.introAgentDirectory"
-        : hasAgentInboundRequest
-          ? "oauth.consent.introAgentMessaging"
-          : "oauth.consent.introIdentityOnly",
+        : visibleScopes.includes("app:read")
+          ? "oauth.consent.introAppDirectory"
+          : visibleScopes.includes("agent:voice")
+            ? "oauth.consent.introAgentVoice"
+            : hasAgentInboundRequest
+              ? "oauth.consent.introAgentMessaging"
+              : "oauth.consent.introIdentityOnly",
   });
 
   function renderEmptyRecognizedScopes() {
@@ -126,12 +133,14 @@ export default function RequestedScopeConsent({
       <div className="text-footnote font-bold text-foreground">
         {formatMessage({ id: "oauth.consent.requestedAccess" })}
       </div>
-      <div className="mt-1 text-callout text-foreground-muted">
-        {requestedAccessCopy}
-      </div>
-      <Card className="mt-3 stack-y-3 p-3">
+      {intro ? (
+        <div className="mt-1 text-callout text-foreground-muted">
+          {requestedAccessCopy}
+        </div>
+      ) : null}
+      <Card className={`${intro ? "mt-3" : "mt-1.5"} stack-y-3 p-3`}>
         {renderEmptyRecognizedScopes()}
-        {(["identity", "agent_directory", "agent_messaging"] as OAuthScopeTier[]).map(renderTierScopes)}
+        {OAUTH_SCOPE_TIERS.map(renderTierScopes)}
         {renderAgentInboundNotice()}
         {renderUnpresentedScopes()}
       </Card>

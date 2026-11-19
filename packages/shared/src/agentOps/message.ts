@@ -73,6 +73,8 @@ export function toAgentMessageLike(envelope: AgentApiMessageEnvelope): AgentMess
       ?? ((envelope as { delegatedBy?: { name?: unknown } | null }).delegatedBy?.name
         ? { name: String((envelope as { delegatedBy: { name: unknown } }).delegatedBy.name) }
         : null),
+    // Raft voice calls: a history read carries the row's `voiceCallId`.
+    posted_by: envelope.posted_by ?? (envelope.voiceCallId ? "voice_call" : null),
     task_status: envelope.task_status ?? envelope.taskStatus ?? null,
     task_number: envelope.task_number ?? envelope.taskNumber ?? null,
     task_assignee_id: envelope.task_assignee_id ?? envelope.taskAssigneeId ?? null,

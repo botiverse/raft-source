@@ -5,6 +5,7 @@ import { useIntl } from "react-intl";
 import { useMemo } from "react";
 import type { AgentDMConversation } from "./AgentDMConversationList";
 import { useDmPeerAvatar } from "../layout/dmPeerAvatar";
+import { messageCardFallbackText } from "../../utils/messageCardFallbackText";
 
 export function AgentDMConversationCard({ item }: { item: AgentDMConversation }) {
   const { formatMessage, locale } = useIntl();
@@ -31,7 +32,7 @@ export function AgentDMConversationCard({ item }: { item: AgentDMConversation })
       channelLabel={formatMessage({ id: "agent.dmConversation.channelLabel" })}
       timestamp={formatRelative(item.lastMessageAt || item.createdAt)}
       author={author}
-      preview={item.lastMessagePreview || formatMessage({ id: "agent.dmConversation.noMessages" })}
+      preview={messageCardFallbackText(item.lastMessagePreview ?? "") || formatMessage({ id: "agent.dmConversation.noMessages" })}
       ariaLabel={formatMessage(
         { id: "agent.dmConversation.rowAria" },
         { name: item.peerDisplayName || item.peerName },

@@ -98,6 +98,8 @@ export const USER_FOREIGN_KEY_CLASSIFICATION = {
   // A View Context grant goes with its granter's account (unusable from the request on: the granter is retired).
   "agent_context_view_grants.granter_user_id": del,
   "agent_runtime_approval_cards.user_id": del,
+  // Raft voice calls (#14860): the caller's call rows, which hold the call's transcript until it is posted.
+  "agent_voice_calls.caller_user_id": del,
   "paid_lifecycle_journeys.user_id": del,
   "appsumo_redemption_claims.user_id": del, // only claims not redeemed: a consumed one is the license's audit
   "user_analytics_ids.user_id": del,
@@ -204,6 +206,7 @@ export const USER_FOREIGN_KEY_CLASSIFICATION = {
   "oauth_app_text_revisions.reviewed_by_user_id": setNull,
   "oauth_app_webhook_configs.updated_by_user_id": setNull,
   "oauth_client_installs.text_confirmed_by_user_id": setNull,
+  "oauth_client_uninstalls.actor_user_id": setNull,
   "oauth_clients.publish_reviewed_by_user_id": setNull,
   "oauth_grants.revoked_by_user_id": setNull,
   "official_app_auto_install_transitions.actor_user_id": setNull,

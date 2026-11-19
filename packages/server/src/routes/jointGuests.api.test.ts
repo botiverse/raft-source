@@ -10,6 +10,9 @@ import { captureEmails, enableExternalChannelsFlag, tokenOf } from "../test/exte
 import { prepareJointHumanMembershipMirror } from "../services/jointHumanMembershipMirror";
 import { acceptJointChannelInvite, addAgent, addHuman, createJointChannel } from "../services/channelService";
 import { createAgent } from "../services/agentService";
+import { mintAgentCredential } from "../services/agentCredentialService";
+import { registerMachine } from "../services/machineService";
+import { placeAgentOnMachine } from "../test/agentMachineFixture";
 import { createMessage } from "../services/messageService";
 import { runChannelConversionJob, startChannelToJointConversion } from "../services/channelConversionService";
 import { checkJointAdmission } from "../services/jointChannelLimitService";
@@ -254,6 +257,39 @@ test("other servers see the Guest only as from the host, with no guest role; the
   const hostView = await status(http, f.hostMember, f.host, `/api/channels/${f.hostChannel.id}/members`);
   const seenByHost = (hostView.body.humans as Human[]).find((human) => human.id === f.guest.id);
   assert.equal(seenByHost?.effectiveChannelRole, "guest", "the host keeps the Guest label");
+});
+
+test("agents: the host's agents see the Guest with its guest role; another server's agents see it only as from the host", async ({ app }) => {
+  const f = await seedJointWithGuest();
+  type Human = { name: string; role?: string | null; servers?: Array<{ name: string; slug: string }> };
+  const suffix = Date.now() % 100000;
+  const hostAgent = await createAgent(f.host.id, `hostbot${suffix}`, { runtime: "codex" });
+  const peerAgent = await createAgent(f.peer.id, `peerbot${suffix}`, { runtime: "codex" });
+  await addAgent(f.hostChannel.id, hostAgent.id);
+  await addAgent(f.peerChannel.id, peerAgent.id);
+  const keyOf = async (agentId: string) => (await mintAgentCredential({ agentId, scopes: ["channels"], name: "joint-guest-roster", issuedVia: "computer", createdByUserId: null })).apiKey;
+  const guestRow = async (path: string, key: string) => {
+    const response = await fetch(`${app.baseUrl}${path}`, { headers: { Authorization: `Bearer ${key}` } });
+    const text = await response.text();
+    assert.equal(response.status, 200, text);
+    const row = (JSON.parse(text) as { humans: Human[] }).humans.find((human) => human.name === f.guest.name);
+    assert.ok(row, `the guest is listed: ${text}`);
+    return row;
+  };
+  const query = (channel: { name: string }) => `channel=${encodeURIComponent(`#${channel.name}`)}`;
+
+  const hostKey = await keyOf(hostAgent.id);
+  const seenByHostAgent = await guestRow(`/internal/agent-api/channel-members?${query(f.hostChannel)}`, hostKey);
+  assert.equal(seenByHostAgent.role, "guest", "the host's agent keeps the Guest label");
+  assert.equal(seenByHostAgent.servers, undefined, "the host's own Guest names no other server");
+  const { machine, apiKey: machineKey } = await registerMachine(f.host.id, f.hostOwner.id, `joint-guest-${suffix}`);
+  await placeAgentOnMachine(hostAgent.id, machine.id);
+  const legacyHost = await guestRow(`/internal/agent/${hostAgent.id}/channel-members?${query(f.hostChannel)}`, machineKey);
+  assert.equal(legacyHost.role, "guest", "the legacy machine route agrees");
+
+  const seenByPeerAgent = await guestRow(`/internal/agent-api/channel-members?${query(f.peerChannel)}`, await keyOf(peerAgent.id));
+  assert.equal("role" in seenByPeerAgent, false, "no role for another server's person");
+  assert.deepEqual(seenByPeerAgent.servers, [{ name: f.host.name, slug: f.host.slug }], "from the host");
 });
 
 test("the Guest sees other servers' members with their server, opens their simplified card, and nobody outside the channel", async ({ app }) => {

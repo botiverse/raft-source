@@ -14,6 +14,16 @@ import { asServerId, type ServerId } from "@botiverse/raft-shared/src/brandedIds
 
 export type { ServerId };
 
+// RFC 086 §5.3: opening a card form's sealed SecretInput values, and sealing
+// them as a client does. Pure functions, no client involved; the one
+// implementation is shared's (the web seals with the same module), inlined
+// with jose like the rest of shared.
+export {
+  createSealedInputsMemory, openSealedInputs, sealedInputsBinding, sealInputs,
+  type OpenSealedInputsOptions, type OpenSealedInputsResult, type SealedInputsBinding, type SealedInputsBindingInputs,
+  type SealedInputsDelivery, type SealedInputsPrivateJwk, type SealedInputsPublicJwk, type SealedInputsRefusal, type SealInputsOptions,
+} from "@botiverse/raft-shared/src/sealedInputs";
+
 /** The public Raft API origin the Raft Apps guide gives. */
 const DEFAULT_BASE_URL = "https://api.raft.build";
 

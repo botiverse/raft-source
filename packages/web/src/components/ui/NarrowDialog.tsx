@@ -4,6 +4,7 @@ import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 import { cn, DialogClose, DialogContent, DialogFooter, DialogTitle, PanelAction, PanelHeader, PanelHeaderContent, PanelTitle, ScrollArea } from "@botiverse/raft-ui";
 import { useMediaQuery } from "../../hooks/effectPrimitives";
+import { SheetPopupBoundary } from "@botiverse/raft-ui/wip";
 import { narrowSurfaceClass, useNarrowKeyboardBox } from "./narrowSheet";
 import { keepEscapeTakenInside, useOverlayLayer } from "./useOverlayLayer";
 
@@ -119,11 +120,16 @@ export function NarrowDialogLayout({
         </PanelHeaderContent>
         <div ref={setSlot} className="flex shrink-0 items-center" data-slot="narrow-dialog-commit" />
       </PanelHeader>
-      {wrapBody ? (
-        <ScrollArea className={NARROW_BODY_CLASS} contentClassName={NARROW_BODY_CONTENT_CLASS} data-testid={testId}>
-          {children}
-        </ScrollArea>
-      ) : children}
+      {/* Every raft-ui popup opened in the body (a select or combobox list, a menu, a popover) flips and sizes
+          under the head, inside the sheet (raft-design: Dialog, Popups in a sheet). Only the body is wrapped,
+          so a popup on a head button keeps to the window. */}
+      <SheetPopupBoundary head={headRef}>
+        {wrapBody ? (
+          <ScrollArea className={NARROW_BODY_CLASS} contentClassName={NARROW_BODY_CONTENT_CLASS} data-testid={testId}>
+            {children}
+          </ScrollArea>
+        ) : children}
+      </SheetPopupBoundary>
     </NarrowScopeContext>
   );
 }

@@ -14,7 +14,7 @@ import { addAgent, addHuman, createChannel } from "../services/channelService";
 import { createServer } from "../services/serverService";
 import * as taskService from "../services/taskService";
 import { getDb } from "../db/index";
-import { taskEvents, tasks, users } from "../db/schema";
+import { servers, taskEvents, tasks, users } from "../db/schema";
 import { createApiTest } from "../test/integration/apiTest";
 import { fixturePasswordHash } from "../test/integration/credentials";
 import { enableTaskV2ConversationsForServer } from "../test/integration/taskV2Flag";
@@ -35,8 +35,14 @@ async function setup(slug: string, opts: { flag: boolean }) {
   await addHuman(channel.id, owner!.id);
   const agent = await createAgent(server.id, `${slug}-bot-${randomUUID().slice(0, 4)}`, { runtime: "claude" });
   await addAgent(channel.id, agent.id);
-  // The reminder shares the task v2 flag.
-  if (opts.flag) await enableTaskV2ConversationsForServer(server.id);
+  // The reminder shares the task v2 flag. It chases only tasks with activity
+  // since the server turned task v2 on (servers.task_v2_on_since, #14438);
+  // left empty, its first evaluation would write "now", after this file's
+  // tasks: set it a day back, before every task here (the oldest is 9h).
+  if (opts.flag) {
+    await enableTaskV2ConversationsForServer(server.id);
+    await getDb().update(servers).set({ taskV2OnSince: new Date(Date.now() - 24 * 60 * 60 * 1000) }).where(eq(servers.id, server.id));
+  }
   const { apiKey } = await mintAgentCredential({
     agentId: agent.id,
     scopes: ["send", "read", "tasks", "channels"],

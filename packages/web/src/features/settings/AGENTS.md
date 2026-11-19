@@ -88,12 +88,34 @@ Feedback) render from there.
     `public_server_v0` feature flag.
   - APIs: `/servers/:id/public-visibility`, `/servers/:id/public-search`.
 - `account/`: Settings › Account. Entry `AccountSection.tsx` (profile card,
-  password, connected accounts, then passkeys, two-step verification, apps,
+  password, connected accounts, then passkeys, two-step verification, signed-in
+  devices, apps,
   Share usage data (`components/settings/UsageDataSettings`), sign-out and
   Delete Account, last); `AccountSignOutSection.tsx`;
   `AppLoginsSection.tsx` (Apps signed in to with the Raft account, RFC 079
   phase 3a: one `AppLoginRow.tsx` each with Revoke → confirm; renders only
   while `GET /me/app-logins` lists one; calls in `appLoginsApi.ts`);
+  `SignedInDevicesSection.tsx` (the person's own sign-ins, server
+  routes/mySessions.ts: one `SignedInDeviceRow.tsx` each, This device first
+  with no action; Sign out per row and Sign out of all other devices open
+  `SignOutDeviceDialog.tsx`, which offers Sign out (`sign_out`) or I no
+  longer have it (`lost_device`, with what it disconnects) when the sign-in
+  approved Computers or agent keys, else one question; with no other sign-in
+  listed but earlier signed-out ones' Computers or keys still working, the
+  button is Disconnect what signed-out devices approved, one red question
+  that sends only `lost_device`; `reauth_required`
+  opens Passkeys' `ReauthDialog` / `NoPasswordDialog`,
+  `second_factor_step_up_required` (`lost_device` only; `sign_out` needs the
+  password alone, #triage:#386) the shared step-up (reason `signOutDevice`,
+  whose "Verify it's you" adds "Lost the device with your authenticator?":
+  `withSecondFactorStepUp`'s `lostDevice` makes Can't verify? offer Reset
+  your password by email first (POST /auth/forgot-password for the own
+  address, Set a password by email without one: the reset revokes every
+  sign-in at once), Sign it out now with your password (`sign_out` instead;
+  not without a password), a passkey warning when one is enrolled, and the
+  two-step reset of `auth/secondFactorRecovery.ts` as a link);
+  `session_not_found` refreshes quietly; calls in `mySessionsApi.ts`, names in
+  `signedInDeviceLabel.ts`);
   `SocialProviderIcon.tsx` (the provider marks `ProviderAccountRow` shows);
   `DeleteAccountSection.tsx` opening Account's
   level-2 page Delete Account, `/s/<slug>/settings/account/delete`
@@ -175,7 +197,9 @@ Feedback) render from there.
     `PATCH /servers/:id/members/:userId` for Delete Account's transfers,
     `DELETE /agents/:id` for its optional Archive, `POST
     /me/account/deletion/notify-agent-owners` for its Notify Owner (the POST
-    request's optional `forceAgentIds` for Force Unbind); signed out, the cancel link's
+    request's optional `forceAgentIds` for Force Unbind); `GET /me/sessions`,
+    `DELETE /me/sessions/:id` and `POST /me/sessions/revoke-others` (Signed-in
+    devices); signed out, the cancel link's
     `POST /auth/account-deletion/cancel` (proposed); `GET /me/app-logins` and
     `DELETE /me/app-logins/:clientId` (always 204).
 - `notifications/`: Settings › Notifications. Entry
@@ -222,7 +246,8 @@ Feedback) render from there.
   `settingsAdministrationRows` (the sections' rows),
   `publicVisibilitySettings`, `serverManagementConfirmDialog`,
   `archivedChannelsSettings`; Account: `accountIdentity*`, `passkeysSettings`,
-  `twoStepVerification*`, `secondFactorSensitiveStepUp`, `accountDeletion`,
+  `twoStepVerification*`, `secondFactorSensitiveStepUp`, `signedInDevices` (in
+  `features/settings/tests/`), `accountDeletion`,
   `wellKnownChangePassword`; Billing: `billingEntry`, `billingSummary`,
   `desktopBillingReturnUrl`; Appearance: `publicSettingsAppearance`,
   `composerSendKeySetting` (in `features/settings/tests/`),

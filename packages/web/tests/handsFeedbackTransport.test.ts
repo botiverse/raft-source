@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { FeedbackTransportError } from "@botiverse/hands-feedback-react";
 import api from "../src/api/client";
 import {
+  feedbackCurrentClient,
   feedbackTransportError,
   handsFeedbackTransport,
 } from "../src/feedback/handsFeedbackTransport";
@@ -219,4 +220,26 @@ test("transport exposes only the SDK closed error vocabulary", () => {
     assert.ok(error instanceof FeedbackTransportError);
     assert.equal(error.code, expected);
   }
+});
+
+test("the list names other clients' tickets against Raft Desktop inside the desktop shell, else the web", () => {
+  try {
+    assert.equal(feedbackCurrentClient(), "web");
+    vi.stubGlobal("window", { raftDesktop: { isDesktop: true } });
+    assert.equal(feedbackCurrentClient(), "desktop");
+    vi.stubGlobal("window", { raftDesktop: { isDesktop: false } });
+    assert.equal(feedbackCurrentClient(), "web");
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+test("the web's transport lists every client's tickets", async () => {
+  const params: unknown[] = [];
+  api.get = (async (_url: string, config?: { params?: unknown }) => {
+    params.push(config?.params);
+    return { data: { tickets: [], next_cursor: null, unread_total: 0 } };
+  }) as typeof api.get;
+  await handsFeedbackTransport.listTickets({ limit: 20, signal: new AbortController().signal });
+  assert.deepEqual(params, [{ limit: 20, sources: "all", degraded_ok: 1 }]);
 });

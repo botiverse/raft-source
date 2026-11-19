@@ -16,7 +16,9 @@
  *
  * 2. **Leave the label to the library.** raft-ui's FieldLabel already draws the
  *    Raft Design System label (13/18 600 ink-2, sentence case); the page adds
- *    only the required marker, never its own type or colour.
+ *    no type or colour of its own. A required field's label carries no mark
+ *    (DS Forms: only optional fields are marked); `required` reaches the
+ *    control as `aria-required` instead.
  *
  * `FieldControl` adopts the control passed as `children` via `render`, so id,
  * `aria-describedby` and `aria-invalid` are wired by the library instead of by
@@ -32,13 +34,14 @@
  */
 import { Children, createContext, isValidElement, useContext, useId, useMemo } from "react";
 import type { ReactElement, ReactNode } from "react";
-import { Field, FieldControl, FieldLabel, LabelAsterisk, SelectTrigger } from "@botiverse/raft-ui";
+import { Field, FieldControl, FieldLabel, SelectTrigger } from "@botiverse/raft-ui";
+import { IntlContext } from "react-intl";
+import { enFallback } from "../../i18n/messages/enFallback";
 
 /**
- * required XOR optional, mirroring raft-ui's own `LabelMarker`. The shared
- * `FormField` types both as plain optional booleans and only *documents* that
- * they are mutually exclusive, so `<FormField required optional>` compiles and
- * renders both markers. Here it is a compile error, as it is in the library.
+ * required XOR optional, mirroring raft-ui's own `LabelMarker`: a field that
+ * is both is a compile error, as it is in the library. Only `optional` marks
+ * the label; `required` is said by the control (`aria-required`).
  */
 type LabelMarker =
   | { required?: boolean; optional?: never }
@@ -97,7 +100,7 @@ export type StableFieldProps = LabelMarker & {
  * A context lets the trigger pick both up itself. `FieldSelectTrigger` below is
  * the one-line opt-in for a select-shaped field.
  */
-const FieldMessageContext = createContext<{ messageId: string; invalid: boolean } | null>(null);
+const FieldMessageContext = createContext<{ messageId: string; invalid: boolean; required: boolean } | null>(null);
 
 /**
  * `SelectTrigger` that wires itself to the enclosing StableField.
@@ -114,6 +117,7 @@ export function FieldSelectTrigger({ children, ...props }: React.ComponentProps<
     <SelectTrigger
       aria-describedby={ctx?.messageId}
       data-invalid={ctx?.invalid ? "true" : undefined}
+      aria-required={ctx?.required ? "true" : undefined}
       {...props}
     >
       {children}
@@ -124,6 +128,8 @@ export function FieldSelectTrigger({ children, ...props }: React.ComponentProps<
 export default function StableField({
   label, required, optional, hint, error, counter, reserveMessage = true, labelAccessory, belowControl, belowDescription, adopt = true, layout = "stacked", htmlFor, className, children,
 }: StableFieldProps) {
+  // The optional marker in the reader's language (raft-ui's own is English); no IntlProvider in some test seams, as FormField.
+  const optionalMarker = useContext(IntlContext)?.formatMessage({ id: "ui.formField.optional" }) ?? enFallback["ui.formField.optional"];
 
   // Exactly one interactive control per field, or fail closed. `Children.toArray`
   // drops JSX comments and conditional nulls, which is what previously made a
@@ -156,8 +162,8 @@ export default function StableField({
   /** Memoised so a keystroke in a sibling control does not re-render every select
    *  trigger under this field. */
   const fieldMessage = useMemo(
-    () => ({ messageId, invalid: Boolean(error) }),
-    [messageId, error],
+    () => ({ messageId, invalid: Boolean(error), required: Boolean(required) }),
+    [messageId, error, required],
   );
   // Only *interactive* children count as the control. Counting every element
   // meant a legitimate field — one control plus a non-interactive notice or
@@ -242,7 +248,7 @@ export default function StableField({
       <div className={layout === "row" ? "flex items-center justify-between gap-3" : "contents"}>
       {labelAccessory ? (
         <div className="flex items-center gap-2">
-          <FieldLabel {...(optional ? { optional } : {})} htmlFor={htmlFor}>{label}{required ? <LabelAsterisk className="ml-1" /> : null}</FieldLabel>
+          <FieldLabel {...(optional ? { optional: optionalMarker } : {})} htmlFor={htmlFor}>{label}</FieldLabel>
           {/* A label action (refresh, edit, random name) is a 32px raft-ui icon
               button (the DS has two icon sizes, 32 and 44) on the 18px DS label
               line (13/18). The negative margin (7px a side) keeps the row at
@@ -254,7 +260,7 @@ export default function StableField({
           </span>
         </div>
       ) : (
-        <FieldLabel {...(optional ? { optional } : {})} htmlFor={htmlFor}>{label}{required ? <LabelAsterisk className="ml-1" /> : null}</FieldLabel>
+        <FieldLabel {...(optional ? { optional: optionalMarker } : {})} htmlFor={htmlFor}>{label}</FieldLabel>
       )}
 
       {control ? (
@@ -287,6 +293,7 @@ export default function StableField({
             <FieldControl
               key="field-control"
               {...(error ? { "data-invalid": "true" } : {})}
+              {...(required ? { "aria-required": "true" } : {})}
               /* Always, not only when there is a message. The row is reserved
                  and always rendered, so this matches what FieldDescription did:
                  with nothing to say it resolves to empty text and announces

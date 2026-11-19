@@ -800,7 +800,7 @@ async function runCli(): Promise<void> {
       await core.verifyBundledPiOAuth();
       process.stdout.write("oauth-bundle-ok\n");
     } else if (process.argv[2] === "__verify-bundled-oar") {
-      // RFC 060: the OAR host's runtimes (grok, qwen, qoder, codebuddy), their session paths and the observe entry, from the bundle.
+      // RFC 060: the OAR host's runtimes (grok, qwen, qoder), their session paths and the observe entry, from the bundle.
       await core.verifyBundledOarHost();
       process.stdout.write("oar-bundle-ok\n");
     } else {

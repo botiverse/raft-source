@@ -972,3 +972,23 @@ test("a migrated reminder reaches only clients that ask, and every mutation poin
   const log = (await logRes.json()) as { events: Array<{ eventType: string }> };
   assert.deepEqual(log.events.map((e) => e.eventType), ["scheduled"], "the migrated event stays server-side");
 });
+
+test("a reminder id that is not a uuid (an inbox item id, a typo) is not found on cancel, snooze, update and log, never a 500", async ({ app }) => {
+  const { agent } = await seed();
+  const headers = agentHeaders(await agentApiKey(agent.id));
+  const base = `${app.baseUrl}/internal/agent-api/reminders`;
+  // Cancel, snooze and update reach getReminderById; log resolves by prefix and was already safe (kept as a guard).
+  for (const badId of ["reminder:3578246c-0000-4000-8000-000000000000:2", "3578246c-0000-4000-8000-00000000000z-extra-chars"]) {
+    const id = encodeURIComponent(badId);
+    const calls: Array<[string, Promise<Response>]> = [
+      ["cancel", fetch(`${base}/${id}`, { method: "DELETE", headers })],
+      ["snooze", fetch(`${base}/${id}/snooze`, { method: "POST", headers, body: JSON.stringify({ delaySeconds: 300 }) })],
+      ["update", fetch(`${base}/${id}`, { method: "PATCH", headers, body: JSON.stringify({ title: "x" }) })],
+      ["log", fetch(`${base}/${id}/log`, { headers })],
+    ];
+    for (const [name, call] of calls) {
+      const res = await call;
+      assert.equal(res.status, 404, `${name} ${badId}: expected not-found, got ${res.status}`);
+    }
+  }
+});

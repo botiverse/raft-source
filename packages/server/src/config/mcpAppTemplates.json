@@ -195,6 +195,16 @@
       "endpointUrl": "https://api.canva.com/connect/v1/mcp",
       "authKind": "oauth",
       "status": "retired"
+    },
+    {
+      "key": "perplexity",
+      "name": "Perplexity",
+      "description": "Web search and cited answers from Perplexity, using the Perplexity account you sign in with.",
+      "homepageUrl": "https://www.perplexity.ai",
+      "logoUrl": "https://app.raft.build/app-logos/perplexity.png",
+      "category": "Productivity & Collaboration",
+      "endpointUrl": "https://api.perplexity.ai/mcp",
+      "authKind": "oauth"
     }
   ]
 }

@@ -1,13 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { currentDate } from "@botiverse/raft-shared";
-import { linkCardToastSchema } from "@botiverse/raft-shared/src/appLinkPreview";
 import { getDb, type DatabaseExecutor } from "../db";
 import { linkCardAttempts, linkCardClientRequests, linkCardOperations, linkCardViews, type LinkCardOperationState } from "../db/schema";
-import { parseStrictJson } from "../lib/strictJson";
 import { admitLinkCardAction } from "./linkCardActionLimits";
 import {
-  callLinkCardActionEndpoint, LINK_CARD_STATE_HINTS, linkCardRateLimited, type LinkCardActionResponse, type LinkCardCallResult,
+  callLinkCardActionEndpoint, LINK_CARD_STATE_HINTS, linkCardRateLimited, parseLinkCardAppAnswer,
+  type LinkCardActionResponse, type LinkCardAppResult, type LinkCardCallResult,
 } from "./linkCardActionService";
 import {
   linkCardReceiptAccess, linkCardReceiptReadable, linkCardStatusTargetInForce, matchLinkCardUrlIdentity, type LinkCardMessageReader,
@@ -34,7 +33,9 @@ import { signCardActionAssertion } from "./oidcService";
 // attribution reaches the viewer only from a status forwarded in this same
 // request, when the viewer may read the receipt now AND the App's current
 // object-read check for the operation's executor passed (its answer is not
-// `not_visible`). Raft never stores them, so they are never replayed.
+// `not_visible`); execute's answer shows the toast of a final answer under the
+// same gates (linkCardActionService.ts). Raft never stores them, so they are
+// never replayed.
 //
 // No network call runs under a database lock: a short transaction decides
 // whether and where to forward and records the attempt, the App is called
@@ -111,9 +112,6 @@ export function parseLinkCardOperationsQuery(query: unknown): LinkCardOperations
 // Answers.
 
 type OperationRow = typeof linkCardOperations.$inferSelect;
-
-/** The private part of a forwarded status: shown only when both gates passed in this request. */
-export type LinkCardAppResult = { toast?: { tone: "info" | "success" | "warning"; text: string }; code?: string; attribution?: string };
 
 /** One receipt from Raft's records: ids, coarse state, revision and the fixed hint. Never App text. */
 function receiptItem(row: Pick<OperationRow, "operationId" | "state" | "receiptRevision">) {
@@ -257,14 +255,11 @@ type StatusAnswer = {
   appResult: LinkCardAppResult | null;
 };
 
-const STATUS_FIELDS = new Set(["status", "code", "attribution", "toast"]);
-const STATUS_VALUES = new Set(["accepted", "executing", "done", "refused", "failed_not_sent", "unknown", "not_visible"]);
-const codePoints = (value: string) => [...value].length;
-const boundedText = (value: unknown, max: number): value is string => typeof value === "string" && codePoints(value) >= 1 && codePoints(value) <= max;
+const STATUS_VALUES = new Set(["accepted", "executing", "done", "refused", "failed_not_sent", "unknown", "not_visible"] as const);
 
 /**
- * The App's status answer, parsed strictly from the raw text (protocol §10.1;
- * C0-control keys, duplicate keys and broken Unicode refuse it):
+ * The App's status answer, by the parser execute's answer shares
+ * (parseLinkCardAppAnswer): strict from the raw text,
  * `{ status, code?, attribution?, toast? }` with `status` one of accepted,
  * executing, done, refused, failed_not_sent, unknown or not_visible, a toast
  * as protocol §4.4, `code` 1-64 and `attribution` 1-200 code points. Anything
@@ -278,24 +273,15 @@ function readStatusAnswer(result: LinkCardCallResult): StatusAnswer {
   if (result.kind === "timeout") return none("timeout");
   if (result.kind === "not_sent") return none("not_sent");
   if (result.kind !== "answered") return none("transport_error");
-  let answer: Record<string, unknown>;
-  try { answer = parseStrictJson(result.text); } catch { return none("invalid_answer"); }
-  const status = answer.status;
-  if (typeof status !== "string" || !STATUS_VALUES.has(status) || Object.keys(answer).some((key) => !STATUS_FIELDS.has(key))) return none("invalid_answer");
-  if (Object.hasOwn(answer, "code") && !boundedText(answer.code, 64)) return none("invalid_answer");
-  if (Object.hasOwn(answer, "attribution") && !boundedText(answer.attribution, 200)) return none("invalid_answer");
-  const toast = Object.hasOwn(answer, "toast") ? linkCardToastSchema.safeParse(answer.toast) : null;
-  if (toast && !toast.success) return none("invalid_answer");
+  const answer = parseLinkCardAppAnswer(result.text, STATUS_VALUES);
+  // A private field outside its bounds refuses the whole status answer.
+  if (!answer || answer.invalidFields.length) return none("invalid_answer");
+  const { status } = answer;
   const outcome = `answered:${status}`;
   const next = status === "accepted" || status === "executing" ? "accepted"
     : status === "done" || status === "refused" || status === "failed_not_sent" ? status : null;
   if (status === "not_visible") return { next: null, outcome, appResult: null };
-  const appResult: LinkCardAppResult = {
-    ...(toast?.success ? { toast: toast.data } : {}),
-    ...(Object.hasOwn(answer, "code") ? { code: answer.code as string } : {}),
-    ...(Object.hasOwn(answer, "attribution") ? { attribution: answer.attribution as string } : {}),
-  };
-  return { next, outcome, appResult: Object.keys(appResult).length ? appResult : null };
+  return { next, outcome, appResult: answer.appResult };
 }
 
 /**

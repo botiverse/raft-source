@@ -186,7 +186,7 @@ test("terminal failure plus idle restart config for one agent does not fail anot
 test("a terminal-failed agent can be started again by an explicit start (field: Cindy 2026-09-11)", async () => {
   await withManager(async (manager) => {
     await terminalFailureWithPendingInbox(manager, "cindy");
-    await expect(manager.startAgent("cindy", promptConfig({ name: "cindy", displayName: "Cindy" }))).resolves.toBeUndefined();
+    await expect(manager.startAgent("cindy", promptConfig({ name: "cindy", displayName: "Cindy" }))).resolves.toBe("started");
     const m = internals(manager);
     expect(m.agents.has("cindy")).toBe(true);
     expect(m.lifecycleRecords.getTerminalFailure("cindy")).toBeUndefined();

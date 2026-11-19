@@ -1,0 +1,44 @@
+{
+  "formatVersion": 1,
+  "id": "predicate_task_system_never_counts",
+  "rule": "predicate",
+  "title": "On a task conversation row, a lifecycle (system) line never counts",
+  "why": "A task's unread is its chat replies.",
+  "status": "agreed",
+  "sources": {
+    "web": [
+      "packages/web/src/store/inboxInPlaceUnread.ts (liveActivityUnread, liveUnreadFields)",
+      "packages/web/src/store/inboxRowPosition.ts (rowPositionVerdict, with inbox_row_position_v1 on)"
+    ],
+    "server": [
+      "infra/risingwave/sql/078-task-conversations.sql (rw_task_conversation_unread_v1)",
+      "packages/server/src/services/inboxUnreadEligibility.ts (countsTowardTaskConversationUnread)"
+    ]
+  },
+  "given": {
+    "viewer": {
+      "type": "user",
+      "id": "viewer-1"
+    },
+    "scope": {
+      "rowKind": "task",
+      "threadFollowed": true
+    },
+    "message": {
+      "senderType": "system",
+      "senderId": "system",
+      "messageType": "system",
+      "causalActorType": "user",
+      "causalActorId": "user-2",
+      "systemSubtype": "channel.member_joined",
+      "mentions": []
+    }
+  },
+  "steps": [],
+  "expect": {
+    "verdict": {
+      "counts": false,
+      "mention": false
+    }
+  }
+}

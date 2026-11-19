@@ -64,6 +64,7 @@ import {
   type AppServerAccess,
   type AppServerAccessServer,
   type OAuthAccessTokenIdentity,
+  type OAuthAuthorizationApprovalSource,
   type OAuthUserConsentSource,
 } from "./oauthService";
 import { oauthClientHasKey } from "./oauthClientKeys";
@@ -404,10 +405,14 @@ export const ACCOUNT_LOGIN_IDENTITY_SCOPES: readonly string[] = scopesOfPhase("i
 
 /**
  * The non-identity scopes a person's account-mode login can carry (Q8):
- * `agent:read` today. Never a resource-bound scope (agent_inbound): an
- * account-mode exchange takes no `resource` (Q15).
+ * `agent:read`, `app:read` and `agent:voice`. Never a resource-bound scope
+ * (agent_inbound): an account-mode exchange takes no `resource` (Q15).
  */
-const ACCOUNT_LOGIN_NON_IDENTITY_SCOPES: readonly string[] = scopesOfPhase("agent_directory");
+const ACCOUNT_LOGIN_NON_IDENTITY_SCOPES: readonly string[] = [
+  ...scopesOfPhase("agent_directory"),
+  ...scopesOfPhase("app_directory"),
+  ...scopesOfPhase("agent_voice"),
+];
 
 /**
  * D13: the requested scopes (already within the App's allowed scopes) an
@@ -527,6 +532,8 @@ export async function issueAccountAuthorizationCode(input: {
   serverHinted: boolean;
   /** As issueHumanAuthorizationCode's: the code is exchanged only while this family is live. */
   approverSessionFamilyId: string | null;
+  /** As issueHumanAuthorizationCode's: on the audit event only. */
+  approvalSource?: OAuthAuthorizationApprovalSource | null;
 }) {
   const db = getDb();
   const now = currentDate();
@@ -599,6 +606,7 @@ export async function issueAccountAuthorizationCode(input: {
         grantType: "authorization_code",
         principalType: "human",
         loginMode: "account",
+        ...(input.approvalSource ? { source: input.approvalSource } : {}),
       },
     }, tx);
     return request!;

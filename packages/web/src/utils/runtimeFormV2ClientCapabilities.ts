@@ -8,7 +8,7 @@ import type { RuntimeFormV2AdvertisedClientCapability } from "@botiverse/raft-ru
  */
 export const WEB_RUNTIME_FORM_V2_ADVERTISED_CAPABILITIES: readonly RuntimeFormV2AdvertisedClientCapability[] = [
   // A dependent value with options that also takes a typed one is a combobox
-  // that keeps its default (runtimeFormV2Choices): Built-in OpenRouter.
+  // that keeps its default (runtimeFormV2Choices): a Built-in preset provider.
   "dependent_select.custom_value_with_options",
   // Protocol v3 shapes (rules, conditional required, the effort source,
   // unavailableOptions), rendered through the shared state.

@@ -7,8 +7,12 @@
 // TODO: switch provider env metadata to codegen-read once Pi exports getApiKeyEnvVars.
 // Regenerate after any Pi SDK bump that affects exposed provider/model metadata.
 //
-// CI gate keeps this in sync with the SDK by re-running the generator and
-// failing on `git diff` drift.
+// CI gate (check:pi-builtin-models-fresh) keeps this in sync with the SDK by
+// re-running the generator and failing on `git diff` drift. It runs only in
+// the full Test workflow, not on PRs: rerun the generator in the PR that bumps
+// Pi. A provider leaving PI_BUILTIN_UNIFORM_TRANSPORT_PROVIDER_IDS_GENERATED
+// stops taking typed model ids (stored ones would no longer parse); the floor
+// test in shared runtimeConfig.test.ts fails then.
 
 export interface PiBuiltinModel {
   id: string;
@@ -701,3 +705,42 @@ export const PI_BUILTIN_PROVIDER_MODELS_GENERATED: Record<string, ReadonlyArray<
     { id: "xiaomi/mimo-v2.6-flash", label: "MiMo-V2.6-Flash" },
   ],
 };
+
+// Providers whose catalog models all share one api, base URL and static
+// headers: a typed model id outside the catalog runs on that transport.
+export const PI_BUILTIN_UNIFORM_TRANSPORT_PROVIDER_IDS_GENERATED = [
+  "deepseek",
+  "minimax",
+  "minimax-cn",
+  "zai",
+  "zai-coding-cn",
+  "moonshotai",
+  "moonshotai-cn",
+  "kimi-coding",
+  "qwen-token-plan",
+  "qwen-token-plan-cn",
+  "openai",
+  "anthropic",
+  "google",
+  "xai",
+  "xiaomi",
+] as const;
+
+// Providers every catalog model of which reasons: a typed model id on one of
+// them is registered with reasoning on (and takes a reasoning effort).
+export const PI_BUILTIN_ALL_REASONING_PROVIDER_IDS_GENERATED = [
+  "deepseek",
+  "minimax",
+  "minimax-cn",
+  "zai",
+  "zai-coding-cn",
+  "moonshotai",
+  "moonshotai-cn",
+  "kimi-coding",
+  "qwen-token-plan",
+  "qwen-token-plan-cn",
+  "anthropic",
+  "google",
+  "xai",
+  "xiaomi",
+] as const;

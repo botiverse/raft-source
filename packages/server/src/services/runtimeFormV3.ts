@@ -7,8 +7,8 @@
  * - visibility -> `uiSchema.rules` (SHOW on an enum condition)
  * - `x-connectionOwned` -> a HIDE rule (provider matches ^connection:) plus a
  *   `dataSchema.allOf` if/else required; a non-owned field shown for a provider
- *   (the gateway limit fields) lists the connection values whose provider is
- *   in its condition, and that connection set is folded into `revision`
+ *   (the limit fields) lists the connection values whose provider is in its
+ *   condition, and that connection set is folded into `revision`
  * - `x-optionsFrom` (a reasoning effort) -> an `x-optionSource`
  *   dependent_select keyed by the parent's option values, with a server-sent
  *   Default ("") first and the parent's status
@@ -22,7 +22,7 @@ import {
   type RuntimeFormV2Option,
   type RuntimeFormV2UnavailableOption,
 } from "@botiverse/raft-runtime-form";
-import { REASONING_EFFORTS, type AgentCreateFormOption } from "@botiverse/raft-shared";
+import { isBuiltInRuntimeGatewayProviderId, REASONING_EFFORTS, type AgentCreateFormOption } from "@botiverse/raft-shared";
 import { createHash } from "node:crypto";
 
 import { isProviderConnectionsEnabled } from "./providerConnectionFeature";
@@ -95,7 +95,17 @@ const keyOf = (pointer: string) => pointer.replace(/^\//, "");
 /** A served v2 definition (create or edit body) as v3. */
 export function toRuntimeFormV3(
   form: RuntimeFormV2Definition,
-  input: { revision: string; connections: readonly RuntimeFormV3Connection[] },
+  input: {
+    revision: string;
+    connections: readonly RuntimeFormV3Connection[];
+    /**
+     * The preset providers whose saved connections take a typed model id (and
+     * so the limits) on the target Computer (builtInTypedModelProvidersFor
+     * `connections`). Absent: none, so a preset connection never shows a
+     * field the save would refuse.
+     */
+    typedConnectionProviderIds?: readonly string[];
+  },
 ): RuntimeFormV2Definition {
   const v3 = structuredClone(form);
   v3.protocolVersion = RUNTIME_FORM_V3_PROTOCOL_VERSION;
@@ -125,10 +135,21 @@ export function toRuntimeFormV3(
   for (const rule of v3.uiSchema?.visibility ?? []) {
     const key = keyOf(rule.pointer);
     const on = keyOf(rule.when.pointer);
-    // A gateway connection drives the fields its provider shows (the limit
-    // fields), except those the connection owns.
+    // A saved connection drives the fields its provider shows (the limit
+    // fields), except those the connection owns: a gateway connection, and a
+    // preset connection whose provider the target Computer also runs a typed
+    // id for through a connection (`typedConnectionProviderIds`), where it
+    // takes a typed id and limits on the same terms as that provider chosen
+    // directly (runtimeFormV2Registry builtInModelFromValues). A Computer
+    // that runs one only directly (every one released before) shows them for
+    // the provider and not for its connections, as its save would refuse them.
+    const typedConnections = input.typedConnectionProviderIds ?? [];
     const aliases = on === SAVED_CONNECTION_FIELD && !owned.has(key)
-      ? input.connections.filter((connection) => rule.when.in.includes(connection.underlyingProviderId)).map((connection) => connection.value)
+      ? input.connections
+        .filter((connection) => rule.when.in.includes(connection.underlyingProviderId)
+          && (isBuiltInRuntimeGatewayProviderId(connection.underlyingProviderId)
+            || typedConnections.includes(connection.underlyingProviderId)))
+        .map((connection) => connection.value)
       : [];
     visibility.set(key, [...(visibility.get(key) ?? []), { on, values: [...rule.when.in, ...aliases] }]);
   }
@@ -172,12 +193,20 @@ export function toRuntimeFormV3(
  */
 export async function serveRuntimeFormV3(
   form: RuntimeFormV2Definition,
-  input: { runtimeId: string; serverId: string; clientCapabilities: readonly string[]; connectionsVisible: boolean },
+  input: {
+    runtimeId: string;
+    serverId: string;
+    clientCapabilities: readonly string[];
+    connectionsVisible: boolean;
+    /** toRuntimeFormV3's: the providers whose saved connections take a typed id on the target Computer. */
+    typedConnectionProviderIds?: readonly string[];
+  },
 ): Promise<RuntimeFormV2Definition> {
   const connections = await runtimeFormV3Connections(input.runtimeId, input.serverId, input.connectionsVisible);
   const served = await buildRuntimeFormV2ForServer(input.runtimeId, input.serverId, input.clientCapabilities) ?? form;
   return toRuntimeFormV3(form, {
     connections,
+    typedConnectionProviderIds: input.typedConnectionProviderIds,
     revision: runtimeFormV3Revision(input.runtimeId, served, input.clientCapabilities, connections),
   });
 }

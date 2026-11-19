@@ -15,7 +15,7 @@ import {
   applyThreadReplyFrame,
   applyThreadReplyUpdate,
   retainNewerThreadReplyContent,
-  threadReplyContentVersion,
+  replacesReplyContent,
   emptyThreadRepliesScope,
   hydrateThreadRepliesScope,
   INLINE_REPLY_CAP,
@@ -122,16 +122,16 @@ function createThreadRepliesDomain(): SyncDomainConfig<ThreadRepliesScope, Threa
       // an older authoritative count.
       // Existing replies can change without allocating a new message seq.
       // A content-only snapshot keeps the window/count fixed and advances a
-      // retained row's content revision; it cannot undo a newer row version.
+      // retained row's content revision (or completes a cut preview); it
+      // cannot undo a newer row version or cut a full one.
       if (incoming.replyCount === currentState.replyCount
         && incoming.replies.length === currentState.replies.length
         && incoming.replies.every((reply, index) => {
           const current = currentState.replies[index];
           return current?.messageId === reply.messageId && current.seq === reply.seq
-            && threadReplyContentVersion(reply) >= threadReplyContentVersion(current);
+            && !replacesReplyContent(current, reply);
         })
-        && incoming.replies.some((reply, index) => threadReplyContentVersion(reply)
-          > threadReplyContentVersion(currentState.replies[index]!))) return true;
+        && incoming.replies.some((reply, index) => replacesReplyContent(reply, currentState.replies[index]!))) return true;
       if (incoming.replyCount < currentState.replyCount) return false;
       if (incoming.replies.length > currentState.replies.length) return true;
       if (incoming.replies.length < currentState.replies.length) return false;

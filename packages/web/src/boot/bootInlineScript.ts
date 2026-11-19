@@ -11,6 +11,7 @@
 
 import { COLUMN_BOUNDS } from "../lib/panelBounds";
 import { BOOT_FETCHES_GLOBAL } from "./bootPrefetch";
+import { LATEST_PAGE_QUERY } from "../store/channelPageQuery";
 import { LOCALE_CATALOGS_ELEMENT_ID } from "../i18n/messages/catalogParts";
 
 /** serverTheme.ts's SERVER_THEME_STORAGE_PREFIX; kept literal so the Vite config can load this file (tests compare them). */
@@ -108,6 +109,30 @@ export const BOOT_CATALOG_PRELOAD_STATEMENT = String.raw`try{var C=JSON.parse(do
 if(${JSON.stringify(BOOT_COMPLETE_LOCALES)}.indexOf(L)<0)W.push(C.en);
 for(j=0;j<W.length;j++){if(typeof W[j]!=="string"||!/^\/assets\/[^"<>]+\.js$/.test(W[j]))continue;x=document.createElement("link");x.rel="modulepreload";x.crossOrigin="";x.href=W[j];document.head.appendChild(x)}}catch(e){}`;
 
+/** The `<script type="application/json">` the build writes with the sign-in page's files (scripts/bootShellPlugin.ts signInPreloadFiles). */
+export const BOOT_SIGN_IN_FILES_ID = "raft-boot-sign-in";
+
+/** pages/landingPages.ts LANDING_QUERY_PARAMS, literal (a test compares them): a link with one opens its landing page, not sign-in. */
+export const BOOT_SIGN_IN_SKIP_PARAMS = [
+  "reset", "revoke_device_login", "second_factor_recovery", "cancel_second_factor_recovery",
+  "cancel_account_deletion", "invite", "verify", "auth_callback",
+] as const;
+
+/** pages/landingPages.ts SIGN_IN_PATHS, literal (a test compares them). */
+export const BOOT_SIGN_IN_PATHS = ["/", "/login"] as const;
+
+/**
+ * A load with no stored session at an address whose page is sign-in
+ * (BOOT_SIGN_IN_PATHS, with none of the landing pages' query parameters):
+ * its chunks (the build's list) are asked for with modulepreload now, in
+ * parallel with the app's own files, not once main.tsx runs. The same rule as
+ * pages/landingPages.ts startsSignInPageEarly. Its words are in the first
+ * part, preloaded above (catalogParts.ts FIRST_PART_PAGES). Nothing waits for
+ * it. Uses `p`, `s` from the script around it.
+ */
+export const BOOT_SIGN_IN_PRELOAD_STATEMENT = String.raw`if(${JSON.stringify(BOOT_SIGN_IN_PATHS)}.indexOf(p.replace(/(.)\/+$/,"$1"))>=0&&!(s&&s.getItem("slock_access_token"))&&!/[?&](${BOOT_SIGN_IN_SKIP_PARAMS.join("|")})(=|&|$)/.test(location.search))try{W=JSON.parse(document.getElementById(${JSON.stringify(BOOT_SIGN_IN_FILES_ID)}).textContent||"[]");
+for(j=0;j<W.length;j++){if(typeof W[j]!=="string"||!/^\/assets\/[^"<>]+\.js$/.test(W[j]))continue;x=document.createElement("link");x.rel="modulepreload";x.crossOrigin="";x.href=W[j];document.head.appendChild(x)}}catch(e){}`;
+
 /** The `<script type="application/json">` the build writes with what the boot prefetch needs (scripts/bootShellPlugin.ts: the API base and this build's version). */
 export const BOOT_PREFETCH_CONFIG_ID = "raft-boot-prefetch";
 
@@ -127,7 +152,11 @@ export const BOOT_SCROLL_MEMORY_PREFIX = "slock.scroll-memory.v1.channel:";
  * server the URL names, the conversation, its latest page of messages, the
  * channel and DM lists, the sidebar order and the members. The server's id
  * comes from the device (the theme cache keeps it beside the slug); without
- * it, from the server list this script just asked for. Each request goes out
+ * it, from the server list this script just asked for, and the list then
+ * carries that wait as `w` (a promise that settles once the server's reads
+ * went out, or it is known they won't), so a server read the app asks for
+ * meanwhile waits for it instead of racing it (bootPrefetch.ts,
+ * bootServerWait). Each request goes out
  * with the headers the API client would send (client.ts), so the client can
  * take its answer instead of asking again (boot/bootPrefetch.ts compares them;
  * any difference, an error or a 401 and it asks itself). Nothing here reads
@@ -164,16 +193,17 @@ e={u:A+u,h:h,t:Date.now(),p:fetch(A+u,{headers:h})};e.p.then(function(){e.d=Date
 S=function(i){var v=null;if(typeof i!=="string"||!/^[0-9a-f-]{36}$/i.test(i))return;
 F("/channels/"+o,i,{"X-Raft-Fetch-Reason":"preload"});
 try{v=sessionStorage.getItem(${JSON.stringify(BOOT_SCROLL_MEMORY_PREFIX)}+o)}catch(e){}
-if(v===null&&!/[?&](thread|msg)(=|&|$)/.test(location.search))F("/messages/channel/"+o+"?limit=50",i);
+if(v===null&&!/[?&](thread|msg)(=|&|$)/.test(location.search))F("/messages/channel/"+o+"${LATEST_PAGE_QUERY}",i);
 F("/channels?archived=include",i);F("/channels/dm",i);F("/servers/"+i+"/sidebar-order",i);F("/servers/"+i+"/members",i)};
 F("/auth/me");
 x=F("/servers");
-if(sid)S(sid);else x.then(function(r){return r.ok?r.clone().json():null}).then(function(l){for(j=0;l&&j<l.length;j++)if(l[j]&&l[j].slug===slug){S(l[j].id);break}}).catch(function(){})}}}catch(e){}`;
+if(sid)S(sid);else Q.w=x.then(function(r){return r.ok?r.clone().json():null}).then(function(l){for(j=0;l&&j<l.length;j++)if(l[j]&&l[j].slug===slug){S(l[j].id);break}}).catch(function(){})}}}catch(e){}`;
 
 export const BOOT_HINTS_SCRIPT = `(function(){var d=document.documentElement,s=null;try{s=localStorage}catch(e){}
 var p=location.pathname,m=/^\\/s\\/([^/?#]+)/.exec(p);
 ${BOOT_LOCALE_STATEMENT}
 ${BOOT_CATALOG_PRELOAD_STATEMENT}
+${BOOT_SIGN_IN_PRELOAD_STATEMENT}
 if(/^\\/artifacts\\/[^/]+(\\/v\\/[^/]+)?\\/?$/.test(p)){d.classList.add("boot-artifact");try{x=new URLSearchParams(location.search);if(x.get("embed")===${JSON.stringify(BOOT_HOST_SHELL_EMBED)}&&x.get("shell")!=="web")d.classList.add("boot-embedded")}catch(e){}return}
 if(!s||!s.getItem("slock_access_token")||!(m||p==="/")){d.classList.add("boot-off");return}
 try{x=new URLSearchParams(location.search);if(x.get("embed")===${JSON.stringify(BOOT_HOST_SHELL_EMBED)}&&x.get("shell")!=="web"){d.classList.add("boot-off");return}}catch(e){}

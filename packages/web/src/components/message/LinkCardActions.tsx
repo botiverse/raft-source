@@ -1,22 +1,23 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { RefObject } from "react";
 import { useIntl } from "react-intl";
-import { Ellipsis } from "lucide-react";
+import { Ellipsis, TriangleAlert } from "lucide-react";
 import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogBody,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
+  Banner,
+  BannerDescription,
   Button,
   DescriptionDetails,
   DescriptionItem,
   DescriptionList,
   DescriptionTerm,
+  Dialog,
+  DialogBody,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -34,6 +35,7 @@ import { publicPreviewUrl } from "@botiverse/raft-shared/src/appLinkPreview";
 import type { LinkCardV2 } from "@botiverse/raft-shared/src/appLinkPreview";
 import { useMediaQuery } from "../../hooks/effectPrimitives";
 import LeavingRaftMark, { opensInNewTabAriaLabel } from "../ui/LeavingRaftMark";
+import { AppLinkIcon } from "./AppLinkIcon";
 import { appLinkDomain, appLinkOpenHref } from "../../utils/appLinkAddress";
 import {
   cancelLinkCardAction,
@@ -44,9 +46,13 @@ import {
   useLinkCardActionsUnavailable,
   useLinkCardViewState,
 } from "./linkCardExecute";
-import type { LinkCardButton } from "./linkCardExecute";
+import type { LinkCardButton, LinkCardConfirm } from "./linkCardExecute";
+import { linkCardFormInputs, linkCardFormProblems, linkCardFormSecrets } from "./linkCardForm";
+import type { LinkCardFormProblem } from "./linkCardForm";
+import { LinkCardFormFields } from "./LinkCardFormFields";
 import { LINK_CARD_COARSE_POINTER_QUERY, LINK_CARD_HOVER_QUERY } from "./linkCardRead";
 import type { AppLinkResult } from "./useAppLinkPreviews";
+import { webLinkProps } from "../../features/webPreview/webLinkRouting";
 
 // The buttons of an App link's card, in its hover card or its block card
 // (AppLinkBlockCard.tsx), and Raft's confirm dialog (addendum 5 §3; protocol
@@ -180,7 +186,7 @@ export function LinkCardActions({ result, owner, placement = "hover" }: { result
           data-link-card-pending={status}
         >
           {status === "holding" ? null : <Spinner size="xs" aria-hidden="true" />}
-          {formatMessage({ id: status === "holding" ? "message.appLink.action.holding" : status === "pending" ? "message.appLink.action.pending" : "message.appLink.action.working" })}
+          {formatMessage({ id: status === "holding" ? "message.appLink.action.holding" : "message.appLink.action.working" })}
         </Text.Sans>
       ) : null}
       <div className={messageCard().actionGroup()} data-link-card-row-buttons="">
@@ -250,7 +256,7 @@ function LinkCardButtonView({ result, button, owner, blocked, loading, described
       variant={variant}
       nativeButton={false}
       role="link"
-      render={<a href={href} target="_blank" rel="noopener noreferrer" aria-label={opensInNewTabAriaLabel(formatMessage, label)} />}
+      render={<a href={href} target="_blank" rel="noopener noreferrer" {...webLinkProps} aria-label={opensInNewTabAriaLabel(formatMessage, label)} />}
       className={GROUP_BUTTON}
       data-link-card-button="navigate"
     >
@@ -352,7 +358,7 @@ function LinkCardMenuItem({ result, button, owner, blocked, describedBy }: {
     return (
       <DropdownMenuLinkItem
         closeOnClick
-        render={<a href={href} target="_blank" rel="noopener noreferrer" aria-label={opensInNewTabAriaLabel(formatMessage, label)} />}
+        render={<a href={href} target="_blank" rel="noopener noreferrer" {...webLinkProps} aria-label={opensInNewTabAriaLabel(formatMessage, label)} />}
         data-link-card-button="navigate"
       >
         <DropdownMenuItemLabel>{label}</DropdownMenuItemLabel>
@@ -380,15 +386,35 @@ function LinkCardMenuItem({ result, button, owner, blocked, describedBy }: {
 
 /**
  * Raft's confirm dialog for an action that asked for `confirm: "prepare"`
- * (protocol §5.2; addendum 5 §3): a modal AlertDialog outside the hover card,
- * so moving the pointer away or the card closing neither closes nor cancels it.
+ * (protocol §5.2; addendum 5 §3): a confirmation, so a raft-ui Dialog at
+ * `size="sm"` (DS PreviewCard › Item card, Dialog › Variants), outside the
+ * hover card, so moving the pointer away or the card closing neither closes
+ * nor cancels it. Cancel first, the confirm last; the confirm is `primary`
+ * because the protocol says only that the action does something, not that it
+ * interrupts or can't be undone (DS AlertDialog › Variants).
  * It shows only the description's title, body, rows and fine print, as plain
  * text, with the App's confirm and cancel labels, and Raft's own line saying
  * which App and host ask. Drawn by the chip that asked; Cancel, Esc and that
  * chip going away send nothing.
+ *
+ * For an App Raft hasn't reviewed (`app.reviewed: false`, RFC 076 §17), Raft
+ * adds "Run by {App}" with the App's stored icon under the title, and its last
+ * line says the App was made on this Server, isn't reviewed by Raft, gets the
+ * person's name and acts with its own access, in place of the App and host
+ * line; the dialog is described by it. It asks before each of that App's
+ * acting buttons: an undo-window one has no description, so the title is its
+ * label, the confirm its label and the cancel Raft's (Kirby, #proj-apps:#60).
+ *
+ * A form on an App-sent card's acting button (RFC 086 §5.1, `confirm.form`)
+ * is filled in here: a small task, so `size="md"` (DS Dialog › Variants), not
+ * closed by a click outside it. For an App Raft hasn't reviewed, the notice
+ * moves above the fields, in a warning Banner (DS Dialog › Rules: what people
+ * must read before they act), so it is read before anything is typed. The
+ * values are read from the fields only when the dialog is confirmed, and go
+ * with the dialog when it closes (LinkCardFormFields.tsx); a SecretInput's
+ * are handed over to be sealed (linkCardSeal.ts) and its field emptied.
  */
 export function LinkCardConfirmDialog({ result, owner, finalFocus }: { result: CardResult; owner: string; finalFocus: RefObject<HTMLElement | null> }) {
-  const { formatMessage } = useIntl();
   const view = result.view;
   const viewKey = view ? linkCardViewKey(view, result.url) : null;
   const confirm = useLinkCardViewState(viewKey).confirm;
@@ -397,22 +423,71 @@ export function LinkCardConfirmDialog({ result, owner, finalFocus }: { result: C
     if (!mine || !viewKey) return;
     return () => cancelLinkCardAction(viewKey);
   }, [mine, viewKey]);
-  const openChange = useCallback((open: boolean) => { if (!open && viewKey) cancelLinkCardAction(viewKey); }, [viewKey]);
-  const confirmAction = useCallback(() => { if (viewKey) void confirmLinkCardAction(viewKey); }, [viewKey]);
   if (!mine || !confirm || !viewKey) return null;
-  const { description, executing } = confirm;
+  // One mount per press: a form's fields (and what was typed in them) never outlive the dialog that asked.
+  return <OpenLinkCardConfirmDialog key={confirm.kind === "prepared" ? confirm.prepared.id : `run:${confirm.label}`} result={result} viewKey={viewKey} confirm={confirm} finalFocus={finalFocus} />;
+}
+
+function OpenLinkCardConfirmDialog({ result, viewKey, confirm, finalFocus }: { result: CardResult; viewKey: string; confirm: LinkCardConfirm; finalFocus: RefObject<HTMLElement | null> }) {
+  const { formatMessage } = useIntl();
+  const bodyId = useId();
+  const noticeId = useId();
+  const fields = useRef(new Map<string, HTMLInputElement>());
+  const [problems, setProblems] = useState<Record<string, LinkCardFormProblem>>({});
+  const { executing, unreviewed, form } = confirm;
+  const openChange = useCallback((open: boolean) => { if (!open) cancelLinkCardAction(viewKey); }, [viewKey]);
+  const confirmAction = useCallback(() => {
+    if (!form) { void confirmLinkCardAction(viewKey); return; }
+    if (executing) return;
+    const values = new Map(form.fields.map((field) => [field.id, fields.current.get(field.id)?.value ?? ""]));
+    const found = linkCardFormProblems(form, values);
+    setProblems(found);
+    const invalid = form.fields.find((field) => found[field.id]);
+    if (invalid) { fields.current.get(invalid.id)?.focus(); return; }
+    const secrets = linkCardFormSecrets(form, values);
+    // SecretInput values are sealed for a prepared action's execute only (RFC 086 §5.1): never through an undo window.
+    if (secrets && confirm.kind !== "prepared") return;
+    // Handed over to be sealed (linkCardSeal.ts clears them once sealed): the masked fields are emptied now.
+    for (const field of form.fields) {
+      const input = field.type === "SecretInput" ? fields.current.get(field.id) : undefined;
+      if (input) input.value = "";
+    }
+    void confirmLinkCardAction(viewKey, linkCardFormInputs(form, values), secrets);
+  }, [form, executing, viewKey, confirm.kind]);
+  // A SecretInput refused input past its byte limit (LinkCardFormFields): it says so now, not on confirm.
+  const tooLong = useCallback((fieldId: string) => setProblems((current) => ({ ...current, [fieldId]: "tooLong" })), []);
+  // A form's first field takes focus when the dialog opens (Base UI's default otherwise).
+  const firstField = useCallback(() => (form ? fields.current.get(form.fields[0]!.id) ?? true : true), [form]);
+  const description = confirm.kind === "prepared" ? confirm.description : null;
+  const title = description ? description.title
+    : form && confirm.kind === "run" ? confirm.label
+    : formatMessage({ id: "message.appLink.action.unreviewed.runTitle" }, { label: confirm.kind === "run" ? confirm.label : "" });
   const domain = appLinkDomain(result.url);
+  // Read out with the title: the App's body, then Raft's notice, which is the one place the person learns Raft hasn't reviewed it.
+  const describedBy = unreviewed ? [description?.body ? bodyId : null, noticeId].filter(Boolean).join(" ") : undefined;
+  const notice = formatMessage({ id: "message.appLink.action.unreviewed.notice" }, { app: result.app.name });
   return (
-    <AlertDialog open onOpenChange={openChange}>
-      <AlertDialogContent finalFocus={finalFocus} aria-busy={executing || undefined} data-link-card-confirm="">
-        <AlertDialogHeader>
-          <AlertDialogTitle className="break-words [overflow-wrap:anywhere]">{description.title}</AlertDialogTitle>
-        </AlertDialogHeader>
-        <AlertDialogBody className="grid gap-3">
-          {description.body ? (
-            <AlertDialogDescription className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]" data-link-card-confirm-body="">{description.body}</AlertDialogDescription>
+    <Dialog open onOpenChange={openChange} disablePointerDismissal={!!form}>
+      <DialogContent size={form ? "md" : "sm"} initialFocus={form ? firstField : undefined} finalFocus={finalFocus} aria-busy={executing || undefined} aria-describedby={describedBy} data-link-card-confirm={confirm.kind}>
+        <DialogHeader>
+          <DialogTitle className="break-words [overflow-wrap:anywhere]">{title}</DialogTitle>
+          <DialogClose disabled={executing} aria-label={formatMessage({ id: "common.confirm.closeDialog" })} data-link-card-confirm-close="" />
+        </DialogHeader>
+        <DialogBody className="grid gap-3">
+          {/* Who is speaking, before the App's own words: the title, body, rows and button labels of a prepared
+              action are the App's, so its icon and name come first (W3 of the #13978 review). */}
+          {unreviewed || description ? (
+            <div className="flex min-w-0 items-center gap-2" data-link-card-confirm-run-by={unreviewed ? "" : undefined} data-link-card-confirm-from={unreviewed ? undefined : ""}>
+              <AppLinkIcon app={result.app} frame="card" />
+              <Text.Sans size="small" className="min-w-0 truncate font-semibold text-foreground">
+                {formatMessage({ id: unreviewed ? "message.appLink.action.unreviewed.runBy" : "message.appLink.action.confirmFrom" }, { app: result.app.name })}
+              </Text.Sans>
+            </div>
           ) : null}
-          {description.rows?.length ? (
+          {description?.body ? (
+            <DialogDescription id={bodyId} className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]" data-link-card-confirm-body="">{description.body}</DialogDescription>
+          ) : null}
+          {description?.rows?.length ? (
             <DescriptionList direction="horizontal" className="w-full" data-link-card-confirm-rows="">
               {description.rows.map((row, index) => (
                 <DescriptionItem key={index}>
@@ -422,19 +497,34 @@ export function LinkCardConfirmDialog({ result, owner, finalFocus }: { result: C
               ))}
             </DescriptionList>
           ) : null}
-          {description.fine_print ? (
+          {description?.fine_print ? (
             <Text.Sans size="small" variant="muted" className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]" data-link-card-confirm-fine-print="">
               {description.fine_print}
             </Text.Sans>
           ) : null}
-          <Text.Sans size="small" variant="muted" className="break-all" data-link-card-confirm-source="">
-            {formatMessage({ id: "message.appLink.action.confirmSource" }, { app: result.app.name, domain: domain ?? "" })}
-          </Text.Sans>
-        </AlertDialogBody>
-        <AlertDialogFooter>
-          <AlertDialogCancel size="lg" disabled={executing}>{description.cancel_label}</AlertDialogCancel>
+          {form && unreviewed ? (
+            <Banner status="warning" data-link-card-confirm-source="unreviewed">
+              <TriangleAlert />
+              <BannerDescription id={noticeId} className="break-words [overflow-wrap:anywhere]">{notice}</BannerDescription>
+            </Banner>
+          ) : null}
+          {form ? <LinkCardFormFields form={form} app={result.app.name} problems={problems} inputs={fields} disabled={executing} onSubmit={confirmAction} onTooLong={tooLong} /> : null}
+          {form && unreviewed ? null : unreviewed ? (
+            <Text.Sans id={noticeId} size="small" variant="muted" className="break-words [overflow-wrap:anywhere]" data-link-card-confirm-source="unreviewed">
+              {notice}
+            </Text.Sans>
+          ) : (
+            <Text.Sans size="small" variant="muted" className="break-all" data-link-card-confirm-source="">
+              {formatMessage({ id: "message.appLink.action.confirmSource" }, { app: result.app.name, domain: domain ?? "" })}
+            </Text.Sans>
+          )}
+        </DialogBody>
+        <DialogFooter>
+          <DialogClose render={<Button variant="ghost" size="lg" />} disabled={executing} data-link-card-confirm-cancel="">
+            {description ? description.cancel_label : formatMessage({ id: "common.confirm.cancel" })}
+          </DialogClose>
           {/* focusableWhenDisabled: the confirm keeps focus while execute is on its way. */}
-          <AlertDialogAction
+          <Button
             focusableWhenDisabled
             variant="primary"
             size="lg"
@@ -443,10 +533,10 @@ export function LinkCardConfirmDialog({ result, owner, finalFocus }: { result: C
             onClick={confirmAction}
             data-link-card-confirm-action=""
           >
-            {description.confirm_label}
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
+            {description ? description.confirm_label : confirm.kind === "run" ? confirm.label : null}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

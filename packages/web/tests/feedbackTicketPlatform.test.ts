@@ -58,11 +58,11 @@ test("a link's platform names a mobile App; anything else is the web's own app",
   }
 });
 
-test("every call about a ticket whose link named a mobile App asks that App, and the web's unread count is left alone", async () => {
+test("every call about a ticket whose link named a mobile App asks that App, and its unread total is reported as that App's", async () => {
   const calls: Call[] = [];
-  const unreadUpdates: number[] = [];
+  const unreadUpdates: Array<[number, string]> = [];
   const transport = createHandsFeedbackTransport(recordingApi(calls, 7), {
-    captureUnread: () => (count) => { unreadUpdates.push(count); },
+    captureUnread: () => (count, source) => { unreadUpdates.push([count, source]); },
   });
   rememberFeedbackTicketPlatform(MOBILE_TICKET, feedbackTicketPlatformFromSearch("?platform=android"));
   const signal = new AbortController().signal;
@@ -77,14 +77,15 @@ test("every call about a ticket whose link named a mobile App asks that App, and
   for (const call of calls) {
     assert.equal((call.params as { platform?: string } | undefined)?.platform, "android", `${call.method} ${call.url}`);
   }
-  assert.deepEqual(unreadUpdates, [], "the Android App's unread total is not the web's");
+  // feedbackUnreadState.ts decides whether the dot counts it (tests/feedbackUnreadState.test.ts).
+  assert.deepEqual(unreadUpdates, [[7, "android"], [7, "android"], [7, "android"]], "the Android App's unread total is not the web's");
 });
 
 test("a web ticket's calls name no platform and keep updating the web's unread count", async () => {
   const calls: Call[] = [];
-  const unreadUpdates: number[] = [];
+  const unreadUpdates: Array<[number, string]> = [];
   const transport = createHandsFeedbackTransport(recordingApi(calls, 2), {
-    captureUnread: () => (count) => { unreadUpdates.push(count); },
+    captureUnread: () => (count, source) => { unreadUpdates.push([count, source]); },
   });
   rememberFeedbackTicketPlatform(MOBILE_TICKET, "android");
   // A link without a platform records nothing.
@@ -97,5 +98,5 @@ test("a web ticket's calls name no platform and keep updating the web's unread c
   for (const call of calls) {
     assert.equal("platform" in ((call.params ?? {}) as object), false, `${call.method} ${call.url}`);
   }
-  assert.deepEqual(unreadUpdates, [2, 2]);
+  assert.deepEqual(unreadUpdates, [[2, "web"], [2, "web"]]);
 });

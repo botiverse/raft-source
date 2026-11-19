@@ -19,7 +19,6 @@ import {
   FieldDescription,
   FieldError,
   FieldLabel,
-  LabelAsterisk,
   LabelOptional,
 } from "@botiverse/raft-ui";
 import { enFallback } from "../../i18n/messages/enFallback";
@@ -28,10 +27,9 @@ import { enFallback } from "../../i18n/messages/enFallback";
 export type FormFieldProps = {
   /** Field label text. */
   label: ReactNode;
-  /** Show a `*` required marker after the label. */
-  required?: boolean;
-  /** Show the localized optional marker in muted case after the label.
-   *  Mutually exclusive with `required`. */
+  /** Show the localized optional marker in muted case after the label. A
+   *  required field's label carries no mark (DS Forms: only optional fields
+   *  are marked); put `required` or `aria-required` on the control. */
   optional?: boolean;
   /** Helper text rendered below the control. */
   hint?: ReactNode;
@@ -57,7 +55,6 @@ export type FormFieldProps = {
 
 export default function FormField({
   label,
-  required,
   optional,
   hint,
   error,
@@ -83,7 +80,6 @@ export default function FormField({
       htmlFor={htmlFor}
     >
       {label}
-      {required ? <LabelAsterisk className="ml-1" /> : null}
       {optional ? (
         <LabelOptional className="ml-1">{optionalLabel}</LabelOptional>
       ) : null}

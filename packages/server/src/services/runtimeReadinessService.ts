@@ -44,6 +44,7 @@ import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { getDb, type DatabaseExecutor } from "../db/index";
 import { agents, computerOutageOccurrences, computerReadinessReports, computers, computerUpgradeRequests, machines, serverMembers, users } from "../db/schema";
 import { mapWithConcurrency } from "../lib/mapWithConcurrency";
+import { agentFindableBy, type AgentFinder } from "./agentMemberListPolicy";
 
 // ── Server facts ──
 
@@ -486,8 +487,13 @@ export function computerReadinessForViewer(
 
 // ── Needs attention (the machine list) ──
 
-/** The agents on these Computers (not deleted), for the needs-attention summary. */
-export async function loadReadinessAgentsByMachine(machineIds: readonly string[], executor: DatabaseExecutor = getDb()): Promise<Map<string, ReadinessOwnedAgent[]>> {
+/**
+ * The agents on these Computers (not deleted) that `finder` may find, for the
+ * needs-attention summary: another person's personal assistant is left out
+ * (agentFindableBy), as in the machine list's own counts, so its id, the
+ * count and its owner's name never reach a member who cannot see it.
+ */
+export async function loadReadinessAgentsByMachine(machineIds: readonly string[], finder: AgentFinder, executor: DatabaseExecutor = getDb()): Promise<Map<string, ReadinessOwnedAgent[]>> {
   const byMachine = new Map<string, ReadinessOwnedAgent[]>();
   if (machineIds.length === 0) return byMachine;
   const rows = await executor.select({
@@ -501,7 +507,7 @@ export async function loadReadinessAgentsByMachine(machineIds: readonly string[]
     creatorType: agents.creatorType,
     creatorId: agents.creatorId,
     assistantOwnerUserId: agents.assistantOwnerUserId,
-  }).from(agents).where(and(inArray(agents.machineId, [...new Set(machineIds)]), isNull(agents.deletedAt)));
+  }).from(agents).where(and(inArray(agents.machineId, [...new Set(machineIds)]), isNull(agents.deletedAt), agentFindableBy(finder)));
   for (const { machineId, ...agent } of rows) {
     if (!machineId) continue;
     byMachine.set(machineId, [...(byMachine.get(machineId) ?? []), agent]);

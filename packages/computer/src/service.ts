@@ -23,7 +23,9 @@ import type { UpgradeStartParams, UpgradeStartResult } from "./lib/types";
 import { compareComputerVersions } from "./computerVersionOrder";
 import { readInstallerRepairHint } from "./installerRepairHint";
 import { acknowledgeMigratedFrom, readMigratedFromForServer } from "./migratedFromMarker";
-import { installerArgs, launchInstallerDetached, scrubInstallerOperationEnv, readInstallerVersion, readLastRemoteUpgradeReceipt, REMOTE_UPGRADE_FAILURE_WATCH_MS, UNIT_ESCAPING_INSTALLER_VERSION, type InstallerDownloadStats, recordRemoteUpgradeLaunch, recordRemoteUpgradeRefusal, waitForRemoteUpgradeFailureReceipt, watchRemoteUpgradeOutcome } from "./externalInstaller";
+import { installerArgs, launchInstallerDetached, scrubInstallerOperationEnv, readInstallerVersion, readLastRemoteUpgradeReceipt, REMOTE_UPGRADE_FAILURE_WATCH_MS, UNIT_ESCAPING_INSTALLER_VERSION, type InstallerDownloadStats, recordRemoteUpgradeLaunch, recordRemoteUpgradeRefusal, remoteUpgradeInstallerFailure, waitForRemoteUpgradeFailureReceipt, watchRemoteUpgradeOutcome,
+  installerChannel,
+} from "./externalInstaller";
 import { clearUpgradeDrainRequests, waitForUpgradeDrain, writeUpgradeDrainRequest, type UpgradeDrainRunner } from "./upgradeDrain";
 import { appendRemoteUpgradeStep, collectRemoteUpgradeSteps, noteServiceTransitionForRemoteUpgrade, upgradeErrorCode, type RemoteUpgradeStepRecord } from "./remoteUpgradeTrace";
 import {
@@ -31,6 +33,9 @@ import {
   UPGRADE_SAFE_KILL_MODES,
   clearSupervisorRecord,
   describeKillModeRequirement,
+  describeScopeUnavailable,
+  runSystemdScopeProbe,
+  type SystemdScopeProbe,
   detectSystemdSupervisor,
   externalSupervisorOptIn,
   runSystemctl,
@@ -53,6 +58,7 @@ import {
   serverRunnerPidPath,
   serverRunnerLockConflictPath,
   serverRunnerLogPath,
+  serverRunnerSpawnedPath,
   assertValidServerId,
   serverConnectedMarkerPath,
   serverRunnerMemoryPath,
@@ -132,6 +138,7 @@ import { claimDeviceSessionRetireReport, scheduleDeviceSessionRetire } from "./d
 import { OS_SUPERVISOR_KIND_ENV_VAR } from "./osSupervisorLifecycle";
 import { SHELL_ENV_STATE_ENV_VAR } from "./shellEnvCapture";
 import { buildRunnerChildEnv, PARENT_LOCK_HELD_ENV_VAR, pinRaftHomeEnv, SOURCE_SERVICE_PID_ENV_VAR } from "./runnerChildEnv";
+import { recordSpawnedRunner } from "./runnerSpawnRecord";
 import { claimRunnerLockConflictReports, clearRunnerLockConflictMarker, handleRunnerLockConflict, releaseDeferredLockOwner } from "./runnerLockConflict";
 import {
   awaitRestartOutcomeAfterConnectionLoss,
@@ -621,7 +628,7 @@ const defaultCoreFactory: ResidentCoreFactory = async (creds, hooks) => {
           // A drained upgrade spawns its installer only after the drain.
           timeoutMs: REMOTE_UPGRADE_FAILURE_WATCH_MS + (ctx.drain?.deadlineMs ?? 0),
         });
-        if (failure) throw new Error(`UPGRADE_INSTALLER_FAILED: ${failure.reason ?? `installer_${failure.outcome}`}`);
+        if (failure) throw remoteUpgradeInstallerFailure(failure);
         return;
       }
       console.warn(
@@ -1081,6 +1088,8 @@ export interface RunServiceDeps {
   detectSystemdSupervisorFn?: typeof detectSystemdSupervisor;
   externalSupervisorOptInFn?: typeof externalSupervisorOptIn;
   systemctl?: typeof runSystemctl;
+  /** `systemd-run --scope true` with the unit's manager: can the installer leave the unit (externalSupervisor.ts)? */
+  systemdScopeProbe?: SystemdScopeProbe;
   readInstallerVersionFn?: typeof readInstallerVersion;
   /** How the supervised hand-off asks this process to shut down (default: SIGTERM to self). */
   signalSelfForRelaunch?: () => void;
@@ -1279,6 +1288,12 @@ export async function runService(deps: RunServiceDeps = {}): Promise<void> {
       return;
     }
     record.child = child;
+    // runner.pid waits for the connection (below); this record lets readiness
+    // see a live runner that has not connected (runner-disconnected) instead of
+    // none (runner-absent). Best-effort: without it readiness reads as before.
+    const spawnRecord = recordSpawnedRunner(serverRunnerSpawnedPath(slockHome, serverId), child.pid, process.pid, (err) => {
+      process.stderr.write(`Service: could not record the spawned runner for ${serverId}: ${err instanceof Error ? err.message : String(err)}. Continuing.\n`);
+    });
     // Keep the runner in `starting` until the daemon's handshake/onConnect path
     // writes its connected marker. A spawned process is not readiness evidence:
     // lock-conflict children can exit almost immediately with "already running"
@@ -1292,6 +1307,7 @@ export async function runService(deps: RunServiceDeps = {}): Promise<void> {
         if (!rec) return;
         rec.child = undefined;
         await clearPidfileAt(serverRunnerPidPath(slockHome, serverId)); // PID-bound stale connection evidence fails closed.
+        await spawnRecord.childExited();
 
         // Operator stop / service shutdown asked this child to exit (managed.flag
         // cleared, stopUnmanagedRunner set `stopping`) → terminal `stopped`, no restart.
@@ -1414,7 +1430,9 @@ export async function runService(deps: RunServiceDeps = {}): Promise<void> {
         : Promise.resolve();
     // No exact version means the saved channel's current release; the
     // installer resolves it and the receipt records what it became.
-    const channel = params.targetVersion ? undefined : await readChannel(slockHome);
+    // readChannel never rejects: a missing or corrupt file reads as the default.
+    const savedChannel = await readChannel(slockHome);
+    const channel = params.targetVersion ? undefined : savedChannel;
     if (channel) claim.channel = channel;
     if (params.scope === "remote") {
       await recordRemoteUpgradeLaunch(slockHome, {
@@ -1457,18 +1475,41 @@ export async function runService(deps: RunServiceDeps = {}): Promise<void> {
         "external_supervisor",
       );
     }
-    await traceStep({ step: "received", outcome: "ok", atMs: receivedAtMs, supervisor, ...(killMode !== undefined ? { killMode } : {}) });
+    // Which channels this machine follows (remoteUpgradeTrace.ts): the saved
+    // release channel also when an exact version was asked, and the installer's
+    // (the same rule the download uses, externalInstaller.ts installerChannel).
+    await traceStep({
+      step: "received", outcome: "ok", atMs: receivedAtMs, supervisor,
+      ...(killMode !== undefined ? { killMode } : {}),
+      channel: savedChannel,
+      installerChannel: installerChannel(),
+    });
     // Resolving (and, when not cached, downloading) the installer happens
     // inside the launch; `download.resolved` splits a failure between the two.
     const downloadStartedAtMs = Date.now();
     const download: InstallerDownloadStats = {};
-    const installerVeto: { reason: string | null } = { reason: null };
-    const vetoOldInstaller = unsafeKillModeRefusal === null ? undefined : async (command: string) => {
+    const installerVeto: { reason: string | null; errorCode: "unsafe_kill_mode" | "scope_unavailable" } = { reason: null, errorCode: "unsafe_kill_mode" };
+    // Under systemd the resolved installer decides, right before spawn: one
+    // older than 0.3.21 stops the service through `raft-computer stop` and
+    // only survives that under KillMode process|mixed; 0.3.21+ moves itself
+    // into a transient scope first, whatever the KillMode, and is `held` after
+    // the download when it cannot (#67: a system unit run as non-root, polkit
+    // refuses the scope). So that one is asked of systemd now, with the
+    // installer's own systemd-run shape.
+    const unitOfService = systemdSupervisor;
+    const vetoInstaller = unitOfService === null ? undefined : async (command: string) => {
       const version = await (deps.readInstallerVersionFn ?? readInstallerVersion)(command);
       let escapesUnit = false;
       try { escapesUnit = version !== null && compareComputerVersions(version, UNIT_ESCAPING_INSTALLER_VERSION) >= 0; } catch { /* unparsable: treat as old */ }
       if (!escapesUnit) {
+        if (unsafeKillModeRefusal === null) return;
         installerVeto.reason = `${unsafeKillModeRefusal} (The installer this upgrade would use is ${version ?? "of unknown version"}; installer ${UNIT_ESCAPING_INSTALLER_VERSION} and later handle this unit without the change.)`;
+        throw new ServiceClientError("UPGRADE_START_REJECTED", installerVeto.reason);
+      }
+      const probe = await (deps.systemdScopeProbe ?? runSystemdScopeProbe)(unitOfService.scope);
+      if (probe.code !== 0) {
+        installerVeto.reason = describeScopeUnavailable(unitOfService.unit, unitOfService.scope, probe.stderr || probe.stdout);
+        installerVeto.errorCode = "scope_unavailable";
         throw new ServiceClientError("UPGRADE_START_REJECTED", installerVeto.reason);
       }
     };
@@ -1478,6 +1519,8 @@ export async function runService(deps: RunServiceDeps = {}): Promise<void> {
     // `draining` once the drain begins.
     let drainBegun!: () => void;
     const drainBegins = new Promise<"draining">((resolve) => { drainBegun = () => resolve("draining"); });
+    /** When the drain ended: `installer_spawned` says how long after it the installer was spawned. */
+    let drainEndedAtMs: number | null = null;
     const runDrain = async (): Promise<void> => {
       if (!drain || params.scope !== "remote") return;
       await traceStep({ step: "download", outcome: download.cached ? "skipped" : "ok", atMs: downloadStartedAtMs, durationMs: Date.now() - downloadStartedAtMs, bytes: download.bytes ?? 0 });
@@ -1486,17 +1529,25 @@ export async function runService(deps: RunServiceDeps = {}): Promise<void> {
       for (const runner of upgradeDrainRunners()) await writeUpgradeDrainRequest(slockHome, runner, request).catch(() => undefined);
       drainBegun();
       const outcome = await (deps.waitForUpgradeDrainFn ?? waitForUpgradeDrain)(slockHome, { request, runners: upgradeDrainRunners });
+      drainEndedAtMs = drainStartedAtMs + outcome.durationMs;
+      // Written (and awaited) before the spawn, with what the runners' own
+      // `drain.finished` events carry: the step log survives the restart the
+      // installer is about to make and is sent by the next runner, while those
+      // events have been seen not to arrive (Computer 1.25.3, 11-15).
       await traceStep({
         step: "drain",
         outcome: "ok",
         atMs: drainStartedAtMs,
         durationMs: outcome.durationMs,
         phase: outcome.finished,
+        notQuiet: outcome.notQuietAtEnd,
+        runners: outcome.runners,
+        ...(outcome.waitedFor !== undefined ? { waitedFor: outcome.waitedFor } : {}),
         ...(outcome.notQuietAtEnd > 0 ? { reason: `${outcome.notQuietAtEnd} agent(s) still working` } : {}),
       });
     };
-    const beforeSpawn = vetoOldInstaller === undefined && !drain ? undefined : async (command: string) => {
-      await vetoOldInstaller?.(command);
+    const beforeSpawn = vetoInstaller === undefined && !drain ? undefined : async (command: string) => {
+      await vetoInstaller?.(command);
       await runDrain();
     };
     const launch = async (): Promise<number> => {
@@ -1509,7 +1560,7 @@ export async function runService(deps: RunServiceDeps = {}): Promise<void> {
             await recordRemoteUpgradeRefusal(slockHome, { requestId: upgradeId, targetVersion: params.targetVersion, reason: installerVeto.reason }).catch(() => undefined);
           }
           await traceStep({ step: "download", outcome: download.cached ? "skipped" : "ok", atMs: downloadStartedAtMs, durationMs: Date.now() - downloadStartedAtMs, bytes: download.bytes ?? 0 });
-          await traceStep({ step: "installer_spawned", outcome: "failed", atMs: Date.now(), errorCode: "unsafe_kill_mode", supervisor, ...(killMode !== undefined ? { killMode } : {}) });
+          await traceStep({ step: "installer_spawned", outcome: "failed", atMs: Date.now(), errorCode: installerVeto.errorCode, supervisor, ...(killMode !== undefined ? { killMode } : {}) });
           throw error;
         }
         const errorCode = upgradeErrorCode(error);
@@ -1525,13 +1576,25 @@ export async function runService(deps: RunServiceDeps = {}): Promise<void> {
             ...(download.bytes !== undefined ? { bytes: download.bytes } : {}),
           });
         } else {
-          await traceStep({ step: "installer_spawned", outcome: "failed", atMs: Date.now(), errorCode, supervisor });
+          // e.g. "installer_launch_failed: spawn EBADF (2 attempts)"
+          await traceStep({ step: "installer_spawned", outcome: "failed", atMs: Date.now(), errorCode, reason: error instanceof Error ? error.message : String(error), supervisor });
         }
         throw error;
       }
       // With a drain the download step was traced when the drain began.
       if (!drain) await traceStep({ step: "download", outcome: download.cached ? "skipped" : "ok", atMs: downloadStartedAtMs, durationMs: Date.now() - downloadStartedAtMs, bytes: download.bytes ?? 0 });
-      await traceStep({ step: "installer_spawned", outcome: pid === null ? "failed" : "ok", atMs: Date.now(), supervisor, ...(killMode !== undefined ? { killMode } : {}), ...(pid === null ? { errorCode: "external_installer_launch_failed" } : {}) });
+      const spawnedAtMs = Date.now();
+      await traceStep({
+        step: "installer_spawned", outcome: pid === null ? "failed" : "ok", atMs: spawnedAtMs, supervisor,
+        // From the drain's end to the spawn returning (the spawn and any retry of it).
+        ...(drainEndedAtMs !== null && spawnedAtMs >= drainEndedAtMs
+          ? { sinceStep: "drain" as const, sinceStepMs: spawnedAtMs - drainEndedAtMs }
+          : {}),
+        ...(killMode !== undefined ? { killMode } : {}),
+        ...(pid === null ? { errorCode: "external_installer_launch_failed" } : {}),
+        // A spawn that failed once and worked on the retry (#67): countable, so the cause can be found.
+        ...(download.spawnRetriedAfter ? { reason: `retried after ${download.spawnRetriedAfter}` } : {}),
+      });
       if (pid === null) throw new Error("external_installer_launch_failed");
       return pid;
     };

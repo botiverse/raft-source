@@ -1,6 +1,6 @@
 import { InlineCode } from "@botiverse/raft-ui";
 import { useIntl } from "react-intl";
-import type { ComputerUpgradeFailureHint } from "@botiverse/raft-shared";
+import type { ComputerUpgradeUnitFailureHint } from "@botiverse/raft-shared";
 
 /**
  * What to do on the machine after a web upgrade failed because of the
@@ -8,7 +8,7 @@ import type { ComputerUpgradeFailureHint } from "@botiverse/raft-shared";
  * the unit, run the install command once, start the unit again. Names the
  * unit and its commands when the failure did.
  */
-export function ComputerUpgradeFailureHintText({ hint }: { hint: ComputerUpgradeFailureHint }) {
+export function ComputerUpgradeFailureHintText({ hint }: { hint: ComputerUpgradeUnitFailureHint }) {
   const { formatMessage } = useIntl();
   const killModeReason = hint.reason === "unsafe_kill_mode";
   if (!hint.unit || (killModeReason && !hint.killMode)) {

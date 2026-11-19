@@ -121,7 +121,6 @@ const KNOWN_DRIFT: ReadonlyArray<readonly [string, readonly string[]]> = [
   ["Verified", ["已核对", "已验证"]],
   ["Working…", ["处理中…", "工作中…"]],
   ["Workspace", ["工作区", "工作空间"]],
-  ["{count} selected", ["已选 {count} 个", "已选 {count} 条"]],
 ];
 
 /** English strings used by >1 id across >1 namespace, whose zh values disagree. */

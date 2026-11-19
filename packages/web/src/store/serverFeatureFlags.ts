@@ -38,6 +38,7 @@ import {
   AGENT_CONTEXT_VIEW_FEATURE_FLAG_KEY,
   AGENT_READ_PROGRESS_FEATURE_FLAG_KEY,
   AGENT_USAGE_FEATURE_FLAG_KEY,
+  AGENT_VOICE_FEATURE_FLAG_KEY,
   PRO_SEAT_ADD_FEATURE_FLAG_KEY,
   PRO_PREPAID_FEATURE_FLAG_KEY,
   AGENT_MIGRATION_HOSTED_FEATURE_FLAG_KEY,
@@ -51,9 +52,9 @@ import {
   HUMAN_AVATAR_BUILDER_FEATURE_FLAG_KEY,
   PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY,
   PUBLIC_SERVER_FEATURE_FLAG_KEY,
+  REFERRAL_SOURCE_PROMPT_FEATURE_FLAG_KEY,
   SERVER_LABS_UI_FEATURE_FLAG_KEY,
   SLACK_BRIDGE_FEATURE_FLAG_KEYS,
-  SERVER_GUEST_FEATURE_FLAG_KEY,
   WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY,
   clearClockTimeout,
   currentRandomUnit,
@@ -123,6 +124,18 @@ export const WEB_PREVIEW_FLAG_KEY = "web_preview_v0";
  * browser: the frame, as before.
  */
 export const DESKTOP_WEB_PREVIEW_VIEW_FLAG_KEY = "desktop_web_preview_view_v0";
+/**
+ * Sign in with Raft in Raft Desktop's built-in browser (security design B,
+ * Tenny 2026-11-13): a page there that sends the person to Raft's authorize
+ * address gets Raft's consent in the app's own window
+ * (features/desktopBrowserSignIn) instead of a stopped navigation, and no
+ * second Raft sign-in. Web (desktop renderer) only: it arms the shell
+ * (apps/desktop main/webPreviewRaftSignIn.ts); the server stores and
+ * evaluates it and reads it nowhere. Server-scoped, default off, no rules
+ * (migration desktop_browser_raft_sign_in_flag). Off: that navigation is
+ * stopped, as before.
+ */
+export const DESKTOP_BROWSER_RAFT_SIGN_IN_FLAG_KEY = "desktop_browser_raft_sign_in_v0";
 
 /**
  * Agent Lounge v0 (#proj-chat:30a58e4d): an agent's Lounge (zh 会客厅), the
@@ -144,7 +157,34 @@ export const AGENT_LOUNGE_FLAG_KEY = "agent_lounge_v0";
  */
 export const INBOX_READ_INPLACE_FLAG_KEY = "inbox_read_inplace_v1";
 
-export { HUMAN_AVATAR_BUILDER_FEATURE_FLAG_KEY, AGENT_READ_PROGRESS_FEATURE_FLAG_KEY, PRO_SEAT_ADD_FEATURE_FLAG_KEY, PRO_PREPAID_FEATURE_FLAG_KEY, APP_PROMPT_TEXT_CONSENT_FEATURE_FLAG_KEY, INTERACTIVE_LINK_CARDS_FEATURE_FLAG_KEY };
+/**
+ * Activity inbox refresh, step 3b (#triage:#244, Tenny): a live message
+ * (`message_new`, `thread_reply`) on a row Activity already lists, patched in
+ * place in full on a settled plain All list, sends no GET /api/channels/inbox
+ * re-read (inboxInPlaceUnread liveMessageRereadOutcome). An unlisted row, a
+ * patch that leaves a field for the re-read, or an unsettled or filtered list
+ * still re-reads; `read_persisted` is step 3a's. Web only: the server stores
+ * and evaluates it and reads it nowhere. Server-scoped, default off, no rules
+ * (migration inbox_message_inplace_flag); turning it on needs a human's
+ * approval. Off: every live message re-reads, as before.
+ */
+export const INBOX_MESSAGE_INPLACE_FLAG_KEY = "inbox_message_inplace_v1";
+
+/**
+ * Activity inbox redesign, step 2 (#triage:#244, Tenny): each listed Activity
+ * row follows the per-row position rule (shared activityRowPosition.ts and
+ * activityUnreadPredicate.ts; store/inboxRowPosition.ts). A live message, a
+ * persisted read and an answer are applied to their row by that rule; where it
+ * is ambiguous, that one row is re-read (`GET /api/channels/inbox?ids=`, at
+ * most one read in flight per row, pending rows batched), never the list. Web
+ * only: the server stores and evaluates it and reads it nowhere.
+ * Server-scoped, default off, no rules (migration inbox_row_position_flag);
+ * turning it on needs a human's approval. Off: steps 3a/3b and every re-read
+ * as before.
+ */
+export const INBOX_ROW_POSITION_FLAG_KEY = "inbox_row_position_v1";
+
+export { HUMAN_AVATAR_BUILDER_FEATURE_FLAG_KEY, AGENT_READ_PROGRESS_FEATURE_FLAG_KEY, PRO_SEAT_ADD_FEATURE_FLAG_KEY, PRO_PREPAID_FEATURE_FLAG_KEY, APP_PROMPT_TEXT_CONSENT_FEATURE_FLAG_KEY, INTERACTIVE_LINK_CARDS_FEATURE_FLAG_KEY, REFERRAL_SOURCE_PROMPT_FEATURE_FLAG_KEY };
 
 const SERVER_FEATURE_FLAG_REGISTRY = {
   // View Context (shared agentContextView.ts). The web reads it for
@@ -161,6 +201,10 @@ const SERVER_FEATURE_FLAG_REGISTRY = {
   // Agent token usage (#proj-o11y:#36): the agent panel's Usage tab, for
   // whoever sees Activity. Off: no tab, and GET /agent-usage answers 404.
   agentUsage: AGENT_USAGE_FEATURE_FLAG_KEY,
+  // Raft voice (shared agentSideAsk.ts): the agent panel's Voice section, for
+  // whoever may edit the agent (ask / call switches and who asked). Off: no
+  // section, and the voice routes answer 404.
+  agentVoice: AGENT_VOICE_FEATURE_FLAG_KEY,
   antiprotonHostedRuntime: ANTIPROTON_HOSTED_RUNTIME_FEATURE_FLAG_KEY,
   appPromptTextConsent: APP_PROMPT_TEXT_CONSENT_FEATURE_FLAG_KEY,
   // Forum-style channels (#proj-chat:#24): the channel settings switch and the
@@ -188,6 +232,8 @@ const SERVER_FEATURE_FLAG_REGISTRY = {
   // only. A stored built avatar draws whatever this reads.
   humanAvatarBuilder: HUMAN_AVATAR_BUILDER_FEATURE_FLAG_KEY,
   inboxReadInPlace: INBOX_READ_INPLACE_FLAG_KEY,
+  inboxMessageInPlace: INBOX_MESSAGE_INPLACE_FLAG_KEY,
+  inboxRowPosition: INBOX_ROW_POSITION_FLAG_KEY,
   // Interactive link cards (RFC 076): App links read in one batched v2 read
   // per message (components/message/useAppLinkPreviews.ts). Off: the GET.
   interactiveLinkCards: INTERACTIVE_LINK_CARDS_FEATURE_FLAG_KEY,
@@ -198,13 +244,16 @@ const SERVER_FEATURE_FLAG_REGISTRY = {
   proSeatAdd: PRO_SEAT_ADD_FEATURE_FLAG_KEY,
   // Prepaid Pro paid once with Alipay (task #19): its choice in the upgrade dialog.
   proPrepaid: PRO_PREPAID_FEATURE_FLAG_KEY,
+  // "How did you hear about Raft?" asked once of a new account outside the
+  // owner setup survey (components/onboarding/ReferralSourcePrompt). Off: no card.
+  referralSourcePrompt: REFERRAL_SOURCE_PROMPT_FEATURE_FLAG_KEY,
   taskV2Conversations: TASK_V2_CONVERSATIONS_FLAG_KEY,
   publicServer: PUBLIC_SERVER_FEATURE_FLAG_KEY,
   serverLabsUi: SERVER_LABS_UI_FEATURE_FLAG_KEY,
   slackBridge: SLACK_BRIDGE_FEATURE_FLAG_KEYS.master,
-  serverGuest: SERVER_GUEST_FEATURE_FLAG_KEY,
   webPreview: WEB_PREVIEW_FLAG_KEY,
   desktopWebPreviewView: DESKTOP_WEB_PREVIEW_VIEW_FLAG_KEY,
+  desktopBrowserRaftSignIn: DESKTOP_BROWSER_RAFT_SIGN_IN_FLAG_KEY,
   workspaceArtifacts: WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY,
 } as const;
 

@@ -4,7 +4,7 @@
 // has signed in, or once disconnected, the steps the create dialog showed are open below it, with the
 // link that switches how it connects; once connected they fold behind "How it connects". Credentials
 // sit beside it for whoever may make them: one agent credential serves the CLI login and the SDK.
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useIntl } from "react-intl";
 import { ChevronDown, ChevronUp, Plus } from "lucide-react";
 import { Button, TextLink, TextLinkExternalIcon } from "@botiverse/raft-ui";
@@ -19,6 +19,8 @@ import type { Agent, ExternalAgentStatus } from "../../store/agentStore";
 import { formatRelativeTime } from "../../utils/relativeTime";
 import { ExternalAgentCredentialList } from "./ExternalAgentCredentialList";
 import { CopyBlock, CopyField } from "./ExternalSetupCopy";
+import { trackExternalAgentSetupAction, trackExternalAgentSetupProgress } from "../../analytics/externalAgentSetup";
+import type { ExternalAgentSetupAction } from "../../analytics/externalAgentSetup";
 import { existingAgentPrompt, externalConnectionState, RAFT_SDK_DOCS_URL, SDK_INSTALL_COMMAND, sdkStarterCode, STATUS_POLL_MS } from "./externalAgentSetup";
 import type { ExternalSetupMethod } from "./externalAgentSetup";
 import { useExternalAgentCredentials } from "./useExternalAgentCredentials";
@@ -97,6 +99,7 @@ export function ExternalAgentConnectionCard({ agent, status, canIssueCredentials
   const credentials = useExternalAgentCredentials(agent.id, canIssueCredentials);
   const [expanded, setExpanded] = useState(false);
   const [confirm, setConfirm] = useState<Confirm>(null);
+  const connectedSeen = useRef(false);
   const method: ExternalSetupMethod = status.externalSetupMethod === "sdk" ? "sdk" : "existing_agent";
   const state = externalConnectionState(status.setupState, display.isOnline);
   const connected = state === "online" || state === "offline";
@@ -107,10 +110,25 @@ export function ExternalAgentConnectionCard({ agent, status, canIssueCredentials
     if (connected) return undefined;
     let active = true;
     const timer = setInterval(() => {
-      void fetchExternalAgentStatus(agent.id).then((next) => { if (active) onStatus(next); }).catch(() => undefined);
+      void fetchExternalAgentStatus(agent.id).then((next) => {
+        if (!active) return;
+        // Connected as this card's own check first sees it, once per card (it is keyed by agent): the poll stops then.
+        if (next.setupState === "connected" && !connectedSeen.current) {
+          connectedSeen.current = true;
+          trackExternalAgentSetupProgress("connected_seen", "profile_card", next.externalSetupMethod === "sdk" ? "sdk" : "existing_agent");
+        }
+        onStatus(next);
+      }).catch(() => undefined);
     }, STATUS_POLL_MS);
     return () => { active = false; clearInterval(timer); };
   }, [agent.id, connected, fetchExternalAgentStatus, onStatus]);
+
+  const trackAction = useCallback((action: ExternalAgentSetupAction) => trackExternalAgentSetupAction(action, "profile_card", method), [method]);
+  const handlePromptCopied = useCallback(() => trackAction("prompt_copied"), [trackAction]);
+  const handleCredentialCopied = useCallback(() => trackAction("credential_copied"), [trackAction]);
+  const handleInstallCopied = useCallback(() => trackAction("install_copied"), [trackAction]);
+  const handleCodeCopied = useCallback(() => trackAction("code_copied"), [trackAction]);
+  const handleSdkGuide = useCallback(() => trackAction("sdk_guide_opened"), [trackAction]);
 
   const handleToggle = useCallback(() => setExpanded((value) => !value), []);
   const handleSwitch = useCallback(() => {
@@ -118,6 +136,7 @@ export function ExternalAgentConnectionCard({ agent, status, canIssueCredentials
     // The same credential works both ways: only the instructions and the remembered method change.
     onStatus({ ...status, externalSetupMethod: next });
     void api.put(`/agents/${encodeURIComponent(agent.id)}/external-setup-method`, { method: next }).catch(() => onStatus(status));
+    trackExternalAgentSetupAction("method_switched", "profile_card", next);
   }, [agent.id, method, onStatus, status]);
 
   const pageCredentialId = credentials.pageCredential?.id ?? null;
@@ -127,18 +146,22 @@ export function ExternalAgentConnectionCard({ agent, status, canIssueCredentials
     // A new page credential replaces the page's earlier one, so it asks first; a first one doesn't.
     if (pageCredentialId) setConfirm({ kind: "replace", credentialId: pageCredentialId });
     else void credentials.create(null).then((made) => {
-      if (made) void fetchExternalAgentStatus(agent.id).then(onStatus).catch(() => undefined);
+      if (!made) return;
+      trackAction("credential_created");
+      void fetchExternalAgentStatus(agent.id).then(onStatus).catch(() => undefined);
     });
-  }, [agent.id, credentials, fetchExternalAgentStatus, onStatus, pageCredentialId]);
+  }, [agent.id, credentials, fetchExternalAgentStatus, onStatus, pageCredentialId, trackAction]);
   const handleReplace = useCallback((credentialId: string) => setConfirm({ kind: "replace", credentialId }), []);
   const handleRevoke = useCallback((credentialId: string) => setConfirm({ kind: "revoke", credentialId }), []);
   const handleCloseConfirm = useCallback(() => setConfirm(null), []);
   const handleConfirm = useCallback(async () => {
     if (!confirm) return;
-    if (confirm.kind === "replace") await credentials.create(confirm.credentialId);
-    else await credentials.revoke(confirm.credentialId);
+    // Only what the server did: a failed or cancelled request records nothing.
+    if (confirm.kind === "replace") {
+      if (await credentials.create(confirm.credentialId)) trackAction("credential_replaced");
+    } else if (await credentials.revoke(confirm.credentialId)) trackAction("credential_revoked");
     void fetchExternalAgentStatus(agent.id).then(onStatus).catch(() => undefined);
-  }, [agent.id, confirm, credentials, fetchExternalAgentStatus, onStatus]);
+  }, [agent.id, confirm, credentials, fetchExternalAgentStatus, onStatus, trackAction]);
 
   const showSteps = !connected || expanded;
   const createLabel = formatMessage({ id: pageCredentialId ? "agent.externalCard.createNewCredential" : "agent.externalCard.createCredential" });
@@ -157,7 +180,7 @@ export function ExternalAgentConnectionCard({ agent, status, canIssueCredentials
       {credentials.secret ? (
         <>
           <p className="text-callout text-foreground-muted">{formatMessage({ id: "agent.createExternal.credentialWarning" }, { name })}</p>
-          <CopyField text={credentials.secret} testId="external-agent-new-credential" />
+          <CopyField text={credentials.secret} testId="external-agent-new-credential" onCopied={handleCredentialCopied} />
           <p className="text-footnote text-foreground-muted">{formatMessage({ id: method === "sdk" ? "agent.createExternal.envHint" : "agent.createExternal.shownOnce" })}</p>
         </>
       ) : (
@@ -192,7 +215,7 @@ export function ExternalAgentConnectionCard({ agent, status, canIssueCredentials
               <>
                 <section className="stack-y-2">
                   <h3 className="text-body font-semibold">{formatMessage({ id: credentialStep ? "agent.createExternal.step1Existing" : "agent.externalCard.promptStep" })}</h3>
-                  <CopyBlock text={existingAgentPrompt(agent, formatMessage)} label={formatMessage({ id: "agent.createExternal.copyPrompt" })} testId="external-agent-prompt" primary collapsed />
+                  <CopyBlock text={existingAgentPrompt(agent, formatMessage)} label={formatMessage({ id: "agent.createExternal.copyPrompt" })} testId="external-agent-prompt" primary collapsed onCopied={handlePromptCopied} />
                 </section>
                 {credentialStep ? (
                   <section className="stack-y-2">
@@ -211,11 +234,11 @@ export function ExternalAgentConnectionCard({ agent, status, canIssueCredentials
                 ) : null}
                 <section className="stack-y-2">
                   <h3 className="text-body font-semibold">{formatMessage({ id: credentialStep ? "agent.createExternal.step2Sdk" : "agent.externalCard.sdkStep" })}</h3>
-                  <CopyField text={SDK_INSTALL_COMMAND} testId="external-agent-install" />
-                  <CopyField text={sdkStarterCode()} testId="external-agent-code" />
+                  <CopyField text={SDK_INSTALL_COMMAND} testId="external-agent-install" onCopied={handleInstallCopied} />
+                  <CopyField text={sdkStarterCode()} testId="external-agent-code" onCopied={handleCodeCopied} />
                   <p className="text-callout text-foreground-muted">
                     {formatMessage({ id: "agent.createExternal.sdkConnectsHint" }, { name })}
-                    <TextLink variant="strong" className="ml-1" render={<a href={RAFT_SDK_DOCS_URL} target="_blank" rel="noopener noreferrer" aria-label={opensInNewTabAriaLabel(formatMessage, formatMessage({ id: "agent.createExternal.sdkGuide" }))} />}>
+                    <TextLink variant="strong" className="ml-1" render={<a href={RAFT_SDK_DOCS_URL} target="_blank" rel="noopener noreferrer" onClick={handleSdkGuide} aria-label={opensInNewTabAriaLabel(formatMessage, formatMessage({ id: "agent.createExternal.sdkGuide" }))} />}>
                       {formatMessage({ id: "agent.createExternal.sdkGuide" })}
                       <TextLinkExternalIcon />
                     </TextLink>
@@ -241,7 +264,7 @@ export function ExternalAgentConnectionCard({ agent, status, canIssueCredentials
           {credentials.secret && connected ? (
             <div className="stack-y-2" data-testid="external-agent-credential-step">
               <p className="text-callout text-foreground-muted">{formatMessage({ id: "agent.createExternal.credentialWarning" }, { name })}</p>
-              <CopyField text={credentials.secret} testId="external-agent-new-credential" />
+              <CopyField text={credentials.secret} testId="external-agent-new-credential" onCopied={handleCredentialCopied} />
             </div>
           ) : null}
         </>

@@ -10,6 +10,7 @@ import type {
   SyncDomainConfig,
   SyncIngestOutcome,
 } from "@botiverse/raft-shared";
+import { compareActivitySeq } from "./activitySeq";
 import { registerServerReset } from "./serverResetRegistry";
 
 export interface ActivityReadStateIdentity {
@@ -92,6 +93,18 @@ export function acceptActivityReadAllAck(
 export function hasActivityReadHold(identity: ActivityReadStateIdentity, scopeId: string): boolean {
   const key = holdKey(identity, scopeId);
   return key !== null && activeReadHolds.has(key);
+}
+
+/**
+ * #triage:#244: the hold covers a row served with activity through `seq` only
+ * up to its read; activity past it (messages this tab never got live, which
+ * would have released the hold) is unread. Unknown `seq`: covered, as before.
+ */
+export function activityReadHoldCovers(identity: ActivityReadStateIdentity, scopeId: string, seq: string | null | undefined): boolean {
+  const key = holdKey(identity, scopeId);
+  const hold = key === null ? undefined : activeReadHolds.get(key);
+  if (!hold) return false;
+  return compareActivitySeq(seq, String(hold.maxReadSeq)) <= 0;
 }
 
 /**

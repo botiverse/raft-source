@@ -9,6 +9,7 @@
 // them. As defense-in-depth EVERY emitted line is additionally run
 // through `redactSecrets()` so even a future bug that drops a credential
 // into a check `detail` cannot leak it.
+import { redactDiagnosticCredentialLines, redactDiagnosticCredentials } from "@botiverse/raft-shared";
 import { buildStatusReport, type StatusReportDeps } from "./status";
 import { describeDuplicateKeyHolder, findDuplicateKeyHolder } from "./duplicateKeyGuard";
 import { describeRaftHomeConflict, findRaftHomeConflictFor, serverRunnerLockConflictPath, serverRunnerMemoryPath, serviceMemoryPath } from "./paths";
@@ -38,17 +39,21 @@ import { hasUnlinkedComputerHandshake, readRunnerLogTail } from "./internal/runn
 // service-axis caller can't silently regress to `~/.slock`.
 // (#wg-raft-computer:f2a02081 BUG 3 sweep.)
 
-// Anything shaped like a Raft credential, JWT, or long opaque token.
-const SECRET_PATTERNS: RegExp[] = [
-  /sk_[a-z]+_[A-Za-z0-9._-]+/g, // sk_computer_* / sk_agent_* / sk_machine_*
-  /\beyJ[A-Za-z0-9._-]{20,}/g, // JWT-ish (base64url header)
-  /\b[A-Fa-f0-9]{40,}\b/g, // long hex blobs
-];
-
+// Every credential shape the shared catalogue knows (Raft keys, JWTs, long hex
+// blobs, as before, plus vendor/cloud keys, Authorization values and
+// secret-named assignments and flags). Paths, emails and URLs stay readable:
+// this is the owner's own terminal.
 export function redactSecrets(line: string): string {
-  let out = line;
-  for (const re of SECRET_PATTERNS) out = out.replace(re, "***REDACTED***");
-  return out;
+  return redactDiagnosticCredentials(line, { mask: "***REDACTED***" });
+}
+
+/**
+ * `redactSecrets` over a run of log lines, line for line: a PEM block or YAML
+ * block secret spanning lines is masked whole (one mask per line it covered),
+ * an orphan PEM marker only on its own line.
+ */
+export function redactSecretLines(lines: readonly string[]): string[] {
+  return redactDiagnosticCredentialLines(lines, { mask: "***REDACTED***" });
 }
 
 export interface DoctorCheck {

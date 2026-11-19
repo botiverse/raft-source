@@ -224,13 +224,38 @@ test.skipIf(inSourceSnapshot)("drain window invariant: every target group's dere
     "utf8",
   );
   const requiredSeconds = (DEFAULT_DRAIN_CLOSE_SPREAD_MS + DRAIN_SPREAD_MARGIN_MS) / 1000;
-  for (const group of ["server", "server_alternate"]) {
+  const budgetSeconds = (DEFAULT_DRAIN_POLL_INTERVAL_MS + DRAIN_PROBE_TIMEOUT_MS + DEFAULT_DRAIN_CLOSE_SPREAD_MS + DRAIN_SPREAD_MARGIN_MS) / 1000;
+  // A target group's delay is either a literal, unset (AWS default 300), or
+  // exactly local.target_deregistration_delay = max(FLOOR, var.drain_spread_seconds + ADD)
+  // (#304: the delay follows the spread). Anything else fails loudly: a guard
+  // that falls back to a default when it cannot read the value checks nothing.
+  const derived = mainTf.match(/^\s*target_deregistration_delay\s*=\s*max\(\s*(\d+)\s*,\s*var\.drain_spread_seconds\s*\+\s*(\d+)\s*\)\s*$/m);
+  const resolveDelaySeconds = (group: string): number => {
     const blockStart = mainTf.indexOf(`resource "aws_lb_target_group" "${group}" {`);
     assert.notEqual(blockStart, -1, `target group ${group} must exist in server-service/main.tf`);
     const blockEnd = mainTf.indexOf("\nresource ", blockStart);
     const block = mainTf.slice(blockStart, blockEnd === -1 ? undefined : blockEnd);
-    const explicit = block.match(/deregistration_delay\s*=\s*(\d+)/);
-    const delaySeconds = explicit ? Number(explicit[1]) : 300; // unset = AWS default 300
+    const line = block.match(/^\s*deregistration_delay\s*=\s*(.+?)\s*$/m);
+    if (!line) return 300; // unset = AWS default 300, asserted below like any other value
+    if (/^\d+$/.test(line[1])) return Number(line[1]);
+    assert.equal(
+      line[1],
+      "local.target_deregistration_delay",
+      `target group ${group}: deregistration_delay must be a literal or exactly local.target_deregistration_delay, got "${line[1]}"`,
+    );
+    assert.ok(derived, "local.target_deregistration_delay must be written as max(FLOOR, var.drain_spread_seconds + ADD)");
+    const [floorSeconds, addSeconds] = [Number(derived![1]), Number(derived![2])];
+    // The added seconds carry the whole chain in front of and behind the
+    // spread, for every spread, not only the default one.
+    const overheadSeconds = (DEFAULT_DRAIN_POLL_INTERVAL_MS + DRAIN_PROBE_TIMEOUT_MS + DRAIN_SPREAD_MARGIN_MS) / 1000;
+    assert.ok(
+      addSeconds >= overheadSeconds,
+      `local.target_deregistration_delay adds ${addSeconds}s to the spread; poll + probe timeout + margin needs ${overheadSeconds}s`,
+    );
+    return Math.max(floorSeconds, DEFAULT_DRAIN_CLOSE_SPREAD_MS / 1000 + addSeconds);
+  };
+  for (const group of ["server", "server_alternate"]) {
+    const delaySeconds = resolveDelaySeconds(group);
     assert.ok(
       delaySeconds >= requiredSeconds,
       `target group ${group}: deregistration_delay ${delaySeconds}s must cover the drain spread ` +
@@ -243,13 +268,8 @@ test.skipIf(inSourceSnapshot)("drain window invariant: every target group's dere
   // the first going-away can lag deregistration by up to poll + timeout.
   // The whole chain must fit the delay; a poll interval bumped to 30s
   // without touching the delay turns this red.
-  const budgetSeconds = (DEFAULT_DRAIN_POLL_INTERVAL_MS + DRAIN_PROBE_TIMEOUT_MS + DEFAULT_DRAIN_CLOSE_SPREAD_MS + DRAIN_SPREAD_MARGIN_MS) / 1000;
   for (const group of ["server", "server_alternate"]) {
-    const blockStart = mainTf.indexOf(`resource "aws_lb_target_group" "${group}" {`);
-    const blockEnd = mainTf.indexOf("\nresource ", blockStart);
-    const block = mainTf.slice(blockStart, blockEnd === -1 ? undefined : blockEnd);
-    const explicit = block.match(/deregistration_delay\s*=\s*(\d+)/);
-    const delaySeconds = explicit ? Number(explicit[1]) : 300;
+    const delaySeconds = resolveDelaySeconds(group);
     assert.ok(
       budgetSeconds <= delaySeconds,
       `target group ${group}: poll ${DEFAULT_DRAIN_POLL_INTERVAL_MS / 1000}s + probe timeout ${DRAIN_PROBE_TIMEOUT_MS / 1000}s + spread ` +

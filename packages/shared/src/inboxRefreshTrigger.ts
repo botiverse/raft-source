@@ -34,9 +34,58 @@ export const INBOX_REFRESH_TRIGGERS = [
   "reply_gap",
   /** Not a socket event: a row's set of live messages counted since its last served answer is full (#244). */
   "counted_cap",
+  /**
+   * The rows below re-read one row, never the list (`GET /api/channels/inbox?ids=`,
+   * `X-Raft-Fetch-Reason: position_reread`): the per-row position rule
+   * (shared activityRowPosition.ts, inbox redesign step 2, web flag
+   * `inbox_row_position_v1`). A batched read carries its first row's trigger.
+   */
+  /** A live message at or below its row's delivered position that this client had not applied: it may have committed after a higher seq. */
+  "ambiguous_seq",
+  /** An answer arrived after a commit-order inversion on the row (a live seq lower than one already applied). */
+  "row_inversion",
+  /** An event for a row without a position (the server could not pair its seq with its latest message). */
+  "row_null_position",
+  /** A live message the unread predicate cannot judge (a system message without its provenance, no seq). */
+  "row_unjudged",
+  /** A read below the row's shown position, or of a mention-only row: the read cannot be split here. */
+  "row_partial_read",
+  /** `thread:updated` said the listed thread row missed replies: that row only. */
+  "row_reply_gap",
+  /**
+   * Not a row read: a row re-read's answer left out a row it asked for (the
+   * route lists only rows that still qualify: access lost, archived, Done,
+   * unfollowed elsewhere), so the list is re-read (`realtime_fallback`).
+   */
+  "row_missing",
+  /**
+   * One live message in 20 applied in place with no re-read: its row is read
+   * once after the usual delay (`X-Raft-Fetch-Reason: position_audit`) and the
+   * answer judges it (the drift check, scope=row). Tenny's acceptance number.
+   */
+  "position_audit",
+  /**
+   * Not an Activity read: a reply came into a followed thread the sidebar's
+   * followed-threads list does not hold (`/channels/threads/followed`,
+   * `realtime_fallback`). That list holds only threads with unread replies,
+   * so a thread read here and dropped from it reloads it (#triage:#389).
+   */
+  "followed_not_listed",
 ] as const;
 
 export type InboxRefreshTrigger = (typeof INBOX_REFRESH_TRIGGERS)[number];
 
 export const INBOX_REFRESH_TRIGGER_HEADER = "X-Raft-Fetch-Trigger";
 export const INBOX_REFRESH_COALESCED_HEADER = "X-Raft-Fetch-Coalesced";
+
+/**
+ * Which read source answered `GET /api/channels/inbox`: `risingwave` (the
+ * serving views) or `postgres` (the canonical read: search, guest access,
+ * forced). A stale answer from the overload cache says the source of the read
+ * it kept. Absent for an answer no conversation read made (an app's object
+ * scope, an empty Pinned or Saved). The web copies it unchanged into its drift
+ * check (`inbox.inplace.backend`).
+ */
+export const INBOX_BACKEND_HEADER = "X-Raft-Inbox-Backend";
+export const INBOX_BACKENDS = ["risingwave", "postgres"] as const;
+export type InboxBackend = (typeof INBOX_BACKENDS)[number];

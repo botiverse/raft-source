@@ -1,4 +1,5 @@
 import { useCallback, useId } from "react";
+import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
 import { Button, MessageEmbed, MessageEmbedFooter, MessageEmbedHeader, Skeleton } from "@botiverse/raft-ui";
 import { TriangleAlert } from "lucide-react";
@@ -27,17 +28,32 @@ export type LinkPreviewPromptState = "idle" | "allowing" | "declining" | "failed
  * replaces, and smaller than one. It names the App and says what allowing
  * tells it; nothing about the link itself. A neutral request: Allow is the
  * ink-bordered button, Don't Allow the frameless one, neither pink nor orange.
+ *
+ * A card message's acting button asks the same question in its own words
+ * (RFC 086; MessageCardActingButtons.tsx): `title` and `body` replace the
+ * link-preview wording, and `secondaryLabel` with `onSecondary` replace Don't
+ * Allow with a button that records nothing ("Not now"). Without them the
+ * prompt is the link-preview one, unchanged.
  */
 export function LinkPreviewConsentPrompt({
   app,
   state,
   onAllow,
   onDecline,
+  title,
+  body,
+  secondaryLabel,
+  onSecondary,
 }: {
   app: LinkPreviewApp;
   state: LinkPreviewPromptState;
   onAllow: (app: LinkPreviewApp) => void;
   onDecline: (app: LinkPreviewApp) => void;
+  title?: ReactNode;
+  body?: ReactNode;
+  secondaryLabel?: string;
+  /** In place of declining: the secondary button only calls this (nothing is saved, so it never loads). */
+  onSecondary?: () => void;
 }) {
   const { formatMessage } = useIntl();
   const titleId = useId();
@@ -49,7 +65,7 @@ export function LinkPreviewConsentPrompt({
         <LinkPreviewAppLogo app={app} />
         <div className="min-w-0 flex-1 pt-[calc((27px-1lh)/2)] text-subhead text-foreground">
           <p id={titleId} className="m-0 break-words [overflow-wrap:anywhere]">
-            {formatMessage(
+            {title ?? formatMessage(
               { id: "message.linkPreviewPrompt.title" },
               { app: app.name, b: (chunks) => <span key="b" className="font-semibold">{chunks}</span> },
             )}
@@ -61,7 +77,7 @@ export function LinkPreviewConsentPrompt({
             </p>
           ) : (
             <p className="m-0 mt-0.5 text-footnote text-foreground-muted">
-              {formatMessage({ id: "message.linkPreviewPrompt.disclosure" }, { app: app.name })}
+              {body ?? formatMessage({ id: "message.linkPreviewPrompt.disclosure" }, { app: app.name })}
             </p>
           )}
         </div>
@@ -88,9 +104,9 @@ export function LinkPreviewConsentPrompt({
           loading={state === "declining"}
           loadingLabel={formatMessage({ id: "message.linkPreviewPrompt.saving" })}
           disabled={state === "allowing"}
-          onClick={decline}
+          onClick={onSecondary ?? decline}
         >
-          {formatMessage({ id: "message.linkPreviewPrompt.dontAllow" })}
+          {secondaryLabel ?? formatMessage({ id: "message.linkPreviewPrompt.dontAllow" })}
         </Button>
       </MessageEmbedFooter>
     </MessageEmbed>

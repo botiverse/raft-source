@@ -305,3 +305,28 @@ test("channel participants distinguish Slack projections from Raft members", asy
   assert.ok(screen.getByText("Slack"));
   assert.ok(screen.getByText("@taylor"));
 });
+
+test("channel add-member: a member who can't create agents sees no Create agent row at all (#wg-rbac:#76)", async () => {
+  const channel = seedAddMemberCandidates();
+  useServerStore.setState({ current: { ...makeServer(), role: "member" } });
+  await openAddMemberView(channel.id);
+  await waitFor(() => {
+    assert.ok(screen.getByText("Runtime Scout"));
+  });
+
+  assert.ok(screen.queryByTestId("add-member-create-agent-entry") === null, "no Create agent entry");
+  assert.ok(screen.queryByTestId("add-member-create-agent-entry-disabled") === null, "no Create agent entry");
+  assert.ok(screen.queryByText("Create agent") === null, "no Create agent entry");
+  assert.ok(screen.queryByText(/creating Agents on this server/) === null, "no Create agent entry");
+  // With nothing to offer the list draws no footer, so no empty band under it.
+  assert.ok(document.querySelector("[data-slot=choice-list-footer]") === null, "no footer");
+});
+
+test("channel add-member: an owner still sees the Create agent row", async () => {
+  const channel = seedAddMemberCandidates();
+  await openAddMemberView(channel.id);
+  await waitFor(() => {
+    assert.ok(screen.getByTestId("add-member-create-agent-entry"));
+  });
+  assert.ok(document.querySelector("[data-slot=choice-list-footer]"));
+});

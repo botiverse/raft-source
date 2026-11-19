@@ -298,6 +298,55 @@ test("a crash reported on a non-error activity (offline + runtime_crashed): memb
   }
 });
 
+// A daemon that stopped a runtime after repeated errors reports a failed start
+// (`runtime_unavailable`) whose detail names the last error: "Runtime stopped
+// after 3 repeated runtime errors ... Last error: <text>". Daemons before the
+// daemon-side scrub sent that text raw, in the detail and an `Error: ...` entry.
+test("an old daemon's failed-start frame (runtime_unavailable) with a raw error: stored, pushed and logged scrubbed and capped", async ({ db: _db }) => {
+  const { agent, orchestrator, send } = await seed();
+  try {
+    const detail = `Runtime stopped after 3 repeated runtime errors with the same fingerprint (73a492211aee0223). Last error: ${SECRET_DETAIL} Raft retries it later by itself; fix the runtime or tooling issue if it keeps failing.`;
+    await send({
+      type: "agent:activity",
+      agentId: agent.id,
+      launchId: "launch-1",
+      daemonInstanceId: "daemon-a",
+      clientSeq: 10,
+      activity: "error",
+      detail,
+      detailKind: "runtime_error",
+      entries: [{ kind: "text", text: `Error: ${detail}` }],
+      isHeartbeat: false,
+    } as unknown as MachineToServerMessage);
+    await send({
+      type: "agent:activity",
+      agentId: agent.id,
+      launchId: "launch-1",
+      daemonInstanceId: "daemon-a",
+      clientSeq: 11,
+      detail,
+      detailKind: "runtime_unavailable",
+      isHeartbeat: false,
+      spawnFailure: { reason: "runtime_repeated_failure" },
+    } as unknown as MachineToServerMessage);
+    await orchestrator.settled((payload) => payload.detailKind === "runtime_unavailable");
+
+    const unavailable = orchestrator.activityPushes().filter((push) => push.payload.detailKind === "runtime_unavailable");
+    assert.ok(unavailable.length > 0, "the failed start was pushed");
+    for (const push of unavailable) {
+      assertNoSecret(push.payload.detail, `runtime_unavailable push to ${push.to.join(",")}`);
+      assert.ok(String(push.payload.detail).length <= 512, "capped");
+    }
+    assertNoSecret((await orchestrator.getActivity(agent.id)).activityDetail, "activity read");
+    const logged = JSON.stringify(await orchestrator.listRecentActivityLog(agent.id, 50));
+    assert.match(logged, /Last error: Codex failed: Authorization: Bearer \[REDACTED_TOKEN\]/, "the activity log keeps the scrubbed entry");
+    assertNoSecret(logged, "activity log");
+    for (const push of orchestrator.activityPushes()) assertNoSecret(JSON.stringify(push.payload), `push ${push.payload.detailKind}`);
+  } finally {
+    await orchestrator.shutdown();
+  }
+});
+
 test("the managers are read at most once per agent per 30 s; evictCache reads them again", async ({ db: _db }) => {
   let now = 1_000_000;
   const clock = { now: () => now, scheduleRepeated: () => null, cancelRepeated: () => undefined, setTimeout: () => null, clearTimeout: () => undefined };

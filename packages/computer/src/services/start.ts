@@ -54,6 +54,7 @@ import {
   describeRaftHomeConflict,
   findRaftHomeConflictFor,
   serverRunnerLockConflictPath,
+  serverRunnerSpawnedPath,
   serverRunnerLogReadFallback,
   serverRunnerPidReadFallback,
   serviceLogPath,
@@ -69,6 +70,7 @@ import { hasUnlinkedComputerHandshake, readRunnerLogTail } from "../internal/run
 import { collectMachineFacts } from "../machineFacts";
 import { machineReadiness, type MachineReadinessReason, type StartReadinessReport } from "../machineReadiness";
 import { clearRunnerLockConflictMarker, lockOwnerCheckCommand } from "../runnerLockConflict";
+import { clearRunnerSpawnRecord } from "../runnerSpawnRecord";
 import {
   convergeCliHostLifecycle,
   hostLifecycleSkipped,
@@ -145,8 +147,9 @@ export interface StartDeps extends ServicePidIdentityDeps {
    * code: a machine still registered on a server it can no longer reach never
    * has that runner ready, and the installer rolled back working upgrades
    * (88602a54, 9e56ad23, 2026-11-02). Only runners alive and merely not
-   * connected, or held off by another daemon's machine lock, are excused
-   * (acceptsPartialReady); none ready still fails.
+   * connected (including one spawned by this service that never connected,
+   * runner.spawned.json), or held off by another daemon's machine lock, are
+   * excused (acceptsPartialReady); none ready still fails.
    */
   acceptPartialReady?: boolean;
   /**
@@ -210,6 +213,7 @@ async function readStartReadiness(
   return machineReadiness(facts, {
     targetServerIds: serverIds,
     expectedVersion: COMPUTER_VERSION,
+    nowMs: currentTimeMs(),
     ...(servicePid !== undefined ? { servicePid } : {}),
   });
 }
@@ -398,7 +402,7 @@ async function selectStartableTargets(
 }
 
 /**
- * Forget the runner pids (and lock-conflict records) an earlier service wrote:
+ * Forget the runner pids (and lock-conflict and spawn records) an earlier service wrote:
  * the service about to start has no runner yet. A runner that outlived its
  * service still holds the daemon machine lock, so the new service's runner
  * meets that lock and the service records that pid again
@@ -409,6 +413,7 @@ async function clearRunnerRecordsLeftByEarlierService(slockHome: string, serverI
   for (const serverId of serverIds) {
     for (const pidfile of serverRunnerPidReadFallback(slockHome, serverId)) await clearPidfileAt(pidfile);
     await clearRunnerLockConflictMarker(serverRunnerLockConflictPath(slockHome, serverId)).catch(() => undefined);
+    await clearRunnerSpawnRecord(serverRunnerSpawnedPath(slockHome, serverId)).catch(() => undefined);
   }
 }
 
@@ -462,11 +467,37 @@ export function buildLockConflictMessage(
   );
 }
 
+/**
+ * Why one runner was not ready at the wait's last read, as its reason code
+ * plus a short explanation. Until 1.25.2 a timeout said only "timed out", so
+ * neither the installer's diagnostic (which keeps `start`'s stderr) nor a
+ * pasted error could tell the cases apart (#77).
+ */
+function describeNotReady(reason: MachineReadinessReason): string {
+  switch (reason.code) {
+    case "runner-not-managed":
+      return "runner-not-managed (the service is not running this server)";
+    case "runner-absent":
+      return "runner-absent (no runner process is alive)";
+    case "runner-unattested":
+      return `runner-unattested (pid ${reason.pid} is alive but has not recorded itself as this version's runner)`;
+    case "runner-version-mismatch":
+      return `runner-version-mismatch (pid ${reason.pid} runs ${reason.actualVersion}, expected ${reason.expectedVersion})`;
+    case "runner-disconnected":
+      return `runner-disconnected (pid ${reason.pid} is running this version but not connected to the server)`;
+    case "runner-lock-conflict":
+      return reason.ownerPid === null
+        ? "runner-lock-conflict (another process holds the daemon lock)"
+        : `runner-lock-conflict (pid ${reason.ownerPid} holds the daemon lock)`;
+  }
+}
+
 async function buildTimeoutMessage(
   slockHome: string,
   serverIds: string[],
   ready: Map<string, number>,
   input: StartInput,
+  reasons: readonly MachineReadinessReason[],
 ): Promise<string> {
   const missing = serverIds.filter((id) => !ready.has(id));
   for (const serverId of missing) {
@@ -489,8 +520,18 @@ async function buildTimeoutMessage(
   const runnerLogPaths = missing.map(
     (serverId) => serverRunnerLogReadFallback(slockHome, serverId)[0],
   );
+  const why = missing
+    .map((serverId) => {
+      const reason = reasons.find((entry) => entry.serverId === serverId);
+      if (!reason) return null;
+      // Several missing: name each by the id the target list above uses.
+      return missing.length === 1 ? describeNotReady(reason) : `${serverId}: ${describeNotReady(reason)}`;
+    })
+    .filter((entry): entry is string => entry !== null);
   return (
-    `Timed out waiting for ${target} to start. Run \`raft-computer status\` and inspect ` +
+    `Timed out waiting for ${target} to start.` +
+    (why.length > 0 ? ` Not ready: ${why.join("; ")}.` : "") +
+    ` Run \`raft-computer status\` and inspect ` +
     `${serviceLogPath(slockHome)} plus per-server runner logs: ${runnerLogPaths.join(", ")}.`
   );
 }
@@ -631,7 +672,7 @@ async function startInner(input: StartInput, options: StartOptions = {}): Promis
       if (lockConflicts.length > 0) {
         throw new ComputerServiceError("START_RUNNER_LOCK_CONFLICT", buildLockConflictMessage(slockHome, lockConflicts, input));
       }
-      const message = await buildTimeoutMessage(slockHome, managedTargets, ready, input);
+      const message = await buildTimeoutMessage(slockHome, managedTargets, ready, input, wait.reasons);
       options.signal?.throwIfAborted?.();
       throw new ComputerServiceError(
         "START_DAEMON_TIMEOUT",
@@ -820,7 +861,7 @@ async function startInner(input: StartInput, options: StartOptions = {}): Promis
     }
     throw new ComputerServiceError(
       "START_DAEMON_TIMEOUT",
-      await buildTimeoutMessage(slockHome, managedTargets, ready, input),
+      await buildTimeoutMessage(slockHome, managedTargets, ready, input, wait.reasons),
     );
   }
 
@@ -859,7 +900,8 @@ function reportStartReadiness(
  * `acceptPartialReady`, at least one runner ready, and every missing runner
  * alive at this version but not connected (`runner-disconnected`), which is
  * what a registration on an unreachable server looks like (runners never stop
- * reconnecting), or held off by another daemon's machine lock
+ * reconnecting; a runner that has never connected since its spawn counts too,
+ * through the service's spawn record), or held off by another daemon's machine lock
  * (`runner-lock-conflict`), which this upgrade cannot resolve and rolling it
  * back would not either. A missing, unattested or wrong-version runner is a
  * fault of this version, and still fails the start.

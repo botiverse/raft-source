@@ -488,11 +488,15 @@ describe("reconciler step 10a: the legacy close path acts on planExit", () => {
     }, perTurn);
   }, 30_000);
 
+  // Each turn's error differs: the same one every turn is the same-fingerprint
+  // fence's (the test after this), which a bare turn end no longer resets.
+  const blockedStreamErrors = ["The stream was blocked.", "The response was withheld by a safety filter.", "No candidates were returned.", "The reply came back empty.", "Generation stopped before any content."];
+
   test("D6: a turn that reports only an error and exits 0 (Gemini after a blocked stream) backs off, then stops", async () => {
     await withManager(async (h) => {
       await startWithPending(h, "blocked");
       for (let turn = 1; turn <= CRASH_STREAK_CAP; turn += 1) {
-        await h.emit([{ kind: "session_init", sessionId: "session-1" }, { kind: "error", message: "The stream was blocked." }, { kind: "turn_end", sessionId: "session-1" }]);
+        await h.emit([{ kind: "session_init", sessionId: "session-1" }, { kind: "error", message: blockedStreamErrors[turn - 1]! }, { kind: "turn_end", sessionId: "session-1" }]);
         await h.cleanExit();
         expect(plans(h).at(-1)).toMatchObject({ plan_kind: "zero_evidence_turn", crash_streak: turn, ...(turn === CRASH_STREAK_CAP ? { hand_to_server: true } : { plan_start: "after" }) });
         if (turn === CRASH_STREAK_CAP) break;
@@ -501,6 +505,23 @@ describe("reconciler step 10a: the legacy close path acts on planExit", () => {
         await settle(() => h.children.length > turn, 2_000);
         await h.deliver(`blocked-${turn}`);
       }
+    }, perTurn);
+  }, 30_000);
+
+  test("D6: the same error in every turn without output trips the same-fingerprint fence at its third, before the crash streak's cap", async () => {
+    await withManager(async (h) => {
+      await startWithPending(h, "blocked");
+      for (let turn = 1; turn <= 3; turn += 1) {
+        await h.emit([{ kind: "session_init", sessionId: "session-1" }, { kind: "error", message: "The stream was blocked." }, { kind: "turn_end", sessionId: "session-1" }]);
+        if (turn === 3) break;
+        await h.cleanExit();
+        await vi.advanceTimersByTimeAsync(10_000 * 2 ** (turn - 1));
+        await settle(() => h.children.length > turn, 2_000);
+        await h.deliver(`blocked-${turn}`);
+      }
+      const named = (name: string) => h.events.filter((event) => event.name === name).map((event) => event.attrs);
+      expect(named("daemon.agent.runtime_error_fingerprint_fence").map((attrs) => attrs.attempts), "a bare turn end does not reset it").toEqual([1, 2, 3]);
+      expect(named("daemon.agent.sticky_failure.handed_to_server")).toMatchObject([{ reason: "runtime_repeated_failure", cause: "fingerprint_fence" }]);
     }, perTurn);
   }, 30_000);
 

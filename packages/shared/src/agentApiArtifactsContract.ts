@@ -1480,3 +1480,57 @@ export const agentApiAssistantOwnerArtifactPublishResponseSchema = lazySchema("a
 
 export type AgentApiAssistantOwnerArtifactPublishBody = z.infer<typeof agentApiAssistantOwnerArtifactPublishBodySchema>;
 export type AgentApiAssistantOwnerArtifactPublishResponse = z.infer<typeof agentApiAssistantOwnerArtifactPublishResponseSchema>;
+
+// ---- POST /assistant/owner-artifact/as-owner (#proj-assistant:#33) ----------
+// A personal assistant publishes an Artifact AS its owner: the owner is its
+// author, homed in a conversation the owner may post in now. Only while the
+// owner has "send as me" on, under the rules of sending a message as them
+// (not the assistant's own DM with them, a DM only while they let it read
+// DMs, never a conversation bridged to an external chat); a receipt in the
+// owner's DM with the assistant names it.
+
+export const agentApiAssistantOwnerArtifactPublishAsOwnerBodySchema = lazySchema("agentApiAssistantOwnerArtifactPublishAsOwnerBodySchema", () => passthroughObject({
+  /**
+   * For a new Artifact, the conversation it goes in, as your owner names it: `#channel`, `dm:@peer` (their existing
+   * DM with them), or a conversation id. Not with `artifact`: a new version stays where the Artifact is.
+   */
+  home: z.string().trim().min(1).max(2048).optional(),
+  /** An Artifact you published as your owner, to push a new version of (its id, pt_ id or link). Absent: a new one, in `home`. */
+  artifact: z.string().trim().min(1).optional(),
+  /** Required for a new Artifact; for a new version, a new title with nothing else changed renames it. */
+  title: z.string().optional(),
+  description: z.string().optional(),
+  /** The file it opens at. Default: the base's; for a new one index.html, or the only file. */
+  entry: z.string().optional(),
+  /** What changed in this version. */
+  note: z.string().optional(),
+  label: z.string().optional(),
+  /** The version your files were made from: required for a new version (the version owner-artifact read returned). */
+  base: z.number().int().positive().optional(),
+  /** The `position` owner-artifact read returned: you have seen every comment up to it. */
+  seen: z.number().int().nonnegative().optional(),
+  /** Files to add or replace, inline (`content`, or `content_base64` for bytes); files not listed carry over from base. */
+  files: z.array(agentApiArtifactPublishFileSchema),
+  /** Paths to remove from the base's files. */
+  delete: z.array(z.string()).optional(),
+}));
+
+export const agentApiAssistantOwnerArtifactPublishAsOwnerResponseSchema = lazySchema("agentApiAssistantOwnerArtifactPublishAsOwnerResponseSchema", () => passthroughObject({
+  artifact: passthroughObject({
+    id: z.string(),
+    /** Its link: tell your owner where it is if they asked. */
+    url: z.string(),
+    /** The version this made, or the current one when nothing changed. */
+    version: z.number().int(),
+    /** The current version already was what you sent: no new version (and no receipt). */
+    unchanged: z.boolean(),
+  }),
+  /** The conversation it lives in, as your owner names it (`#channel`, `dm:@peer`). */
+  home: passthroughObject({
+    id: z.string(),
+    ref: z.string(),
+  }),
+}));
+
+export type AgentApiAssistantOwnerArtifactPublishAsOwnerBody = z.infer<typeof agentApiAssistantOwnerArtifactPublishAsOwnerBodySchema>;
+export type AgentApiAssistantOwnerArtifactPublishAsOwnerResponse = z.infer<typeof agentApiAssistantOwnerArtifactPublishAsOwnerResponseSchema>;

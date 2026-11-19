@@ -569,7 +569,7 @@ export default function CreateChannelDialog({
             onError={setError}
             onChangeName={handleChangeCollidingName}
           />
-          <FormField label={formatMessage({ id: "channel.create.nameLabel" })} required>
+          <FormField label={formatMessage({ id: "channel.create.nameLabel" })}>
             <Input
               type="text"
               value={name}

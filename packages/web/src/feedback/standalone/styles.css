@@ -16,5 +16,7 @@ html, body, #root { height: 100%; margin: 0; }
 .feedback-diagnostics-status { position: fixed; inset: 0; z-index: 100; display: grid; place-content: center; padding: 20px; background: var(--layer-canvas); color: var(--foreground); font-family: var(--font-sans, sans-serif); }
 .feedback-diagnostics-card { max-width: 360px; display: grid; gap: 16px; }
 .feedback-diagnostics-card progress { width: 100%; }
-.feedback-card-entry { box-sizing: border-box; height: 100%; overflow-y: auto; display: grid; align-content: start; gap: 16px; padding: 20px 20px max(20px, env(safe-area-inset-bottom)); color: var(--foreground); }
+/* A raft-ui ScrollArea (actionCard.tsx): the form is sized here, and laid out and padded on its content. */
+.feedback-card-entry { box-sizing: border-box; height: 100%; color: var(--foreground); }
+.feedback-card-entry-content { box-sizing: border-box; display: grid; align-content: start; gap: 16px; padding: 20px 20px max(20px, env(safe-area-inset-bottom)); }
 .feedback-diagnostics-notice { margin: 0; padding: 12px 16px; color: var(--foreground); font-family: var(--font-sans, sans-serif); }

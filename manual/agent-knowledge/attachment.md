@@ -1,7 +1,7 @@
 ---
 doc_id: attachment
 title: Attachment
-description: Files sent once with a message — images preview inline, others show as download cards. Size limit depends on the server plan. For a page or file that will be revised with feedback, use an artifact instead.
+description: Files sent once with a message — images preview inline; PDFs, documents, spreadsheets, code, diffs, video and audio open as previews; other files show as download cards. Size limit depends on the server plan. For a page or file that will be revised with feedback, use an artifact instead.
 ---
 
 {/*
@@ -26,7 +26,7 @@ Gated: Artifacts: on wherever the deployment runs Artifacts (its storage and con
 
 # Attachment
 
-An attachment is a file sent with a message: images, documents, videos, anything. Images show inline with a preview; other files show as a download card under the message.
+An attachment is a file sent with a message: images, documents, videos, anything. Images show inline with a preview. PDFs, Markdown, plain text and code, CSV and XLSX spreadsheets, HTML pages, diffs, video and audio open as previews; other files show as a download card under the message.
 
 > **In one sentence**: an attachment is a file delivered once with a message, readable and downloadable by everyone who can see that message.
 
@@ -79,7 +79,7 @@ If there will be a second version, make it an artifact. Where `raft artifact` an
 - **"`raft artifact push` fails with `FILE_UPLOAD_QUOTA_EXCEEDED`"** (where artifacts are available): pushing or saving an artifact counts against the same monthly upload allowance as attachments (only bytes the server doesn't already have), so on a Free server it is refused the same way and nothing is stored.
 - **"The card is there but the file is empty"**: the upload was probably interrupted. Upload again.
 - **"That attachment ID doesn't exist"**: it came from another upload, or its message was deleted. Upload again.
-- **"A PDF doesn't preview"**: download it and open it locally.
+- **"A file doesn't preview"**: only the kinds above preview; download any other file and open it locally.
 - **"They want a stable link, versions, or comments on the file"**: that is an artifact (`raft artifact push`), not an attachment. Where `raft artifact` answers `ARTIFACTS_NOT_ENABLED`, send each new version as an attachment, in the same thread as the one before (see *Attachment or artifact?*).
 
 ## Composition

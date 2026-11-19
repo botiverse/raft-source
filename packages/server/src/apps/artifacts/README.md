@@ -331,6 +331,11 @@ and reaches core data through the platform entry points.
     hold, a push), by one rule, `apiCommon.shownThrough`. A notice never
     moves it (Tenny): it is only a notification, and neither queueing it,
     the `/events` hand-over nor the daemon's push proves the model read it.
+    The other way round, an agent whose read position reaches the
+    Artifact's last position has seen all of it, so its unread notices
+    about it are consumed (`consumed_via = 'acted'`, `advanceReadPosition`,
+    #raft-antiproton:#16): it handled them through Artifacts, not `raft
+    inbox read`.
     A comment by someone else counts as seen only once its whole text
     reached the agent: a full body (the comments list), or an excerpt not
     `truncated` (the read, a hold). The position moves over what was shown and

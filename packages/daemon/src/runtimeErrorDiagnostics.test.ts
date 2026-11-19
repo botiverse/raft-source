@@ -13,7 +13,9 @@ import {
   MAX_VISIBLE_CRASH_DETAIL_CHARS,
   scrubRuntimeErrorDiagnosticText,
   runtimeErrorTraceClassAttrs,
+  normalizeRuntimeErrorForFingerprint,
 } from "./runtimeErrorDiagnostics";
+import { DIAGNOSTIC_REDACTION_CREDENTIAL_SAMPLES } from "../../shared/src/test/diagnosticRedactionCredentialSamples";
 import {
   boundedRuntimeErrorDetail,
   classifyRuntimeErrorCode,
@@ -90,6 +92,37 @@ test("buildRuntimeErrorDiagnosticEnvelope redacts secrets and truncates long mes
   assert.match(excerpt, /\[REDACTED_TOKEN\]/);
   assert.match(excerpt, /\[REDACTED_EMAIL\]/);
   assert.match(excerpt, /\[REDACTED_QUERY\]|%5BREDACTED_QUERY%5D/);
+});
+
+// Security review (2026-11): the excerpt's scrubber let JSON-quoted keys,
+// Basic auth, bare JWTs, cloud keys and secret flags through to telemetry.
+test("buildRuntimeErrorDiagnosticEnvelope: the excerpt masks every shared credential sample and keeps the error readable", () => {
+  for (const { label, sample, mustNotContain } of DIAGNOSTIC_REDACTION_CREDENTIAL_SAMPLES) {
+    const excerpt = String(buildRuntimeErrorDiagnosticEnvelope(sample).eventAttrs.runtime_error_message_excerpt);
+    assert.ok(!excerpt.includes(mustNotContain), `${label} leaked into the excerpt: ${excerpt}`);
+  }
+  const envelope = buildRuntimeErrorDiagnosticEnvelope(
+    'API Error: 401 from https://api.example.test/v1/messages {"type":"error","api_key": "Zq81mNw2Lp0x"} Authorization: Basic dXNlcjpodW50ZXIy',
+  );
+  assert.equal(
+    envelope.eventAttrs.runtime_error_message_excerpt,
+    'API Error: 401 from https://api.example.test/v1/messages {"type":"error","api_key": "[REDACTED_TOKEN]"} Authorization: Basic [REDACTED_TOKEN]',
+  );
+  assert.equal(envelope.spanAttrs.runtime_error_http_status, 401, "the raw text still drives classification");
+});
+
+test("buildRuntimeErrorDiagnosticEnvelope: the fingerprint is taken on scrubbed text, so a new secret value is not a new error", () => {
+  const fingerprint = (message: string) => buildRuntimeErrorDiagnosticEnvelope(message).spanAttrs.runtime_error_fingerprint;
+  assert.equal(fingerprint('401 {"api_key": "Zq81mNw2Lp0x"}'), fingerprint('401 {"api_key": "Ab12cd34Ef"}'));
+  assert.equal(fingerprint("exit 1: claude --api-key Zq81mNw2Lp0x"), fingerprint("exit 1: claude --api-key Ab12cd34Ef"));
+  // Text with nothing to mask fingerprints exactly as before: scrubbing leaves it alone.
+  for (const message of [
+    "API Error: 400 model claude-sonnet-4-5-20250929 not found (request 123e4567-e89b-12d3-a456-426614174000)",
+    "fatal: bad object 3c0f7bab8e1d2f3a4b5c6d7e8f90123456789abc in src/tokenizer.ts",
+  ]) {
+    assert.equal(scrubRuntimeErrorDiagnosticText(message), message);
+    assert.equal(normalizeRuntimeErrorForFingerprint(scrubRuntimeErrorDiagnosticText(message)), normalizeRuntimeErrorForFingerprint(message));
+  }
 });
 
 test("buildRuntimeErrorDiagnosticEnvelope detoxes poisoned stderr (env-assignment + GitHub tokens + trace-no-raw)", () => {

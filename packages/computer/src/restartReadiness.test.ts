@@ -154,3 +154,19 @@ test("callerIsRunnerHosted: only a non-empty SLOCK_AGENT_ID marks an agent-hoste
   assert.equal(callerIsRunnerHosted({ SLOCK_AGENT_ID: "" }), false);
   assert.equal(callerIsRunnerHosted({ SLOCK_AGENT_ID: "agent-1" }), true);
 });
+
+test("classify: a spawned runner that has not connected is named only for the live service's own spawn", () => {
+  const nowMs = Date.UTC(2026, 10, 14, 12, 0, 0);
+  const spawnedRunner = runner("s1", {
+    pid: null,
+    alive: false,
+    connectionEvidence: null,
+    versionEvidence: { pid: 300, version: VERSION, installRoot: "/opt/raft", writtenAt: "2026-11-14T11:59:00.000Z" },
+    spawned: { pid: 300, servicePid: 900, spawnedAt: nowMs - 60_000, alive: true },
+  });
+  const detail = (servicePid: number) =>
+    classifyRestartReadiness(facts([spawnedRunner]), ["s1"], 2_000, VERSION, { servicePid, nowMs }).runners[0];
+  assert.deepEqual(detail(900), { serverId: "s1", state: "pending", detail: "runner starting (pid 300), not connected to the server yet" });
+  // An orphan an earlier service spawned is not named as this service's runner.
+  assert.deepEqual(detail(901), { serverId: "s1", state: "pending", detail: "runner process not started yet" });
+});

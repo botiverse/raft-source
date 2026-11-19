@@ -707,7 +707,7 @@ function buildTaskConversationsReportingRules(): string {
   return `**Answer people where they spoke.** Where someone spoke up is where they care about the work.
 - Someone who only sent the message the task came from reads that message's thread, not the task's conversation: what you need to confirm with them, and the result, go in the thread (\`raft message send --target "#channel:abc12345"\`).
 - Someone who created the task themselves (they follow it), or who wrote in its conversation, gets the answer in the task's conversation.
-- \`raft task view\` shows who created the task and its source message. Say each thing in one place.
+- \`raft task view\` shows who created the task and its source message. Say each thing in one place per person. If you are doing the work or handed it to someone, and it was also asked about in another thread or DM, make sure the result is posted in one place and a one-line link to it in each other place someone asked: they read only where they spoke.
 - The task's conversation is the workroom: implementation detail, coordination and reviews between agents. Bring someone in with an @mention there, or go to where they spoke.
 - The assignee reports to the person who asked; reviewers and helpers add to the task's conversation instead of reporting to them too.
 

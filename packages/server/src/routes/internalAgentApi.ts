@@ -1,3 +1,4 @@
+import { markAgentProgress } from "../services/agentProgressMarks";
 import { AGENT_LOUNGE_OUTSIDER_REFUSAL, isLoungeOutsiderAgent } from "../services/agentLoungeService";
 import { wakeForEventsMergedSinceHandover } from "../services/appItemWakeCoalescing";
 import { renderAgentFacingContents } from "../services/agentFacingContent";
@@ -13,6 +14,7 @@ import { getAppInstallationSetup } from "../services/appSetupService";
 import { issueAgentAudienceJwt, AgentAudienceJwtError } from "../services/agentAudienceJwtService";
 import { respondToTaskWriteError } from "../lib/taskWriteErrorResponse";
 import { sharedSseStreamRegistry } from "../services/sseStreamRegistry";
+import { isDraining, recordDrainRefusal } from "../services/drainState";
 import { isReadMutationFenceRefusal } from "../services/readMutationSequencer";
 import { serializeErrorForLog } from "../tracing/safeErrorLog";
 import { REMINDER_MIGRATED, refuseIfRemindersMovedToApp, reminderMigratedRefusal } from "./reminderAppRollout";
@@ -143,6 +145,7 @@ import {
   type AgentApiAssistantOwnerMessagesQuery,
   type AgentApiAssistantOwnerArtifactQuery,
   type AgentApiAssistantOwnerArtifactPublishBody,
+  type AgentApiAssistantOwnerArtifactPublishAsOwnerBody,
   type AgentApiAssistantSendAsOwnerBody,
   type AgentApiAssistantForwardAsOwnerBody,
   type AgentApiAssistantSearchForwardTargetsQuery,
@@ -175,6 +178,7 @@ import * as assistantSendAsOwnerService from "../services/assistantSendAsOwnerSe
 import * as assistantForwardAsOwnerService from "../services/assistantForwardAsOwnerService";
 import { assistantReachesApp } from "../services/assistantRouteAllowlist";
 import { publishOwnerArtifact, readOwnerArtifact } from "../services/assistantOwnerArtifacts";
+import { publishOwnerArtifactAsOwner } from "../services/assistantOwnerArtifactAsOwner";
 import { ASSISTANT_INTEGRATION_NOT_ALLOWED_BODY } from "../services/assistantIntegrations";
 import { resolveReadableAttachmentAuthorityContext } from "../services/attachmentAuthorityService";
 import {
@@ -202,14 +206,21 @@ import {
   admitMessageCardUpdate,
   applyMessageCardUpdate,
   findCommittedMessageCardUpdate,
+  MESSAGE_CARD_ACTIONS_NEXT_STEP,
   MESSAGE_CARD_NOT_FOUND_BODY,
+  messageCardForNames,
   prepareMessageCardSend,
   prepareMessageCardUpdate,
   withinMessageCardUpdateWindow,
   type MessageCardRefusal,
   type MessageCardSend,
 } from "../services/messageCardService";
-import { isMessageCardMetadata, MESSAGE_CARD_ERROR_CODES, type MessageCard } from "@botiverse/raft-shared";
+import {
+  admitMessageCardActionsSend, assertMessageCardActionsAllowed, MessageCardActionsRefusedError, messageCardSenderApp, resolveMessageCardFor,
+} from "../services/messageCardActionService";
+import {
+  isMessageCardMetadata, MESSAGE_CARD_ERROR_CODES, messageCardActingButtons, messageCardForUser, refusalSentenceProblem, type MessageCard, type MessageCardActions,
+} from "@botiverse/raft-shared";
 import {
   loadCanonicalTaskFactsByMessageId,
   refreshQueuedAgentTaskProjections,
@@ -252,7 +263,8 @@ import {
   type TaskSurfaceChannel,
 } from "../services/taskChannelSurface";
 import { emitTaskCreated, emitTaskDeleted, emitTaskMessageNew } from "../services/taskRealtimeEvents";
-import { isTaskV2ConversationsEnabled, isTaskV2ConversationsEnabledForChannel, readTaskV2ConversationsEnabled, INVALID_TASK_SOURCE_STEP, taskSourceRequiredRefusal } from "../services/taskConversationsGate";
+import { isTaskV2ConversationsEnabled, isTaskV2ConversationsEnabledForChannel, readTaskV2ConversationsEnabled, INVALID_TASK_SOURCE_STEP, isPreTaskSourceCli, taskSourceRequiredRefusal } from "../services/taskConversationsGate";
+import { creatorSourceMessageContent, postTaskCreatorSourceMessage, TASK_SOURCE_MESSAGE_TOO_LONG_REFUSAL, taskCreatorSourceSendRefusal } from "../services/taskCreatorSourceMessage";
 import { isV2Task, pendingTaskConversationFollowReason, taskUsesOwnConversation, type TaskModeFields } from "../services/taskV2Mode";
 import {
   describeTaskMutation,
@@ -269,7 +281,7 @@ import { noteAgentHistoryBlock } from "../services/agentHistoryBlocks";
 import { agentHistoryLimitedRefusal, agentHistoryLimitNote, agentSearchHistoryLimitNote, getServerHistoryWindowForRead, isAttachmentBehindWindow, isBehindHistoryWindow, lastSeqBehindWindow } from "../services/historyWindow";
 import type { HistoryWindow } from "../services/historyWindow";
 import { resolveMessageResourceAccess } from "../services/messageResourceAccess";
-import { emitProjectedMessageUpdate, projectUpdatedMessageForLocalChannel } from "./messages";
+import { emitProjectedMessageUpdate, MAX_MESSAGE_LENGTH, projectUpdatedMessageForLocalChannel } from "./messages";
 import { resolveCardMessageForSender } from "../services/messageCardConversation";
 import { getAttachmentFileSizeLimitBytes, getLegacyAttachmentFileSizeLimitBytes } from "../services/attachmentUploadPolicy";
 import { attachmentUploadCapabilitiesSchema } from "@botiverse/raft-shared/src/attachmentUploadContract";
@@ -409,6 +421,8 @@ import {
   UPLOAD_MEMBERSHIP_REQUIRED_REFUSAL,
   APP_CLIENT_KEY_REQUIRED_REFUSAL,
   APP_NOT_FOUND_REFUSAL,
+  CARD_BUTTONS_ENDPOINT_REFUSAL,
+  cardButtonsRefusal,
   appManageAuthorityRefusal,
   APP_TRANSFER_FIELDS_REQUIRED_REFUSAL,
   appTransferTargetNotFoundRefusal,
@@ -478,7 +492,7 @@ import {
   resolveRequestAttachmentFileSizeLimitBytes,
   runSingleAttachmentUpload,
 } from "./attachments";
-import { addTraceEvent, errorClassOf, getCurrentTraceSpan, recordTraceEvent, tracePhase, withTraceChildSpan, withTraceRoot } from "../tracing/semanticTrace";
+import { addTraceEvent, createTraceDbQueryTracer, errorClassOf, getCurrentTraceSpan, recordTraceEvent, tracePhase, withTraceChildSpan, withTraceRoot } from "../tracing/semanticTrace";
 import { agentRequestContextFromHeaders, recordAgentContextReturned } from "../tracing/agentContextReturnTrace";
 import { agentIdHashAttrs, serverIdHashAttrs } from "../tracing/traceIdentity";
 import { cardEvaluatedAttrs } from "../tracing/agentCardTrace";
@@ -560,8 +574,11 @@ import {
   queryFeedbackLocators,
 } from "../services/productFeedbackLocatorService";
 import { parseOffsetQueryParam } from "../lib/offsetQueryParam";
+import { allowCardButtons, cardButtonsView, getActionEndpointState, withdrawCardButtons } from "../services/appLinkPreviewService";
 import { admitAgentApiWrite, agentApiWriteBudgetNoun, AGENT_API_WRITE_WINDOW_SECONDS, type AgentApiWriteBudgetClass } from "../services/agentApiWriteLimits";
-import { assistantAllowedOAuthClientUuid, resolveAgentLoginClient } from "../services/oauthClientKeys";
+import { assistantAllowedOAuthClientUuid, resolveAgentLoginClient, resolveOAuthClientByKey } from "../services/oauthClientKeys";
+import { getProductEventSink } from "../services/productEventIngest";
+import { recordIntegrationServiceRequested, recordUnresolvedServiceLookup } from "../services/integrationServiceRequested";
 
 export const internalAgentApiRouter: RouterType = Router();
 
@@ -1153,7 +1170,9 @@ function agentApiRequestValidators<K extends AgentApiRouteKey>(routeKey: K): Req
  *
  * actionWithdraw (POST /actions/:messageId/withdraw, a question card's agent
  * taking it back) has no legacy twin: it takes action:prepare, as the prepare
- * of the card it withdraws did.
+ * of the card it withdraws did. Nor has actionOperations (GET
+ * /prepare-action/operations, `raft action prepare --list`), which takes
+ * action:prepare too.
  *
  * userChannels (GET /users/:name/channels, `raft user info`) has no legacy
  * twin: it replaces serverInfo + channelMembers and requires channel:read here
@@ -1206,6 +1225,8 @@ export const AGENT_API_ROUTE_GRANTS: Partial<Record<AgentApiRouteKey, AgentScope
   taskIdleNudge: "task:read",
   actionPrepare: "action:prepare",
   actionWithdraw: "action:prepare",
+  // What `raft action prepare --list` lists: what prepare would take.
+  actionOperations: "action:prepare",
 };
 
 /**
@@ -1305,6 +1326,7 @@ export const AGENT_API_WRITE_BUDGET_ROUTES: Partial<Record<AgentApiRouteKey, Age
   artifactPublish: "artifactWrites",
   // A personal assistant's publish into its DM with its owner (#proj-assistant:#31): the same class as a push.
   assistantOwnerArtifactPublish: "artifactWrites",
+  assistantOwnerArtifactPublishAsOwner: "artifactWrites",
   artifactImport: "artifactWrites",
   artifactComment: "artifactWrites",
   artifactReview: "artifactWrites",
@@ -1351,6 +1373,43 @@ function agentApiWriteUnits(operation: string, body: unknown): number {
   return 1;
 }
 
+/**
+ * Answers a write `admitAgentApiWrite` did not admit: 400 for one request
+ * larger than a minute's budget, else 429 RATE_LIMITED (Retry-After).
+ */
+function refuseAgentApiWriteBudget(
+  req: Request,
+  res: Response,
+  kind: AgentApiWriteBudgetClass,
+  operation: string,
+  admission: Exclude<Awaited<ReturnType<typeof admitAgentApiWrite>>, { admitted: true }>,
+): void {
+  if (admission.scope === "request") {
+    refuse(res, 400, {
+      code: "agent_api_write_too_large",
+      // A review's units are its comments (each one write).
+      error: operation === "artifactReview"
+        ? `One review can carry at most ${admission.limit} comments, each one of this agent's writes; split it into smaller reviews.`
+        : `One request can carry at most ${admission.limit} ${agentApiWriteBudgetNoun(kind)}; split it into smaller requests.`,
+    });
+    return;
+  }
+  const { limit, retryAfterSeconds } = admission;
+  const wait = `Retry in ${retryAfterSeconds} second${retryAfterSeconds === 1 ? "" : "s"}.`;
+  const what = agentApiWriteBudgetNoun(kind);
+  setRequestTraceRateLimiter(res, `agent-api-${kind}-${admission.scope}`);
+  res.setHeader("Cache-Control", "private, no-store");
+  if (!req.readableEnded) res.setHeader("Connection", "close");
+  refuse(res, 429, {
+    code: AGENT_API_RATE_LIMITED_CODE,
+    error: admission.scope === "agent"
+      ? `This agent made too many ${what}: the limit is ${limit} a minute. ${wait}`
+      : `The agents of this server made too many ${what}: the limit is ${limit} a minute for the whole server. ${wait}`,
+    retryAfterSeconds,
+    details: { operation, limit, windowSeconds: AGENT_API_WRITE_WINDOW_SECONDS, retryAfterSeconds },
+  });
+}
+
 /** res.locals: the budget class a request was already charged to (a push, ahead of its body's parser). */
 const WRITE_BUDGET_CHARGED = "agentApiWriteBudgetCharged";
 
@@ -1383,30 +1442,7 @@ export function agentApiWriteBudget(routeKind: AgentApiWriteBudgetClass, operati
         next();
         return;
       }
-      if (admission.scope === "request") {
-        refuse(res, 400, {
-          code: "agent_api_write_too_large",
-          // A review's units are its comments (each one write).
-          error: operation === "artifactReview"
-            ? `One review can carry at most ${admission.limit} comments, each one of this agent's writes; split it into smaller reviews.`
-            : `One request can carry at most ${admission.limit} ${agentApiWriteBudgetNoun(kind)}; split it into smaller requests.`,
-        });
-        return;
-      }
-      const { limit, retryAfterSeconds } = admission;
-      const wait = `Retry in ${retryAfterSeconds} second${retryAfterSeconds === 1 ? "" : "s"}.`;
-      const what = agentApiWriteBudgetNoun(kind);
-      setRequestTraceRateLimiter(res, `agent-api-${kind}-${admission.scope}`);
-      res.setHeader("Cache-Control", "private, no-store");
-      if (!req.readableEnded) res.setHeader("Connection", "close");
-      refuse(res, 429, {
-        code: AGENT_API_RATE_LIMITED_CODE,
-        error: admission.scope === "agent"
-          ? `This agent made too many ${what}: the limit is ${limit} a minute. ${wait}`
-          : `The agents of this server made too many ${what}: the limit is ${limit} a minute for the whole server. ${wait}`,
-        retryAfterSeconds,
-        details: { operation, limit, windowSeconds: AGENT_API_WRITE_WINDOW_SECONDS, retryAfterSeconds },
-      });
+      refuseAgentApiWriteBudget(req, res, kind, operation, admission);
     } catch (err) {
       next(err);
     }
@@ -1414,6 +1450,26 @@ export function agentApiWriteBudget(routeKind: AgentApiWriteBudgetClass, operati
   (handler as RequestHandler & { __agentApiWriteBudget?: AgentApiWriteBudgetClass }).__agentApiWriteBudget = routeKind;
   return handler;
 }
+
+/**
+ * #proj-runtime:#62: an Agent API call that changes something and succeeded
+ * is progress for the repeated-wake guard (agentProgressMarks.ts): every
+ * contract route but a GET and the POSTs that only read. Marked when the
+ * response finishes with a 2xx, so a refused or failed call marks nothing.
+ * (A read that moves the agent's read position is marked where it moves:
+ * channelService.markRead, noteAgentReadAdvance, consumed app events.)
+ */
+const READ_ONLY_POST_ROUTES: ReadonlySet<AgentApiRouteKey> = new Set<AgentApiRouteKey>(["inboxRead", "contextSearch", "contextRead", "resolveChannel"]);
+
+const markAgentProgressOnSuccess: RequestHandler = (req, res, next) => {
+  const agentId = req.actingAgentId;
+  if (agentId) {
+    res.once("finish", () => {
+      if (res.statusCode >= 200 && res.statusCode < 300) markAgentProgress(agentId);
+    });
+  }
+  next();
+};
 
 /**
  * A contract route: `before` (a first-party app's client gate), then the
@@ -1429,6 +1485,7 @@ function mountAgentApiRoute(routeKey: AgentApiRouteKey, handlers: RequestHandler
     requireAgentCapability(route.capability),
     ...(grant ? [requireAgentGrant(grant)] : []),
     ...(writeBudget ? [agentApiWriteBudget(writeBudget, routeKey)] : []),
+    ...(route.method !== "GET" && !READ_ONLY_POST_ROUTES.has(routeKey) ? [markAgentProgressOnSuccess] : []),
     ...handlers,
   ];
   switch (route.method) {
@@ -1575,6 +1632,8 @@ function toAgentApiMessageEnvelope(
   message: AgentApiMessageSource,
   content: string,
   viewerAgentId: string,
+  /** RFC 086: the handles of the people the page's cards are for (messageCardForNames), so their acting buttons name them. */
+  messageCardForNames?: ReadonlyMap<string, string>,
 ): AgentApiMessageEnvelope {
   // An action card's `presentation.card` is for human clients only.
   const { senderHandle, ...messageEnvelopeFields } = messageWithoutAgentHiddenActionCardSpec(message);
@@ -1602,7 +1661,7 @@ function toAgentApiMessageEnvelope(
     createdAt,
     timestamp,
     // RFC 082: `card=r<revision>` in the reader's header; `content` is the card's fallback.
-    ...agentMessageCardField("actionMetadata" in message ? message.actionMetadata : null),
+    ...agentMessageCardField("actionMetadata" in message ? message.actionMetadata : null, messageCardForNames),
     ...(message.taskCurrentProjection && {
       taskCurrentProjection: {
         ...message.taskCurrentProjection,
@@ -2055,8 +2114,9 @@ async function listRecentFreshnessMessagesAfterSeq(
   // form a reply target and drop every held message. Resolve the agent-facing
   // identity of the send target once and label each held envelope with it.
   const identity = await messageService.resolveAgentConversationIdentity(agentServerId, agentId, channelId);
+  const forNames = await messageCardForNames(recentMessages);
   return (await withAgentMessageReactions(await withAgentSourceTasks(recentMessages, undefined, agentServerId))).map((message) => ({
-    ...toAgentApiMessageEnvelope(message, typeof message.content === "string" ? message.content : "", agentId),
+    ...toAgentApiMessageEnvelope(message, typeof message.content === "string" ? message.content : "", agentId, forNames),
     ...identity,
   }));
 }
@@ -3798,6 +3858,10 @@ async function serveAgentHistoryRead(
     // `consume=false`: return the page without marking it read, for reads
     // whose output may never reach the model.
     const consume = historyQuery.consume !== "false";
+    // Each step of a read is timed on the request's span, a failed one too
+    // (db.query.failed), so a read that runs into the statement timeout says
+    // which step it was (#triage:#388: one agent's inbox reads at ~15 s).
+    const step = createTraceDbQueryTracer("agent.history.read");
 
     if (!channelRef) {
       refuse(res, 400, HISTORY_TARGET_REQUIRED_REFUSAL);
@@ -3902,7 +3966,7 @@ async function serveAgentHistoryRead(
     }
     const resolved = taskConversation
       ? { channelId: taskConversation.channelId, type: "thread" as const }
-      : await channelService.resolveChannelByName(serverId, actingAgentId, channelRef);
+      : await step("history.resolve_channel", () => channelService.resolveChannelByName(serverId, actingAgentId, channelRef));
     if (!resolved) {
       // Report which entity is actually missing. Saying "Channel not found" for a
       // thread ref whose channel resolves fine sent one reader into 8 retries and
@@ -3947,23 +4011,23 @@ async function serveAgentHistoryRead(
     }
 
     const channelId = resolved.channelId;
-    const hasAccess = await channelService.canAgentAccessChannel(channelId, actingAgentId);
+    const hasAccess = await step("history.access", () => channelService.canAgentAccessChannel(channelId, actingAgentId));
     if (!hasAccess) {
       refuse(res, 403, HISTORY_NOT_ACCESSIBLE_REFUSAL);
       return;
     }
-    if (!await assistantConfinedToOwnerDm(req, channelId)) {
+    if (!await step("history.assistant_scope", () => assistantConfinedToOwnerDm(req, channelId))) {
       setRequestTraceErrorCode(res, "assistant_outside_owner_dm");
       refuseKeepingTraceReason(res, 404, AGENT_CHANNEL_NOT_FOUND_REFUSAL);
       return;
     }
 
-    const channel = await channelService.getChannel(channelId);
+    const channel = await step("history.channel", () => channelService.getChannel(channelId));
     const jointThreadProjection = isSubConversationType(channel?.type)
-      ? await channelService.getJointThreadProjectionByLocalThread(channelId, serverId)
+      ? await step("history.joint_thread", () => channelService.getJointThreadProjectionByLocalThread(channelId, serverId))
       : null;
     const resolvedAccess = channel?.type === "joint"
-      ? await channelService.resolveChannelAccess({ serverId, channelId })
+      ? await step("history.joint_access", () => channelService.resolveChannelAccess({ serverId, channelId }))
       : null;
     const storageChannelId = jointThreadProjection?.canonicalThreadChannelId
       ?? (resolvedAccess?.kind === "joint" ? resolvedAccess.canonicalChannelId : channelId);
@@ -3997,8 +4061,8 @@ async function serveAgentHistoryRead(
     // what a person on this server sees, no further back. `hiddenThroughSeq`:
     // the newest seq behind it (0 when nothing is), never shown, so treated as
     // already read.
-    const historyWindow = await getServerHistoryWindowForRead(serverId);
-    const hiddenThroughSeq = await lastSeqBehindWindow(storageChannelId, historyWindow);
+    const historyWindow = await step("history.window", () => getServerHistoryWindowForRead(serverId));
+    const hiddenThroughSeq = await step("history.last_seq_behind_window", () => lastSeqBehindWindow(storageChannelId, historyWindow));
     // With what the window hides goes the offer of an upgrade card, where the
     // server allows one (#10999: null past Free or in a shared channel) and
     // the client can post it (else no hint at all). Not
@@ -4024,7 +4088,7 @@ async function serveAgentHistoryRead(
       return;
     }
     const beforeSeq = beforeResolution?.ok ? beforeResolution.seq : undefined;
-    const lastReadSeq = await channelService.getAgentLegacyReadCursor(actingAgentId, channelId);
+    const lastReadSeq = await step("history.read_cursor", () => channelService.getAgentLegacyReadCursor(actingAgentId, channelId));
     const unreadAfterSeq = unread ? Math.max(0, Number(lastReadSeq) || 0) : undefined;
     const afterSeq = afterResolution?.ok ? afterResolution.seq : unreadAfterSeq;
     let rawMsgs;
@@ -4082,14 +4146,14 @@ async function serveAgentHistoryRead(
       hasOlder = context.hasOlder;
       hasNewer = context.hasNewer;
     } else {
-      rawMsgs = await messageService.listMessages(storageChannelId, limit + 1, beforeSeq, afterSeq, historyWindow.cutoff, {
+      rawMsgs = await step("history.list_messages", () => messageService.listMessages(storageChannelId, limit + 1, beforeSeq, afterSeq, historyWindow.cutoff, {
         forwardedBundleViewerAgentId: actingAgentId,
         viewerServerId: serverId,
         includeSenderTimezone: true,
-      });
+      }));
     }
     const msgs = jointThreadProjection || resolvedAccess?.kind === "joint"
-      ? await messageService.projectJointMessagesToLocalChannel(rawMsgs, projectionChannelId, serverId)
+      ? await step("history.joint_projection", () => messageService.projectJointMessagesToLocalChannel(rawMsgs, projectionChannelId, serverId))
       : rawMsgs;
     const page = around
       ? { messages: msgs, hasOlder, hasNewer }
@@ -4120,8 +4184,9 @@ async function serveAgentHistoryRead(
     // `historyLimitMessage` in the window header): a read back to the start of
     // the window with older messages behind it, or a forward read (`--after`,
     // `--unread`) that started behind the window and skipped what it hides.
-    const historyLimited = historyWindow.cutoff !== undefined && (afterSeq === undefined
-      ? !hasOlder && await messageService.hasOlderMessages(storageChannelId, historyWindow.cutoff, beforeSeq)
+    const windowCutoff = historyWindow.cutoff;
+    const historyLimited = windowCutoff !== undefined && (afterSeq === undefined
+      ? !hasOlder && await step("history.has_older", () => messageService.hasOlderMessages(storageChannelId, windowCutoff, beforeSeq))
       : hiddenThroughSeq > afterSeq);
     // Paging back (`--before`) into the window's start is an explicit reach
     // for older messages; a default page that touches it is not (C+ step 2).
@@ -4134,9 +4199,10 @@ async function serveAgentHistoryRead(
     // What this read does to the read position, decided here (the response
     // reports it) and run by commitReadPosition() only once the response has
     // passed its contract: a read that cannot answer leaves the page unread.
-    const readPositionMoves: Array<() => Promise<void>> = [];
+    // Each move is timed under its own name (a non-awaited mark or a schedule would read ~0 ms).
+    const readPositionMoves: Array<{ name: string; move: () => Promise<void> }> = [];
     const commitReadPosition = async (): Promise<void> => {
-      for (const move of readPositionMoves) await move();
+      for (const { name, move } of readPositionMoves) await step(name, move);
     };
     if (consume && !around && pageMsgs.length > 0) {
       const pageSeqs = pageMsgs
@@ -4179,16 +4245,16 @@ async function serveAgentHistoryRead(
       );
       if (readThroughSeq !== null && readThroughSeq > priorReadSeq) {
         const throughSeq = readThroughSeq;
-        readPositionMoves.push(async () => {
+        readPositionMoves.push({ name: "history.mark_read.through", move: async () => {
           // An unread read is awaited: the next `--unread` must start after this
           // page, not race the write and return the same messages again.
           const marking = markAgentRead(throughSeq).catch(() => {});
           if (unread) await marking;
-        });
+        } });
       }
       if (maxSeq > 0 && canAdvanceModelSeen && maxSeq > Math.max(priorReadSeq, readThroughSeq ?? 0)) {
         const deferredFromSeq = Math.max(priorReadSeq, readThroughSeq ?? 0);
-        readPositionMoves.push(async () => {
+        readPositionMoves.push({ name: "history.mark_read.deferred_schedule", move: async () => {
           scheduleDeferredReadAdvance({
             agentId: actingAgentId,
             channelId,
@@ -4206,7 +4272,7 @@ async function serveAgentHistoryRead(
               ...attrs,
             }),
           });
-        });
+        } });
       }
     }
 
@@ -4215,7 +4281,7 @@ async function serveAgentHistoryRead(
     // moves over it (or the inbox would count it unread forever).
     if (consume && unread && pageMsgs.length === 0 && hiddenThroughSeq > Math.max(0, Number(lastReadSeq) || 0)) {
       readThroughSeq = hiddenThroughSeq;
-      readPositionMoves.push(async () => {
+      readPositionMoves.push({ name: "history.mark_read.hidden", move: async () => {
         const readState = await channelService.markRead({ kind: "agent", id: actingAgentId }, channelId, hiddenThroughSeq);
         void emitScopeReadUpdated({
           io: req.app.get("io") as SocketServer | undefined,
@@ -4226,7 +4292,7 @@ async function serveAgentHistoryRead(
           maxReadSeq: readState.maxReadSeq,
           changed: readState.changed,
         });
-      });
+      } });
     }
 
     // The agent's own messages are never unread for it: the inbox count and the
@@ -4238,43 +4304,45 @@ async function serveAgentHistoryRead(
     const ownSender = { senderType: "agent" as const, senderId: actingAgentId };
     // Task v2: chat messages list the tasks hanging under them (flag-on servers).
     // Each reaction names who reacted (handle and kind), for the reactions line of a read.
-    const shownMsgs = await withAgentMessageReactions(await withAgentSourceTasks(unread
+    const shownMsgs = await step("history.decorate", async () => withAgentMessageReactions(await withAgentSourceTasks(unread
       ? pageMsgs.filter((message) => !(message.senderType === ownSender.senderType && message.senderId === ownSender.senderId))
-      : pageMsgs, undefined, serverId));
+      : pageMsgs, undefined, serverId)));
     if (unread && hasNewer && pageMsgs.length > 0) {
       const pageLastSeq = Math.max(...pageMsgs.map((message) => Number(message.seq)));
-      hasNewer = (await messageService.listMessages(storageChannelId, 1, undefined, pageLastSeq, historyWindow.cutoff, { excludeSender: ownSender })).length > 0;
+      hasNewer = (await step("history.has_newer_unread", () => messageService.listMessages(storageChannelId, 1, undefined, pageLastSeq, historyWindow.cutoff, { excludeSender: ownSender }))).length > 0;
     }
 
-    const renderedContents = await agentPermalinkRenderService.renderAgentReadablePermalinksInTexts(
+    const renderedContents = await step("history.render_permalinks", () => agentPermalinkRenderService.renderAgentReadablePermalinksInTexts(
       shownMsgs.map((message) => message.content),
       serverId,
-    );
+    ));
     // Resolve the evidence key from the same authority that resolved this
     // request. Message envelopes intentionally omit channel identity fields,
     // so reconstructing a target from a rendered row can only guess (and in
     // CLI 0.0.28 guessed `#undefined`, collapsing every target together).
     let resolvedHistoryTarget = taskConversation
       ? taskConversation.ref
-      : await channelService.resolveAgentFacingChannelRef(
+      : await step("history.target_ref", () => channelService.resolveAgentFacingChannelRef(
         serverId,
         actingAgentId,
         projectionChannelId,
-      );
+      ));
     let dmHistoryScope = channel?.type === "dm";
-    const cardChannel = await resolveChannelCardRow(channel, serverId);
+    const cardChannel = await step("history.channel_card", () => resolveChannelCardRow(channel, serverId));
     if (channel?.type === "thread" && channel.parentMessageId) {
-      const parent = await messageService.getMessage(channel.parentMessageId);
-      const parentChannel = parent ? await channelService.getChannel(parent.channelId) : null;
+      const parentMessageId = channel.parentMessageId;
+      const parent = await step("history.thread_parent", () => messageService.getMessage(parentMessageId));
+      const parentChannel = parent ? await step("history.thread_parent_channel", () => channelService.getChannel(parent.channelId)) : null;
       dmHistoryScope = parentChannel?.type === "dm";
       const parentTarget = parent
-        ? await channelService.resolveAgentFacingChannelRef(serverId, actingAgentId, parent.channelId)
+        ? await step("history.thread_parent_ref", () => channelService.resolveAgentFacingChannelRef(serverId, actingAgentId, parent.channelId))
         : null;
       if (parentTarget) {
         resolvedHistoryTarget = `${parentTarget}:${channel.parentMessageId.slice(0, 8)}`;
       }
     }
-    const peerCard = dmHistoryScope ? await resolvePeerCard(serverId, actingAgentId, channel) : null;
+    const peerCard = dmHistoryScope ? await step("history.peer_card", () => resolvePeerCard(serverId, actingAgentId, channel)) : null;
+    const historyForNames = await step("history.names", () => messageCardForNames(shownMsgs));
     const historyBody: AgentApiHistoryResponse = {
       target: resolvedHistoryTarget ?? channelRef,
       ...(dmHistoryScope && channel && { consumption_scope: {
@@ -4294,6 +4362,7 @@ async function serveAgentHistoryRead(
             message.actionMetadata,
           ),
           actingAgentId,
+          historyForNames,
         )
       ),
       has_more: hasOlder || hasNewer,
@@ -4738,7 +4807,7 @@ async function handleReaction(
   await emitProjectedMessageUpdate(req.app.get("io"), message, enriched, localChannelId, serverId);
   const projected = await projectUpdatedMessageForLocalChannel(message, enriched, localChannelId, serverId);
   const [withReactors] = await withAgentMessageReactions([projected]);
-  res.json(toAgentApiMessageEnvelope(withReactors ?? projected, projected.content, actingAgentId));
+  res.json(toAgentApiMessageEnvelope(withReactors ?? projected, projected.content, actingAgentId, await messageCardForNames([projected])));
 }
 
 registerAgentApiRoute("messageReactionAdd", ...agentApiRequestValidators("messageReactionAdd"), validateAgentApiResponseMiddleware("messageReactionAdd"), async (req, res) => {
@@ -4794,6 +4863,8 @@ type CheckedMessageCardUpdate = {
   jointPostingAuthorityChannelId: string | null;
   /** The message's stored channel the checks ran on: the write refuses a message moved since. */
   storageChannelId: string;
+  /** RFC 086: the new card's acting buttons, checked as at send; null: the acting buttons end. */
+  actions: MessageCardActions | null;
 };
 
 function refuseMessageCardUpdate(res: Response, status: number, body: { error: string; code: string; [key: string]: unknown } | (AgentApiRateLimitedBody & { retry_after: number })): void {
@@ -4860,10 +4931,51 @@ async function checkMessageCardUpdate(req: Request, res: Response, body: AgentAp
     refuseMessageCardUpdate(res, 403, { error: "This channel is read-only on your current plan. Upgrade to continue.", code: "channel_read_only" });
     return null;
   }
-  const prepared = prepareMessageCardUpdate({ card: body.card, content: body.content });
+  const prepared = prepareMessageCardUpdate({ card: body.card, content: body.content, actions: body.actions });
   if (!prepared.ok) {
-    refuseMessageCardUpdate(res, prepared.refusal.status, prepared.refusal.body);
+    if (prepared.refusal.body.code === MESSAGE_CARD_ERROR_CODES.actionsNotAllowed) {
+      addTraceEvent("agent_api.message_card_update.refused", { code: prepared.refusal.body.code, status: 400 });
+      refuseMessageCardActions(res, prepared.refusal.body.error);
+    } else {
+      refuseMessageCardUpdate(res, prepared.refusal.status, prepared.refusal.body);
+    }
     return null;
+  }
+  // RFC 086 §4.1: `for` is fixed at send; an update carrying `actions` runs
+  // every send check again, now (Tenny 21a5e576), for the send's `for`.
+  const storedFor = messageCardForUser(message.actionMetadata);
+  // An App subject, as at send: compared with the stored person only after Raft's mapping.
+  if (body.for !== undefined && (await resolveMessageCardFor({ senderAgentId: actingAgentId, serverId, raw: body.for }))?.id !== storedFor) {
+    addTraceEvent("agent_api.message_card_update.refused", { code: MESSAGE_CARD_ERROR_CODES.actionsNotAllowed, status: 400 });
+    refuseMessageCardActions(res, "for is fixed when the card is sent: an update can't name another person or add one.");
+    return null;
+  }
+  if (prepared.actions) {
+    try {
+      await assertMessageCardActionsAllowed({
+        senderAgentId: actingAgentId, serverId, channelId: conversationId,
+        buttons: messageCardActingButtons({ card: prepared.card, actions: prepared.actions }), forUserId: storedFor,
+      });
+    } catch (err) {
+      if (err instanceof channelService.ChannelArchivedError) {
+        refuseMessageCardUpdate(res, 409, { error: "This channel is archived; its messages no longer change.", code: "channel_archived" });
+        return null;
+      }
+      if (!(err instanceof MessageCardActionsRefusedError)) throw err;
+      addTraceEvent("agent_api.message_card_update.refused", { code: err.code, status: 400 });
+      refuseMessageCardActions(res, err.message, err.code);
+      return null;
+    }
+    // RFC 086 §4.5: an update that gives a card acting buttons it didn't have spends the App's send budget, as a send with them does.
+    if (messageCardActingButtons(message.actionMetadata).length === 0) {
+      const app = await messageCardSenderApp(actingAgentId);
+      const budget = app ? await admitMessageCardActionsSend({ clientId: app.clientId, serverId }) : { admitted: true as const };
+      if (!budget.admitted && "limit" in budget) {
+        addTraceEvent("agent_api.message_card_update.refused", { code: AGENT_API_RATE_LIMITED_CODE, status: 429 });
+        refuse(res, 429, messageCardActionsRateLimited(budget, "messageCardUpdate"));
+        return null;
+      }
+    }
   }
   // The limits, spent only now: past either, 429 with `retry_after` (seconds),
   // the agent API's RATE_LIMITED body and `Retry-After`.
@@ -4888,6 +5000,7 @@ async function checkMessageCardUpdate(req: Request, res: Response, body: AgentAp
     senderWroteContent: prepared.senderWroteContent,
     jointPostingAuthorityChannelId: conversation.joint?.postingAuthorityChannelId ?? null,
     storageChannelId: message.channelId,
+    actions: prepared.actions,
   };
 }
 
@@ -4911,6 +5024,7 @@ registerAgentApiRoute(
           idempotencyKey,
           card: body.card,
           content: body.content,
+          actions: body.actions,
         })
         : null;
       if (!outcome) {
@@ -4922,6 +5036,7 @@ registerAgentApiRoute(
           card: checked.card,
           content: checked.content,
           senderWroteContent: checked.senderWroteContent,
+          actions: checked.actions,
           expectedRevision: body.expectedRevision,
           idempotencyKey,
           jointPostingAuthorityChannelId: checked.jointPostingAuthorityChannelId,
@@ -5738,6 +5853,18 @@ internalAgentApiRouter.get("/wake-hints/stream", requireAgentCapability("read"),
       await rebuildPendingThirdPartyAgentEvents(agentOrchestrator, actingAgentId)
         .catch((err) => console.error("internal.agent-api third-party event rebuild failed:", serializeErrorForLog(err)));
     });
+
+    // A draining task opens no new stream: the going-away spread ends only
+    // the streams registered at drain start, so one opened in the seconds the
+    // ALB still routes here would be hard-cut at deregistration expiry
+    // (deployment thread 3f292dc3). Checked right before the stream opens, so
+    // a request that began before the drain is refused too; the CLI bridge
+    // treats a 5xx as retryable and reconnects after its backoff.
+    if (isDraining()) {
+      recordDrainRefusal("sse");
+      res.set("Retry-After", "1").status(503).json({ error: "This server is restarting; reconnect", code: "server_draining" });
+      return;
+    }
 
     res.writeHead(200, {
       "content-type": "text/event-stream",
@@ -7022,6 +7149,35 @@ async function isAgentSendKeyCommitted(agentId: string, idempotencyKey: string):
   return Boolean(committed);
 }
 
+/**
+ * RFC 086 §4.1: 400 `message_card_actions_not_allowed` (§5.2: `message_card_encryption_key_required`), nothing stored. A
+ * sentence that can't stand in a refusal (it quotes an App's name or a key
+ * that reads as a flag) says the rule instead.
+ */
+function refuseMessageCardActions(
+  res: Response, error: string,
+  code: MessageCardActionsRefusedError["code"] = MESSAGE_CARD_ERROR_CODES.actionsNotAllowed,
+): void {
+  setRequestTraceErrorCode(res, code);
+  refuse(res, 400, {
+    code,
+    error: refusalSentenceProblem(error) === null ? error : "This card's acting buttons (actions) or for can't be stored here.",
+    suggestedNextAction: MESSAGE_CARD_ACTIONS_NEXT_STEP,
+  });
+}
+
+/** RFC 086 §4.5: past the App's 30 card sends with acting buttons a minute on this Server (an update that adds them counts too). */
+function messageCardActionsRateLimited(
+  budget: { limit: number; windowSeconds: number; retryAfterSeconds: number }, operation: "messageSendV2" | "messageCardUpdate",
+): RefusalInput {
+  return {
+    code: AGENT_API_RATE_LIMITED_CODE,
+    error: `This App sent too many cards with acting buttons on this Server: at most ${budget.limit} a minute. Wait ${budget.retryAfterSeconds} second${budget.retryAfterSeconds === 1 ? "" : "s"}, then try again.`,
+    retryAfterSeconds: budget.retryAfterSeconds,
+    details: { operation, limit: budget.limit, windowSeconds: budget.windowSeconds, retryAfterSeconds: budget.retryAfterSeconds },
+  };
+}
+
 /** A send target that resolves to nothing the agent can post in (404 `target_not_found`; agentRouteRefusals.ts). */
 function refuseSendTargetNotFound(res: Response, target: string): void {
   const { status, refusal } = unwritableTargetRefusal(null, target);
@@ -7067,6 +7223,9 @@ async function handleAgentApiMessageSend(
       : undefined;
     // RFC 082: a card on a v2 send (checked below, before anything is resolved or held).
     const requestedCard = routeKey === "messageSendV2" ? sendBody.card : undefined;
+    // RFC 086: an App's acting buttons on that card, and the one person they are for.
+    const requestedActions = routeKey === "messageSendV2" ? sendBody.actions : undefined;
+    const requestedFor = routeKey === "messageSendV2" ? sendBody.for : undefined;
     const isSendDraft = sendDraft === true;
     const isContinueAnyway = continueAnyway === true;
     const withholdFreshnessContext = freshnessContextMode === "withheld";
@@ -7196,15 +7355,31 @@ async function handleAgentApiMessageSend(
     // replay below answers it (the original message, or 409 for another
     // send). Its card is still prepared, to compare with the committed one.
     let messageCardSend: MessageCardSend | null = null;
+    if (requestedCard === undefined && (requestedActions !== undefined || requestedFor !== undefined)) {
+      traceSendRouteFailure("bad_request", 400);
+      refuseMessageCardActions(res, "actions and for belong to a card: send them with card.");
+      return;
+    }
     if (requestedCard !== undefined) {
       let refusal: MessageCardRefusal | null = null;
-      const prepared = prepareMessageCardSend({ card: requestedCard, content: requestedContent, mentions, attachmentIds });
+      // RFC 086 §4.1: only an App's bot sends acting buttons or names for (checked again, with every other rule, in the send's transaction).
+      if ((requestedActions !== undefined || requestedFor !== undefined) && !await messageCardSenderApp(actingAgentId)) {
+        traceSendRouteFailure("bad_request", 400);
+        refuseMessageCardActions(res, "Only an App's bot can send a card with acting buttons (actions) or for.");
+        return;
+      }
+      // RFC 086: the person `for` names, an App subject resolved through Raft's mapping, and their handle to mention them.
+      const forUser = requestedFor !== undefined ? await resolveMessageCardFor({ senderAgentId: actingAgentId, serverId, raw: requestedFor }) : null;
+      const prepared = prepareMessageCardSend({
+        card: requestedCard, content: requestedContent, mentions, attachmentIds, actions: requestedActions, for: requestedFor, forUser,
+      });
       if (prepared.ok) messageCardSend = prepared.send;
       else refusal = prepared.refusal;
       if (refusal) {
         addTraceEvent("agent_api_send.message_card.refused", { code: refusal.body.code, limit: refusal.body.limit ?? null });
         traceSendRouteFailure("bad_request", refusal.status);
-        res.status(refusal.status).json(refusal.body);
+        if (refusal.body.code === MESSAGE_CARD_ERROR_CODES.actionsNotAllowed) refuseMessageCardActions(res, refusal.body.error);
+        else res.status(refusal.status).json(refusal.body);
         return;
       }
     }
@@ -7483,6 +7658,19 @@ async function handleAgentApiMessageSend(
       return;
     }
 
+    // RFC 086 §4.5: an App spends one of its 30 card sends with acting
+    // buttons a minute on this Server, as the send goes out (a retry of a
+    // send that already committed spends none: the replay answers it).
+    const messageCardActing = messageCardSend?.metadata.actions ? messageCardSend.metadata : null;
+    if (messageCardActing && !(typeof idempotencyKey === "string" && idempotencyKey.length > 0 && await isAgentSendKeyCommitted(actingAgentId, idempotencyKey))) {
+      const app = await messageCardSenderApp(actingAgentId);
+      const budget = app ? await admitMessageCardActionsSend({ clientId: app.clientId, serverId }) : { admitted: true as const };
+      if (!budget.admitted && "limit" in budget) {
+        traceSendRouteFailure("bad_request", 429);
+        refuse(res, 429, messageCardActionsRateLimited(budget, "messageSendV2"));
+        return;
+      }
+    }
     const sendAttention = await buildDriveByJoinedToPostAttention(actingAgentId, resolved, agentFacingTarget);
     // A personal assistant's message may go back to WeChat only if, as it is
     // sent, its turn carries a WeChat message from this very DM (top level):
@@ -7505,7 +7693,20 @@ async function handleAgentApiMessageSend(
         mentionContract: routeKey === "messageSend" ? "v1" : "v2",
         // RFC 082: the card's metadata (revision 1); a derived fallback mentions no one.
         ...(messageCardSend
-          ? { actionMetadata: messageCardSend.metadata, contentMentions: messageCardSend.contentMentions }
+          ? {
+            actionMetadata: messageCardSend.metadata, contentMentions: messageCardSend.contentMentions,
+            // RFC 086 §4.1: the card's `for`, mentioned by id.
+            ...(messageCardSend.forMention ? { raftMentions: [messageCardSend.forMention] } : {}),
+          }
+          : {}),
+        // RFC 086 §4.1: a card's acting buttons and `for`, checked in the send's transaction.
+        ...(messageCardActing
+          ? {
+            checkAgentInsertInTransaction: (executor: DatabaseExecutor) => assertMessageCardActionsAllowed({
+              senderAgentId: actingAgentId, serverId, channelId: resolved.channelId,
+              buttons: messageCardActingButtons(messageCardActing), forUserId: messageCardForUser(messageCardActing),
+            }, executor),
+          }
           : {}),
         attachmentIds: Array.isArray(attachmentIds) ? attachmentIds : [],
         ...(typeof idempotencyKey === "string" && idempotencyKey.length > 0
@@ -7616,6 +7817,17 @@ async function handleAgentApiMessageSend(
       ...(messageCardSend ? messageCardReceiptField(enriched.actionMetadata) : {}),
     });
   } catch (err) {
+    if (err instanceof MessageCardActionsRefusedError) {
+      traceSendRouteFailure("bad_request", 400);
+      refuseMessageCardActions(res, err.message, err.code);
+      return;
+    }
+    // RFC 086: the card's checks in the send's transaction found the conversation archived since the archive check above.
+    if (err instanceof channelService.ChannelArchivedError) {
+      traceSendRouteFailure("channel_archived", 409);
+      refuse(res, 409, CHANNEL_ARCHIVED_REFUSAL);
+      return;
+    }
     if (routeKey !== "messageSend" && err instanceof messageService.MentionValidationError && err.code) {
       traceSendRouteFailure("mention_validation", 400);
       refuse(res, 400, { code: err.code, error: err.message });
@@ -8119,7 +8331,7 @@ registerAgentApiRoute("messageSearch", async (req, res) => {
       ...historyLimit,
       results: searchResponse.results.map((result, index) => {
         // RFC 077: an agent reads "sent by an assistant for its owner" as `delegated_by=@name`, as on every other message it reads.
-        const { externalMessage, delegatedBy, retracted: _retracted, ...visibleResult } = result;
+        const { externalMessage, delegatedBy, retracted: _retracted, postedByVoiceCall, ...visibleResult } = result;
         const external = result.senderType === "external_projection";
         // Slack-bridged rows read like ordinary messages; other external content stays inert.
         const inert = external && (!isSlackBridgedExternalProvider(externalMessage?.provider)
@@ -8139,6 +8351,7 @@ registerAgentApiRoute("messageSearch", async (req, res) => {
           senderType: toAgentFacingActorType(result.senderType),
           ...(externalMessage ? { external_message: externalMessage } : {}),
           ...(delegatedBy ? { delegated_by: { name: delegatedBy.name } } : {}),
+          ...(postedByVoiceCall ? { posted_by: "voice_call" as const } : {}),
           content: inert
             ? renderThirdPartyInertText({ field: "tool_result", value: result.content })
             : renderAgentCommentScopedContent(
@@ -8245,7 +8458,7 @@ registerAgentApiRoute("channelMembers", async (req, res) => {
       humans: visibleHumans.map((human) => {
         const servers = channelService.agentVisibleMemberServers(human, serverId);
         // Another server's person: their role stays with their organization.
-        return { name: human.name, description: human.description, ...(human.serverId === serverId ? { role: human.role } : {}), ...(servers ? { servers } : {}) };
+        return { name: human.name, description: human.description, ...(channelService.isViewerServerMember(human, serverId) ? { role: human.role } : {}), ...(servers ? { servers } : {}) };
       }),
     });
   } catch (err) {
@@ -8791,6 +9004,7 @@ registerAgentApiRoute("assistantOwnerMessages", ...agentApiRequestValidators("as
       message_count: pageMsgs.length,
     });
     const ownerMsgs = await withAgentMessageReactions(pageMsgs);
+    const ownerForNames = await messageCardForNames(ownerMsgs);
     sendAgentApiResponse("assistantOwnerMessages", res, {
       owner: { userId: ownerUserId },
       channelId,
@@ -8802,6 +9016,7 @@ registerAgentApiRoute("assistantOwnerMessages", ...agentApiRequestValidators("as
             message.actionMetadata,
           ),
           req.actingAgentId!,
+          ownerForNames,
         ),
         ...conversationLabels,
       })),
@@ -8885,6 +9100,51 @@ registerAgentApiRoute("assistantOwnerArtifactPublish", ...agentApiRequestValidat
       error: "Failed to publish the Artifact",
       code: "agent_api_assistant_owner_artifact_publish_failed",
       logPrefix: "[AgentAPI] Failed to publish an Artifact for an assistant",
+      err,
+    });
+  }
+});
+
+// #proj-assistant:#33: an Artifact published AS the owner, under send-as-owner's rules; every check, refusal and
+// the receipt live in assistantOwnerArtifactAsOwner.
+registerAgentApiRoute("assistantOwnerArtifactPublishAsOwner", ...agentApiRequestValidators("assistantOwnerArtifactPublishAsOwner"), async (req, res) => {
+  try {
+    // The owner from the assistant's own record, never from the request (Tenny, #32).
+    const ownerUserId = await requireAssistantOwner(req, res);
+    if (!ownerUserId) return;
+    const app = firstPartyApps().find((candidate) => candidate.actingFor?.publishAs);
+    if (!app) {
+      refuse(res, 404, { code: "artifact_not_found", error: "Artifacts can't be published here." });
+      return;
+    }
+    const orchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
+    const result = await publishOwnerArtifactAsOwner({
+      io: req.app.get("io"),
+      orchestrator,
+      agentId: req.actingAgentId!,
+      serverId: req.serverId!,
+      ownerUserId,
+      request: req.body as AgentApiAssistantOwnerArtifactPublishAsOwnerBody,
+      outbox: appNoticeOutbox(app, orchestrator),
+    });
+    if (!result.ok) {
+      noteAppPaywallHit(req, result.paywallHit, null);
+      if (result.retryAfterSeconds !== undefined) res.setHeader("Retry-After", String(result.retryAfterSeconds));
+      refuse(res, result.status as RefusalStatus, {
+        code: result.code,
+        error: result.error,
+        ...(result.details ? { details: result.details } : {}),
+        ...(result.retryAfterSeconds !== undefined ? { retryAfterSeconds: result.retryAfterSeconds } : {}),
+      } as RefusalInput);
+      return;
+    }
+    res.status(result.status);
+    sendAgentApiResponse("assistantOwnerArtifactPublishAsOwner", res, result.body);
+  } catch (err: unknown) {
+    sendJsonServerError(req, res, {
+      error: "Failed to publish the Artifact as the owner",
+      code: "agent_api_assistant_owner_artifact_publish_as_owner_failed",
+      logPrefix: "[AgentAPI] Failed to publish an Artifact as an assistant's owner",
       err,
     });
   }
@@ -9437,6 +9697,13 @@ registerAgentApiRoute("integrationList", ...agentApiRequestValidators("integrati
         ? { resolvedServiceId: resolvedService.ok ? resolvedService.client.id : null }
         : {}),
     });
+    // Counts a `--service` name nothing here answers to (integration_service_requested). After the
+    // response, and never for an assistant, whose list is cut down to one app on purpose.
+    if (!assistant && typeof serviceQuery === "string" && resolvedService && !resolvedService.ok && resolvedService.status === 404) {
+      void recordUnresolvedServiceLookup(getProductEventSink(req.app), {
+        serverId, agentId, rawService: serviceQuery, clientKeyMatched: resolvedService.clientKeyMatched === true, mcpApps: allMcpApps,
+      });
+    }
   } catch (err) {
     sendJsonServerError(req, res, {
       error: "Failed to list agent integrations",
@@ -9640,6 +9907,11 @@ registerAgentApiRoute("integrationLogin", ...agentApiRequestValidators("integrat
       if (!marketplaceResolved.ok) {
         closeTrace({ outcome: "rejected", reason: "service_resolution_failed", httpStatus: marketplaceResolved.status });
         res.status(marketplaceResolved.status).json({ error: marketplaceResolved.error });
+        if (marketplaceResolved.status === 404) {
+          void recordIntegrationServiceRequested(getProductEventSink(req.app), {
+            serverId, agentId, rawService: body.service, outcome: "not_offered", command: "login",
+          });
+        }
         return;
       }
       appType = marketplaceResolved.client.appType;
@@ -9700,6 +9972,9 @@ registerAgentApiRoute("integrationLogin", ...agentApiRequestValidators("integrat
       phase = "response";
       sendAgentApiResponse("integrationLogin", res, response);
       closeTrace({ outcome: "success", reason: "install_required", httpStatus: 200 });
+      void recordIntegrationServiceRequested(getProductEventSink(req.app), {
+        serverId, agentId, rawService: body.service, outcome: "not_installed", command: "login",
+      });
       return;
     }
     appType = resolved.client.appType;
@@ -10477,6 +10752,60 @@ registerAgentApiRoute("integrationAppList", async (req, res) => {
     });
   }
 });
+// RFC 076 §17: an agent with manageIntegrations on its Server reads or sets an
+// App's card buttons there, as a person does on the App's page (routes/integrations.ts
+// GET/PUT/DELETE .../action-endpoint/own-server-actions; same services, same
+// rule for people and agents). Anyone else, an unknown App, or one neither
+// from nor installed on this Server: the one 404.
+registerAgentApiRoute("integrationAppCardButtons", ...agentApiRequestValidators("integrationAppCardButtons"), async (req, res) => {
+  try {
+    const agentId = req.actingAgentId!;
+    const serverId = req.serverId!;
+    const body = req.body as AgentApiRequestBodyByRoute["integrationAppCardButtons"];
+    const actionEndpoint = body.actionEndpoint?.trim() || null;
+    if ((body.action === "allow") !== (actionEndpoint !== null)) {
+      refuse(res, 400, CARD_BUTTONS_ENDPOINT_REFUSAL);
+      return;
+    }
+    const client = await resolveOAuthClientByKey(body.clientKey.trim());
+    if (!client || !await actorHasServerCapabilityInServer(serverId, "agent", agentId, "manageIntegrations")) {
+      refuse(res, 404, APP_NOT_FOUND_REFUSAL);
+      return;
+    }
+    const actor = { type: "agent" as const, id: agentId };
+    const result = body.action === "allow" ? await allowCardButtons({ clientId: client.id, serverId, actor, actionEndpoint: actionEndpoint! })
+      : body.action === "withdraw" ? await withdrawCardButtons({ clientId: client.id, serverId, actor })
+        : null;
+    if (result && result.kind !== "changed") {
+      refuse(res, result.kind === "not_found" ? 404 : 409, cardButtonsRefusal(result.kind));
+      return;
+    }
+    const state = await getActionEndpointState(client.id, serverId);
+    if (!state) {
+      refuse(res, 404, APP_NOT_FOUND_REFUSAL);
+      return;
+    }
+    const view = cardButtonsView(state);
+    sendAgentApiResponse("integrationAppCardButtons", res, {
+      clientId: client.id,
+      clientKey: client.clientKey,
+      cardButtons: view && { ...view, changedAt: view.changedAt?.toISOString() ?? null },
+    });
+    if (result) {
+      recordRaftCliActivity(req, agentId, {
+        command: `integration.app.card-buttons.${body.action}`,
+        summary: `Card buttons of ${client.clientKey}: ${body.action}`,
+        correlationId: client.id,
+      });
+    }
+  } catch (err) {
+    sendJsonServerError(req, res, {
+      error: "Failed to manage the app's card buttons",
+      logPrefix: "internal.agent-api.integrations-app-card-buttons error:",
+      err,
+    });
+  }
+});
 registerAgentApiRoute("integrationAppStatus", ...agentApiRequestValidators("integrationAppStatus"), async (req, res) => {
   try {
     const query = req.query as AgentApiRequestQueryByRoute["integrationAppStatus"];
@@ -10809,8 +11138,17 @@ registerAgentApiRoute("taskCreate", ...agentApiRequestValidators("taskCreate"), 
       return;
     }
     // Task v2: a task always has a source, the message that asked for it
-    // (#wg-task-v2:#23). Flag off keeps the pre-v2 host message.
-    if (taskV2 && items.some((item) => item.source_message_id === undefined)) {
+    // (#wg-task-v2:#23). Flag off keeps the pre-v2 host message. A CLI too old
+    // to send one (before Computer 1.0.53) can't do what the refusal asks:
+    // its create gets the agent's own message posted as the source below, as
+    // the web's New task does (#wg-task-v2:#25), rather than every task it
+    // makes failing until its Computer is upgraded. Which CLI sent it comes
+    // from request headers any client can set, so it is not a security
+    // boundary: a client that claims to be an old CLI gets only what the
+    // agent's own message send would give it (the checks before the post
+    // below, its message budget, no mentions).
+    const postsOwnSource = taskV2 && items.some((item) => item.source_message_id === undefined);
+    if (postsOwnSource && !await isPreTaskSourceCli(agentApiClientOf(req), agentId)) {
       refuse(res, 400, taskSourceRequiredRefusal(channel));
       return;
     }
@@ -10856,6 +11194,36 @@ registerAgentApiRoute("taskCreate", ...agentApiRequestValidators("taskCreate"), 
       });
     }
 
+    // An old CLI's sourceless create (postsOwnSource): what would refuse
+    // posting its source message is checked here, and the message is posted
+    // last, right before the create, so a refused create posts nothing.
+    const sourceless = postsOwnSource ? createItems.filter((item) => !item.sourceMessageId) : [];
+    const ownSourceContent = sourceless.length > 0 ? creatorSourceMessageContent(sourceless) : null;
+    if (ownSourceContent !== null) {
+      if (ownSourceContent.length > MAX_MESSAGE_LENGTH) {
+        refuse(res, 400, TASK_SOURCE_MESSAGE_TOO_LONG_REFUSAL);
+        return;
+      }
+      // Everything an agent's message send checks before it posts
+      // (resolveWritableAgentTarget, handleAgentApiMessageSend): posting
+      // rights in this channel (canAgentPostToChannel: a live agent of its
+      // server and a member, the assistant rules, #all, the private agent
+      // DMs) and the archive were checked for the create above
+      // (assertAgentApiTaskWritableChannel); a migration receipt DM takes no
+      // message; a plan limit's read-only. The send itself refuses a DM whose
+      // peer left and a joint channel access change (taskCreatorSourceSendRefusal).
+      if (await channelService.isAgentMigrationReceiptChannel(ctx.channelId)) {
+        const err = DmTargetResolutionError.migrationReceiptReadOnly(channel);
+        res.status(err.status).json(err.toResponseBody());
+        return;
+      }
+      const billingReadOnly = await getChannelBillingReadOnly(ctx.channelId, serverId);
+      if (billingReadOnly) {
+        refuse(res, 403, channelBillingReadOnlyRefusal(billingReadOnly));
+        return;
+      }
+    }
+
     const sourceMessageIds = [...new Set(createItems.flatMap((item) => item.sourceMessageId ? [item.sourceMessageId] : []))];
     const gate = await gateTaskWriteFreshness(req, {
       action: "task_create",
@@ -10870,6 +11238,52 @@ registerAgentApiRoute("taskCreate", ...agentApiRequestValidators("taskCreate"), 
       return;
     }
 
+    if (ownSourceContent !== null) {
+      // The posted source is a message, so it spends the agent's message
+      // budget like a send, not only the task-change one this route is
+      // charged (600 creates a minute would otherwise post 600 messages
+      // against a send's 120). Charged here, after every refusal and hold,
+      // so a create that posts nothing spends nothing of it.
+      const messageBudget = await admitAgentApiWrite("messages", { agentId, serverId, units: 1 });
+      if (!messageBudget.admitted) {
+        refuseAgentApiWriteBudget(req, res, "messages", "taskCreate", messageBudget);
+        return;
+      }
+      try {
+        const source = await postTaskCreatorSourceMessage(req.app.get("io") as SocketServer, req.app.get("agentOrchestrator") as AgentOrchestrator, {
+          localChannelId: ctx.channelId,
+          creator: { type: "agent", id: agentId, name: ctx.agent.displayName || ctx.agent.name || "Agent" },
+          taskCount: sourceless.length,
+          content: ownSourceContent,
+          // A keyed retry whose create did not commit (a committed one was
+          // replayed above) gets the message it already posted, not a second.
+          ...(idempotency && { agentSendKey: `task-create-source:${idempotency.idempotencyKey}` }),
+        });
+        for (const item of sourceless) item.sourceMessageId = source.id;
+        // How often the fallback still fires: once it is near zero it can go
+        // (Tenny looks at it in the weekly flag cleanup, #wg-task-v2:#25).
+        addTraceEvent("task.create.posted_own_source", {
+          client_version: agentApiClientOf(req).version ?? "unknown",
+          computer_version: await machineService.agentComputerVersion(agentId) ?? "unknown",
+          task_count: sourceless.length,
+        });
+      } catch (err) {
+        if (err instanceof messageService.AgentSendIdempotencyConflictError) {
+          refuse(res, 409, { code: err.code, error: "This idempotency key was already used for a different task create: use a new key for a changed create." });
+          return;
+        }
+        const refusal = taskCreatorSourceSendRefusal(err);
+        if (refusal) {
+          refuse(res, refusal.status, refusal.refusal);
+          return;
+        }
+        throw err;
+      }
+    }
+
+    // If the create fails after a source message was posted above, the
+    // message stays, as the web's New task leaves it: it already reached the
+    // channel and its agents, and it says what the agent was making tasks of.
     let created: Awaited<ReturnType<typeof taskService.createTasks>>["tasks"];
     let hostMessages: Awaited<ReturnType<typeof taskService.createTasks>>["hostMessages"];
     let hostMessagesVisible: boolean;
@@ -12577,6 +12991,7 @@ registerAgentApiRoute("taskView", ...agentApiRequestValidators("taskView"), asyn
         page.messages.map((message) => message.content),
         serverId,
       );
+      const recentForNames = await messageCardForNames(page.messages);
       recent = (await withAgentMessageReactions(page.messages)).map((message, index) => toAgentApiMessageEnvelope(
         message,
         messageService.appendAgentFacingForwardedSnapshot(
@@ -12584,6 +12999,7 @@ registerAgentApiRoute("taskView", ...agentApiRequestValidators("taskView"), asyn
           message.actionMetadata,
         ),
         agentId,
+        recentForNames,
       ));
     }
 
@@ -13397,7 +13813,13 @@ registerAgentApiRoute("appConfigPatch", ...agentApiRequestValidators("appConfigP
 
 function actionPrepareResponseBody(card: actionCardsService.PreparedActionCard): AgentApiResponseByRoute["actionPrepare"] {
   // The agent gets the card's metadata without `presentation.card` (copy for human clients).
-  return { messageId: card.messageId, metadata: withoutAgentHiddenActionCardSpec({ ...card.metadata }), ...(card.existing ? { existing: true } : {}) };
+  return {
+    messageId: card.messageId,
+    metadata: withoutAgentHiddenActionCardSpec({ ...card.metadata }),
+    ...(card.existing ? { existing: true } : {}),
+    // A request card (RFC 085 §4.2 step 5): the summary the person sees, with the names this agent may see.
+    ...(card.preparedRequest ? { preparedRequest: card.preparedRequest } : {}),
+  };
 }
 
 // Ahead of the capability, grant and body checks, so a refused prepare names
@@ -13517,6 +13939,8 @@ mountAgentApiRoute("actionWithdraw", [...agentApiRequestValidators("actionWithdr
       messageId: out.messageId,
       metadata: { ...out.metadata },
       ...(out.alreadyWithdrawn ? { alreadyWithdrawn: true } : {}),
+      // A request card's one result kind (RFC 085): `withdrawn`, with its summary as this agent may see it.
+      ...(out.preparedRequest ? { preparedRequest: out.preparedRequest } : {}),
     });
     recordRaftCliActivity(req, agentId, {
       command: "action.withdraw",
@@ -13532,6 +13956,20 @@ mountAgentApiRoute("actionWithdraw", [...agentApiRequestValidators("actionWithdr
     sendJsonServerError(req, res, {
       error: "Failed to withdraw the question card",
       logPrefix: "internal.agent-api.withdraw-action error:",
+      err,
+    });
+  }
+}]);
+
+// RFC 085 §4.2 discovery (`raft action prepare --list`): the request-card operations this agent may prepare here.
+mountAgentApiRoute("actionOperations", [...agentApiRequestValidators("actionOperations"), validateAgentApiResponseMiddleware("actionOperations"), async (req, res) => {
+  try {
+    const { preparableOperations } = await import("../services/preparedRequestPrepare");
+    sendAgentApiResponse("actionOperations", res, await preparableOperations(req.serverId!));
+  } catch (err) {
+    sendJsonServerError(req, res, {
+      error: "Failed to list the operations you can prepare",
+      logPrefix: "internal.agent-api.prepare-action-operations error:",
       err,
     });
   }

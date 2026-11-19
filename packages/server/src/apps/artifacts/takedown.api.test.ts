@@ -9,7 +9,6 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import {
-  SERVER_GUEST_FEATURE_FLAG_KEY,
   artifactPublicPaths,
   artifactWebPaths,
   asArtifactId,
@@ -19,7 +18,7 @@ import {
   type ServerId,
 } from "@botiverse/raft-shared";
 import { getDb } from "../../db/index";
-import { featureFlagRules, objectInboxStates, serverMembers } from "../../db/schema";
+import { objectInboxStates, serverMembers } from "../../db/schema";
 import { createAgent } from "../../services/agentService";
 import { AGENT_API_KEY_HMAC_SECRET_ENV, mintAgentCredential } from "../../services/agentCredentialService";
 import { addAgent, addHuman, createChannel } from "../../services/channelService";
@@ -104,9 +103,6 @@ async function seedWorld(seed: ReturnType<typeof createSeed>) {
   const peer = await seed.server({ owner: peerUser });
   await addMember(peer.id, author.id);
   __answerFlagForTests(WORKSPACE_ARTIFACTS_FEATURE_FLAG_KEY, true);
-  await getDb().insert(featureFlagRules).values([
-    { flagKey: SERVER_GUEST_FEATURE_FLAG_KEY, stage: "server", priority: 0, decision: "allow", values: [server.id] },
-  ]);
   const agentA = await createAgent(server.id, `td-a-${label()}`, { runtime: "claude", model: "sonnet", creatorType: "user", creatorId: author.id });
   const room = await createChannel(server.id, `td-room-${label()}`, undefined, "private");
   // The guest's one channel is #room (#wg-rbac:#15); it joins it below like the others.

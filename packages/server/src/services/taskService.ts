@@ -867,11 +867,16 @@ async function enrichWithNames(rows: MessageRow[], executor: DatabaseExecutor = 
  * `messages.task_*` is retained as a frozen snapshot (rollback ledger, @stdrc
  * 2026-07-31 keep-and-observe) but is no longer read as truth by anything here.
  */
-export async function listTasks(channelId: string, statusFilter?: TaskStatus) {
+export async function listTasks(channelId: string, statusFilter?: TaskStatus, opts: { taskIds?: readonly string[] } = {}) {
   const db = getDb();
 
   const taskConditions = [conversionReadChannelPredicate(tasks.channelId, channelId)];
   if (statusFilter) taskConditions.push(eq(tasks.status, statusFilter));
+  // Only these tasks of the list (GET /api/sync/changes rebuilding changed rows).
+  if (opts.taskIds) {
+    if (opts.taskIds.length === 0) return [];
+    taskConditions.push(inArray(tasks.id, [...opts.taskIds]));
+  }
 
   // A failed query is not an empty board. Let each route report the failure;
   // callers can only assert completeness after the query and enrichment pass.
@@ -919,6 +924,7 @@ export async function listTasksAssignedToAgent(
   visibleChannelIds: string[],
   agentId: string,
   statusFilter?: TaskStatus | "all",
+  opts: { activeSince?: Date } = {},
 ) {
   const db = getDb();
   if (visibleChannelIds.length === 0) return [];
@@ -940,6 +946,8 @@ export async function listTasksAssignedToAgent(
   } else if (!statusFilter) {
     conditions.push(inArray(tasks.status, [...UNFINISHED_TASK_STATUSES]));
   }
+  // Only tasks with activity at or after this time (the idle task reminder).
+  if (opts.activeSince) conditions.push(sql`${taskActivityAt} >= ${opts.activeSince.toISOString()}::timestamptz`);
 
   const rows = await db
     .selectDistinctOn([tasks.channelId, tasks.taskNumber, tasks.id], { task: tasks, readChannelId: readSurface.channelId })
@@ -1014,11 +1022,12 @@ export async function countTasksAssignedToAgent(visibleChannelIds: readonly stri
 }
 
 /**
- * At most `limit` task v2 tasks this agent created that nobody holds, in these
- * already-authorized channel ids, most recently updated first (idle task
- * reminder). Only statuses the caller names, each created at or before its
- * cutoff: a task's "untouched" clock cannot start before its creation, so a
- * younger one cannot be due and must not take a place under the limit.
+ * At most `limit` tasks this agent created that nobody holds, in these
+ * already-authorized channel ids, with activity at or after `activeSince`,
+ * most recently updated first (idle task reminder). Only statuses the caller
+ * names, each created at or before its cutoff: a task's "untouched" clock
+ * cannot start before its creation, so a younger one cannot be due and must
+ * not take a place under the limit.
  *
  * Reads tasks through idx_tasks_channel_status like the assigned reads, no
  * index on the creator; the creator and assignee are filters on those rows. No
@@ -1027,7 +1036,7 @@ export async function countTasksAssignedToAgent(visibleChannelIds: readonly stri
 export async function listUnassignedTasksCreatedByAgent(
   visibleChannelIds: readonly string[],
   agentId: string,
-  opts: { createdByStatus: Partial<Record<TaskStatus, Date>>; limit: number },
+  opts: { createdByStatus: Partial<Record<TaskStatus, Date>>; activeSince: Date; limit: number },
 ) {
   const statuses = Object.entries(opts.createdByStatus).flatMap(([status, cutoff]) => cutoff
     ? [and(eq(tasks.status, status as TaskStatus), lte(tasks.createdAt, cutoff))]
@@ -1054,7 +1063,7 @@ export async function listUnassignedTasksCreatedByAgent(
       eq(tasks.createdByType, "agent"),
       eq(tasks.createdById, agentId),
       isNull(tasks.claimedById),
-      or(eq(tasks.ownConversation, true), isNotNull(tasks.conversationChannelId)),
+      sql`${taskActivityAt} >= ${opts.activeSince.toISOString()}::timestamptz`,
       or(...statuses),
     ))
     .orderBy(asc(tasks.id), asc(readSurface.position))

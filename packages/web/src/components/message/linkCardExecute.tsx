@@ -6,16 +6,22 @@ import { create } from "zustand";
 import { toast } from "@botiverse/raft-ui";
 import { clearClockTimeout, currentTimeMs, setClockTimeout } from "@botiverse/raft-shared";
 import { LINK_CARD_OPERATION_CHANGED_EVENT, linkCardToastSchema } from "@botiverse/raft-shared/src/appLinkPreview";
-import type { LinkCardElement } from "@botiverse/raft-shared/src/appLinkPreview";
+import type { MessageCardForm } from "@botiverse/raft-shared";
 import api from "../../api/client";
 import { getSocket, onSocketCreated } from "../../api/socket";
 import { DEFAULT_LOCALE } from "../../i18n/locale";
 import { shownLocaleMessages } from "../../i18n/messages";
-import type { MessageId } from "../../i18n/messages";
+import { noteLinkCardApp, showAppToast, showStateHint, showWarning } from "./linkCardToasts";
 import { useAuthStore } from "../../store/authStore";
 import { linkPreviewViewerKey } from "../../store/linkPreviewConsentStore";
 import { useServerStore } from "../../store/serverStore";
 import { LinkCardUndoCountdown } from "./LinkCardUndoCountdown";
+import { linkCardButtonForm } from "./linkCardForm";
+import type { LinkCardButton } from "./linkCardForm";
+import { sealLinkCardSecrets } from "./linkCardSeal";
+import type { LinkCardSealTo } from "./linkCardSeal";
+import { findRecord, forgetRecord, patchRecord, putRecord, readLinkCardOperationRecords, UUID } from "./linkCardOperationRecords";
+import type { LinkCardOperationRecord } from "./linkCardOperationRecords";
 import type { AppLinkResult, LinkCardActionHandle } from "./useAppLinkPreviews";
 
 // The hover card's buttons (protocol v3.2.3 §4.4, §5.2-§5.4, §7, §8.2-§8.3;
@@ -32,10 +38,14 @@ import type { AppLinkResult, LinkCardActionHandle } from "./useAppLinkPreviews";
 // - execute with `undoWindowMs`: a toast counts the window down with Undo. Undo
 //   sends nothing; when the window ends, execute is sent once, whatever the
 //   hover card does meanwhile.
+// - an App Raft hasn't reviewed (`app.reviewed: false`, RFC 076 §17; this
+//   client declares `unreviewed_app.v1`): Raft's dialog comes before every
+//   acting button. A prepared one's says so after prepare; an undo-window one
+//   asks first, before anything is sent, and confirming starts its window.
 // - execute moves the message view's request count on (protocol §7.1); the
 //   view shows the pending state until the read after the answer returns, and
 //   while the operation it started is open. Its `client_request_id` is kept in
-//   a small local record per viewer and Server (`slock:link-card-operations:*`)
+//   a small local record per viewer and Server (linkCardOperationRecords.ts)
 //   with the operation id once known. An answer that doesn't come (no answer,
 //   5xx, LOCK_TIMEOUT) is asked for again with the same id, which Raft answers
 //   from its records (§5.3.2 step 2); a reload recovers the operation by status,
@@ -45,11 +55,13 @@ import type { AppLinkResult, LinkCardActionHandle } from "./useAppLinkPreviews";
 //   `link_card.operation_changed` hint names it. A toast shows at most once
 //   per receipt revision: the App's own toast only when status returns it
 //   (`app_result`), else Raft's fixed hint for a new state. A terminal receipt
-//   reads the card again if the message is still shown.
+//   reads the card again if the message is still shown. An operation that
+//   ends at execute's answer shows the same way: the App's toast when the
+//   answer carries one (`app_result`, `execute.toast.v1`), else the hint.
 
 type Format = IntlShape["formatMessage"];
 type CardResult = Extract<AppLinkResult, { kind: "card" }>;
-export type LinkCardButton = Extract<LinkCardElement, { type: "Button" }>["props"];
+export type { LinkCardButton } from "./linkCardForm";
 type ExecuteAction = Extract<LinkCardButton["action"], { kind: "execute" }>;
 
 /**
@@ -103,7 +115,6 @@ export const LINK_CARD_LOOKUP_COOLDOWN_MS = 60_000;
 // ---------------------------------------------------------------------------
 // Answers, read as this client needs them (unknown fields are ignored).
 
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const uuid = z.string().regex(UUID);
 const codePoints = (min: number, max: number) => z.string().refine((value) => {
   const length = [...value].length;
@@ -127,16 +138,20 @@ const prepareAnswerSchema = z.union([
   z.object({ prepared_action_id: uuid, prepared_digest: z.string().regex(/^[0-9a-f]{64}$/), description: descriptionSchema }),
   z.object({ status: z.literal("refused") }),
 ]);
+// The App's private result: present only when Raft's gates passed in this
+// status, or in this execute that the App's answer finished (`execute.toast.v1`).
+// An App result this client can't read is no App result: Raft's hint shows,
+// and the rest of the answer still counts (Kirby, #13978 review W2).
+const appResultSchema = z.object({ toast: linkCardToastSchema.optional() }).optional().catch(undefined);
 const executeAnswerSchema = z.union([
-  z.object({ operation_id: uuid, state: z.enum(OPERATION_STATES) }),
+  z.object({ operation_id: uuid, state: z.enum(OPERATION_STATES), app_result: appResultSchema }),
   z.object({ state: z.literal("not_visible") }),
 ]);
 const receiptSchema = z.object({
   operation_id: uuid,
   state: z.enum(OPERATION_STATES),
   receipt_revision: z.number().int().min(0),
-  // The App's private result: present only when both of Raft's gates passed in this status.
-  app_result: z.object({ toast: linkCardToastSchema.optional() }).optional(),
+  app_result: appResultSchema,
 });
 type Receipt = z.infer<typeof receiptSchema>;
 const statusAnswerSchema = z.union([receiptSchema, z.object({ operation_id: uuid, state: z.literal("not_visible") })]);
@@ -194,77 +209,30 @@ export async function linkCardUrlSha256(url: string): Promise<string | null> {
 }
 
 // ---------------------------------------------------------------------------
-// Local records: the operations this browser started, per viewer and Server
-// (localStorage, like utils/computerAttentionSeen.ts). Bounded (50, 48 hours)
-// and best-effort; the server stays the source of truth. No URL or App text
-// is kept: ids, the URL's digest, and which receipt was last shown.
-
-const RECORDS_PREFIX = "slock:link-card-operations";
-const RECORDS_MAX = 50;
-const RECORD_TTL_MS = 48 * 3600_000;
-const recordSchema = z.object({
-  message_id: z.string().min(1).max(200),
-  url_sha256: z.string().regex(/^[0-9a-f]{64}$/),
-  client_request_id: z.string().min(1).max(128).optional(),
-  operation_id: uuid.optional(),
-  at: z.number(),
-  toasted_revision: z.number().int().optional(),
-  toasted_state: z.string().max(40).optional(),
-}).refine((record) => !!record.client_request_id || !!record.operation_id);
-export type LinkCardOperationRecord = z.infer<typeof recordSchema>;
-
-const recordsKey = (viewerKey: string) => `${RECORDS_PREFIX}:${viewerKey}`;
-export function readLinkCardOperationRecords(viewerKey: string): LinkCardOperationRecord[] {
-  try {
-    const parsed: unknown = JSON.parse(globalThis.localStorage?.getItem(recordsKey(viewerKey)) ?? "[]");
-    if (!Array.isArray(parsed)) return [];
-    const now = currentTimeMs();
-    return parsed.flatMap((raw) => {
-      const record = recordSchema.safeParse(raw);
-      return record.success && now - record.data.at < RECORD_TTL_MS ? [record.data] : [];
-    });
-  } catch {
-    return [];
-  }
-}
-function writeRecords(viewerKey: string, records: LinkCardOperationRecord[]) {
-  try {
-    if (!records.length) globalThis.localStorage?.removeItem(recordsKey(viewerKey));
-    else globalThis.localStorage?.setItem(recordsKey(viewerKey), JSON.stringify(records.slice(-RECORDS_MAX)));
-  } catch {
-    // Best effort: the server keeps the operation; this only speeds up recovery.
-  }
-}
-type RecordMatch = { clientRequestId?: string; operationId?: string };
-const matches = (record: LinkCardOperationRecord, match: RecordMatch) =>
-  (!!match.clientRequestId && record.client_request_id === match.clientRequestId) || (!!match.operationId && record.operation_id === match.operationId);
-function putRecord(viewerKey: string, record: LinkCardOperationRecord) {
-  const records = readLinkCardOperationRecords(viewerKey).filter((existing) => !matches(existing, { clientRequestId: record.client_request_id, operationId: record.operation_id }));
-  writeRecords(viewerKey, [...records, record]);
-}
-function patchRecord(viewerKey: string, match: RecordMatch, patch: Partial<LinkCardOperationRecord>) {
-  writeRecords(viewerKey, readLinkCardOperationRecords(viewerKey).map((record) => (matches(record, match) ? { ...record, ...patch } : record)));
-}
-function forgetRecord(viewerKey: string, match: RecordMatch) {
-  const records = readLinkCardOperationRecords(viewerKey);
-  const kept = records.filter((record) => !matches(record, match));
-  if (kept.length !== records.length) writeRecords(viewerKey, kept);
-}
-const findRecord = (viewerKey: string, match: RecordMatch) => readLinkCardOperationRecords(viewerKey).find((record) => matches(record, match));
-
-// ---------------------------------------------------------------------------
 // Per-view state, shared by every chip of the view (a link written twice) and
 // kept while the hover card is closed.
 
 export type LinkCardConfirm = {
   /** The chip that asked: it draws the dialog and gives focus back. */
   owner: string;
-  handle: string;
-  prepared: { id: string; digest: string };
-  description: LinkCardDescription;
   /** Confirmed: execute is on its way and the dialog waits for its answer. */
   executing: boolean;
-};
+  /**
+   * The App isn't reviewed by Raft (`app.reviewed: false` on the card it was
+   * pressed on, RFC 076 §17): the dialog says who runs it and what that means.
+   */
+  unreviewed: boolean;
+  form?: MessageCardForm; // An App-sent card button's form (RFC 086 §5.1), filled in the dialog; its values go only to execute.
+} & (
+  /** A prepared action (`confirm: "prepare"`), with the App's description: confirming executes it. */
+  | { kind: "prepared"; handle: string; prepared: { id: string; digest: string }; description: LinkCardDescription; sealTo?: LinkCardSealTo }
+  /**
+   * An undo-window button of an App Raft hasn't reviewed, which has no
+   * description: Raft's dialog is titled with its label, and confirming starts
+   * its undo window as for any App.
+   */
+  | { kind: "run"; label: string }
+);
 /**
  * What `actionId` holds while a read button reads. Not a possible action_id
  * (`^[a-z][a-z0-9_]*$` has no ":"), so an execute named `read` never looks busy
@@ -338,24 +306,6 @@ function backgroundFormat(): Format {
   return latestFormat ?? fallbackFormat();
 }
 
-/** Raft's fixed hint per state, localized (the server's English text is the same copy). */
-const STATE_HINTS: Record<LinkCardOperationState, { id: MessageId; tone: "info" | "success" | "warning" }> = {
-  sent: { id: "message.appLink.action.state.sent", tone: "info" },
-  accepted: { id: "message.appLink.action.state.accepted", tone: "info" },
-  done: { id: "message.appLink.action.state.done", tone: "success" },
-  refused: { id: "message.appLink.action.state.notCarriedOut", tone: "warning" },
-  failed_not_sent: { id: "message.appLink.action.state.notCarriedOut", tone: "warning" },
-  unknown: { id: "message.appLink.action.state.unconfirmed", tone: "warning" },
-  needs_reconciliation: { id: "message.appLink.action.state.unconfirmed", tone: "warning" },
-  resolved_manually: { id: "message.appLink.action.state.resolvedManually", tone: "info" },
-};
-function showToast(tone: "info" | "success" | "warning", text: string) {
-  if (tone === "success") toast.success(text);
-  else if (tone === "warning") toast.warning(text);
-  else toast.info(text);
-}
-const showStateHint = (format: Format, state: LinkCardOperationState) => showToast(STATE_HINTS[state].tone, format({ id: STATE_HINTS[state].id }));
-const showWarning = (format: Format, id: MessageId, values?: Record<string, string | number>) => showToast("warning", format({ id }, values));
 
 // ---------------------------------------------------------------------------
 // Mounted messages.
@@ -569,6 +519,8 @@ async function recoverByUrl(input: { viewerKey: string; view: LinkCardMessageVie
 type FollowTarget = { viewerKey: string; messageKey: string; viewKey: string; url: string };
 type Follow = FollowTarget & { at: number; shown: { revision: number; state?: string } };
 const followed = new Map<string, Follow>();
+/** The links of a message (`<viewer>:<server>|<messageId>`) this tab follows an operation on: a card message keeps them registered once the App took their buttons away (RFC 086). */
+export const followedLinkCardUrls = (messageKey: string): string[] => [...new Set([...followed.values()].filter((known) => known.messageKey === messageKey).map((known) => known.url))];
 
 /** This tab follows `operationId` for a view: pending there, and its status polled while the message is mounted. */
 function follow(operationId: string, target: FollowTarget, input: { state: LinkCardOperationState; at: number; now: boolean; shown: Follow["shown"] }) {
@@ -665,9 +617,7 @@ function applyReceipt(viewerKey: string, receipt: Receipt) {
   if (!known && !record) return;
   const shown = known?.shown ?? { revision: record?.toasted_revision ?? 0, state: record?.toasted_state };
   if (receipt.receipt_revision > shown.revision) {
-    const appToast = receipt.app_result?.toast;
-    if (appToast) showToast(appToast.tone, appToast.text);
-    else if (receipt.state !== shown.state) showStateHint(backgroundFormat(), receipt.state);
+    if (!showAppToast(backgroundFormat(), receipt.state, receipt.app_result?.toast, known?.viewKey) && receipt.state !== shown.state) showStateHint(backgroundFormat(), receipt.state);
     if (known) known.shown = { revision: receipt.receipt_revision, state: receipt.state };
     if (record) patchRecord(viewerKey, { operationId: receipt.operation_id }, { toasted_revision: Math.max(receipt.receipt_revision, record.toasted_revision ?? 0), toasted_state: receipt.state });
   }
@@ -755,9 +705,11 @@ function listenForHints() {
 // ---------------------------------------------------------------------------
 // Presses.
 
-type PressContext = { viewerKey: string; viewKey: string; view: LinkCardMessageView; url: string; format: Format; owner: string };
+type PressContext = { viewerKey: string; viewKey: string; view: LinkCardMessageView; url: string; format: Format; owner: string; quietViewPending?: boolean };
 /** The press each view's dialog confirms. */
 const pressContexts = new Map<string, PressContext>();
+/** The undo-window button each view's dialog asks about (an App Raft hasn't reviewed), and the card it was pressed on. */
+const runs = new Map<string, { card: CardResult; button: LinkCardButton }>();
 /** Undo windows running, by view. */
 const holds = new Map<string, { undo: () => void }>();
 
@@ -775,18 +727,25 @@ function sameExecuteButton(result: CardResult, action: ExecuteAction): LinkCardB
 
 /**
  * A button of a v2 card was pressed. `navigate` is a link and never comes
- * here. Nothing starts while the view is busy or has an open operation.
+ * here. Nothing starts while the view is busy or has an open operation. An
+ * undo-window button of an App Raft hasn't reviewed asks in Raft's dialog
+ * first (RFC 076 §17); nothing is sent, nor read, until it is confirmed.
  */
-export async function pressLinkCardButton({ result, button, owner, format }: { result: CardResult; button: LinkCardButton; owner: string; format: Format }) {
+export async function pressLinkCardButton({ result, button, owner, format, quietViewPending }: {
+  result: CardResult; button: LinkCardButton; owner: string; format: Format;
+  /** A card message's buttons (RFC 086): a 409 VIEW_PENDING shows no warning, only the view's pending state. */
+  quietViewPending?: boolean;
+}) {
   const view = result.view;
   const action = button.action;
   if (!view || action.kind === "navigate" || button.disabledReason) return;
   const viewerKey = viewerKeyOf(view.key);
   const viewKey = linkCardViewKey(view, result.url);
+  noteLinkCardApp(viewKey, result.app.name);
   const state = viewState(viewKey);
   if (state.busy || state.operation || useLinkCardActionStore.getState().unavailable[viewerKey]) return;
   latestFormat = format;
-  const context: PressContext = { viewerKey, viewKey, view, url: result.url, format, owner };
+  const context: PressContext = { viewerKey, viewKey, view, url: result.url, format, owner, ...(quietViewPending ? { quietViewPending } : {}) };
 
   if (action.kind === "read") {
     setBusy(viewKey, "reading", READ_BUSY_KEY);
@@ -795,7 +754,28 @@ export async function pressLinkCardButton({ result, button, owner, format }: { r
     clearBusy(viewKey);
     return;
   }
+  if (!handleFor(result, action.action_id)) return;
+  const form = linkCardButtonForm(action);
+  // An undo-window button asks first for an App Raft hasn't reviewed, and to fill in its form (RFC 086 §5.1).
+  if ((result.app.reviewed === false || form) && !("confirm" in action)) {
+    pressContexts.set(viewKey, context);
+    runs.set(viewKey, { card: result, button });
+    setViewState(viewKey, (current) => ({
+      operation: current.operation, busy: "confirming", actionId: action.action_id,
+      confirm: { kind: "run", owner, label: button.label, unreviewed: result.app.reviewed === false, executing: false, ...(form ? { form } : {}) },
+    }));
+    return;
+  }
+  await pressExecute(context, result, button);
+}
 
+/**
+ * An execute button, from its press or from Raft's dialog that asked first:
+ * its handle, read again first if it is old, then prepare or the undo window.
+ */
+async function pressExecute(context: PressContext, result: CardResult, button: LinkCardButton, inputs: Record<string, string> | null = null) {
+  const { viewKey, view, format } = context;
+  const action = button.action as ExecuteAction;
   let card = result;
   let pressed: LinkCardButton = button;
   let handle = handleFor(card, action.action_id);
@@ -807,7 +787,8 @@ export async function pressLinkCardButton({ result, button, owner, format }: { r
     const fresh = read.kind === "read" && read.result?.kind === "card" ? read.result : null;
     const again = fresh ? sameExecuteButton(fresh, action) : null;
     handle = fresh && again ? handleFor(fresh, action.action_id) : undefined;
-    if (!fresh || !again || !handle) {
+    // Values typed for a form the App has since changed are not sent.
+    if (!fresh || !again || !handle || JSON.stringify(linkCardButtonForm(again.action)) !== JSON.stringify(linkCardButtonForm(action))) {
       clearBusy(viewKey);
       showWarning(format, read.kind === "failed" ? "message.appLink.action.readFailed" : "message.appLink.action.changed");
       return;
@@ -816,12 +797,12 @@ export async function pressLinkCardButton({ result, button, owner, format }: { r
     pressed = again;
   }
   const pressedAction = pressed.action as ExecuteAction;
-  if ("confirm" in pressedAction) await prepare(context, card, pressedAction.action_id, handle);
-  else hold(context, pressedAction.action_id, handle, pressedAction.undoWindowMs, pressed.label);
+  if ("confirm" in pressedAction) await prepare(context, card, pressedAction.action_id, handle, linkCardButtonForm(pressedAction));
+  else hold(context, pressedAction.action_id, handle, pressedAction.undoWindowMs, pressed.label, inputs);
 }
 
 /** `POST /link-cards/prepare`, then Raft's dialog with the App's description. */
-async function prepare(context: PressContext, card: CardResult, actionId: string, handle: string) {
+async function prepare(context: PressContext, card: CardResult, actionId: string, handle: string, form: MessageCardForm | undefined) {
   const { viewKey, format } = context;
   // The schema requires it on a v2 card; without it there is nothing to claim.
   if (!card.businessRevision) { clearBusy(viewKey); return; }
@@ -841,27 +822,47 @@ async function prepare(context: PressContext, card: CardResult, actionId: string
   setViewState(viewKey, (current) => ({
     operation: current.operation, busy: "confirming", actionId,
     confirm: {
-      owner: context.owner, handle, prepared: { id: prepared.prepared_action_id, digest: prepared.prepared_digest },
-      description: prepared.description, executing: false,
+      kind: "prepared", owner: context.owner, handle, prepared: { id: prepared.prepared_action_id, digest: prepared.prepared_digest },
+      description: prepared.description, unreviewed: card.app.reviewed === false, executing: false, ...(form ? { form } : {}),
+      ...(card.sealsTo?.[actionId] ? { sealTo: card.sealsTo[actionId] } : {}), // The App's key, as this read answered it (RFC 086 §5.3).
     },
   }));
 }
 
-/** Raft's dialog was confirmed: execute with the prepared id and digest. The dialog closes on the answer. */
-export async function confirmLinkCardAction(viewKey: string) {
+/**
+ * Raft's dialog was confirmed. A prepared action: execute with the prepared
+ * id and digest; the dialog closes on the answer. An undo-window button that
+ * asked first: the dialog closes and the press goes on, its undo window as
+ * for any App.
+ */
+export async function confirmLinkCardAction(viewKey: string, inputs: Record<string, string> | null = null, secrets: Map<string, string> | null = null) {
   const state = viewState(viewKey);
   const context = pressContexts.get(viewKey);
   const confirm = state.confirm;
   if (!confirm || confirm.executing || !context) return;
+  if (confirm.kind === "run") {
+    const run = runs.get(viewKey);
+    pressContexts.delete(viewKey);
+    runs.delete(viewKey);
+    clearBusy(viewKey);
+    if (run) await pressExecute(context, run.card, run.button, inputs);
+    return;
+  }
   setViewState(viewKey, (current) => ({ ...current, confirm: current.confirm && { ...current.confirm, executing: true } }));
-  await execute(context, state.actionId ?? "", confirm.handle, confirm.prepared);
+  const actionId = state.actionId ?? "";
+  const clientRequestId = globalThis.crypto.randomUUID();
+  // A form's SecretInput values, sealed first to the App's key, read again (RFC 086 §5.3); failed closed, nothing is sent.
+  const sealed = secrets ? await sealLinkCardSecrets(context, { actionId, handle: confirm.handle, prepared: confirm.prepared, clientRequestId, sealTo: confirm.sealTo, values: secrets }) : undefined;
+  if (sealed === null) { pressContexts.delete(viewKey); clearBusy(viewKey); return; }
+  await execute(context, actionId, confirm.handle, confirm.prepared, inputs, clientRequestId, sealed);
 }
 
-/** Cancel, Esc, or the chip that asked went away: nothing is sent (the prepared record just expires). */
+/** Cancel, Esc, or the chip that asked went away: nothing is sent (a prepared record just expires). */
 export function cancelLinkCardAction(viewKey: string) {
   const confirm = viewState(viewKey).confirm;
   if (!confirm || confirm.executing) return;
   pressContexts.delete(viewKey);
+  runs.delete(viewKey);
   clearBusy(viewKey);
 }
 
@@ -872,7 +873,7 @@ export function cancelLinkCardAction(viewKey: string) {
  * a time: if a newer one replaces it (or it is swiped away) while the window
  * runs, it comes back once, so Undo stays reachable (addendum 5 §3).
  */
-function hold(context: PressContext, actionId: string, handle: string, windowMs: number, label: string) {
+function hold(context: PressContext, actionId: string, handle: string, windowMs: number, label: string, inputs: Record<string, string> | null) {
   const { viewKey, format } = context;
   setBusy(viewKey, "holding", actionId);
   const deadline = currentTimeMs() + windowMs;
@@ -907,7 +908,7 @@ function hold(context: PressContext, actionId: string, handle: string, windowMs:
   const timer = setClockTimeout(() => {
     if (settled) return;
     settle();
-    void execute(context, actionId, handle, null);
+    void execute(context, actionId, handle, null, inputs);
   }, windowMs);
   show();
   holds.set(viewKey, { undo });
@@ -918,17 +919,20 @@ function hold(context: PressContext, actionId: string, handle: string, windowMs:
  * before it is sent; the view's request count moves on as it goes. An answer
  * that doesn't come is asked for again with the same request
  * (LINK_CARD_EXECUTE_RETRY_MS), which Raft answers from its records if it
- * went through. The answer shows only Raft's fixed hint for its state (never
- * the App's words); the card is read again after it.
+ * went through. The answer shows Raft's fixed hint for its state, or, when the
+ * App's answer finished the operation, the App's toast if Raft relayed one
+ * (`app_result`; never from Raft's records); the card is read again after it.
  */
-async function execute(context: PressContext, actionId: string, handle: string, prepared: { id: string; digest: string } | null) {
+async function execute(context: PressContext, actionId: string, handle: string, prepared: { id: string; digest: string } | null, inputs: Record<string, string> | null, clientRequestId = globalThis.crypto.randomUUID(), sealedInputs?: string) {
   const { viewerKey, viewKey, view, url, format } = context;
-  const clientRequestId = globalThis.crypto.randomUUID();
   const urlSha256 = await linkCardUrlSha256(url);
   if (urlSha256) putRecord(viewerKey, { message_id: view.messageId, url_sha256: urlSha256, client_request_id: clientRequestId, at: currentTimeMs() });
   view.beginExecute();
   setBusy(viewKey, "executing", actionId);
-  const body = { client_request_id: clientRequestId, handle, ...(prepared ? { prepared_action_id: prepared.id, prepared_digest: prepared.digest } : {}) };
+  // A form's TextInput values and sealed SecretInput values (RFC 086 §5.4) ride only here, held in this request alone; a retry re-sends it from memory.
+  const body = {
+    client_request_id: clientRequestId, handle, ...(prepared ? { prepared_action_id: prepared.id, prepared_digest: prepared.digest } : {}), ...(inputs ? { inputs } : {}), ...(sealedInputs ? { sealed_inputs: sealedInputs } : {}),
+  };
   let data: unknown;
   try {
     for (let attempt = 0; ; attempt += 1) {
@@ -958,8 +962,9 @@ async function execute(context: PressContext, actionId: string, handle: string, 
     await refresh(viewKey, view.key, url);
     return;
   }
-  const { operation_id: operationId, state } = answer.data;
-  showStateHint(format, state);
+  const { operation_id: operationId, state, app_result: appResult } = answer.data;
+  // Finished at once: the App's toast when it sent one, else Raft's hint, as when status finishes it.
+  if (!(TERMINAL.has(state) && showAppToast(format, state, appResult?.toast, viewKey))) showStateHint(format, state);
   if (TERMINAL.has(state)) forgetRecord(viewerKey, { clientRequestId });
   else {
     patchRecord(viewerKey, { clientRequestId }, { operation_id: operationId, toasted_state: state });
@@ -1012,7 +1017,7 @@ async function actionFailed(context: PressContext, error: unknown, phase: "prepa
   }
   if (status === 409) {
     forget();
-    showWarning(format, body.code === "VIEW_PENDING" ? "message.appLink.action.conflictPending" : "message.appLink.action.conflict");
+    if (!(context.quietViewPending && body.code === "VIEW_PENDING")) showWarning(format, body.code === "VIEW_PENDING" ? "message.appLink.action.conflictPending" : "message.appLink.action.conflict");
     const named = typeof body.operation_id === "string" && UUID.test(body.operation_id) ? body.operation_id : null;
     if (named) await followOperation(context, named);
     else if (body.code === "VIEW_PENDING") await recoverByUrl({ viewerKey, view, url });
@@ -1046,6 +1051,7 @@ export function resetLinkCardActionsForTests() {
   for (const { undo } of [...holds.values()]) undo();
   holds.clear();
   pressContexts.clear();
+  runs.clear();
   registrations.clear();
   for (const socket of hintSockets) socket.off(LINK_CARD_OPERATION_CHANGED_EVENT, onOperationChanged);
   hintSockets = [];
